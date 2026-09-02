@@ -8,10 +8,11 @@ service over released Core wire records and SessionStore's durable aggregate.
 Read [`CLAUDE.md`](CLAUDE.md). Open an issue for non-trivial public API,
 authorization, or wire-surface changes so compatibility can be reviewed first.
 
-Factory must not import Host or Harness, anywhere, including tests. Centrifuge
-is confined to `internal/realtime`, the web UI bundle to `cmd/factory`, and the
-Kubernetes SDK to `internal/placement/kubernetes`. Do not add local `replace`
-directives or vendored dependencies. If you need to move a pinned dependency,
+Factory must not import Host or Harness, anywhere, including tests, and three
+further dependencies are confined to one subtree each. The rules are listed in
+[`CLAUDE.md`](CLAUDE.md) and enforced by `import_boundary_test.go`; that list is
+deliberately not repeated here, because a third copy is a third thing to forget.
+Do not add local `replace` directives or vendored dependencies. If you need to move a pinned dependency,
 use `go get`, update `releasedLooprigVersions` in `module_pin_test.go` in the
 same change, and check that `go mod tidy` leaves `go.mod` unchanged afterwards.
 

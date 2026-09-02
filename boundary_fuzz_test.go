@@ -4,6 +4,8 @@ import (
 	"slices"
 	"strings"
 	"testing"
+
+	"github.com/looprig/factory/internal/modfiles"
 )
 
 // segmentPrefix is an INDEPENDENT implementation of the containment question,
@@ -79,6 +81,40 @@ func FuzzScopedRulesNeverEscapeTheirScope(f *testing.F) {
 				t.Fatalf("violatedRule(%q, %q) attributed the rejection to %q, want %q",
 					dir, sample, violated.name, rule.name)
 			}
+		}
+	})
+}
+
+// FuzzModfilesDecisionSurfaceMatchesTheSanctionedSet generalises the table in
+// import_boundary_test.go over arbitrary names.
+//
+// The table exists because a coverage-guided mutator will not reliably invent
+// the string "generated"; this exists because the table cannot enumerate every
+// name a future edit might add. Neither subsumes the other, and the oracle is
+// an independent restatement of the justification rather than a copy of the
+// implementation, so a widened rule dies here whatever reason string it
+// invents -- including one that reuses an existing reason.
+func FuzzModfilesDecisionSurfaceMatchesTheSanctionedSet(f *testing.F) {
+	for _, seed := range []string{
+		"", "a", ".", "_", "..", "vendor", "vendored", "testdata", "testdata2",
+		".git", ".github", ".worktrees", "_scratch", "generated", "gen",
+		"zz_generated.go", "node_modules", "third_party", "internal", "cmd",
+	} {
+		f.Add(seed)
+	}
+
+	f.Fuzz(func(t *testing.T, name string) {
+		wantReason, wantIgnored := sanctionedIgnoredDirectory(name)
+		gotReason, gotIgnored := modfiles.IgnoredDirectory(name)
+		if gotIgnored != wantIgnored || gotReason != wantReason {
+			t.Fatalf("modfiles.IgnoredDirectory(%q) = (%q, %v), sanctioned answer is (%q, %v)",
+				name, gotReason, gotIgnored, wantReason, wantIgnored)
+		}
+		wantReason, wantIgnored = sanctionedIgnoredFile(name)
+		gotReason, gotIgnored = modfiles.IgnoredFile(name)
+		if gotIgnored != wantIgnored || gotReason != wantReason {
+			t.Fatalf("modfiles.IgnoredFile(%q) = (%q, %v), sanctioned answer is (%q, %v)",
+				name, gotReason, gotIgnored, wantReason, wantIgnored)
 		}
 	})
 }

@@ -10,11 +10,13 @@ fan-out, and optional UI composition.
 The boundary is enforced by `import_boundary_test.go`, not by convention. Five
 rules, applied to every Go file in the module, production and test alike:
 
+<!-- boundary-rules:begin -->
 - `github.com/looprig/host` — forbidden **everywhere**.
 - `github.com/looprig/harness` — forbidden **everywhere**.
 - `github.com/centrifugal/...` — only under `internal/realtime`.
 - `github.com/looprig/wui` — only under `cmd/factory`.
 - `k8s.io/...` and `sigs.k8s.io/...` — only under `internal/placement/kubernetes`.
+<!-- boundary-rules:end -->
 
 Factory talks to Host **through Core and SessionStore records**. That is the
 positive half of the first two rules and the reason they are absolute: there is
@@ -60,8 +62,11 @@ string table is one `go mod tidy` away from being dropped.
   requiring each to be driven to a rejection and each scoped rule to a
   permitted in-scope answer and a rejected out-of-scope one.
 
-When you add a rule, add its cases and its entry in `sampleImports`; both the
-coverage assertion and the fuzz target fail if you do not. A rule scoped to
+When you add a rule, add its cases, its `docToken`, and its entry in
+`sampleImports`; the coverage assertion, the fuzz target and
+`documented_rules_test.go` each fail if you do not. That last one holds the
+`boundary-rules` blocks in this file and in `README.md` to the declared list, so
+a sixth rule cannot leave the prose describing five. A rule scoped to
 `""` must also have an entry in `forbiddenModules`, or
 `TestEveryForbiddenModuleIsAnEverywhereImportRule` fails: go.mod may not
 require what no file may import.
@@ -85,16 +90,62 @@ one buys an extra scan rather than an exemption. The root's own `.git` is
 excluded, and that exclusion has its own fixture case so widening it to swallow
 nested repositories fails.
 
+**Nothing here restates `modfiles`. The detector consults it.**
+`modfiles` decides visibility on five axes — which directories it refuses to
+enter, which files it refuses to read, the boundary marker set, the `.go`
+suffix, and a fail-closed symlink check — and anything hidden by any of them is
+outside all five import rules *and* outside `make fmt-check`, which pipes the
+same enumerator. The first version of this guard restated two axes as its own
+literals and did not cover the other two, and it failed in both directions:
+
+- **Too narrow.** Appending `|| name == "generated"` to the directory rule —
+  one word, in an `internal/` helper nobody reviews as "the product" — hid
+  every file under any `generated/` directory from all five rules and from
+  `gofmt`, while this test stayed silent. Unlike `_x.go` or `testdata/`, a
+  directory named `generated` **is compiled by Go**, so the hidden import was a
+  real dependency of a real build.
+- **Too wide.** It descended into `testdata/` and dot-prefixed directories that
+  `modfiles` never enters, so it reported `.worktrees/feature-x` and
+  `internal/modfiles/testdata/fixturemod` as boundaries. Both reports were
+  false, and the prescribed remedy was harmful: declaring a `testdata` fixture
+  module makes the guard scan a fixture whose whole purpose is to contain a
+  forbidden import. `AGENTS.md` names `.worktrees/` as a structural path and
+  this program's own workflow creates them, so that one would have broken
+  `make check` on `main` the first time anyone added a worktree.
+
+So `modfiles` exports `IgnoredDirectory`, `IgnoredFile` and `BoundaryMarkers`,
+each returning a **reason**, and the detector stops descending exactly where
+`modfiles` stops. Adding a sixth reason there cannot leave the detector behind.
+
+**Sharing removes the disagreement; it does not narrow the shared answer** — a
+widened shared predicate is a hole in both walks at once. So the sanctioned
+answer is pinned separately, by an independent restatement written from the
+justification rather than from the code
+(`sanctionedIgnoredDirectory`/`sanctionedIgnoredFile`, deliberately spelled with
+`strings.HasPrefix` rather than an index so a copy-paste cannot pass for
+agreement). A table names the specific hazards a mutator would not invent —
+`generated`, `zz_generated.go`, `node_modules`, `bazel-out` — and
+`FuzzModfilesDecisionSurfaceMatchesTheSanctionedSet` generalises it. The
+sanction is: `vendor`, `testdata`, and dot- or underscore-prefixed names, all of
+which Go itself declines to build. **Nothing Go would compile may be hidden.**
+
+`TestModuleFileSetMatchesAnIndependentEnumeration` compares `modfiles.Files`
+against a re-derivation from the sanctioned rules, over the real tree and over a
+fixture exercising every axis. It is the only assertion covering the `.go`
+suffix axis: narrowing that test to exclude `_test.go` would hide every test
+from the import rules, and nothing else would say so.
+
 **Both markers are tested with `os.Lstat`, which is the same shape
-`modfiles.nestedBoundary` uses, and that agreement is the point.** `Lstat`
+`modfiles.nestedBoundary` uses, and that agreement is now structural.** `Lstat`
 succeeds for a **file** as well as a directory, and both `git submodule add`
 and `git worktree add` write `.git` as a file holding a `gitdir:` pointer. A
 detector recognising only the directory form disagreed with the enumerator it
 polices: a submodule under `factory/` made its whole subtree invisible to all
 five rules with nothing failing — likelier in practice than the nested-`go.mod`
-case. If you change how a boundary is recognised here, change it to match
-`modfiles`, not to match your intuition; two implementations of "what is a
-boundary" are what went wrong. A directory that is both a nested module and a
+case. Do not reintroduce a second
+implementation of "what is a boundary"; change `modfiles` and let the detector
+follow, and widen the sanctioned restatement only with a justification of the
+form "Go does not build this". A directory that is both a nested module and a
 nested repository is reported twice, because removing one marker does not
 restore the walk.
 

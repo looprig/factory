@@ -60,8 +60,19 @@ func goModViolations(content string, released, forbidden map[string]string) (int
 				violations = append(violations, where+"declares module "+strings.Join(directive.args, " ")+", want "+factoryModulePath)
 			}
 		case "replace":
+			// The verb is banned outright, so classifying the five replace
+			// forms is unnecessary here. Naming a forbidden module when one
+			// appears is not classification, it is teaching: rejected either
+			// way, but "you may not depend on Host" is the fact worth learning.
+			detail := ""
+			for _, arg := range directive.args {
+				if forbiddenName, ok := firstPrefixMatch(arg, forbiddenNames); ok {
+					detail = " It also names " + forbiddenName + ", which Factory must never depend on: " + forbidden[forbiddenName] + "."
+					break
+				}
+			}
 			violations = append(violations, where+"declares a replace directive ("+strings.Join(directive.args, " ")+
-				"); a published module file must not contain one, and a GOWORK=off failure is a dependency release still owed, not something to work around")
+				"); a published module file must not contain one, and a GOWORK=off failure is a dependency release still owed, not something to work around."+detail)
 		case "require":
 			if len(directive.args) == 0 {
 				continue
@@ -272,6 +283,7 @@ func TestGoModViolations(t *testing.T) {
 		content       string
 		wantLooprig   int
 		wantViolation string // substring; "" means no violation at all
+		wantAbsent    string // substring no violation may contain
 	}{
 		{
 			name:        "the shipped shape",
@@ -362,6 +374,17 @@ func TestGoModViolations(t *testing.T) {
 			wantViolation: "requires github.com/looprig/core at v0.8.0, which is not the released version this module may name (v0.7.0)",
 		},
 		{
+			name:          "a replace naming a forbidden module says so",
+			content:       "module github.com/looprig/factory\n\nreplace github.com/looprig/host v1.0.0 => ../host\n",
+			wantViolation: "It also names github.com/looprig/host, which Factory must never depend on",
+		},
+		{
+			name:          "an ordinary replace does not mention a forbidden module",
+			content:       "module github.com/looprig/factory\n\nreplace github.com/looprig/core => ../core\n",
+			wantViolation: "declares a replace directive (github.com/looprig/core => ../core)",
+			wantAbsent:    "must never depend on",
+		},
+		{
 			name:          "a QUOTED replace",
 			content:       "module github.com/looprig/factory\n\nreplace \"github.com/looprig/core\" => \"../core\"\n",
 			wantViolation: "line 3 declares a replace directive (github.com/looprig/core => ../core)",
@@ -400,6 +423,9 @@ func TestGoModViolations(t *testing.T) {
 			}
 			if !slices.ContainsFunc(violations, func(v string) bool { return strings.Contains(v, tt.wantViolation) }) {
 				t.Fatalf("violations = %q, want one containing %q", violations, tt.wantViolation)
+			}
+			if tt.wantAbsent != "" && slices.ContainsFunc(violations, func(v string) bool { return strings.Contains(v, tt.wantAbsent) }) {
+				t.Fatalf("violations = %q, none may contain %q", violations, tt.wantAbsent)
 			}
 		})
 	}

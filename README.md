@@ -22,11 +22,13 @@ test — and applies five rules:
 
 | Dependency | Permitted in |
 |---|---|
+<!-- boundary-rules:begin -->
 | `github.com/looprig/host` | nowhere |
 | `github.com/looprig/harness` | nowhere |
 | `github.com/centrifugal/...` | `internal/realtime/...` |
 | `github.com/looprig/wui` | `cmd/factory/...` |
 | `k8s.io/...`, `sigs.k8s.io/...` | `internal/placement/kubernetes/...` |
+<!-- boundary-rules:end -->
 
 The rules are functions over PARSED import paths; nothing matches against source
 text, and containment is compared by whole path segments, so
