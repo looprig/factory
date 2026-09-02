@@ -18,6 +18,8 @@ same change, and check that `go mod tidy` leaves `go.mod` unchanged afterwards.
 Do not add a nested `go.mod` or a nested repository inside this module without
 declaring it in `allowedNestedBoundaries`. Such a directory stops the
 module-owned walk, and every import rule silently stops applying inside it.
+This includes a git submodule or a worktree, whose `.git` is a file rather than
+a directory, and a `vendor/` tree.
 
 ## Build and test
 

@@ -37,12 +37,15 @@ containing each scope so an exemption whose directory does not exist yet is stil
 proven reachable and still proven to reject the location just outside it.
 
 Two companion guards keep that scan honest. `TestModuleHasNoUndeclaredNestedBoundary`
-fails on any nested `go.mod`, `.git` or `vendor` below the root, because such a
-directory stops the module-owned walk and makes all five rules silently stop
-applying to its whole subtree; a declared boundary is scanned in its own right
-rather than exempted. And `module_pin_test.go` parses `go.mod`'s grammar to
-assert there is no `replace` directive in either spelling and that every
-Looprig requirement names its exact released version — `go mod verify` checks
+fails on any nested `go.mod`, `.git` or `vendor` below the root — including the
+`.git` **file** that a submodule or worktree writes — because such a directory
+stops the module-owned walk and makes all five rules silently stop applying to
+its whole subtree; a declared boundary is scanned in its own right rather than
+exempted. And `module_pin_test.go` parses `go.mod`'s grammar to
+assert there is no `replace` directive in either spelling — and with tokens
+unquoted, since go.mod permits `require "github.com/looprig/host" v1.0.0` and a
+split-only parser would skip it silently — and that every Looprig requirement
+names its exact released version — `go mod verify` checks
 content hashes, not version shape, so nothing else in `make check` would
 notice. Modules Factory may never import are rejected there before the
 released-version map is consulted, so the ban does not expire the day one of

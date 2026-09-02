@@ -72,7 +72,8 @@ require what no file may import.
 skip is correct — a nested repository is not this module's content — but the
 consequence is that **all five rules silently stop applying inside such a
 subtree**. A reviewer proved it: `internal/httpapi/go.mod` beside a file
-importing `github.com/looprig/host` scanned nine files and passed. This
+importing `github.com/looprig/host` left the import scan passing with the
+offending file simply absent from its count. This
 workspace already ships nested modules (`flow/store`, `pluto/cmd/pluto`), so a
 later `factory/internal/testkit/go.mod` is not hypothetical.
 
@@ -84,18 +85,36 @@ one buys an extra scan rather than an exemption. The root's own `.git` is
 excluded, and that exclusion has its own fixture case so widening it to swallow
 nested repositories fails.
 
-A live `vendor/` is refused by the Go toolchain before any test runs
-(`inconsistent vendoring`), so on the real tree that arm never gets to speak;
-it is exercised in the detector's fixture instead.
+**Both markers are tested with `os.Lstat`, which is the same shape
+`modfiles.nestedBoundary` uses, and that agreement is the point.** `Lstat`
+succeeds for a **file** as well as a directory, and both `git submodule add`
+and `git worktree add` write `.git` as a file holding a `gitdir:` pointer. A
+detector recognising only the directory form disagreed with the enumerator it
+polices: a submodule under `factory/` made its whole subtree invisible to all
+five rules with nothing failing — likelier in practice than the nested-`go.mod`
+case. If you change how a boundary is recognised here, change it to match
+`modfiles`, not to match your intuition; two implementations of "what is a
+boundary" are what went wrong. A directory that is both a nested module and a
+nested repository is reported twice, because removing one marker does not
+restore the walk.
+
+The `vendor` arm is **live, not fixture-only**. An *inconsistent* vendor tree
+is refused by the toolchain first (`inconsistent vendoring`), but
+`GOWORK=off go mod vendor` produces a **consistent** one: `go build ./...`
+then succeeds and this test is what fails. That is exactly the workspace's
+stated hazard — a real vendor tree silently consulted under `GOWORK=off`,
+which is the one mode meant to verify a module against its true pins — so do
+not weaken this arm on the belief that Go catches it for you.
 
 ## go.mod's shape is a test, not prose
 
 `go mod verify` checks content hashes, not version shape: nothing in `make
 check` would otherwise notice a `replace` directive or a pin moved to a
 pseudo-version. `module_pin_test.go` parses go.mod's grammar — both the
-`require x v1` and `require ( … )` spellings, since a guard understanding only
-one is defeated by reformatting, the same failure mode as matching source text
-for imports — and asserts:
+`require x v1` and `require ( … )` spellings, **and with every token passed
+through `strconv.Unquote`**, since a guard understanding only one spelling is
+defeated by reformatting, the same failure mode as matching source text for
+imports — and asserts:
 
 - no `replace` directive, in either spelling;
 - the module path is `github.com/looprig/factory`;
@@ -110,6 +129,15 @@ absence that expires the day factory ships.
 `TestForbiddenModulesAreRejectedBeforeTheVersionMap` drives the situation that
 exposes it — Host present in the released map at the version named — and
 asserts the message, not merely that something was reported.
+
+The quoting case is not hypothetical decoration. go.mod's grammar permits
+quoted tokens and the toolchain resolves them normally, so before the fix a
+go.mod holding one ordinary Looprig require and a quoted
+`github.com/looprig/host` passed this guard **entirely** — the requirement was
+neither forbidden-checked, nor version-checked, nor counted — while `go build`
+resolved Host as usual. `go mod tidy` normalises quotes away, but tidy is not
+in `make check`, and "nobody would write that" is the premise this guard exists
+not to rely on.
 
 When a Looprig dependency moves, update `releasedLooprigVersions` in the same
 change, and move the pin with `go get`, never `go mod tidy`.

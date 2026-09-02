@@ -113,6 +113,35 @@ func firstPrefixMatch(module string, prefixes []string) (string, bool) {
 	return "", false
 }
 
+// goModFields splits a go.mod line into tokens and UNQUOTES each one.
+//
+// The unquoting is not decoration. go.mod's grammar permits quoted tokens and
+// the toolchain accepts them -- `go mod edit -json` resolves
+// `require "github.com/looprig/host" v1.0.0` to Path: github.com/looprig/host
+// -- so a split-only parser carries the quote characters into args[0], no
+// prefix test matches, and the requirement is SILENTLY SKIPPED: not
+// forbidden-checked, not version-checked, not counted. A go.mod with one
+// ordinary Looprig require and a quoted github.com/looprig/host passed this
+// guard entirely while `go build` resolved Host normally.
+//
+// This is the failure mode named just below -- a guard that understands one
+// spelling is defeated by reformatting -- applied to quoting rather than to
+// block form, and it is fixed the same way the import guard already fixes it,
+// by unquoting rather than by matching text. Both Go string literal forms are
+// accepted, since strconv.Unquote takes interpreted and raw quoting alike.
+//
+// A token that is not a quoted literal is left exactly as it is, so bare paths,
+// versions and the => operator are untouched.
+func goModFields(line string) []string {
+	fields := strings.Fields(line)
+	for index, field := range fields {
+		if unquoted, err := strconv.Unquote(field); err == nil {
+			fields[index] = unquoted
+		}
+	}
+	return fields
+}
+
 // parseGoModDirectives reads go.mod's grammar rather than searching its text.
 // Both spellings of every verb exist in real files — `require x v1` and a
 // `require ( … )` block — and a guard that understood only one would be
@@ -137,10 +166,10 @@ func parseGoModDirectives(content string) []modDirective {
 				blockVerb = ""
 				continue
 			}
-			directives = append(directives, modDirective{verb: blockVerb, args: strings.Fields(line), line: number})
+			directives = append(directives, modDirective{verb: blockVerb, args: goModFields(line), line: number})
 			continue
 		}
-		fields := strings.Fields(line)
+		fields := goModFields(line)
 		verb, rest := fields[0], fields[1:]
 		if len(rest) == 1 && rest[0] == "(" {
 			blockVerb = verb
@@ -185,6 +214,10 @@ replace (
 
 exclude github.com/looprig/natsstore v0.5.0
 
+require "github.com/looprig/fsstore" v0.5.1
+
+replace "github.com/looprig/natsstore" => "../natsstore"
+
 tool (
 	honnef.co/go/tools/cmd/staticcheck
 )
@@ -200,7 +233,16 @@ tool (
 		{verb: "replace", args: []string{"github.com/looprig/storage", "=>", "../storage"}, line: 17},
 		{verb: "replace", args: []string{"github.com/looprig/wui", "v0.1.0", "=>", "github.com/looprig/wui", "v0.2.0"}, line: 18},
 		{verb: "exclude", args: []string{"github.com/looprig/natsstore", "v0.5.0"}, line: 21},
-		{verb: "tool", args: []string{"honnef.co/go/tools/cmd/staticcheck"}, line: 24},
+		// go.mod's grammar permits quoted tokens and the toolchain accepts
+		// them: `go mod edit -json` resolves a quoted path to the bare one. A
+		// parser that split on whitespace and stopped would carry the quote
+		// characters into args[0], so no prefix test would match and the
+		// requirement would be silently skipped -- neither forbidden-checked
+		// nor version-checked. That is this file's own stated failure mode,
+		// "defeated by reformatting", applied to quoting rather than blocks.
+		{verb: "require", args: []string{"github.com/looprig/fsstore", "v0.5.1"}, line: 23},
+		{verb: "replace", args: []string{"github.com/looprig/natsstore", "=>", "../natsstore"}, line: 25},
+		{verb: "tool", args: []string{"honnef.co/go/tools/cmd/staticcheck"}, line: 28},
 	}
 	if len(got) != len(want) {
 		t.Fatalf("parsed %d directives, want %d:\ngot  %+v\nwant %+v", len(got), len(want), got, want)
@@ -221,7 +263,8 @@ func TestGoModViolations(t *testing.T) {
 		"github.com/looprig/storage":      "v0.6.0",
 	}
 	forbidden := map[string]string{
-		"github.com/looprig/host": "Factory and Host exchange Core and SessionStore records, never code",
+		"github.com/looprig/host":    "Factory and Host exchange Core and SessionStore records, never code",
+		"github.com/looprig/harness": "Harness is Host's runtime",
 	}
 
 	tests := []struct {
@@ -305,6 +348,34 @@ func TestGoModViolations(t *testing.T) {
 			content:       "module github.com/looprig/factory\n\nrequire github.com/looprig/host\n",
 			wantLooprig:   0,
 			wantViolation: "requires github.com/looprig/host, which Factory must never depend on",
+		},
+		{
+			name:          "a QUOTED forbidden module",
+			content:       "module github.com/looprig/factory\n\nrequire \"github.com/looprig/host\" v1.0.0\n",
+			wantLooprig:   0,
+			wantViolation: "requires github.com/looprig/host, which Factory must never depend on",
+		},
+		{
+			name:          "a QUOTED pin off its released version",
+			content:       "module github.com/looprig/factory\n\nrequire \"github.com/looprig/core\" v0.8.0\n",
+			wantLooprig:   1,
+			wantViolation: "requires github.com/looprig/core at v0.8.0, which is not the released version this module may name (v0.7.0)",
+		},
+		{
+			name:          "a QUOTED replace",
+			content:       "module github.com/looprig/factory\n\nreplace \"github.com/looprig/core\" => \"../core\"\n",
+			wantViolation: "line 3 declares a replace directive (github.com/looprig/core => ../core)",
+		},
+		{
+			name:        "a QUOTED module path is still the module path",
+			content:     "module \"github.com/looprig/factory\"\n\nrequire github.com/looprig/core v0.7.0\n",
+			wantLooprig: 1,
+		},
+		{
+			name:          "a raw-quoted forbidden module",
+			content:       "module github.com/looprig/factory\n\nrequire `github.com/looprig/harness` v1.0.0\n",
+			wantLooprig:   0,
+			wantViolation: "requires github.com/looprig/harness, which Factory must never depend on",
 		},
 		{
 			name:          "a nested module under a forbidden one",
