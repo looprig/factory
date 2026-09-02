@@ -3,6 +3,7 @@ package factory_test
 import (
 	"go/parser"
 	"go/token"
+	"io/fs"
 	"os"
 	"path"
 	"path/filepath"
@@ -649,4 +650,210 @@ func writeGoFixture(t *testing.T, root, relative, content string) {
 	if err := os.WriteFile(target, []byte(content), 0o600); err != nil {
 		t.Fatalf("write fixture %q: %v", relative, err)
 	}
+}
+
+// ---------------------------------------------------------------------------
+// The guard's SUBJECT is the module, not the tree.
+//
+// modfiles stops descending at any directory holding go.mod or .git, and that
+// skip is right in itself — a nested repository is not this module's content.
+// The consequence is that all five rules above silently stop applying inside
+// such a subtree, with nothing failing and nothing printed. A reviewer proved
+// it: internal/httpapi/go.mod beside a file importing github.com/looprig/host
+// scanned 9 files and passed. TestBoundaryScopesAreNotStale sees this only for
+// the three scoped directories and is blind everywhere else.
+//
+// This program already ships nested modules (flow/store, pluto/cmd/pluto), so
+// "a later runbook adds factory/internal/testkit/go.mod" is not hypothetical.
+// ---------------------------------------------------------------------------
+
+// allowedNestedBoundaries maps a module-relative directory to the reason it is
+// allowed to be a nested module or repository. It is empty, and an entry is not
+// a hole: every allowed boundary is SCANNED IN ITS OWN RIGHT by the assertion
+// below, so admitting one buys an extra scan rather than an exemption.
+var allowedNestedBoundaries = map[string]string{}
+
+// nestedBoundary is a directory the module-owned walk refuses to descend into.
+type nestedBoundary struct {
+	dir    string // relative to the module root, slash-separated
+	marker string // what stopped the walk: "go.mod", ".git" or "vendor"
+}
+
+func TestModuleHasNoUndeclaredNestedBoundary(t *testing.T) {
+	t.Parallel()
+
+	boundaries, visited, err := nestedBoundaries(".")
+	if err != nil {
+		t.Fatalf("find nested boundaries: %v", err)
+	}
+	// Anti-vacuity on the axis that cannot legitimately shrink: the walk must
+	// have descended somewhere. A detector that visits nothing finds nothing.
+	if visited == 0 {
+		t.Fatal("the boundary walk visited no directories, so this check is vacuous")
+	}
+	t.Logf("visited %d directories", visited)
+
+	for _, boundary := range boundaries {
+		reason, allowed := allowedNestedBoundaries[boundary.dir]
+		if !allowed {
+			t.Errorf("%s contains %s, which stops the module-owned walk: every import rule silently stops applying to that whole subtree. Declare it in allowedNestedBoundaries (which then scans it separately) or remove it",
+				boundary.dir, boundary.marker)
+			continue
+		}
+		if strings.TrimSpace(reason) == "" {
+			t.Errorf("%s is allowed to be a nested %s with no reason given", boundary.dir, boundary.marker)
+		}
+		if boundary.marker == "vendor" {
+			t.Errorf("%s is a vendor directory; no repository in this workspace vendors", boundary.dir)
+			continue
+		}
+		// The allowlist is not an exemption. Scan the nested module too.
+		scanned, violations, err := boundaryViolations(filepath.FromSlash(boundary.dir))
+		if err != nil {
+			t.Errorf("scan allowed nested boundary %s: %v", boundary.dir, err)
+			continue
+		}
+		if scanned == 0 {
+			t.Errorf("allowed nested boundary %s scanned no Go files", boundary.dir)
+		}
+		for _, violation := range violations {
+			t.Error(violation)
+		}
+	}
+}
+
+// TestNestedBoundaryDetectorFindsEveryMarker is the positive control. The live
+// assertion above reports zero today, and a detector that can only ever report
+// zero is worth nothing, so it is made to report one — of each marker, at
+// several depths — before the zero is believed.
+func TestNestedBoundaryDetectorFindsEveryMarker(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	writeGoFixture(t, root, "go.mod", "module github.com/looprig/factory\n")
+	writeGoFixture(t, root, "root.go", "package fixture\n")
+	writeGoFixture(t, root, "internal/httpapi/go.mod", "module example.com/nested\n")
+	writeGoFixture(t, root, "internal/httpapi/routes.go", "package httpapi\n\nimport _ \"github.com/looprig/host\"\n")
+	writeGoFixture(t, root, "internal/deep/tree/tool/.git/HEAD", "ref: refs/heads/main\n")
+	writeGoFixture(t, root, "vendor/github.com/x/y/z.go", "package z\n")
+	// The ROOT's own .git must NOT be reported. Without this case the
+	// exclusion that makes the live assertion pass would itself be untested,
+	// and widening it to swallow nested .git directories would go unnoticed.
+	writeGoFixture(t, root, ".git/HEAD", "ref: refs/heads/main\n")
+
+	boundaries, visited, err := nestedBoundaries(root)
+	if err != nil {
+		t.Fatalf("nestedBoundaries: %v", err)
+	}
+	if visited == 0 {
+		t.Fatal("the fixture walk visited no directories")
+	}
+	got := map[string]string{}
+	for _, boundary := range boundaries {
+		got[boundary.dir] = boundary.marker
+	}
+	want := map[string]string{
+		"internal/httpapi":        "go.mod",
+		"internal/deep/tree/tool": ".git",
+		"vendor":                  "vendor",
+	}
+	if len(got) != len(want) {
+		t.Fatalf("boundaries = %v, want %v", got, want)
+	}
+	for dir, marker := range want {
+		if got[dir] != marker {
+			t.Errorf("boundary at %s reported marker %q, want %q", dir, got[dir], marker)
+		}
+	}
+
+	// And the premise: those subtrees really are invisible to the scan, which
+	// is the whole reason the detector exists.
+	scanned, violations, err := boundaryViolations(root)
+	if err != nil {
+		t.Fatalf("boundaryViolations: %v", err)
+	}
+	if scanned != 1 {
+		t.Fatalf("scanned %d files, want 1 (only root.go is module-owned)", scanned)
+	}
+	if len(violations) != 0 {
+		t.Fatalf("violations = %q; the host import inside the nested module is not this module's to report, which is exactly the invisibility being detected", violations)
+	}
+}
+
+// TestAllowedNestedBoundaryIsStillScanned pins that an allowlist entry buys an
+// extra scan rather than a hole: a declared nested module whose own code breaks
+// the boundary is still reported.
+func TestAllowedNestedBoundaryIsStillScanned(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	writeGoFixture(t, root, "go.mod", "module example.com/nested\n")
+	writeGoFixture(t, root, "tool.go", "package tool\n\nimport _ \"github.com/looprig/harness\"\n")
+
+	scanned, violations, err := boundaryViolations(root)
+	if err != nil {
+		t.Fatalf("boundaryViolations: %v", err)
+	}
+	if scanned != 1 {
+		t.Fatalf("scanned %d files, want 1", scanned)
+	}
+	if len(violations) != 1 {
+		t.Fatalf("violations = %q, want exactly one", violations)
+	}
+}
+
+// nestedBoundaries reports every directory below root that stops the
+// module-owned walk, together with the number of directories it visited.
+//
+// It descends INTO the boundaries it finds, deliberately: a nested module
+// inside a nested module is two separate invisibilities, and reporting only the
+// outermost would hide the inner one behind the fix for the outer.
+func nestedBoundaries(root string) ([]nestedBoundary, int, error) {
+	absoluteRoot, err := filepath.Abs(root)
+	if err != nil {
+		return nil, 0, err
+	}
+	var found []nestedBoundary
+	visited := 0
+	err = filepath.WalkDir(absoluteRoot, func(p string, entry fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if !entry.IsDir() {
+			return nil
+		}
+		visited++
+		if p == absoluteRoot {
+			return nil
+		}
+		relative, err := filepath.Rel(absoluteRoot, p)
+		if err != nil {
+			return err
+		}
+		relative = filepath.ToSlash(relative)
+		if entry.Name() == ".git" {
+			// The ROOT's own .git is this repository's metadata, not a nested
+			// boundary. A .git anywhere below the root is one, and is reported
+			// against the directory it makes invisible — its parent.
+			if parent := path.Dir(relative); parent != "." {
+				found = append(found, nestedBoundary{dir: parent, marker: ".git"})
+			}
+			return filepath.SkipDir
+		}
+		if entry.Name() == "vendor" {
+			found = append(found, nestedBoundary{dir: relative, marker: "vendor"})
+			return filepath.SkipDir
+		}
+		if _, err := os.Lstat(filepath.Join(p, "go.mod")); err == nil {
+			found = append(found, nestedBoundary{dir: relative, marker: "go.mod"})
+		} else if !os.IsNotExist(err) {
+			return err
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, 0, err
+	}
+	slices.SortFunc(found, func(a, b nestedBoundary) int { return strings.Compare(a.dir, b.dir) })
+	return found, visited, nil
 }

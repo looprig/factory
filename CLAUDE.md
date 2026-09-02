@@ -61,7 +61,58 @@ string table is one `go mod tidy` away from being dropped.
   permitted in-scope answer and a rejected out-of-scope one.
 
 When you add a rule, add its cases and its entry in `sampleImports`; both the
-coverage assertion and the fuzz target fail if you do not.
+coverage assertion and the fuzz target fail if you do not. A rule scoped to
+`""` must also have an entry in `forbiddenModules`, or
+`TestEveryForbiddenModuleIsAnEverywhereImportRule` fails: go.mod may not
+require what no file may import.
+
+## The guard's subject is the MODULE, not the tree
+
+`modfiles` stops descending at any directory holding `go.mod` or `.git`. The
+skip is correct — a nested repository is not this module's content — but the
+consequence is that **all five rules silently stop applying inside such a
+subtree**. A reviewer proved it: `internal/httpapi/go.mod` beside a file
+importing `github.com/looprig/host` scanned nine files and passed. This
+workspace already ships nested modules (`flow/store`, `pluto/cmd/pluto`), so a
+later `factory/internal/testkit/go.mod` is not hypothetical.
+
+`TestModuleHasNoUndeclaredNestedBoundary` closes it: every directory below the
+root holding `go.mod`, `.git` or named `vendor` must appear in
+`allowedNestedBoundaries` with a reason. **An entry there is not a hole** — an
+allowed boundary is scanned in its own right by the same rules, so declaring
+one buys an extra scan rather than an exemption. The root's own `.git` is
+excluded, and that exclusion has its own fixture case so widening it to swallow
+nested repositories fails.
+
+A live `vendor/` is refused by the Go toolchain before any test runs
+(`inconsistent vendoring`), so on the real tree that arm never gets to speak;
+it is exercised in the detector's fixture instead.
+
+## go.mod's shape is a test, not prose
+
+`go mod verify` checks content hashes, not version shape: nothing in `make
+check` would otherwise notice a `replace` directive or a pin moved to a
+pseudo-version. `module_pin_test.go` parses go.mod's grammar — both the
+`require x v1` and `require ( … )` spellings, since a guard understanding only
+one is defeated by reformatting, the same failure mode as matching source text
+for imports — and asserts:
+
+- no `replace` directive, in either spelling;
+- the module path is `github.com/looprig/factory`;
+- every `github.com/looprig/*` requirement names its exact released version
+  from `releasedLooprigVersions`;
+- nothing in `forbiddenModules` is required at ANY version.
+
+**`forbiddenModules` is consulted before `releasedLooprigVersions`, and that
+order is the point.** The sibling `host` module rejects `factory` today because
+there is no released version of it to name — so the ban is an accident of
+absence that expires the day factory ships.
+`TestForbiddenModulesAreRejectedBeforeTheVersionMap` drives the situation that
+exposes it — Host present in the released map at the version named — and
+asserts the message, not merely that something was reported.
+
+When a Looprig dependency moves, update `releasedLooprigVersions` in the same
+change, and move the pin with `go get`, never `go mod tidy`.
 
 ## Not implemented yet
 
@@ -70,4 +121,7 @@ admission, routing, placement and realtime are later tasks in runbook 05.
 `cmd/factory`, `internal/realtime` and `internal/placement/kubernetes` do not
 exist; their exemptions grant nothing today and
 `TestBoundaryScopesAreNotStale` will fail if one of those directories appears
-without a Go file in it.
+without a Go file in it. Do not add a placeholder Go file to satisfy it: that
+would permanently satisfy a live tripwire, trading a guard that fires the day a
+directory appears unearned for a directory that is always "earned" by a file
+that means nothing.

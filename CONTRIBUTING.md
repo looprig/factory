@@ -12,7 +12,12 @@ Factory must not import Host or Harness, anywhere, including tests. Centrifuge
 is confined to `internal/realtime`, the web UI bundle to `cmd/factory`, and the
 Kubernetes SDK to `internal/placement/kubernetes`. Do not add local `replace`
 directives or vendored dependencies. If you need to move a pinned dependency,
-use `go get`; check that `go mod tidy` leaves `go.mod` unchanged afterwards.
+use `go get`, update `releasedLooprigVersions` in `module_pin_test.go` in the
+same change, and check that `go mod tidy` leaves `go.mod` unchanged afterwards.
+
+Do not add a nested `go.mod` or a nested repository inside this module without
+declaring it in `allowedNestedBoundaries`. Such a directory stops the
+module-owned walk, and every import rule silently stops applying inside it.
 
 ## Build and test
 

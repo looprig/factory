@@ -36,6 +36,18 @@ if it finds no files, and `TestScanReachesEveryRuleScope` builds a fixture modul
 containing each scope so an exemption whose directory does not exist yet is still
 proven reachable and still proven to reject the location just outside it.
 
+Two companion guards keep that scan honest. `TestModuleHasNoUndeclaredNestedBoundary`
+fails on any nested `go.mod`, `.git` or `vendor` below the root, because such a
+directory stops the module-owned walk and makes all five rules silently stop
+applying to its whole subtree; a declared boundary is scanned in its own right
+rather than exempted. And `module_pin_test.go` parses `go.mod`'s grammar to
+assert there is no `replace` directive in either spelling and that every
+Looprig requirement names its exact released version — `go mod verify` checks
+content hashes, not version shape, so nothing else in `make check` would
+notice. Modules Factory may never import are rejected there before the
+released-version map is consulted, so the ban does not expire the day one of
+them ships.
+
 `go.mod` names exact released versions and contains no `replace` directive;
 nothing here is vendored, so `GOWORK=off go test ./...` verifies the module
 against the versions it actually pins.
