@@ -3,7 +3,7 @@ package identity
 import (
 	"context"
 	"errors"
-	"strings"
+	"regexp"
 
 	sessionwire "github.com/looprig/core/sessionwire/v1"
 	factoryidentity "github.com/looprig/factory/identity"
@@ -79,25 +79,41 @@ func authorizationResult(allowed bool) error {
 	return nil
 }
 
+// parsedSessionChannel is the result of parseSessionChannel. Its tenant and
+// session are meaningful only when valid is true. A channel that does not match
+// the grammar yields the zero value; a channel that matches the grammar but
+// whose segments fail TenantID/SessionID validation yields those captured
+// segments with valid false, so an unvalidated tenant can be present in the
+// struct. sessionChannelAllowed is the sole production reader of either field
+// and is the only place permitted to consult them.
 type parsedSessionChannel struct {
 	tenant  sessionwire.TenantID
 	session sessionwire.SessionID
 	valid   bool
 }
 
+var sessionChannelPattern = regexp.MustCompile(`\Asession:([^:]+):([^:]+)\z`)
+
+// sessionChannelAllowed compares the parsed tenant with the principal's. The
+// parsed.valid conjunct is load-bearing, not defensive: it is what stops the
+// unvalidated tenant described above from being compared. Dropping it is a
+// behaviour change, not a simplification: it makes AuthorizeSubscribe admit
+// "session:tenant-a:\xff", which
+// TestSubscribeParsesBeforeComparingAndParsingDoesNotGrantAccess rejects.
 func sessionChannelAllowed(principalTenant sessionwire.TenantID, parsed parsedSessionChannel) bool {
 	return parsed.valid && parsed.tenant == principalTenant
 }
 
 func parseSessionChannel(channel string) parsedSessionChannel {
-	parts := strings.Split(channel, ":")
-	if len(parts) != 3 || parts[0] != "session" {
+	matches := sessionChannelPattern.FindStringSubmatch(channel)
+	if len(matches) != 3 {
 		return parsedSessionChannel{}
 	}
-	tenant := sessionwire.TenantID(parts[1])
-	session := sessionwire.SessionID(parts[2])
-	if tenant.Validate() != nil || session.Validate() != nil {
-		return parsedSessionChannel{}
+	tenant := sessionwire.TenantID(matches[1])
+	session := sessionwire.SessionID(matches[2])
+	return parsedSessionChannel{
+		tenant:  tenant,
+		session: session,
+		valid:   tenant.Validate() == nil && session.Validate() == nil,
 	}
-	return parsedSessionChannel{tenant: tenant, session: session, valid: true}
 }
