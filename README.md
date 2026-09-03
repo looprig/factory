@@ -116,6 +116,15 @@ credential and not to a bearer one, and `Authenticator.CredentialSource` is the
 single reader of that precedence rule -- a CSRF guard that re-derived it could
 disagree, and would do so by skipping CSRF rather than by failing.
 
+For the same reason the operation context is built by a **method**,
+`Authenticator.NewOperationContext`, which derives the source rather than
+accepting it. Taking it as a parameter moved "which credential authenticated
+this" back into the edge's hands one call further out, and a caller that wrote
+`SourceBearer` for a cookie-authenticated operation would make the CSRF guard
+skip. `NewOperationContextWithSource` remains for a caller that authenticated by
+a route this package does not model, and is documented as the exception rather
+than the default.
+
 A `Credential` redacts under `%v`, `%s`, `%q`, `%#v`, `log/slog` and
 `encoding/json`, because the likeliest way a token reaches a log is that
 somebody formatted the value they were handed. Those are **not** independent

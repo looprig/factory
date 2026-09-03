@@ -263,6 +263,21 @@ is misconfigured; inheriting the local default would hand an unscoped service
 credential authority over whichever tenant a deployment happens to default to,
 and a service principal is the identity authorized for the cross-tenant sweep.
 
+**Which credential authenticated an operation is derived, never supplied.**
+`Authenticator.NewOperationContext` is a method so the source comes from the
+same `presented` the authentication used. It was a free function taking the
+source as a parameter, and mutating that constructor to ignore its argument and
+record `SourceBearer` for everything **survived the whole suite**, because every
+call site happened to pass `SourceBearer`. That mutant is the CSRF-bypass bug:
+an ambient cookie credential recorded as a bearer, and A1.3's guard skips --
+silently, and in the direction that looks safe.
+`TestTheOperationContextRecordsTheCredentialAuthenticationUsed` now compares the
+recorded source against the credential the VERIFIER received, so the two ends of
+the derivation are checked against each other rather than each against the same
+expectation. `NewOperationContextWithSource` still exists for a caller that
+authenticated by an unmodelled route; its doc says what the method prevents.
+**A parameter is a place a caller can be wrong; a derivation is not.**
+
 **An Authenticator holds no per-process state.** That is spec section 10 --
 authentication state is stateless or shared durably, never held in one Factory
 process -- and it is why the seam is a `Verifier` rather than a session table.

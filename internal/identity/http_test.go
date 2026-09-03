@@ -536,6 +536,72 @@ func TestCredentialSourceAgreesWithWhatAuthenticationUsed(t *testing.T) {
 	}
 }
 
+// TestTheOperationContextRecordsTheCredentialAuthenticationUsed is the link
+// that was missing. TestCredentialSourceAgreesWithWhatAuthenticationUsed ties
+// CredentialSource to AuthenticateRequest, but nothing tied EITHER to the
+// operation context a handler actually reads -- so a constructor that ignored
+// its argument and recorded SourceBearer for everything passed the whole suite.
+// That mutant is the CSRF-bypass shape: an ambient cookie credential, recorded
+// as a bearer, and A1.3's guard skips.
+//
+// The assertion is against the credential the VERIFIER received, not against
+// what the test set up, so the two ends of the derivation are compared rather
+// than each compared to the same expectation.
+func TestTheOperationContextRecordsTheCredentialAuthenticationUsed(t *testing.T) {
+	t.Parallel()
+
+	principal, err := factoryidentity.NewPrincipal("tenant-1", "user-1", factoryidentity.KindActor)
+	if err != nil {
+		t.Fatalf("NewPrincipal: %v", err)
+	}
+	requests := map[string]func() *http.Request{
+		"bearer": func() *http.Request { return bearerRequest("token-1") },
+		"cookie": func() *http.Request { return cookieRequest(identity.DefaultCookieName, "token-1") },
+		"header wins": func() *http.Request {
+			r := cookieRequest(identity.DefaultCookieName, "cookie-token")
+			r.Header.Set("Authorization", "Bearer token-1")
+			return r
+		},
+	}
+	for _, name := range slices.Sorted(maps.Keys(requests)) {
+		build := requests[name]
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			verifier := &recordingVerifier{claims: validClaims()}
+			a := newTestAuthenticator(t, identity.Config{Verifier: verifier})
+			r := build()
+			if _, err := a.AuthenticateRequest(context.Background(), r); err != nil {
+				t.Fatalf("AuthenticateRequest: %v", err)
+			}
+			if len(verifier.seen) != 1 {
+				t.Fatalf("the verifier saw %d credentials, want 1", len(verifier.seen))
+			}
+			got, ok := identity.OperationContextFrom(a.NewOperationContext(context.Background(), r, principal))
+			if !ok {
+				t.Fatal("the derived context reports no operation context")
+			}
+			if got.CredentialSource != verifier.seen[0].Source() {
+				t.Errorf("the operation context records the %q credential while authentication verified the %q one",
+					got.CredentialSource, verifier.seen[0].Source())
+			}
+			if got.Principal != principal {
+				t.Errorf("Principal = %+v, want %+v", got.Principal, principal)
+			}
+		})
+	}
+
+	// A request carrying no readable credential records no source. A guard
+	// must not be able to read the empty answer as permission, so it is
+	// asserted rather than left to whatever the zero value happens to be.
+	a := newTestAuthenticator(t, identity.Config{Verifier: constantVerifier(validClaims())})
+	bare := httptest.NewRequest(http.MethodGet, "/v1/sessions", nil)
+	got, ok := identity.OperationContextFrom(a.NewOperationContext(context.Background(), bare, principal))
+	if !ok || got.CredentialSource != identity.Source("") {
+		t.Errorf("a request with no credential recorded source %q (ok %t), want the empty source", got.CredentialSource, ok)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Tenancy.
 // ---------------------------------------------------------------------------
@@ -952,32 +1018,39 @@ func TestOperationContextRoundTrips(t *testing.T) {
 	if _, ok := identity.OperationContextFrom(context.Background()); ok {
 		t.Error("a bare context reports an operation context")
 	}
-	ctx := identity.NewOperationContext(context.Background(), r, principal, identity.SourceBearer)
-	got, ok := identity.OperationContextFrom(ctx)
-	if !ok {
-		t.Fatal("the derived context reports no operation context")
-	}
-	want := identity.OperationContext{
-		Principal:        principal,
-		CredentialSource: identity.SourceBearer,
-		TraceID:          "4bf92f3577b34da6a3ce929d0e0e4736",
-	}
-	if got != want {
-		t.Errorf("OperationContextFrom = %+v, want %+v", got, want)
+	// Every source is driven, not just the bearer one. With only a bearer row
+	// a constructor that IGNORED its argument and hard-coded SourceBearer
+	// passed the whole suite, and that mutant is the CSRF-bypass bug: an
+	// operation authenticated by an ambient cookie, recorded as a bearer, and
+	// the guard skips.
+	for _, source := range []identity.Source{identity.SourceBearer, identity.SourceCookie, identity.SourceLink, identity.Source("")} {
+		ctx := identity.NewOperationContextWithSource(context.Background(), r, principal, source)
+		got, ok := identity.OperationContextFrom(ctx)
+		if !ok {
+			t.Fatal("the derived context reports no operation context")
+		}
+		want := identity.OperationContext{
+			Principal:        principal,
+			CredentialSource: source,
+			TraceID:          "4bf92f3577b34da6a3ce929d0e0e4736",
+		}
+		if got != want {
+			t.Errorf("OperationContextFrom = %+v, want %+v", got, want)
+		}
 	}
 
 	// A nil request is not a shape any edge produces today, and the guard is
 	// still driven: the alternative to answering "" is a panic inside
 	// authentication, which is the worst place in the server to discover a
 	// caller passed nil.
-	if got, ok := identity.OperationContextFrom(identity.NewOperationContext(context.Background(), nil, principal, identity.SourceBearer)); !ok || got.TraceID != "" {
+	if got, ok := identity.OperationContextFrom(identity.NewOperationContextWithSource(context.Background(), nil, principal, identity.SourceBearer)); !ok || got.TraceID != "" {
 		t.Errorf("NewOperationContext with no request carried %+v (ok %t), want an empty trace", got, ok)
 	}
 
 	link := identity.NewLinkOperationContext(context.Background(), principal)
-	want = identity.OperationContext{Principal: principal, CredentialSource: identity.SourceLink}
-	if got, ok := identity.OperationContextFrom(link); !ok || got != want {
-		t.Errorf("NewLinkOperationContext carried %+v (ok %t), want %+v", got, ok, want)
+	wantLink := identity.OperationContext{Principal: principal, CredentialSource: identity.SourceLink}
+	if got, ok := identity.OperationContextFrom(link); !ok || got != wantLink {
+		t.Errorf("NewLinkOperationContext carried %+v (ok %t), want %+v", got, ok, wantLink)
 	}
 }
 
@@ -1036,7 +1109,7 @@ func TestTraceIDIsCopiedOnlyFromAWellFormedTraceparent(t *testing.T) {
 			if tt.header != "" {
 				r.Header.Set("traceparent", tt.header)
 			}
-			got, ok := identity.OperationContextFrom(identity.NewOperationContext(context.Background(), r, principal, identity.SourceBearer))
+			got, ok := identity.OperationContextFrom(identity.NewOperationContextWithSource(context.Background(), r, principal, identity.SourceBearer))
 			if !ok {
 				t.Fatal("no operation context")
 			}
@@ -1143,7 +1216,7 @@ func TestNoAuthMaterialReachesErrorsLogsOrContexts(t *testing.T) {
 				rendered["unwrapped error"] += unwrapped.Error()
 			}
 		}
-		octx := identity.NewOperationContext(context.Background(), bearerRequest(nonce), principal, identity.SourceBearer)
+		octx := identity.NewOperationContextWithSource(context.Background(), bearerRequest(nonce), principal, identity.SourceBearer)
 		got, _ := identity.OperationContextFrom(octx)
 		rendered["operation context %#v"] = fmt.Sprintf("%#v", got)
 		rendered["operation context %+v"] = fmt.Sprintf("%+v", got)

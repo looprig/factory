@@ -494,9 +494,35 @@ type OperationContext struct {
 
 type contextKey struct{}
 
-// NewOperationContext derives the operation context for an authenticated
-// request. It copies the principal and the trace identifier, and nothing else.
-func NewOperationContext(ctx context.Context, r *http.Request, principal factoryidentity.Principal, source Source) context.Context {
+// NewOperationContext derives the operation context for a request this
+// Authenticator authenticated. It copies the principal and the trace
+// identifier, and nothing else.
+//
+// It is a METHOD because the credential source must not be stated by the
+// caller. Passing it in put the answer to "which credential authenticated
+// this" back in the edge's hands one call further out than
+// AuthenticateRequest -- the exact drift CredentialSource was exported to
+// prevent -- and an edge that wrote SourceBearer for a cookie-authenticated
+// operation would make A1.3's CSRF guard skip, silently and in the safe-looking
+// direction. Deriving it here through the same presented() the authentication
+// used means there is one implementation of the rule and no order for a caller
+// to get wrong.
+//
+// A request whose credential cannot be read records an empty source, which no
+// guard may read as permission.
+func (a *Authenticator) NewOperationContext(ctx context.Context, r *http.Request, principal factoryidentity.Principal) context.Context {
+	source, _ := a.CredentialSource(r)
+	return NewOperationContextWithSource(ctx, r, principal, source)
+}
+
+// NewOperationContextWithSource is the EXCEPTION, for a caller that
+// authenticated by some route this Authenticator does not model and therefore
+// has to state the source itself.
+//
+// Prefer Authenticator.NewOperationContext. This function is where a wrong
+// answer to "which credential authenticated this" enters, and a wrong answer
+// here is a CSRF guard that skips rather than an error anybody sees.
+func NewOperationContextWithSource(ctx context.Context, r *http.Request, principal factoryidentity.Principal, source Source) context.Context {
 	return context.WithValue(ctx, contextKey{}, OperationContext{
 		Principal:        principal,
 		CredentialSource: source,
