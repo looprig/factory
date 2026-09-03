@@ -497,10 +497,14 @@ func (n *normalizer) expression(expression ast.Expr) (string, error) {
 			// operand order, so its sessionChannelAllowed result is unaffected
 			// by the == sort below, which the parenthesized row's is not.
 			//
-			// No accept row can fail on the sort's DELETION, and that is
-			// structural rather than an omission: with two conjuncts the only
-			// reordering of production is the sorted one, so an eq-first row
-			// normalizes to the want whether this line runs or not.
+			// No accept row can be the SOLE thing bound to the sort's
+			// deletion. The five rows that keep production's conjunct order do
+			// fail on it, but only for the reason the production audit does;
+			// and no eq-first row can fail on it -- with two conjuncts the
+			// only reordering of production is the sorted one, so an eq-first
+			// row normalizes to the want whether this line runs or not. A
+			// conjunct-order-only row that isolates the deletion is therefore
+			// structurally impossible rather than an omission.
 			sort.Strings(terms)
 			return "and:" + strings.Join(terms, "&"), nil
 		}
