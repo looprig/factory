@@ -48,7 +48,11 @@ const (
 // reads the real authorize.go and principal.go from disk, filtered to the
 // declarations the policy is made of, and requires each audited function to
 // normalize to its expected canonical string. The other three tests in this file
-// are tests OF the analyzer and assert nothing about production.
+// are tests OF the analyzer: they assert nothing about production BEHAVIOUR,
+// but they do depend on production SOURCE TEXT. Each builds its fixtures from
+// productionSources with replaceOnce, which requires the quoted text to occur
+// exactly once in the real file, so a rename in authorize.go or principal.go
+// fails them.
 func TestAuthorizationInformationFlow(t *testing.T) {
 	t.Parallel()
 	imports := newAuditImporter()
@@ -126,6 +130,7 @@ func TestAuthorizationAnalyzerAcceptsEquivalentSafeForms(t *testing.T) {
 		{"immutable local method expression", `return authorizationResult(principal.IsService())`, `check := factoryidentity.Principal.IsService; return authorizationResult(check(principal))`},
 		{"reversed equality", `return parsed.valid && parsed.tenant == principalTenant`, `return parsed.valid && principalTenant == parsed.tenant`},
 		{"reordered parenthesized conjunction", `return parsed.valid && parsed.tenant == principalTenant`, `return ((principalTenant == parsed.tenant) && (parsed.valid))`},
+		{"reordered conjunction", `return parsed.valid && parsed.tenant == principalTenant`, `return parsed.tenant == principalTenant && parsed.valid`},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -471,9 +476,31 @@ func (n *normalizer) expression(expression ast.Expr) (string, error) {
 				return "", err
 			}
 			// && is commutative, so conjunct order must not change the
-			// canonical form. This normalization is what lets the
-			// "reordered parenthesized conjunction" row of
-			// TestAuthorizationAnalyzerAcceptsEquivalentSafeForms pass.
+			// canonical form. Two separate probes bound this, and they bound
+			// different things.
+			//
+			// TestAuthorizationInformationFlow bounds the normalization's
+			// PRESENCE. An "eq:" term always sorts before a "field:" term, so
+			// the want in checks is eq-first, while production writes
+			// parsed.valid && parsed.tenant == principalTenant -- valid-first.
+			// Deleting the sort therefore fails the production audit, and with
+			// it the five accept rows that keep production's conjunct order.
+			//
+			// The "reordered conjunction" and "reordered parenthesized
+			// conjunction" rows of
+			// TestAuthorizationAnalyzerAcceptsEquivalentSafeForms bound it as
+			// order-INSENSITIVE rather than as some fixed permutation: they are
+			// the only rows written eq-first, so replacing this sort with an
+			// unconditional swap of a two-term chain passes the production audit
+			// and every other row, and fails only there. Of the two, "reordered
+			// conjunction" is the isolating one -- it keeps production's ==
+			// operand order, so its sessionChannelAllowed result is unaffected
+			// by the == sort below, which the parenthesized row's is not.
+			//
+			// No accept row can fail on the sort's DELETION, and that is
+			// structural rather than an omission: with two conjuncts the only
+			// reordering of production is the sorted one, so an eq-first row
+			// normalizes to the want whether this line runs or not.
 			sort.Strings(terms)
 			return "and:" + strings.Join(terms, "&"), nil
 		}
