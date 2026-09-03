@@ -61,78 +61,75 @@ func TestAuthorizerAllowsEveryTenantOperation(t *testing.T) {
 	}
 }
 
-func TestAuthorizerRejectsAnUnconstructedPrincipalForEveryOperation(t *testing.T) {
+func TestOpaqueOperationValuesNeverGrantAnUnconstructedPrincipal(t *testing.T) {
+	t.Parallel()
+
+	authorizer := internalidentity.Authorizer{}
+	ctx := context.Background()
+	principals := []struct {
+		name    string
+		value   factoryidentity.Principal
+		allowed bool
+	}{
+		{"tenant-a actor", actor(t, "tenant-a"), true},
+		{"tenant-b actor", actor(t, "tenant-b"), true},
+		{"unconstructed", factoryidentity.Principal{}, false},
+	}
+	sessions := []sessionwire.SessionID{"shared-session", "session-a", "session-b"}
+	objects := []sessionwire.ObjectReference{
+		{ObjectID: "shared-object"},
+		{ObjectID: "object-a"},
+		{ObjectID: "object-b"},
+	}
+	controlKinds := []sessionstore.CommandKind{"create", "input", "interrupt", "restore", "gate_response"}
+
+	// AuthorizeControl has no CommandID parameter, so this test does not pretend
+	// to cover one. Same-CommandID tenant isolation belongs to admission in A3;
+	// this seam receives only the principal, tenant-local session and operation.
+	for _, session := range sessions {
+		for _, principal := range principals {
+			t.Run("session_read/"+string(session)+"/"+principal.name, func(t *testing.T) {
+				assertAuthorization(t, authorizer.AuthorizeSessionRead(ctx, principal.value, session), principal.allowed)
+			})
+		}
+		for _, object := range objects {
+			for _, principal := range principals {
+				t.Run("object_read/"+string(session)+"/"+object.ObjectID+"/"+principal.name, func(t *testing.T) {
+					assertAuthorization(t, authorizer.AuthorizeObjectRead(ctx, principal.value, session, object), principal.allowed)
+				})
+			}
+		}
+		for _, kind := range controlKinds {
+			for _, principal := range principals {
+				t.Run("control/"+string(session)+"/"+string(kind)+"/"+principal.name, func(t *testing.T) {
+					assertAuthorization(t, authorizer.AuthorizeControl(ctx, principal.value, session, kind), principal.allowed)
+				})
+			}
+		}
+	}
+}
+
+func TestAuthorizerRejectsAnUnconstructedPrincipalForOperationsWithoutOpaqueValues(t *testing.T) {
 	t.Parallel()
 
 	authorizer := internalidentity.Authorizer{}
 	principal := factoryidentity.Principal{}
 	ctx := context.Background()
-	session := sessionwire.SessionID("session-a")
-	object := sessionwire.ObjectReference{ObjectID: "object-a"}
 
 	tests := []struct {
 		name      string
 		authorize func() error
 	}{
 		{"list", func() error { return authorizer.AuthorizeSessionList(ctx, principal) }},
-		{"read", func() error { return authorizer.AuthorizeSessionRead(ctx, principal, session) }},
-		{"object", func() error { return authorizer.AuthorizeObjectRead(ctx, principal, session, object) }},
-		{"control", func() error {
-			return authorizer.AuthorizeControl(ctx, principal, session, sessionstore.CommandKind("input"))
-		}},
 		{"subscribe", func() error { return authorizer.AuthorizeSubscribe(ctx, principal, "session:tenant-a:session-a") }},
 		{"service sweep", func() error { return authorizer.AuthorizeServiceSweep(ctx, principal) }},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
 			if err := tt.authorize(); !errors.Is(err, internalidentity.ErrUnauthorized) {
 				t.Fatalf("authorize = %v, want ErrUnauthorized", err)
 			}
 		})
-	}
-}
-
-func TestAuthorizerConfinesOpaqueIdentifiersToThePrincipalTenant(t *testing.T) {
-	t.Parallel()
-
-	authorizer := internalidentity.Authorizer{}
-	tenantA := actor(t, "tenant-a")
-	tenantB := actor(t, "tenant-b")
-	ctx := context.Background()
-
-	// Session, command and object identifiers are tenant-local. The same values
-	// therefore authorize in both scopes; none of them can select the other
-	// tenant because the downstream request takes its tenant from Principal.
-	sharedSession := sessionwire.SessionID("same-session")
-	sharedCommand := sessionwire.CommandID("same-command")
-	sharedObject := sessionwire.ObjectReference{ObjectID: "same-object"}
-	for name, authorize := range map[string]func(factoryidentity.Principal) error{
-		"session": func(principal factoryidentity.Principal) error {
-			return authorizer.AuthorizeSessionRead(ctx, principal, sharedSession)
-		},
-		"command " + string(sharedCommand): func(principal factoryidentity.Principal) error {
-			return authorizer.AuthorizeControl(ctx, principal, sharedSession, "input")
-		},
-		"object": func(principal factoryidentity.Principal) error {
-			return authorizer.AuthorizeObjectRead(ctx, principal, sharedSession, sharedObject)
-		},
-	} {
-		t.Run(name, func(t *testing.T) {
-			t.Parallel()
-			for _, principal := range []factoryidentity.Principal{tenantA, tenantB} {
-				if err := authorize(principal); err != nil {
-					t.Fatalf("tenant %q authorize = %v, want nil", principal.Tenant(), err)
-				}
-			}
-		})
-	}
-
-	if err := authorizer.AuthorizeSubscribe(ctx, tenantA, "session:tenant-b:same-session"); !errors.Is(err, internalidentity.ErrUnauthorized) {
-		t.Fatalf("tenant-a subscribing to tenant-b = %v, want ErrUnauthorized", err)
-	}
-	if err := authorizer.AuthorizeSubscribe(ctx, tenantB, "session:tenant-a:same-session"); !errors.Is(err, internalidentity.ErrUnauthorized) {
-		t.Fatalf("tenant-b subscribing to tenant-a = %v, want ErrUnauthorized", err)
 	}
 }
 
@@ -170,6 +167,9 @@ func TestSubscribeParsesBeforeComparingAndParsingDoesNotGrantAccess(t *testing.T
 				t.Fatalf("AuthorizeSubscribe(%q) = %v, want nil", tt.channel, err)
 			}
 		})
+	}
+	if err := authorizer.AuthorizeSubscribe(ctx, actor(t, "tenant-b"), "session:tenant-a:session-a"); !errors.Is(err, internalidentity.ErrUnauthorized) {
+		t.Fatalf("tenant-b subscribing to tenant-a = %v, want ErrUnauthorized", err)
 	}
 }
 
@@ -216,4 +216,14 @@ func service(t *testing.T, tenant sessionwire.TenantID) factoryidentity.Principa
 		t.Fatalf("NewPrincipal(service) = %v", err)
 	}
 	return principal
+}
+
+func assertAuthorization(t *testing.T, err error, allowed bool) {
+	t.Helper()
+	if allowed && err != nil {
+		t.Fatalf("authorize = %v, want nil", err)
+	}
+	if !allowed && !errors.Is(err, internalidentity.ErrUnauthorized) {
+		t.Fatalf("authorize = %v, want ErrUnauthorized", err)
+	}
 }
