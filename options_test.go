@@ -328,36 +328,138 @@ func TestNewCopiesTheCallersCSRFConfiguration(t *testing.T) {
 
 // TestNewNamesEverySeamThatIsMissing is what makes the order the seams are
 // checked in unobservable. Reporting the first missing seam would have made
-// that order a contract -- reordering the list would change which name a
+// that order a contract -- reordering the check list would change which name a
 // caller with two defects is told about -- while telling the caller less.
+//
+// The second row is the one that holds the SORT rather than merely passing a
+// value through it. Its two seams are checked in the opposite order to the one
+// they sort into, so deleting slices.Sort fails here; the first row's pair is
+// already ascending in both, so it establishes completeness and says nothing
+// about ordering. A row of the first kind alone left the sort with no reader at
+// all, and the "the check order acquires no reader" claim resting on a line no
+// test held.
 func TestNewNamesEverySeamThatIsMissing(t *testing.T) {
 	t.Parallel()
 
-	base := RequiredOptions()
-	kept := slices.DeleteFunc(slices.Clone(base), func(o Option) bool {
-		return o.name == "WithAuthorizer" || o.name == "WithSessionReader"
-	})
-	if len(kept) != len(base)-2 {
-		t.Fatalf("the two seams this case drops are not both in RequiredOptions()")
+	tests := []struct {
+		name string
+		drop []string
+		want []string
+	}{
+		{
+			name: "a pair whose check order is already its sorted order",
+			drop: []string{"WithAuthorizer", "WithSessionReader"},
+			want: []string{"WithAuthorizer", "WithSessionReader"},
+		},
+		{
+			// WithCommands is checked fourth and WithCSRF last, but 'S' (0x53)
+			// sorts before 'o' (0x6f), so the sorted answer inverts the pair.
+			name: "a pair whose check order is the reverse of its sorted order",
+			drop: []string{"WithCommands", "WithCSRF"},
+			want: []string{"WithCSRF", "WithCommands"},
+		},
 	}
-	server, err := New(kept...)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			base := RequiredOptions()
+			kept := slices.DeleteFunc(slices.Clone(base), func(o Option) bool {
+				return slices.Contains(tt.drop, o.name)
+			})
+			if len(kept) != len(base)-len(tt.drop) {
+				t.Fatalf("the seams this case drops (%v) are not all in RequiredOptions()", tt.drop)
+			}
+			server, err := New(kept...)
+			if err == nil {
+				t.Fatalf("New() without %v = %+v, want an error", tt.drop, server)
+			}
+			if !errors.Is(err, ErrMissingDependency) {
+				t.Fatalf("error %v does not wrap ErrMissingDependency", err)
+			}
+			var missing *MissingSeamsError
+			if !errors.As(err, &missing) {
+				t.Fatalf("error %v is not a *MissingSeamsError", err)
+			}
+			if !slices.Equal(missing.Options, tt.want) {
+				t.Errorf("MissingSeamsError.Options = %v, want %v", missing.Options, tt.want)
+			}
+			for _, name := range tt.want {
+				if !strings.Contains(err.Error(), name) {
+					t.Errorf("error %q does not name %q", err, name)
+				}
+			}
+		})
+	}
+}
+
+// TestMissingSeamsAreReportedBeforeAConflictingUI pins the check order New's
+// own doc comment states. Both defects are present, so exactly one of the two
+// answers is returned and the order is what decides which: a caller that
+// supplied no seams at all is told about the seams, not about its UI.
+func TestMissingSeamsAreReportedBeforeAConflictingUI(t *testing.T) {
+	t.Parallel()
+
+	server, err := New(WithUIHandler(stubHandler()), WithUIFS(stubFS()))
 	if err == nil {
-		t.Fatalf("New() without two seams = %+v, want an error", server)
+		t.Fatalf("New() with two UI options and no seams = %+v, want an error", server)
 	}
-	if !errors.Is(err, ErrMissingDependency) {
-		t.Fatalf("error %v does not wrap ErrMissingDependency", err)
+	if errors.Is(err, ErrConflictingUI) {
+		t.Fatalf("New() reported the UI conflict %v while every seam was also missing", err)
 	}
 	var missing *MissingSeamsError
 	if !errors.As(err, &missing) {
 		t.Fatalf("error %v is not a *MissingSeamsError", err)
 	}
-	want := []string{"WithAuthorizer", "WithSessionReader"}
-	if !slices.Equal(missing.Options, want) {
-		t.Errorf("MissingSeamsError.Options = %v, want %v in sorted order", missing.Options, want)
+	if len(missing.Options) != len(RequiredOptions()) {
+		t.Errorf("MissingSeamsError.Options = %v, want all %d required seams", missing.Options, len(RequiredOptions()))
 	}
-	for _, name := range want {
-		if !strings.Contains(err.Error(), name) {
-			t.Errorf("error %q does not name %q", err, name)
+}
+
+// TestMissingSeamsAreAlwaysReportedInSortedOrder is the property the two rows
+// above sample. It exists because sampling was not enough: a COMPOUND mutation
+// that deleted slices.Sort and simultaneously reordered the check list so that
+// those particular two seams already came out in sorted order survived both
+// rows. Any fixed set of pairs can be defeated the same way.
+//
+// So this drives every non-empty subset of the required seams -- 2^n-1 of them,
+// which is 127 today -- and requires the report to be exactly the dropped set
+// in sorted order. Deleting the sort now survives only if the check list is
+// itself reordered into full sorted order, and that program is equivalent: the
+// output is the sorted set for every input, which is the whole claim.
+func TestMissingSeamsAreAlwaysReportedInSortedOrder(t *testing.T) {
+	t.Parallel()
+
+	base := RequiredOptions()
+	if len(base) == 0 {
+		t.Fatal("no seams are required, so this sweep is vacuous")
+	}
+	if len(base) > 16 {
+		t.Fatalf("%d required seams is too many for an exhaustive sweep; make this a sampled property", len(base))
+	}
+	for mask := 1; mask < 1<<len(base); mask++ {
+		var dropped []string
+		var kept []Option
+		for i, opt := range base {
+			if mask&(1<<i) != 0 {
+				dropped = append(dropped, opt.name)
+			} else {
+				kept = append(kept, opt)
+			}
+		}
+		server, err := New(kept...)
+		if err == nil {
+			t.Fatalf("dropping %v: New() = %+v, want an error", dropped, server)
+		}
+		var missing *MissingSeamsError
+		if !errors.As(err, &missing) {
+			t.Fatalf("dropping %v: New() = %v, want a *MissingSeamsError", dropped, err)
+		}
+		// dropped is built in CHECK order; want is sorted here, independently.
+		want := slices.Clone(dropped)
+		slices.Sort(want)
+		if !slices.Equal(missing.Options, want) {
+			t.Fatalf("dropping %v: Options = %v, want %v", dropped, missing.Options, want)
 		}
 	}
 }

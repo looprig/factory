@@ -75,15 +75,19 @@ embedder that mounts its own or none composes the same `Server`.
 Each public seam is the union of the narrow interfaces the packages that CALL
 it declare for themselves, in `internal/httpapi`, `internal/admission` and
 `internal/realtime/clientlink`. There is no shared dependency package. The two
-sets are held together by a test rather than by discipline: a consumer that
-widens its interface fails the build until the public seam is widened with it.
-The public seams therefore name only standard-library, Core and SessionStore
-types, since a deployer outside this module cannot import
+sets are held together by tests rather than by discipline, and the two
+directions fail differently: widening a CONSUMER's interface still compiles and
+fails `TestPublicSeamsSatisfyTheirConsumers`, while widening a PUBLIC seam past
+its consumers fails the build outright, because the test fake that implements
+every seam no longer does.
+
+The public seams name only standard-library, Core, SessionStore and
+`factory/identity` types, since a deployer outside this module cannot import
 `github.com/looprig/factory/internal/...` to name anything else -- which is why
-`Principal` and the CSRF configuration live in the public `identity` package.
-`internal/realtime/hostlink`'s dialer is deliberately NOT on that surface: the
-HostLink protocol is internal, and what composition configures is the pool's
-limits.
+`Principal` and the CSRF configuration are in the public `identity` package in
+the first place. `internal/realtime/hostlink`'s dialer is deliberately NOT on
+that surface: the HostLink protocol is internal, and what composition configures
+is the pool's limits.
 
 ## Status
 

@@ -17,6 +17,15 @@ import (
 )
 
 // Authorizer decides the one operation that is not a tenant operation.
+//
+// It declares ONLY the sweep, and that is a statement about where authorization
+// happens rather than an omission: a command reaches admission already
+// authorized, at the httpapi or clientlink edge that accepted it. The
+// consequence is worth stating before A2 wires anything here -- a THIRD caller
+// of this package, one that is not one of those two edges, would admit an
+// unauthorized command, because nothing in admission would refuse it. Such a
+// caller needs its own authorization at its own edge, or this interface needs
+// the operation added to it.
 type Authorizer interface {
 	// AuthorizeServiceSweep covers the cross-tenant due-work sweep over the
 	// service-control shards. It is never reachable by a tenant principal and

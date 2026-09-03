@@ -64,11 +64,11 @@ func TestNewPrincipalValidates(t *testing.T) {
 }
 
 // TestPrincipalHasNoAssignableOrSharedState is the immutability claim, checked
-// against the two ways a value type loses it: an exported field, which lets a
-// holder rewrite its own tenant, and a reference member, which lets a COPY
-// observe a write through the original. Nothing else in this module can make
-// that assertion, because both defects compile and both pass every behavioural
-// test a value type has.
+// against the ways a value type loses it: an exported field, which lets a
+// holder rewrite its own tenant, and a member through which a COPY can observe
+// a write to the original. Nothing else in this module can make that assertion,
+// because every one of those defects compiles and passes every behavioural test
+// a value type has.
 func TestPrincipalHasNoAssignableOrSharedState(t *testing.T) {
 	t.Parallel()
 
@@ -82,15 +82,54 @@ func TestPrincipalHasNoAssignableOrSharedState(t *testing.T) {
 			t.Errorf("Principal.%s is exported, so a holder can rewrite it", field.Name)
 		}
 		if shared := sharesMemory(field.Type); shared != "" {
-			t.Errorf("Principal.%s is %s, so a copy shares %s with its original", field.Name, field.Type, shared)
+			t.Errorf("Principal.%s is %s: a %s member lets a copy observe a write through the original",
+				field.Name, field.Type, shared)
 		}
 	}
 }
 
-// sharesMemory names the kind that makes a copy share state, or "" if none.
+// TestPrincipalIsComparable is a second reader of the same field set, and it is
+// not redundant: a func member is caught by sharesMemory, but it ALSO makes
+// Principal non-comparable, which silently breaks every == and != on one --
+// including the equality that clientlink's seam test asserts an authenticator
+// returned the principal it was given.
+func TestPrincipalIsComparable(t *testing.T) {
+	t.Parallel()
+
+	if typ := reflect.TypeOf(identity.Principal{}); !typ.Comparable() {
+		t.Fatalf("%s is not comparable, so == and != on a Principal no longer compile", typ)
+	}
+	first, err := identity.NewPrincipal("tenant-1", "user-1", identity.KindActor)
+	if err != nil {
+		t.Fatalf("NewPrincipal: %v", err)
+	}
+	second, err := identity.NewPrincipal("tenant-1", "user-1", identity.KindActor)
+	if err != nil {
+		t.Fatalf("NewPrincipal: %v", err)
+	}
+	if first != second {
+		t.Error("two principals built from the same verified credentials are not equal")
+	}
+	other, err := identity.NewPrincipal("tenant-2", "user-1", identity.KindActor)
+	if err != nil {
+		t.Fatalf("NewPrincipal: %v", err)
+	}
+	if first == other {
+		t.Error("principals in different tenants compare equal")
+	}
+}
+
+// sharesMemory names the kind that lets a copy observe a write through the
+// original, or "" if none.
+//
+// Interface and Func are in the list for the same reason Pointer is, and
+// leaving them out was a live hole rather than a theoretical one: an unexported
+// `claims any` field holding a *[]string is copied by value while both copies
+// read the same slice, and this detector answered "" to it.
 func sharesMemory(typ reflect.Type) string {
 	switch typ.Kind() {
-	case reflect.Pointer, reflect.Slice, reflect.Map, reflect.Chan, reflect.UnsafePointer:
+	case reflect.Pointer, reflect.Slice, reflect.Map, reflect.Chan, reflect.UnsafePointer,
+		reflect.Interface, reflect.Func:
 		return typ.Kind().String()
 	case reflect.Array:
 		return sharesMemory(typ.Elem())
@@ -105,29 +144,46 @@ func sharesMemory(typ reflect.Type) string {
 }
 
 // TestSharesMemoryDetectsEachSharingKind keeps the assertion above from passing
-// because its detector answers "" to everything.
+// because its detector answers "" to everything. The cases are reflect.Types
+// rather than values, because an interface- or func-typed member cannot be
+// presented as an `any` -- reflect.TypeOf would report the DYNAMIC type and the
+// two kinds this test was extended to cover would never reach the detector.
 func TestSharesMemoryDetectsEachSharingKind(t *testing.T) {
 	t.Parallel()
 
 	type nested struct{ P *int }
-	shared := []any{
-		new(int),
-		[]byte(nil),
-		map[string]string(nil),
-		make(chan int),
-		nested{},
-		[2]nested{},
-		struct{ Inner nested }{},
+	shared := []reflect.Type{
+		reflect.TypeFor[*int](),
+		reflect.TypeFor[[]byte](),
+		reflect.TypeFor[map[string]string](),
+		reflect.TypeFor[chan int](),
+		reflect.TypeFor[any](),
+		reflect.TypeFor[error](),
+		reflect.TypeFor[func()](),
+		reflect.TypeFor[nested](),
+		reflect.TypeFor[[2]nested](),
+		reflect.TypeFor[struct{ Inner nested }](),
+		reflect.TypeFor[struct{ Claims any }](),
+		reflect.TypeFor[struct{ Resolve func() string }](),
+		reflect.TypeFor[[2]any](),
 	}
-	for _, value := range shared {
-		typ := reflect.TypeOf(value)
+	if len(shared) == 0 {
+		t.Fatal("no sharing kinds are driven, so this test is vacuous")
+	}
+	for _, typ := range shared {
 		if sharesMemory(typ) == "" {
 			t.Errorf("sharesMemory(%s) = \"\", want a sharing kind", typ)
 		}
 	}
-	notShared := []any{"", 0, identity.Kind(""), [2]string{}, struct{ A string }{}}
-	for _, value := range notShared {
-		typ := reflect.TypeOf(value)
+	notShared := []reflect.Type{
+		reflect.TypeFor[string](),
+		reflect.TypeFor[int](),
+		reflect.TypeFor[identity.Kind](),
+		reflect.TypeFor[[2]string](),
+		reflect.TypeFor[struct{ A string }](),
+		reflect.TypeFor[identity.Principal](),
+	}
+	for _, typ := range notShared {
 		if got := sharesMemory(typ); got != "" {
 			t.Errorf("sharesMemory(%s) = %q, want \"\"", typ, got)
 		}

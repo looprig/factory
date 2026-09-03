@@ -11,8 +11,14 @@ import (
 	"github.com/looprig/factory/identity"
 )
 
-// Composition errors. Every failure New reports is one of these, wrapped in an
-// *OptionError naming the option it belongs to.
+// Composition errors. Every failure New reports wraps one of these sentinels,
+// so errors.Is classifies any of them.
+//
+// The CONCRETE type varies and a caller that switches on it must handle three
+// shapes: an *OptionError naming one option, a *MissingSeamsError naming every
+// seam that was not supplied -- the most common failure, and NOT an
+// *OptionError -- and ErrConflictingUI returned bare, since it belongs to two
+// options rather than one.
 var (
 	// ErrNilOption reports a nil entry in the option slice.
 	ErrNilOption = errors.New("factory: nil option")
@@ -40,13 +46,16 @@ type OptionError struct {
 func (e *OptionError) Error() string { return e.Option + ": " + e.Err.Error() }
 func (e *OptionError) Unwrap() error { return e.Err }
 
-// MissingSeamsError names every seam a composition failed to supply.
+// MissingSeamsError names every seam a composition failed to supply. It is not
+// an *OptionError, because it belongs to a set of options rather than to one.
 //
 // All of them are reported at once, and SORTED, for two reasons. A caller with
 // three missing seams is not sent round the build-and-fail loop three times;
 // and the order the seams are checked in acquires no reader, so it stays what
 // it is -- an ordering chosen for readability -- rather than becoming a
-// contract nobody meant to make.
+// contract nobody meant to make. The sort is held by a case whose check order
+// and sorted order DIFFER; without one, deleting the sort would change nothing
+// observable and that second claim would quietly stop being true.
 type MissingSeamsError struct {
 	// Options are the option constructors that had to be supplied and were not.
 	Options []string

@@ -21,8 +21,10 @@ import (
 // import github.com/looprig/factory/internal/... to name the parts. Every
 // method here names only a standard-library, Core or SessionStore type, so
 // each is assignable to its narrow counterpart with no adapter, and
-// seam_test.go asserts exactly that: widening a consumer's interface without
-// widening the seam fails to compile.
+// server_test.go asserts exactly that in both directions: a consumer that
+// widens its interface fails TestPublicSeamsSatisfyTheirConsumers, and a public
+// seam widened past its consumers fails
+// TestPublicSeamsAreExactlyTheUnionOfTheirConsumers.
 
 // Authenticator derives an immutable Principal from a request or a ClientLink
 // connect credential.
@@ -124,10 +126,6 @@ func New(opts ...Option) (*Server, error) {
 		}
 	}
 
-	if cfg.ui != nil && cfg.uiFS != nil {
-		return nil, ErrConflictingUI
-	}
-
 	var missing []string
 	for _, required := range []struct {
 		name    string
@@ -148,6 +146,14 @@ func New(opts ...Option) (*Server, error) {
 	if len(missing) > 0 {
 		slices.Sort(missing)
 		return nil, &MissingSeamsError{Options: missing}
+	}
+
+	// Only now, with every seam present, do the values get read against each
+	// other. Running this earlier told a caller that supplied NO seams and both
+	// UI options about the UI, which is the defect it is least likely to care
+	// about; TestMissingSeamsAreReportedBeforeAConflictingUI holds the order.
+	if cfg.ui != nil && cfg.uiFS != nil {
+		return nil, ErrConflictingUI
 	}
 
 	if err := cfg.csrf.Validate(); err != nil {

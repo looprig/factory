@@ -155,21 +155,39 @@ func TestPublicSeamsNameNoInternalType(t *testing.T) {
 	}
 }
 
-// internalNamingSeam and storageNamingProbe exist so the two assertions above
-// cannot pass because namedTypesIn returns nothing. They are driven against the
-// detectors, not against the seams.
+// These probes exist so the two assertions above cannot pass because
+// namedTypesIn returns nothing. They are driven against the detectors, not
+// against the seams, and each hides the offending type one layer deeper than
+// the last -- directly, behind an anonymous interface, and behind an anonymous
+// struct -- because an unnamed composite is a hiding place rather than a leaf.
 type internalNamingSeam interface {
 	Reject(httpapi.Authenticator) error
+}
+
+type internalBehindAnInterface interface {
+	Reject(interface {
+		Auth(httpapi.Authenticator) error
+	}) error
+}
+
+type internalBehindAStruct interface {
+	Reject(struct{ A httpapi.Authenticator }) error
 }
 
 func TestNamedTypesInFindsTheTypesTheAssertionsLookFor(t *testing.T) {
 	t.Parallel()
 
-	internalNames := namedTypesIn(iface[internalNamingSeam]())
-	if !slices.ContainsFunc(internalNames, func(typ reflect.Type) bool {
-		return slices.Contains(strings.Split(typ.PkgPath(), "/"), "internal")
-	}) {
-		t.Errorf("namedTypesIn did not find the internal type in %s: %v", iface[internalNamingSeam](), internalNames)
+	for _, probe := range []reflect.Type{
+		iface[internalNamingSeam](),
+		iface[internalBehindAnInterface](),
+		iface[internalBehindAStruct](),
+	} {
+		names := namedTypesIn(probe)
+		if !slices.ContainsFunc(names, func(typ reflect.Type) bool {
+			return slices.Contains(strings.Split(typ.PkgPath(), "/"), "internal")
+		}) {
+			t.Errorf("namedTypesIn did not find the internal type in %s: %v", probe, names)
+		}
 	}
 
 	// The Storage assertion's detector is the same walker with a different
@@ -243,6 +261,20 @@ func collectNamedTypes(typ reflect.Type, out *[]reflect.Type, seen map[reflect.T
 		}
 		for i := range typ.NumOut() {
 			collectNamedTypes(typ.Out(i), out, seen)
+		}
+	// An ANONYMOUS interface or struct is a named type's hiding place, not a
+	// leaf: `interface{ Auth(httpapi.Authenticator) error }` and
+	// `struct{ A httpapi.Authenticator }` are both spellable in a seam
+	// signature, and before these two arms the walker returned nothing for
+	// either, so both assertions above passed on a seam that did name the type
+	// they exist to forbid.
+	case reflect.Interface:
+		for i := range typ.NumMethod() {
+			collectNamedTypes(typ.Method(i).Type, out, seen)
+		}
+	case reflect.Struct:
+		for i := range typ.NumField() {
+			collectNamedTypes(typ.Field(i).Type, out, seen)
 		}
 	}
 }

@@ -60,10 +60,23 @@ func (c CSRFConfig) Validate() error {
 	return nil
 }
 
-// validateOrigin holds an entry to the exact form a browser sends in an Origin
-// header. The final comparison is what rejects a path, a query, a fragment,
-// userinfo and a trailing slash in one step, rather than by enumerating the
-// shapes someone thought of.
+// validateOrigin holds an entry to the shape of an Origin header:
+// scheme://host[:port] and nothing else. The final comparison is what rejects a
+// path, a query, a fragment, userinfo and a trailing slash in one step, rather
+// than by enumerating the shapes someone thought of.
+//
+// It is a SHAPE check, not a normalization, and the difference matters to
+// whoever writes the matcher. url.Parse lowercases the scheme but leaves the
+// host exactly as written, so `https://APP.Example.COM`, an explicit `:443`, a
+// trailing dot, and a Unicode host rather than its punycode form all pass here
+// and then never equal the Origin a browser actually sends. The duplicate check
+// in Validate compares exact strings for the same reason, so those variants
+// count as distinct entries.
+//
+// Nothing here depends on that yet, because nothing compares an origin yet.
+// A1.3 owns the comparison, and it must normalize both sides -- or narrow this
+// function -- rather than assume an entry that validated is an entry that can
+// match.
 func validateOrigin(origin string) error {
 	if origin == "" {
 		return fmt.Errorf("%w: TrustedOrigins contains an empty entry", ErrInvalidCSRFConfig)
