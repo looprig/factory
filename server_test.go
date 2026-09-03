@@ -9,6 +9,7 @@ import (
 	"github.com/looprig/factory"
 	"github.com/looprig/factory/internal/admission"
 	"github.com/looprig/factory/internal/httpapi"
+	internalidentity "github.com/looprig/factory/internal/identity"
 	"github.com/looprig/factory/internal/realtime/clientlink"
 	"github.com/looprig/factory/internal/realtime/hostlink"
 )
@@ -25,8 +26,12 @@ func publicSeams() map[reflect.Type][]reflect.Type {
 		iface[factory.Commands]():            {iface[admission.Commands]()},
 		iface[factory.Directory]():           {iface[admission.Directory]()},
 		iface[factory.PlacementController](): {iface[admission.PlacementController]()},
-		iface[factory.Clock]():               {iface[admission.Clock]()},
-		iface[factory.UUIDSource]():          {iface[admission.UUIDSource]()},
+		// internal/identity declares a Clock with only Now, because expiry is
+		// the only time it reads. Pairing it here is what keeps the union
+		// assertion honest: a narrower consumer must still be satisfied by the
+		// one object a deployer supplies.
+		iface[factory.Clock]():      {iface[admission.Clock](), iface[internalidentity.Clock]()},
+		iface[factory.UUIDSource](): {iface[admission.UUIDSource]()},
 	}
 }
 
@@ -109,6 +114,8 @@ func allSeams() []reflect.Type {
 		iface[admission.PlacementController](),
 		iface[admission.Clock](),
 		iface[admission.UUIDSource](),
+		iface[internalidentity.Clock](),
+		iface[internalidentity.Verifier](),
 		iface[hostlink.Dialer](),
 		iface[hostlink.Link](),
 	}

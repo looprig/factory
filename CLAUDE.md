@@ -209,6 +209,14 @@ not mention a type from `internal/`. That is the whole reason `Principal` and
 `internal/identity` as runbook 05's file list anticipated; A1's derivation code
 belongs beside them.
 
+`internal/identity` is where that derivation code went: `Credential`, `Claims`,
+`Verifier`, the `Authenticator` and `OperationContext` have no external
+implementer, so none of them is vocabulary a deployer has to learn. What A1.1
+added to the PUBLIC package is only what an implementer must NAME:
+`ErrUnauthenticated` and `ErrCredentialExpired`. The expired sentinel wraps the
+other, so an edge matching one classification still catches both; it is separate
+because it is the one rejection a browser acts on without a human.
+
 `server.go`'s public seams are therefore the UNION of the narrow ones, and
 `TestPublicSeamsSatisfyTheirConsumers` plus
 `TestPublicSeamsAreExactlyTheUnionOfTheirConsumers` hold them equal in both
@@ -227,11 +235,50 @@ is correct rather than an oversight, because the HostLink protocol is internal
 and the boundary rules already confine its engine to `internal/realtime`. What
 composition configures from outside is `HostLinkLimits`.
 
+## Identity derivation reads no tenant carrier, and holds no state
+
+Two properties of `internal/identity` are load-bearing, and both are held
+structurally rather than by review.
+
+**A tenant comes only from verified claims or from configuration.** The
+derivation names none of `URL`, `RequestURI`, `Body`, `Form`, `PathValue`,
+`Host` or their relatives, so there is nothing to "reject": a conflicting tenant
+in a request is never read. `TestTenantComesOnlyFromVerifiedClaims` sweeps every
+carrier a request offers, and `TestTheDerivationNamesNoTenantCarrier` scans the
+PARSED file for the selectors themselves -- the behavioural sweep can only cover
+the carriers somebody thought of, and the structural one is what survives a
+carrier nobody did.
+
+The default tenant is applied to an ACTOR only. A service credential is minted
+by deployment configuration and can name its own scope, so one that names none
+is misconfigured; inheriting the local default would hand an unscoped service
+credential authority over whichever tenant a deployment happens to default to,
+and a service principal is the identity authorized for the cross-tenant sweep.
+
+**An Authenticator holds no per-process state.** That is spec section 10 --
+authentication state is stateless or shared durably, never held in one Factory
+process -- and it is why the seam is a `Verifier` rather than a session table.
+`TestAuthenticatorDeclaresNoPerProcessState` is the structural half, and it is
+the half a behavioural test cannot supply: a per-process cache is invisible to a
+two-replica test in every case where the cache misses. What it establishes is
+bounded -- state reachable THROUGH an injected seam is the deployer's.
+
+**No auth material reaches an error or a log.** The single place foreign text
+enters is the verifier's error, and its TEXT is kept scrubbed while the error
+VALUE is dropped, so no unwrapping reaches a message this package has not
+scrubbed. `Credential` then redacts under `%v`/`%s`/`%q`, `%#v`, `slog` and
+`encoding/json` through four DIFFERENT methods, none of which covers the others.
+The nonce sweep in `TestNoAuthMaterialReachesErrorsLogsOrContexts` uses a fresh
+random credential for the reason `pgstore` uses one for a DSN: a fixed token is
+indistinguishable from ordinary message text.
+
 ## Not implemented yet
 
-Composition seams (A0.2) are defined and validated; identity derivation, the
-HTTP API, admission, routing, placement and the realtime engines are later
-tasks in runbook 05. `internal/realtime` now exists and holds the ClientLink
+Composition seams (A0.2) and identity derivation (A1.1) are done; the HTTP API,
+admission, routing, placement and the realtime engines are later tasks in
+runbook 05. Nothing wires the `Authenticator` into `factory.New` yet -- there is
+no default authenticator option, because a deployment supplies the `Verifier`
+and there is no credible default for one. `internal/realtime` now exists and holds the ClientLink
 and HostLink seams. `cmd/factory` and `internal/placement/kubernetes` do not
 exist; their exemptions grant nothing today and `TestBoundaryScopesAreNotStale`
 will fail if one of those directories appears without a Go file in it. Do not

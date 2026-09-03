@@ -26,6 +26,12 @@ func TestNewPrincipalValidates(t *testing.T) {
 		{name: "empty subject", tenant: "tenant-1", subject: "", kind: identity.KindActor, wantErr: "subject"},
 		{name: "unknown kind", tenant: "tenant-1", subject: "user-1", kind: identity.Kind("admin"), wantErr: "kind"},
 		{name: "empty kind", tenant: "tenant-1", subject: "user-1", kind: identity.Kind(""), wantErr: "kind"},
+		{name: "tenant at the byte limit", tenant: sessionwire.TenantID(strings.Repeat("t", sessionwire.MaxIDBytes)), subject: "user-1", kind: identity.KindActor},
+		{name: "tenant over the byte limit", tenant: sessionwire.TenantID(strings.Repeat("t", sessionwire.MaxIDBytes+1)), subject: "user-1", kind: identity.KindActor, wantErr: "tenant"},
+		{name: "tenant that is not UTF-8", tenant: sessionwire.TenantID("\xff"), subject: "user-1", kind: identity.KindActor, wantErr: "tenant"},
+		{name: "subject at the byte limit", tenant: "tenant-1", subject: strings.Repeat("s", sessionwire.MaxIDBytes), kind: identity.KindActor},
+		{name: "subject over the byte limit", tenant: "tenant-1", subject: strings.Repeat("s", sessionwire.MaxIDBytes+1), kind: identity.KindActor, wantErr: "subject"},
+		{name: "subject that is not UTF-8", tenant: "tenant-1", subject: "\xff", kind: identity.KindActor, wantErr: "subject"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -187,5 +193,37 @@ func TestSharesMemoryDetectsEachSharingKind(t *testing.T) {
 		if got := sharesMemory(typ); got != "" {
 			t.Errorf("sharesMemory(%s) = %q, want \"\"", typ, got)
 		}
+	}
+}
+
+// TestExpiryIsAKindOfUnauthenticated holds the wrapping that lets one edge
+// handler answer both. If the two sentinels were siblings, every caller
+// matching ErrUnauthenticated would silently stop recognising an expired
+// credential, which is the commonest rejection a running deployment produces.
+func TestExpiryIsAKindOfUnauthenticated(t *testing.T) {
+	t.Parallel()
+
+	if !errors.Is(identity.ErrCredentialExpired, identity.ErrUnauthenticated) {
+		t.Error("ErrCredentialExpired does not wrap ErrUnauthenticated")
+	}
+	if errors.Is(identity.ErrUnauthenticated, identity.ErrCredentialExpired) {
+		t.Error("ErrUnauthenticated matches ErrCredentialExpired, so an invalid credential reads as an expired one")
+	}
+	// The two classes are disjoint from the constructor's class: a caller that
+	// could not build a principal has not been told anything about a
+	// credential, and a caller with no credential has not built a bad one.
+	for _, pair := range []struct {
+		name       string
+		err, other error
+	}{
+		{"unauthenticated/invalid", identity.ErrUnauthenticated, identity.ErrInvalidPrincipal},
+		{"expired/invalid", identity.ErrCredentialExpired, identity.ErrInvalidPrincipal},
+	} {
+		if errors.Is(pair.err, pair.other) {
+			t.Errorf("%s: the two error classes are not distinguishable", pair.name)
+		}
+	}
+	if !strings.Contains(identity.ErrCredentialExpired.Error(), "expired") {
+		t.Errorf("ErrCredentialExpired reads %q, which does not say what happened", identity.ErrCredentialExpired)
 	}
 }

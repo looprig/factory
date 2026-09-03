@@ -73,8 +73,8 @@ and is exercised as such** -- the default binary mounts the Vite bundle, and an
 embedder that mounts its own or none composes the same `Server`.
 
 Each public seam is the union of the narrow interfaces the packages that CALL
-it declare for themselves, in `internal/httpapi`, `internal/admission` and
-`internal/realtime/clientlink`. There is no shared dependency package. The two
+it declare for themselves, in `internal/httpapi`, `internal/admission`,
+`internal/identity` and `internal/realtime/clientlink`. There is no shared dependency package. The two
 sets are held together by tests rather than by discipline, and the two
 directions fail differently: widening a CONSUMER's interface still compiles and
 fails `TestPublicSeamsSatisfyTheirConsumers`, while widening a PUBLIC seam past
@@ -89,9 +89,35 @@ the first place. `internal/realtime/hostlink`'s dialer is deliberately NOT on
 that surface: the HostLink protocol is internal, and what composition configures
 is the pool's limits.
 
+## Identity
+
+`internal/identity` derives a principal from an inbound credential: an
+`Authorization: Bearer` header or the session cookie for REST, a connect token
+for a ClientLink. Two properties are the reason it is a package rather than a
+handler:
+
+- **A tenant comes only from verified claims or from configuration.** Nothing
+  in the derivation reads the URL, the path, a path value, the body, a form or
+  the `Host` header, so a conflicting tenant in a request is not weighed and
+  discarded -- it is never read. `TestTheDerivationNamesNoTenantCarrier` holds
+  that over the PARSED file, because a behavioural sweep can only cover the
+  carriers somebody thought of.
+- **An `Authenticator` holds no per-process state.** Every decision is a
+  function of the credential, the injected `Verifier` and the injected `Clock`,
+  so a browser whose WebSocket reconnects to another Factory replica is
+  authenticated there with no handoff. That is section 10 of the spec, and it is
+  the same requirement that makes `WithCSRF` mandatory.
+
+An `OperationContext` carries exactly a `Principal` and a W3C trace identifier
+into a request's context; the field set is enumerated by test, so a header, a
+cookie or a raw token cannot be added to it quietly. A `Credential` redacts
+under `%v`, `%s`, `%q`, `%#v`, `log/slog` and `encoding/json`, each through a
+different method, because the likeliest way a token reaches a log is that
+somebody formatted the value they were handed.
+
 ## Status
 
-Seams. `contract.go` states the cross-service contract and `server.go` /
-`options.go` state the composition; identity derivation, the HTTP API,
-admission, routing, placement and the realtime engines are the subject of later
-tasks in runbook 05.
+Seams and identity derivation. `contract.go` states the cross-service contract,
+`server.go` / `options.go` state the composition, and `internal/identity`
+derives principals; the HTTP API, admission, routing, placement and the realtime
+engines are the subject of later tasks in runbook 05.
