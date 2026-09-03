@@ -55,21 +55,14 @@ func (Authorizer) AuthorizeControl(_ context.Context, principal factoryidentity.
 // channel. Parsing is completed independently before the parsed tenant is
 // compared with the principal; a syntactically valid channel is not a grant.
 func (Authorizer) AuthorizeSubscribe(_ context.Context, principal factoryidentity.Principal, channel string) error {
-	tenant, _, ok := parseSessionChannel(channel)
-	if !ok || authorizeTenantPrincipal(principal) != nil || tenant != principal.Tenant() {
-		return ErrUnauthorized
-	}
-	return nil
+	return authorizationResult(sessionChannelAllowed(principal.Tenant(), parseSessionChannel(channel)))
 }
 
 // AuthorizeServiceSweep authorizes the cross-tenant reconciliation sweep. It
 // is the only decision that is not confined to the principal's own tenant and
 // consequently requires a service identity.
 func (Authorizer) AuthorizeServiceSweep(_ context.Context, principal factoryidentity.Principal) error {
-	if authorizeTenantPrincipal(principal) != nil || !principal.IsService() {
-		return ErrUnauthorized
-	}
-	return nil
+	return authorizationResult(principal.IsService())
 }
 
 func authorizeTenantPrincipal(principal factoryidentity.Principal) error {
@@ -79,15 +72,32 @@ func authorizeTenantPrincipal(principal factoryidentity.Principal) error {
 	return nil
 }
 
-func parseSessionChannel(channel string) (sessionwire.TenantID, sessionwire.SessionID, bool) {
+func authorizationResult(allowed bool) error {
+	if !allowed {
+		return ErrUnauthorized
+	}
+	return nil
+}
+
+type parsedSessionChannel struct {
+	tenant  sessionwire.TenantID
+	session sessionwire.SessionID
+	valid   bool
+}
+
+func sessionChannelAllowed(principalTenant sessionwire.TenantID, parsed parsedSessionChannel) bool {
+	return parsed.valid && parsed.tenant == principalTenant
+}
+
+func parseSessionChannel(channel string) parsedSessionChannel {
 	parts := strings.Split(channel, ":")
 	if len(parts) != 3 || parts[0] != "session" {
-		return "", "", false
+		return parsedSessionChannel{}
 	}
 	tenant := sessionwire.TenantID(parts[1])
 	session := sessionwire.SessionID(parts[2])
 	if tenant.Validate() != nil || session.Validate() != nil {
-		return "", "", false
+		return parsedSessionChannel{}
 	}
-	return tenant, session, true
+	return parsedSessionChannel{tenant: tenant, session: session, valid: true}
 }
