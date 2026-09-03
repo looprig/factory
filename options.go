@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io/fs"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/looprig/factory/identity"
@@ -38,6 +39,24 @@ type OptionError struct {
 
 func (e *OptionError) Error() string { return e.Option + ": " + e.Err.Error() }
 func (e *OptionError) Unwrap() error { return e.Err }
+
+// MissingSeamsError names every seam a composition failed to supply.
+//
+// All of them are reported at once, and SORTED, for two reasons. A caller with
+// three missing seams is not sent round the build-and-fail loop three times;
+// and the order the seams are checked in acquires no reader, so it stays what
+// it is -- an ordering chosen for readability -- rather than becoming a
+// contract nobody meant to make.
+type MissingSeamsError struct {
+	// Options are the option constructors that had to be supplied and were not.
+	Options []string
+}
+
+func (e *MissingSeamsError) Error() string {
+	return "factory: required seams are missing: " + strings.Join(e.Options, ", ")
+}
+
+func (e *MissingSeamsError) Unwrap() error { return ErrMissingDependency }
 
 // Option configures a Server. An option is applied at most once; supplying one
 // twice is an error rather than a silent last-wins.

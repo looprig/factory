@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"slices"
 	"time"
 
 	sessionwire "github.com/looprig/core/sessionwire/v1"
@@ -127,6 +128,7 @@ func New(opts ...Option) (*Server, error) {
 		return nil, ErrConflictingUI
 	}
 
+	var missing []string
 	for _, required := range []struct {
 		name    string
 		present bool
@@ -140,8 +142,12 @@ func New(opts ...Option) (*Server, error) {
 		{"WithCSRF", cfg.csrfSet},
 	} {
 		if !required.present {
-			return nil, &OptionError{Option: required.name, Err: ErrMissingDependency}
+			missing = append(missing, required.name)
 		}
+	}
+	if len(missing) > 0 {
+		slices.Sort(missing)
+		return nil, &MissingSeamsError{Options: missing}
 	}
 
 	if err := cfg.csrf.Validate(); err != nil {

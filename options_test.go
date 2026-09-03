@@ -325,3 +325,39 @@ func TestNewCopiesTheCallersCSRFConfiguration(t *testing.T) {
 		t.Errorf("server origin became %q after a caller mutated an accessor result, want %q", got, wantOrigin)
 	}
 }
+
+// TestNewNamesEverySeamThatIsMissing is what makes the order the seams are
+// checked in unobservable. Reporting the first missing seam would have made
+// that order a contract -- reordering the list would change which name a
+// caller with two defects is told about -- while telling the caller less.
+func TestNewNamesEverySeamThatIsMissing(t *testing.T) {
+	t.Parallel()
+
+	base := RequiredOptions()
+	kept := slices.DeleteFunc(slices.Clone(base), func(o Option) bool {
+		return o.name == "WithAuthorizer" || o.name == "WithSessionReader"
+	})
+	if len(kept) != len(base)-2 {
+		t.Fatalf("the two seams this case drops are not both in RequiredOptions()")
+	}
+	server, err := New(kept...)
+	if err == nil {
+		t.Fatalf("New() without two seams = %+v, want an error", server)
+	}
+	if !errors.Is(err, ErrMissingDependency) {
+		t.Fatalf("error %v does not wrap ErrMissingDependency", err)
+	}
+	var missing *MissingSeamsError
+	if !errors.As(err, &missing) {
+		t.Fatalf("error %v is not a *MissingSeamsError", err)
+	}
+	want := []string{"WithAuthorizer", "WithSessionReader"}
+	if !slices.Equal(missing.Options, want) {
+		t.Errorf("MissingSeamsError.Options = %v, want %v in sorted order", missing.Options, want)
+	}
+	for _, name := range want {
+		if !strings.Contains(err.Error(), name) {
+			t.Errorf("error %q does not name %q", err, name)
+		}
+	}
+}
