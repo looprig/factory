@@ -248,6 +248,12 @@ func TestAuthorizerAllowsEveryTenantOperation(t *testing.T) {
 	session := sessionwire.SessionID("shared-session")
 	object := sessionwire.ObjectReference{ObjectID: "shared-object"}
 
+	// The rows enumerate the OPERATIONS A1.2 names, not the methods that answer
+	// them, so "session read", "journal" and "gates" are three rows over one
+	// identical AuthorizeSessionRead call and are not three seams' worth of
+	// coverage. That they collapse to one call is the seam's design, not an
+	// oversight: httpapi.Authorizer.AuthorizeSessionRead is documented in
+	// internal/httpapi/deps.go as covering status, journal and gate reads.
 	tests := []struct {
 		name      string
 		authorize func() error

@@ -1,3 +1,26 @@
+// This file is the authorization information-flow analyzer. It type-checks the
+// production sources of factory/identity and factory/internal/identity and pins
+// the SYNTACTIC SHAPE of each authorization decision: which function is called,
+// which parameter or field every argument is read from, and which statements
+// parseSessionChannel is allowed to contain.
+//
+// What it does NOT prove is runtime behaviour. It never executes an
+// authorization, so a decision that normalizes to the expected string could
+// still be wrong. The behavioural claim lives elsewhere: the tables in
+// authorize_test.go, and FuzzAuthorizeSubscribeMatchesIndependentGrammar in the
+// root package, which checks AuthorizeSubscribe against a Cut/Contains oracle
+// written independently of the production regexp.
+//
+// Fidelity limit, and it is deliberate: newAuditImporter (below) does not load
+// the real github.com/looprig/core/sessionwire/v1 or
+// github.com/looprig/sessionstore. It synthesizes stand-in packages with
+// types.NewPackage, in which TenantID and SessionID are named string types
+// carrying a Validate method that has a signature and no implementation -- the
+// go/types model has no bodies. The analyzer can therefore prove only WHICH
+// function a term calls; it proves nothing about what that validation accepts or
+// rejects. The stand-in is what keeps the analyzer hermetic and independent of a
+// Core release. It is not a sign that the real Core types went missing.
+
 package identity_test
 
 import (
@@ -21,6 +44,11 @@ const (
 	wantPattern  = `\Asession:([^:]+):([^:]+)\z`
 )
 
+// TestAuthorizationInformationFlow is the production assertion of this file: it
+// reads the real authorize.go and principal.go from disk, filtered to the
+// declarations the policy is made of, and requires each audited function to
+// normalize to its expected canonical string. The other three tests in this file
+// are tests OF the analyzer and assert nothing about production.
 func TestAuthorizationInformationFlow(t *testing.T) {
 	t.Parallel()
 	imports := newAuditImporter()
@@ -45,6 +73,10 @@ func TestAuthorizationInformationFlow(t *testing.T) {
 	}
 }
 
+// TestAuthorizationAnalyzerRejectsUnsafeSnippets tests the ANALYZER, not
+// production. Each row rewrites a copy of the production source into a form that
+// must not pass, and the row fails if the analyzer accepts it. It is what stops
+// the analyzer above from being vacuous.
 func TestAuthorizationAnalyzerRejectsUnsafeSnippets(t *testing.T) {
 	t.Parallel()
 	internal, public := productionSources(t)
@@ -80,6 +112,10 @@ func TestAuthorizationAnalyzerRejectsUnsafeSnippets(t *testing.T) {
 	}
 }
 
+// TestAuthorizationAnalyzerAcceptsEquivalentSafeForms tests the ANALYZER, not
+// production. Each row rewrites the production source into a form that means the
+// same thing and must still pass, which bounds how strict the analyzer may be so
+// a legitimate refactor is not reported as a policy change.
 func TestAuthorizationAnalyzerAcceptsEquivalentSafeForms(t *testing.T) {
 	t.Parallel()
 	internal, public := productionSources(t)
@@ -101,6 +137,9 @@ func TestAuthorizationAnalyzerAcceptsEquivalentSafeForms(t *testing.T) {
 	}
 }
 
+// TestAuthorizationAnalyzerReturnsErrorsForMalformedInput tests the ANALYZER,
+// not production. It feeds input the analyzer cannot handle and requires a
+// descriptive, non-empty error rather than a silent pass.
 func TestAuthorizationAnalyzerReturnsErrorsForMalformedInput(t *testing.T) {
 	t.Parallel()
 	internal, public := productionSources(t)
@@ -155,6 +194,33 @@ func auditAuthorization(internal, public *typedSource) error {
 	if len(internal.files) == 0 || len(public.files) == 0 {
 		return fmt.Errorf("authorization audit has no production files")
 	}
+	// The want strings below are written in the bespoke canonical grammar that
+	// normalizeFunctionResult and normalizer.expression emit. Its whole
+	// vocabulary is:
+	//
+	//	param:NAME          a parameter, renamed to a positional role by
+	//	                    newNormalizer's parameterRoles table, so renaming a
+	//	                    parameter in production does not move an expectation
+	//	field:NAME(RECV)    a struct field read from the receiver expression RECV
+	//	call:NAME(ARG,...)  a call of an approved function NAME; a method call
+	//	                    carries its receiver as the FIRST argument
+	//	const:NAME          a named constant
+	//	literal:VALUE       a constant-folded literal
+	//	eq:A&B              an == comparison, with A and B SORTED, so operand
+	//	                    order is not part of the expectation
+	//	and:A&B&...         a && chain, flattened and SORTED, so conjunct order
+	//	                    is not part of the expectation
+	//	nil                 the nil identifier
+	//
+	// So "and:eq:field:tenant(param:parsed)&param:principalTenant&field:valid(param:parsed)"
+	// reads as: a conjunction of (the parsed value's tenant field compared for
+	// equality with the principalTenant parameter) and (the parsed value's valid
+	// field), in either order.
+	//
+	// Anything the grammar has no form for is an ERROR rather than a term: an
+	// unapproved function, field or method, a mutable or multiply assigned
+	// local, an unsupported operator, an unsupported statement. That is what
+	// makes an expectation exhaustive rather than a substring match.
 	checks := []struct {
 		pkg            *typedSource
 		function, want string
@@ -404,6 +470,10 @@ func (n *normalizer) expression(expression ast.Expr) (string, error) {
 			if err := n.andTerms(expression, &terms); err != nil {
 				return "", err
 			}
+			// && is commutative, so conjunct order must not change the
+			// canonical form. This normalization is what lets the
+			// "reordered parenthesized conjunction" row of
+			// TestAuthorizationAnalyzerAcceptsEquivalentSafeForms pass.
 			sort.Strings(terms)
 			return "and:" + strings.Join(terms, "&"), nil
 		}
@@ -416,6 +486,10 @@ func (n *normalizer) expression(expression ast.Expr) (string, error) {
 			if err != nil {
 				return "", err
 			}
+			// == is commutative, so operand order must not change the
+			// canonical form. This normalization is what lets the
+			// "reversed equality" row of
+			// TestAuthorizationAnalyzerAcceptsEquivalentSafeForms pass.
 			values := []string{left, right}
 			sort.Strings(values)
 			return "eq:" + strings.Join(values, "&"), nil
@@ -531,6 +605,10 @@ func auditParser(source *typedSource) error {
 	if parserFunction.Body == nil {
 		return fmt.Errorf("parseSessionChannel has no body")
 	}
+	// Every check below indexes Body.List positionally, so the statement count
+	// is what makes the audit total rather than a spot check: parseSessionChannel
+	// is pinned to exactly its five statements -- match, reject, tenant capture,
+	// session capture, return -- because a sixth would not be audited at all.
 	if len(parserFunction.Body.List) != 5 {
 		return fmt.Errorf("parseSessionChannel statement count is not 5")
 	}
@@ -586,6 +664,16 @@ func auditParser(source *typedSource) error {
 	if !valid {
 		return fmt.Errorf("parser validity is not both Core validations")
 	}
+	// Whole-body shape, counted over the entire subtree rather than the five
+	// top-level statements, so nothing escapes the positional audit by hiding
+	// inside an expression. The 1 branch is the len(matches) != 3 reject; the 2
+	// returns are that reject and the final result; the 6 calls are exactly the
+	// set identified above -- FindStringSubmatch, len, the TenantID and SessionID
+	// conversions, and the two Validate calls. A seventh call is by construction
+	// one nothing above has identified.
+	//
+	// A refactor of parseSessionChannel is EXPECTED to fail here. The fix is to
+	// re-audit the new shape and update these counts, not to relax them.
 	branches, returns, calls := 0, 0, 0
 	ast.Inspect(parserFunction.Body, func(node ast.Node) bool {
 		switch node.(type) {
@@ -946,6 +1034,18 @@ func productionSources(t *testing.T) (string, string) {
 	}
 	return string(internal), string(public)
 }
+
+// replaceOnce builds an analyzer fixture by rewriting production source that the
+// caller QUOTES VERBATIM. Requiring exactly one occurrence is deliberate: a
+// fixture that silently stopped matching would leave its test asserting against
+// unmutated source and passing vacuously.
+//
+// The consequence is that a source-text change to a quoted line -- including a
+// benign rename of a local in authorize.go -- is EXPECTED to fail here, with
+// `fixture occurrence of "..." = 0, want 1`, which names neither the cause nor
+// the fix. The fix is to update the quoted text in the table above to match the
+// new source. It is never to loosen the match to a substring or to a count of at
+// least one.
 func replaceOnce(t *testing.T, source, old, replacement string) string {
 	t.Helper()
 	if strings.Count(source, old) != 1 {

@@ -54,6 +54,15 @@ func (Authorizer) AuthorizeControl(_ context.Context, principal factoryidentity.
 // AuthorizeSubscribe authorizes a canonical session:{tenant}:{session}
 // channel. Parsing is completed independently before the parsed tenant is
 // compared with the principal; a syntactically valid channel is not a grant.
+//
+// It is the one tenant-scoped seam that does not call authorizeTenantPrincipal,
+// and it needs no separate empty-tenant check because the grammar subsumes one:
+// sessionChannelPattern's [^:]+ capture cannot match an empty string, so a
+// parsed tenant that is "" is never valid, and an unconstructed Principal --
+// whose tenant is "" -- therefore never equals a valid parsed tenant. The
+// "subscribe" row of
+// TestAuthorizerRejectsAnUnconstructedPrincipalForOperationsWithoutOpaqueValues
+// exercises that case.
 func (Authorizer) AuthorizeSubscribe(_ context.Context, principal factoryidentity.Principal, channel string) error {
 	return authorizationResult(sessionChannelAllowed(principal.Tenant(), parseSessionChannel(channel)))
 }
@@ -65,11 +74,25 @@ func (Authorizer) AuthorizeServiceSweep(_ context.Context, principal factoryiden
 	return authorizationResult(principal.IsService())
 }
 
+// authorizeTenantPrincipal is the sole check on the four tenant-scoped seams
+// that take no channel: an authenticated principal is confined to its own
+// tenant, so holding any non-empty tenant is the whole of the decision.
+//
+// The emptiness test is sufficient ONLY because factoryidentity.NewPrincipal is
+// the sole constructor of a usable Principal -- it rejects an empty or invalid
+// tenant and an empty subject, and returns the ZERO Principal on any rejection
+// -- and because Principal's fields are unexported, so no package outside
+// factory/identity can build a partially populated one. A composite literal
+// written INSIDE package factory/identity would invalidate that: it can set a
+// tenant without a subject, or a subject without a tenant. Two mutants that are
+// equivalent today would then become live authorization bypasses with no test
+// to catch them -- replacing Tenant() with Subject() here, and adding a
+// magic-subject early grant -- because the analyzer's checks list in
+// authorize_flow_test.go does not cover this function. Do not construct a
+// Principal composite literal in this package without first pinning that
+// invariant.
 func authorizeTenantPrincipal(principal factoryidentity.Principal) error {
-	if principal.Tenant() == "" {
-		return ErrUnauthorized
-	}
-	return nil
+	return authorizationResult(principal.Tenant() != "")
 }
 
 func authorizationResult(allowed bool) error {
@@ -84,8 +107,12 @@ func authorizationResult(allowed bool) error {
 // the grammar yields the zero value; a channel that matches the grammar but
 // whose segments fail TenantID/SessionID validation yields those captured
 // segments with valid false, so an unvalidated tenant can be present in the
-// struct. sessionChannelAllowed is the sole production reader of either field
-// and is the only place permitted to consult them.
+// struct. sessionChannelAllowed is the sole production reader of tenant and
+// valid, and is the only place permitted to consult them. session has no
+// production reader at all: it is captured for symmetry with the grammar and
+// consumed once inside parseSessionChannel to compute valid, and nothing reads
+// the stored field afterwards. What holds it in place is the analyzer's
+// three-field shape check in authorize_flow_test.go, not a caller.
 type parsedSessionChannel struct {
 	tenant  sessionwire.TenantID
 	session sessionwire.SessionID

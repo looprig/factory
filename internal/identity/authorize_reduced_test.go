@@ -18,6 +18,14 @@ func TestAuthorizationResultExhaustsItsDomain(t *testing.T) {
 	}
 }
 
+// TestSessionChannelAllowedExhaustsItsReducedDomain walks the whole 3x3x2
+// reduced domain, but its oracle restates sessionChannelAllowed's body in the
+// same terms, so it is a domain-exhaustion smoke test rather than an independent
+// check. Do not cite it as coverage of the tenant comparison. The independent
+// oracles are the table in
+// TestSubscribeParsesBeforeComparingAndParsingDoesNotGrantAccess
+// (authorize_test.go) and the Cut/Contains oracle in
+// FuzzAuthorizeSubscribeMatchesIndependentGrammar (root package).
 func TestSessionChannelAllowedExhaustsItsReducedDomain(t *testing.T) {
 	t.Parallel()
 
