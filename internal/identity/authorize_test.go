@@ -3,6 +3,12 @@ package identity_test
 import (
 	"context"
 	"errors"
+	"go/ast"
+	"go/parser"
+	"go/token"
+	"path"
+	"reflect"
+	"strconv"
 	"testing"
 
 	sessionwire "github.com/looprig/core/sessionwire/v1"
@@ -25,6 +31,213 @@ var (
 	_ clientlink.Authorizer = internalidentity.Authorizer{}
 	_ admission.Authorizer  = internalidentity.Authorizer{}
 )
+
+// TestAuthorizerOpaqueSeamParametersAreUnread derives both sides of the rule:
+// the public A0.2 seam supplies the parameter types, and the package directory
+// supplies every production file and concrete Authorizer method. Parameters
+// other than context, principal, and AuthorizeSubscribe's channel are opaque
+// tenant-local operation values. They must remain blank, so no particular
+// SessionID, ObjectReference, CommandKind, or future seam value can grant
+// authority independently of the principal.
+func TestAuthorizerOpaqueSeamParametersAreUnread(t *testing.T) {
+	t.Parallel()
+
+	seam, opaqueTypes, channelParameters := authorizerSeam(t)
+	files := productionFiles(t)
+	if len(files) < 2 {
+		t.Fatalf("found %d production files, want at least 2 so the scan cannot pass over an empty or pinned file set", len(files))
+	}
+	if len(seam) < 6 {
+		t.Fatalf("factory.Authorizer has %d methods, want at least the six A0.2 operation classes", len(seam))
+	}
+	if len(opaqueTypes) < 3 {
+		t.Fatalf("classified %d opaque seam types, want at least SessionID, ObjectReference, and CommandKind", len(opaqueTypes))
+	}
+	for _, required := range []reflect.Type{
+		reflect.TypeOf(sessionwire.SessionID("")),
+		reflect.TypeOf(sessionwire.ObjectReference{}),
+		reflect.TypeOf(sessionstore.CommandKind("")),
+	} {
+		if typ := qualifiedReflectType(required); !opaqueTypes[typ] {
+			t.Errorf("derived opaque seam types omit %s", typ)
+		}
+	}
+	if channelParameters != 1 {
+		t.Fatalf("classified %d channel parameters, want exactly AuthorizeSubscribe's channel", channelParameters)
+	}
+
+	methods := make(map[string]string)
+	opaqueParameters := 0
+	for _, filename := range files {
+		parsed, err := parser.ParseFile(token.NewFileSet(), filename, nil, parser.SkipObjectResolution)
+		if err != nil {
+			t.Fatalf("parse %s: %v", filename, err)
+		}
+		imports := resolvedImports(t, filename, parsed)
+		for _, declaration := range parsed.Decls {
+			method, ok := declaration.(*ast.FuncDecl)
+			if !ok || !authorizerReceiver(method.Recv) {
+				continue
+			}
+			if previous, exists := methods[method.Name.Name]; exists {
+				t.Errorf("Authorizer.%s is declared in both %s and %s", method.Name.Name, previous, filename)
+			}
+			methods[method.Name.Name] = filename
+
+			parameters := resolvedParameters(t, filename, method, imports)
+			for index, parameter := range parameters {
+				if method.Name.Name == "AuthorizeSubscribe" && parameter.typ == stringType && parameter.name == "channel" {
+					continue
+				}
+				if opaqueTypes[parameter.typ] {
+					opaqueParameters++
+					if parameter.name != "" && parameter.name != "_" {
+						t.Errorf("%s: Authorizer.%s opaque parameter %d (%s) is named %q; keep it blank so it cannot grant authority",
+							filename, method.Name.Name, index, parameter.typ, parameter.name)
+					}
+					continue
+				}
+				if parameter.typ == contextType || parameter.typ == principalType {
+					continue
+				}
+				t.Errorf("%s: Authorizer.%s parameter %d (%s %q) is neither a derived opaque seam type nor the context/principal/channel exception",
+					filename, method.Name.Name, index, parameter.typ, parameter.name)
+			}
+		}
+	}
+	if len(methods) < len(seam) {
+		t.Fatalf("found %d concrete Authorizer methods across %d files, want at least the %d seam methods", len(methods), len(files), len(seam))
+	}
+	if opaqueParameters < 5 {
+		t.Fatalf("classified %d concrete opaque parameters, want at least the five currently present", opaqueParameters)
+	}
+	for name := range seam {
+		if _, ok := methods[name]; !ok {
+			t.Errorf("factory.Authorizer.%s has no concrete internal/identity.Authorizer method", name)
+		}
+	}
+	for name, filename := range methods {
+		if ast.IsExported(name) {
+			if _, ok := seam[name]; !ok {
+				t.Errorf("%s: exported Authorizer.%s is absent from the factory.Authorizer seam", filename, name)
+			}
+		}
+	}
+}
+
+type qualifiedType struct {
+	pkg  string
+	name string
+}
+
+func (typ qualifiedType) String() string {
+	if typ.pkg == "" {
+		return typ.name
+	}
+	return typ.pkg + "." + typ.name
+}
+
+var (
+	contextType   = qualifiedType{pkg: "context", name: "Context"}
+	principalType = qualifiedType{pkg: "github.com/looprig/factory/identity", name: "Principal"}
+	stringType    = qualifiedType{name: "string"}
+)
+
+func authorizerSeam(t *testing.T) (map[string]struct{}, map[qualifiedType]bool, int) {
+	t.Helper()
+	typeOf := reflect.TypeOf((*factory.Authorizer)(nil)).Elem()
+	methods := make(map[string]struct{}, typeOf.NumMethod())
+	opaque := make(map[qualifiedType]bool)
+	channels := 0
+	for index := range typeOf.NumMethod() {
+		method := typeOf.Method(index)
+		methods[method.Name] = struct{}{}
+		for parameter := range method.Type.NumIn() {
+			typ := qualifiedReflectType(method.Type.In(parameter))
+			switch {
+			case typ == contextType, typ == principalType:
+			case method.Name == "AuthorizeSubscribe" && typ == stringType:
+				channels++
+			default:
+				opaque[typ] = true
+			}
+		}
+	}
+	return methods, opaque, channels
+}
+
+func qualifiedReflectType(typ reflect.Type) qualifiedType {
+	return qualifiedType{pkg: typ.PkgPath(), name: typ.Name()}
+}
+
+type resolvedParameter struct {
+	name string
+	typ  qualifiedType
+}
+
+func resolvedParameters(t *testing.T, filename string, method *ast.FuncDecl, imports map[string]string) []resolvedParameter {
+	t.Helper()
+	var parameters []resolvedParameter
+	for _, field := range method.Type.Params.List {
+		typ, ok := resolveSyntacticType(field.Type, imports)
+		if !ok {
+			t.Fatalf("%s: cannot resolve Authorizer.%s parameter type %T", filename, method.Name.Name, field.Type)
+		}
+		if len(field.Names) == 0 {
+			parameters = append(parameters, resolvedParameter{typ: typ})
+			continue
+		}
+		for _, name := range field.Names {
+			parameters = append(parameters, resolvedParameter{name: name.Name, typ: typ})
+		}
+	}
+	return parameters
+}
+
+func resolveSyntacticType(expression ast.Expr, imports map[string]string) (qualifiedType, bool) {
+	switch expression := expression.(type) {
+	case *ast.Ident:
+		return qualifiedType{name: expression.Name}, true
+	case *ast.SelectorExpr:
+		qualifier, ok := expression.X.(*ast.Ident)
+		if !ok {
+			return qualifiedType{}, false
+		}
+		pkg, ok := imports[qualifier.Name]
+		return qualifiedType{pkg: pkg, name: expression.Sel.Name}, ok
+	default:
+		return qualifiedType{}, false
+	}
+}
+
+func resolvedImports(t *testing.T, filename string, file *ast.File) map[string]string {
+	t.Helper()
+	imports := make(map[string]string, len(file.Imports))
+	for _, spec := range file.Imports {
+		pkg, err := strconv.Unquote(spec.Path.Value)
+		if err != nil {
+			t.Fatalf("%s: unquote import %s: %v", filename, spec.Path.Value, err)
+		}
+		name := path.Base(pkg)
+		if spec.Name != nil {
+			name = spec.Name.Name
+		}
+		imports[name] = pkg
+	}
+	return imports
+}
+
+func authorizerReceiver(receivers *ast.FieldList) bool {
+	if receivers == nil || len(receivers.List) != 1 {
+		return false
+	}
+	typ := receivers.List[0].Type
+	if pointer, ok := typ.(*ast.StarExpr); ok {
+		typ = pointer.X
+	}
+	name, ok := typ.(*ast.Ident)
+	return ok && name.Name == "Authorizer"
+}
 
 func TestAuthorizerAllowsEveryTenantOperation(t *testing.T) {
 	t.Parallel()
@@ -61,6 +274,9 @@ func TestAuthorizerAllowsEveryTenantOperation(t *testing.T) {
 	}
 }
 
+// TestOpaqueOperationValuesNeverGrantAnUnconstructedPrincipal is the concrete
+// control for the structural test above. This finite cross-product catches
+// recognizable special cases; it does not establish the universal property.
 func TestOpaqueOperationValuesNeverGrantAnUnconstructedPrincipal(t *testing.T) {
 	t.Parallel()
 
