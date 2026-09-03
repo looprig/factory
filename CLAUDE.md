@@ -193,14 +193,48 @@ not to rely on.
 When a Looprig dependency moves, update `releasedLooprigVersions` in the same
 change, and move the pin with `go get`, never `go mod tidy`.
 
+## Where an interface goes
+
+A narrow interface belongs to the package that CALLS it. `internal/httpapi`,
+`internal/admission`, `internal/realtime/clientlink` and
+`internal/realtime/hostlink` each declare theirs; there is no shared dependency
+package, and adding one would make widening a dependency invisible at the place
+that acquired it.
+
+One constraint overrides that, and it is the language, not a preference: a
+deployer implements `Authenticator` and `Authorizer` from OUTSIDE this module
+and must be able to NAME every type in their signatures, so a public seam may
+not mention a type from `internal/`. That is the whole reason `Principal` and
+`CSRFConfig` live in the public `identity` package rather than in
+`internal/identity` as runbook 05's file list anticipated; A1's derivation code
+belongs beside them.
+
+`server.go`'s public seams are therefore the UNION of the narrow ones, and
+`TestPublicSeamsSatisfyTheirConsumers` plus
+`TestPublicSeamsAreExactlyTheUnionOfTheirConsumers` hold them equal in both
+directions. They are assignable with no adapter only because every method names
+just standard-library, Core, SessionStore or `identity` types -- which is why
+`Clock` is spelled with `AfterFunc` returning an unnamed `func() bool` rather
+than a named `Timer`: a named type declared in each package would make the two
+`Clock`s different interfaces across the `internal/` boundary.
+`TestNoSeamNamesAStoragePrimitive` is the "SessionStore domain interface, not
+raw Storage" rule made checkable, and it is driven against a probe so it cannot
+pass by finding nothing.
+
+`internal/realtime/hostlink.Dialer` is the one seam NOT on the public surface.
+Its `Dial` returns a `hostlink.Link`, which no external package may name; that
+is correct rather than an oversight, because the HostLink protocol is internal
+and the boundary rules already confine its engine to `internal/realtime`. What
+composition configures from outside is `HostLinkLimits`.
+
 ## Not implemented yet
 
-This module is a scaffold. Composition seams (A0.2), identity, the HTTP API,
-admission, routing, placement and realtime are later tasks in runbook 05.
-`cmd/factory`, `internal/realtime` and `internal/placement/kubernetes` do not
-exist; their exemptions grant nothing today and
-`TestBoundaryScopesAreNotStale` will fail if one of those directories appears
-without a Go file in it. Do not add a placeholder Go file to satisfy it: that
-would permanently satisfy a live tripwire, trading a guard that fires the day a
-directory appears unearned for a directory that is always "earned" by a file
-that means nothing.
+Composition seams (A0.2) are defined and validated; identity derivation, the
+HTTP API, admission, routing, placement and the realtime engines are later
+tasks in runbook 05. `internal/realtime` now exists and holds the ClientLink
+and HostLink seams. `cmd/factory` and `internal/placement/kubernetes` do not
+exist; their exemptions grant nothing today and `TestBoundaryScopesAreNotStale`
+will fail if one of those directories appears without a Go file in it. Do not
+add a placeholder Go file to satisfy it: that would permanently satisfy a live
+tripwire, trading a guard that fires the day a directory appears unearned for a
+directory that is always "earned" by a file that means nothing.

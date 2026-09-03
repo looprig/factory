@@ -1,0 +1,415 @@
+package factory
+
+import (
+	"errors"
+	"fmt"
+	"io/fs"
+	"net/http"
+	"time"
+
+	"github.com/looprig/factory/identity"
+)
+
+// Composition errors. Every failure New reports is one of these, wrapped in an
+// *OptionError naming the option it belongs to.
+var (
+	// ErrNilOption reports a nil entry in the option slice.
+	ErrNilOption = errors.New("factory: nil option")
+	// ErrDuplicateOption reports an option supplied more than once.
+	ErrDuplicateOption = errors.New("factory: option supplied more than once")
+	// ErrNilDependency reports an option carrying a nil interface value.
+	ErrNilDependency = errors.New("factory: nil dependency")
+	// ErrMissingDependency reports a required seam nothing supplied.
+	ErrMissingDependency = errors.New("factory: required seam is missing")
+	// ErrConflictingUI reports both UI options supplied at once.
+	ErrConflictingUI = errors.New("factory: WithUIHandler and WithUIFS are mutually exclusive")
+	// ErrInvalidLimits reports a limit value or relationship this composition
+	// refuses.
+	ErrInvalidLimits = errors.New("factory: invalid limits")
+)
+
+// OptionError names the option a composition failure belongs to.
+type OptionError struct {
+	// Option is the constructor's name, or the name of the option that had to
+	// be supplied and was not.
+	Option string
+	Err    error
+}
+
+func (e *OptionError) Error() string { return e.Option + ": " + e.Err.Error() }
+func (e *OptionError) Unwrap() error { return e.Err }
+
+// Option configures a Server. An option is applied at most once; supplying one
+// twice is an error rather than a silent last-wins.
+type Option struct {
+	name  string
+	apply func(*config) error
+}
+
+type config struct {
+	authenticator Authenticator
+	authorizer    Authorizer
+	reads         SessionReader
+	commands      Commands
+	directory     Directory
+	placement     PlacementController
+
+	clock Clock
+	uuids UUIDSource
+
+	csrf      identity.CSRFConfig
+	csrfSet   bool
+	reconcile ReconcileLimits
+	client    ClientLinkLimits
+	host      HostLinkLimits
+
+	ui   http.Handler
+	uiFS fs.FS
+}
+
+func option(name string, apply func(*config) error) Option {
+	return Option{name: name, apply: apply}
+}
+
+// nilDependency is what every option returns for an explicit nil. A nil is not
+// a request for the default: the defaulted seams are defaulted by their
+// ABSENCE, so a nil here is a caller passing a dependency it failed to build.
+func nilDependency(name string) error {
+	return &OptionError{Option: name, Err: ErrNilDependency}
+}
+
+// WithAuthenticator supplies the HTTP and ClientLink authenticator.
+func WithAuthenticator(a Authenticator) Option {
+	return option("WithAuthenticator", func(c *config) error {
+		if a == nil {
+			return nilDependency("WithAuthenticator")
+		}
+		c.authenticator = a
+		return nil
+	})
+}
+
+// WithAuthorizer supplies the authorizer for every public operation.
+func WithAuthorizer(a Authorizer) Option {
+	return option("WithAuthorizer", func(c *config) error {
+		if a == nil {
+			return nilDependency("WithAuthorizer")
+		}
+		c.authorizer = a
+		return nil
+	})
+}
+
+// WithSessionReader supplies the durable read plane.
+func WithSessionReader(r SessionReader) Option {
+	return option("WithSessionReader", func(c *config) error {
+		if r == nil {
+			return nilDependency("WithSessionReader")
+		}
+		c.reads = r
+		return nil
+	})
+}
+
+// WithCommands supplies the durable command plane.
+func WithCommands(cmds Commands) Option {
+	return option("WithCommands", func(c *config) error {
+		if cmds == nil {
+			return nilDependency("WithCommands")
+		}
+		c.commands = cmds
+		return nil
+	})
+}
+
+// WithDirectory supplies the observed target directory.
+func WithDirectory(d Directory) Option {
+	return option("WithDirectory", func(c *config) error {
+		if d == nil {
+			return nilDependency("WithDirectory")
+		}
+		c.directory = d
+		return nil
+	})
+}
+
+// WithPlacementController supplies the placement controller.
+func WithPlacementController(p PlacementController) Option {
+	return option("WithPlacementController", func(c *config) error {
+		if p == nil {
+			return nilDependency("WithPlacementController")
+		}
+		c.placement = p
+		return nil
+	})
+}
+
+// WithClock replaces the system clock.
+func WithClock(clock Clock) Option {
+	return option("WithClock", func(c *config) error {
+		if clock == nil {
+			return nilDependency("WithClock")
+		}
+		c.clock = clock
+		return nil
+	})
+}
+
+// WithUUIDSource replaces the random identifier source.
+func WithUUIDSource(u UUIDSource) Option {
+	return option("WithUUIDSource", func(c *config) error {
+		if u == nil {
+			return nilDependency("WithUUIDSource")
+		}
+		c.uuids = u
+		return nil
+	})
+}
+
+// WithCSRF supplies the origin and CSRF configuration. It has no default.
+func WithCSRF(cfg identity.CSRFConfig) Option {
+	return option("WithCSRF", func(c *config) error { c.csrf = cfg; c.csrfSet = true; return nil })
+}
+
+// WithReconcileLimits replaces the reconciliation limits.
+func WithReconcileLimits(l ReconcileLimits) Option {
+	return option("WithReconcileLimits", func(c *config) error { c.reconcile = l; return nil })
+}
+
+// WithClientLinkLimits replaces the local ClientLink and fan-out queue limits.
+func WithClientLinkLimits(l ClientLinkLimits) Option {
+	return option("WithClientLinkLimits", func(c *config) error { c.client = l; return nil })
+}
+
+// WithHostLinkLimits replaces the HostLink pool limits.
+func WithHostLinkLimits(l HostLinkLimits) Option {
+	return option("WithHostLinkLimits", func(c *config) error { c.host = l; return nil })
+}
+
+// WithUIHandler mounts a caller-supplied user interface handler.
+func WithUIHandler(h http.Handler) Option {
+	return option("WithUIHandler", func(c *config) error {
+		if h == nil {
+			return nilDependency("WithUIHandler")
+		}
+		c.ui = h
+		return nil
+	})
+}
+
+// WithUIFS mounts a static user interface bundle.
+func WithUIFS(dir fs.FS) Option {
+	return option("WithUIFS", func(c *config) error {
+		if dir == nil {
+			return nilDependency("WithUIFS")
+		}
+		c.uiFS = dir
+		return nil
+	})
+}
+
+// ReconcileLimits bounds Factory's periodic reconciliation of pending commands
+// with no live owner.
+type ReconcileLimits struct {
+	// Interval is the sweep cadence.
+	Interval time.Duration
+	// ClaimTTL is how long a reconciliation claim suppresses duplicate work.
+	ClaimTTL time.Duration
+	// ApplyDeadline is how long an accepted command may stay unapplied before
+	// it becomes rejected/runtime_unavailable.
+	ApplyDeadline time.Duration
+	// MaxDuePerSweep bounds the due records one sweep withdraws.
+	MaxDuePerSweep int
+	// MaxConcurrent bounds concurrent reconciliations in this replica.
+	MaxConcurrent int
+}
+
+// DefaultReconcileLimits is the configuration a composition gets if it names
+// none.
+func DefaultReconcileLimits() ReconcileLimits {
+	return ReconcileLimits{
+		Interval:       5 * time.Second,
+		ClaimTTL:       30 * time.Second,
+		ApplyDeadline:  5 * time.Minute,
+		MaxDuePerSweep: 256,
+		MaxConcurrent:  8,
+	}
+}
+
+// Validate reports why these limits may not be used.
+func (l ReconcileLimits) Validate() error {
+	if err := positive("ReconcileLimits.Interval", l.Interval); err != nil {
+		return err
+	}
+	if err := positive("ReconcileLimits.ClaimTTL", l.ClaimTTL); err != nil {
+		return err
+	}
+	if err := positive("ReconcileLimits.ApplyDeadline", l.ApplyDeadline); err != nil {
+		return err
+	}
+	if err := atLeastOne("ReconcileLimits.MaxDuePerSweep", l.MaxDuePerSweep); err != nil {
+		return err
+	}
+	if err := atLeastOne("ReconcileLimits.MaxConcurrent", l.MaxConcurrent); err != nil {
+		return err
+	}
+	// A sweep cadence at or beyond the claim TTL means every claim this replica
+	// took has expired by the time the next sweep looks at it, so claims stop
+	// suppressing duplicate placement work.
+	if l.Interval >= l.ClaimTTL {
+		return fmt.Errorf("%w: ReconcileLimits.Interval (%v) must be shorter than ClaimTTL (%v)",
+			ErrInvalidLimits, l.Interval, l.ClaimTTL)
+	}
+	// A claim never extends a command's apply deadline, so a TTL at or beyond
+	// the deadline describes a claim that outlives the command it was taken for.
+	if l.ClaimTTL >= l.ApplyDeadline {
+		return fmt.Errorf("%w: ReconcileLimits.ClaimTTL (%v) must be shorter than ApplyDeadline (%v)",
+			ErrInvalidLimits, l.ClaimTTL, l.ApplyDeadline)
+	}
+	return nil
+}
+
+// ClientLinkLimits bounds this replica's local connections and fan-out queues.
+type ClientLinkLimits struct {
+	// MaxConnections bounds concurrent ClientLinks on this replica.
+	MaxConnections int
+	// PerConnectionQueue bounds one connection's outbound queue in messages.
+	PerConnectionQueue int
+	// WriteTimeout bounds one outbound write.
+	WriteTimeout time.Duration
+	// PingInterval is how often the server pings an idle connection.
+	PingInterval time.Duration
+	// PongTimeout is how long a ping may go unanswered.
+	PongTimeout time.Duration
+}
+
+// DefaultClientLinkLimits is the configuration a composition gets if it names
+// none. MaxConnections is sized for the 1,000-5,000 connection scale a Factory
+// replica is expected to hold.
+func DefaultClientLinkLimits() ClientLinkLimits {
+	return ClientLinkLimits{
+		MaxConnections:     5000,
+		PerConnectionQueue: 256,
+		WriteTimeout:       5 * time.Second,
+		PingInterval:       25 * time.Second,
+		PongTimeout:        10 * time.Second,
+	}
+}
+
+// Validate reports why these limits may not be used.
+func (l ClientLinkLimits) Validate() error {
+	if err := atLeastOne("ClientLinkLimits.MaxConnections", l.MaxConnections); err != nil {
+		return err
+	}
+	if err := atLeastOne("ClientLinkLimits.PerConnectionQueue", l.PerConnectionQueue); err != nil {
+		return err
+	}
+	if err := positive("ClientLinkLimits.WriteTimeout", l.WriteTimeout); err != nil {
+		return err
+	}
+	if err := positive("ClientLinkLimits.PingInterval", l.PingInterval); err != nil {
+		return err
+	}
+	if err := positive("ClientLinkLimits.PongTimeout", l.PongTimeout); err != nil {
+		return err
+	}
+	// A pong deadline at or beyond the ping cadence never separates a slow peer
+	// from a dead one: the next ping is sent before the previous one's deadline
+	// has been reached.
+	if l.PongTimeout >= l.PingInterval {
+		return fmt.Errorf("%w: ClientLinkLimits.PongTimeout (%v) must be shorter than PingInterval (%v)",
+			ErrInvalidLimits, l.PongTimeout, l.PingInterval)
+	}
+	// A write allowed to block past the liveness deadline holds the connection
+	// that deadline exists to reclaim.
+	if l.WriteTimeout > l.PongTimeout {
+		return fmt.Errorf("%w: ClientLinkLimits.WriteTimeout (%v) must not exceed PongTimeout (%v)",
+			ErrInvalidLimits, l.WriteTimeout, l.PongTimeout)
+	}
+	return nil
+}
+
+// HostLinkLimits bounds this replica's demand-driven HostLink pool.
+type HostLinkLimits struct {
+	// MaxLinks bounds concurrent HostLinks. One link multiplexes every session
+	// binding to one Host, so this bounds Hosts, not sessions.
+	MaxLinks int
+	// DialTimeout bounds one dial.
+	DialTimeout time.Duration
+	// IdleTimeout is how long a link with no local demand is kept.
+	IdleTimeout time.Duration
+	// ReconnectMin and ReconnectMax bound the reconnect backoff.
+	ReconnectMin time.Duration
+	ReconnectMax time.Duration
+}
+
+// DefaultHostLinkLimits is the configuration a composition gets if it names
+// none.
+func DefaultHostLinkLimits() HostLinkLimits {
+	return HostLinkLimits{
+		MaxLinks:     256,
+		DialTimeout:  5 * time.Second,
+		IdleTimeout:  60 * time.Second,
+		ReconnectMin: 250 * time.Millisecond,
+		ReconnectMax: 10 * time.Second,
+	}
+}
+
+// Validate reports why these limits may not be used.
+func (l HostLinkLimits) Validate() error {
+	if err := atLeastOne("HostLinkLimits.MaxLinks", l.MaxLinks); err != nil {
+		return err
+	}
+	if err := positive("HostLinkLimits.DialTimeout", l.DialTimeout); err != nil {
+		return err
+	}
+	if err := positive("HostLinkLimits.IdleTimeout", l.IdleTimeout); err != nil {
+		return err
+	}
+	if err := positive("HostLinkLimits.ReconnectMin", l.ReconnectMin); err != nil {
+		return err
+	}
+	if err := positive("HostLinkLimits.ReconnectMax", l.ReconnectMax); err != nil {
+		return err
+	}
+	if l.ReconnectMin > l.ReconnectMax {
+		return fmt.Errorf("%w: HostLinkLimits.ReconnectMin (%v) must not exceed ReconnectMax (%v)",
+			ErrInvalidLimits, l.ReconnectMin, l.ReconnectMax)
+	}
+	// A link is opened on local subscription demand. If a dial may take longer
+	// than the idle window, a link can become reapable before it has served the
+	// demand that opened it.
+	if l.DialTimeout > l.IdleTimeout {
+		return fmt.Errorf("%w: HostLinkLimits.DialTimeout (%v) must not exceed IdleTimeout (%v)",
+			ErrInvalidLimits, l.DialTimeout, l.IdleTimeout)
+	}
+	return nil
+}
+
+func positive(name string, d time.Duration) error {
+	if d <= 0 {
+		return fmt.Errorf("%w: %s is %v, want a positive duration", ErrInvalidLimits, name, d)
+	}
+	return nil
+}
+
+func atLeastOne(name string, n int) error {
+	if n < 1 {
+		return fmt.Errorf("%w: %s is %d, want at least 1", ErrInvalidLimits, name, n)
+	}
+	return nil
+}
+
+// CSRF returns the composed origin and CSRF configuration. The result shares no
+// memory with the Server's copy, so a caller that inspects and then reuses the
+// returned key buffer cannot change what a running Factory signs with.
+func (s *Server) CSRF() identity.CSRFConfig { return s.cfg.csrf.Clone() }
+
+// ReconcileLimits returns the composed reconciliation limits.
+func (s *Server) ReconcileLimits() ReconcileLimits { return s.cfg.reconcile }
+
+// ClientLinkLimits returns the composed ClientLink limits.
+func (s *Server) ClientLinkLimits() ClientLinkLimits { return s.cfg.client }
+
+// HostLinkLimits returns the composed HostLink pool limits.
+func (s *Server) HostLinkLimits() HostLinkLimits { return s.cfg.host }
