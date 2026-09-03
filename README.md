@@ -108,12 +108,29 @@ handler:
   authenticated there with no handoff. That is section 10 of the spec, and it is
   the same requirement that makes `WithCSRF` mandatory.
 
-An `OperationContext` carries exactly a `Principal` and a W3C trace identifier
-into a request's context; the field set is enumerated by test, so a header, a
-cookie or a raw token cannot be added to it quietly. A `Credential` redacts
-under `%v`, `%s`, `%q`, `%#v`, `log/slog` and `encoding/json`, each through a
-different method, because the likeliest way a token reaches a log is that
-somebody formatted the value they were handed.
+An `OperationContext` carries exactly a `Principal`, which credential
+authenticated the operation, and a W3C trace identifier; the field set is
+enumerated by test, so a header, a cookie or a raw token cannot be added to it
+quietly. The credential source is there because CSRF applies to an ambient
+credential and not to a bearer one, and `Authenticator.CredentialSource` is the
+single reader of that precedence rule -- a CSRF guard that re-derived it could
+disagree, and would do so by skipping CSRF rather than by failing.
+
+A `Credential` redacts under `%v`, `%s`, `%q`, `%#v`, `log/slog` and
+`encoding/json`, because the likeliest way a token reaches a log is that
+somebody formatted the value they were handed. Those are **not** independent
+mechanisms, and the difference was measured: deleting `GoString` or
+`MarshalJSON` changes what `%#v` and `encoding/json` produce, while deleting
+`LogValue` changes nothing a `slog.TextHandler` prints, because its `KindAny`
+path falls back to `fmt` and reaches `String`. `LogValue` is kept for the
+handlers that reflect instead, and is held by a runtime `slog.LogValuer`
+assertion rather than by a rendering.
+
+Scrubbing a verifier's error text is byte-for-byte replacement, so it removes a
+**verbatim** credential and nothing else. A verifier that embeds a prefix, a
+digest or a re-encoding leaks that derivative, and
+`TestScrubbingCoversOnlyAVerbatimCredential` pins the boundary from both sides
+rather than leaving it to a caveat.
 
 ## Status
 

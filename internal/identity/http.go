@@ -64,6 +64,10 @@ const (
 	authorizationHeader = "Authorization"
 	bearerScheme        = "bearer"
 	traceparentHeader   = "traceparent"
+
+	// maxTraceparentBytes is a generous ceiling on a 55-byte header, leaving
+	// room for the trailing fields a future version may add.
+	maxTraceparentBytes = 256
 )
 
 // redactedPlaceholder is what a scrubbed credential is replaced by. It is a
@@ -89,10 +93,16 @@ const (
 //
 // Its value is unexported and every rendering a consumer can reach is
 // overridden, because the likeliest way a token reaches a log is that somebody
-// formatted the value they were handed. Each rendering is defeated by a
-// DIFFERENT method -- String for %v/%s/%q, GoString for %#v, LogValue for slog,
-// MarshalJSON for a structured encoder -- so none of them covers the others,
-// and none of them is decoration.
+// formatted the value they were handed.
+//
+// The four methods are NOT four independent mechanisms, and the difference was
+// measured rather than assumed. Deleting GoString or MarshalJSON changes what
+// %#v and encoding/json produce; deleting LogValue does not change what
+// slog.TextHandler produces, because its KindAny path falls back to fmt and
+// reaches String. LogValue is kept because slog.LogValuer is part of the type's
+// contract -- a handler that reflects over the value rather than formatting it
+// sees the difference -- and it is held by an interface assertion rather than
+// by a rendering, since no rendering reads it.
 //
 // Value is still readable, because a Verifier that cannot read the credential
 // cannot verify it. The claim is that a Credential does not leak by ACCIDENT.
@@ -267,8 +277,17 @@ func (a *Authenticator) AuthenticateLink(ctx context.Context, token string) (fac
 // two credentials is verified, and would make a mistyped header silently
 // authenticate as whatever cookie the browser happened to send.
 func (a *Authenticator) presented(r *http.Request) (Credential, error) {
-	if header := r.Header.Get(authorizationHeader); header != "" {
-		token, ok := bearerToken(header)
+	// PRESENCE decides, not emptiness. A client library that always sets the
+	// header and leaves it empty when it holds no token is ordinary, and
+	// treating an empty header as absent would hand exactly that client the
+	// fall-through this function exists to prevent. More than one header is
+	// refused for the same reason: nothing may choose between two credentials.
+	if values, present := r.Header[authorizationHeader]; present {
+		if len(values) != 1 {
+			return Credential{}, fmt.Errorf("%w: the request carries %d %s headers, so no credential is unambiguous",
+				factoryidentity.ErrUnauthenticated, len(values), authorizationHeader)
+		}
+		token, ok := bearerToken(values[0])
 		if !ok {
 			return Credential{}, fmt.Errorf("%w: the %s header is not a bearer credential", factoryidentity.ErrUnauthenticated, authorizationHeader)
 		}
@@ -282,8 +301,34 @@ func (a *Authenticator) presented(r *http.Request) (Credential, error) {
 	return NewCredential(SourceCookie, cookie.Value), nil
 }
 
-// bearerToken accepts exactly scheme, space, token: one credential, no interior
-// space, and a case-insensitive scheme as RFC 9110 requires.
+// CredentialSource reports which credential a request presents, and whether it
+// presents one at all. It does not verify anything.
+//
+// It exists so that A1.3's CSRF guard, which applies to an AMBIENT credential
+// and not to a bearer one, reads the answer from the one implementation of the
+// precedence rule instead of re-deriving "is there an Authorization header"
+// beside it. Two implementations of that rule would be two chances to disagree
+// about which credential a request is authenticated with, and the disagreement
+// would present as CSRF being skipped rather than as an error.
+func (a *Authenticator) CredentialSource(r *http.Request) (Source, bool) {
+	if r == nil {
+		return "", false
+	}
+	credential, err := a.presented(r)
+	if err != nil {
+		return "", false
+	}
+	return credential.Source(), true
+}
+
+// bearerToken accepts exactly scheme, whitespace, token.
+//
+// RFC 9110's credentials grammar is `auth-scheme 1*SP token68`, so REPEATED
+// spaces after the scheme are legal and are trimmed rather than rejected. What
+// is refused is anything after the token: a space or a tab inside it would mean
+// the header carries a second field this function has decided to ignore, which
+// is how a parser ends up authenticating half a credential. The scheme compares
+// case-insensitively, as the same grammar requires.
 func bearerToken(header string) (string, bool) {
 	scheme, rest, found := strings.Cut(header, " ")
 	if !found || !strings.EqualFold(scheme, bearerScheme) {
@@ -306,10 +351,16 @@ func (a *Authenticator) authenticate(ctx context.Context, credential Credential)
 	if err != nil {
 		// The verifier's message is kept, because "bad signature" and "issuer
 		// unreachable" are different operational problems and discarding the
-		// text discards the diagnosis. Only its TEXT is kept, scrubbed: the
-		// error VALUE is dropped, so no unwrapping reaches a message this
-		// package has not scrubbed. The price is that a caller cannot match a
-		// verifier's own sentinel, which is what redaction costs.
+		// text discards the diagnosis. Only its TEXT is kept: the error VALUE
+		// is dropped, so no unwrapping reaches a message this package has not
+		// passed through redactSecrets.
+		//
+		// Two limits, both derived from the mechanism rather than hoped for.
+		// The caller cannot match a verifier's own sentinel, which is what
+		// dropping the value costs. And redactSecrets is string equality, so
+		// it removes a VERBATIM credential and nothing else: a verifier that
+		// embeds a prefix, a hash or a re-encoding of the token leaks that
+		// derivative through here. See redactSecrets.
 		detail := redactSecrets(err.Error(), credential.Value())
 		if errors.Is(err, factoryidentity.ErrUnauthenticated) {
 			return factoryidentity.Principal{}, fmt.Errorf("%w: the %s credential was not verified: %s",
@@ -367,6 +418,15 @@ func (a *Authenticator) tenantFor(claims Claims) (sessionwire.TenantID, error) {
 
 // redactSecrets replaces each secret in message with a fixed placeholder.
 //
+// It is byte-for-byte replacement and claims nothing more. A verifier whose
+// error text holds a TRANSFORM of the credential -- the first sixteen
+// characters, a digest, a re-encoding -- is not covered, and no scrubber
+// working on the finished string could be: it cannot recognise a derivative it
+// was not given. TestScrubbingCoversOnlyAVerbatimCredential pins that boundary
+// from both sides so the limit is a measured property rather than a caveat.
+// The alternative is to discard the verifier's message entirely, which costs
+// the operator the difference between "bad signature" and "issuer unreachable".
+//
 // The empty-secret guard is unreachable today and is kept anyway: authenticate
 // rejects an empty credential BEFORE the verifier is called -- which
 // TestAnEmptyCredentialIsRejectedBeforeVerification holds -- so the value
@@ -422,6 +482,11 @@ func isTokenByte(b byte) bool {
 type OperationContext struct {
 	// Principal is the authenticated caller.
 	Principal factoryidentity.Principal
+	// CredentialSource is which credential authenticated this operation. It is
+	// approved because CSRF applies to an AMBIENT credential and not to a
+	// bearer one, so A1.3's guard needs the answer and must not recompute it;
+	// see Authenticator.CredentialSource. It carries no authority of its own.
+	CredentialSource Source
 	// TraceID is the W3C trace-id of the inbound request, or empty. It is a
 	// correlation identifier and carries no authority.
 	TraceID string
@@ -431,17 +496,18 @@ type contextKey struct{}
 
 // NewOperationContext derives the operation context for an authenticated
 // request. It copies the principal and the trace identifier, and nothing else.
-func NewOperationContext(ctx context.Context, r *http.Request, principal factoryidentity.Principal) context.Context {
+func NewOperationContext(ctx context.Context, r *http.Request, principal factoryidentity.Principal, source Source) context.Context {
 	return context.WithValue(ctx, contextKey{}, OperationContext{
-		Principal: principal,
-		TraceID:   traceIDFrom(r),
+		Principal:        principal,
+		CredentialSource: source,
+		TraceID:          traceIDFrom(r),
 	})
 }
 
 // NewLinkOperationContext derives it for a ClientLink RPC, which has no request
 // headers to take a trace identifier from.
 func NewLinkOperationContext(ctx context.Context, principal factoryidentity.Principal) context.Context {
-	return context.WithValue(ctx, contextKey{}, OperationContext{Principal: principal})
+	return context.WithValue(ctx, contextKey{}, OperationContext{Principal: principal, CredentialSource: SourceLink})
 }
 
 // OperationContextFrom reads the operation context back. The boolean is false
@@ -466,6 +532,15 @@ func traceIDFrom(r *http.Request) string {
 	}
 	header := r.Header.Get(traceparentHeader)
 	if header == "" {
+		return ""
+	}
+	// Bound the header before splitting it. Factory does not own the
+	// http.Server -- an embedder supplies it, and MaxHeaderBytes with it -- so
+	// this function must not assume a bound it did not set. Splitting a
+	// megabyte header allocates about a million strings for every request that
+	// sends one, and the walk below then visits all of them. A version-00
+	// traceparent is 55 bytes.
+	if len(header) > maxTraceparentBytes {
 		return ""
 	}
 	fields := strings.Split(header, "-")

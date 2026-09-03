@@ -249,6 +249,14 @@ PARSED file for the selectors themselves -- the behavioural sweep can only cover
 the carriers somebody thought of, and the structural one is what survives a
 carrier nobody did.
 
+The structural scan enumerates the package's production files with
+`os.ReadDir`, and that is not a stylistic choice. Pinned to `http.go`, it passed
+unchanged when a second file in the package called `r.PathValue("tenant")` and
+`r.URL.Query().Get("tenant")`; nothing else would have reported it, since
+`import_boundary_test.go` walks imports rather than selectors. A1.2 and A1.3
+both add files here. **A guard naming its own subject cannot fail for a subject
+that did not exist when it was written.**
+
 The default tenant is applied to an ACTOR only. A service credential is minted
 by deployment configuration and can name its own scope, so one that names none
 is misconfigured; inheriting the local default would hand an unscoped service
@@ -263,11 +271,29 @@ the half a behavioural test cannot supply: a per-process cache is invisible to a
 two-replica test in every case where the cache misses. What it establishes is
 bounded -- state reachable THROUGH an injected seam is the deployer's.
 
-**No auth material reaches an error or a log.** The single place foreign text
-enters is the verifier's error, and its TEXT is kept scrubbed while the error
-VALUE is dropped, so no unwrapping reaches a message this package has not
-scrubbed. `Credential` then redacts under `%v`/`%s`/`%q`, `%#v`, `slog` and
-`encoding/json` through four DIFFERENT methods, none of which covers the others.
+**No auth material reaches an error or a log, with two stated limits.** The
+single place foreign text enters is the verifier's error: its TEXT is kept and
+its VALUE dropped, so no unwrapping reaches a message that did not go through
+`redactSecrets`. But `redactSecrets` is string equality, so it removes a
+VERBATIM credential and nothing else -- a verifier embedding
+`c.Value()[:16]` puts sixty-four bits of the token into an error the caller will
+log, and no scrubber working on a finished string could catch it. That is
+`TestScrubbingCoversOnlyAVerbatimCredential`, asserted from BOTH sides so the
+limit is measured rather than promised. The alternative is discarding the
+verifier's message, which costs the operator "bad signature" against "issuer
+unreachable".
+
+`Credential` redacts under `%v`/`%s`/`%q`, `%#v`, `slog` and `encoding/json`.
+These are **not four independent mechanisms**, and counting them meant deleting
+each and watching the outcome: `GoString` and `MarshalJSON` are each read by one
+rendering, `String` by the rest, and **`LogValue` is read by none of them** --
+`slog.TextHandler`'s `KindAny` path falls back to `fmt` and reaches `String`, so
+deleting `LogValue` changed no output. It is kept because `slog.LogValuer` is
+part of the contract and a reflecting handler would differ, and it is held by a
+RUNTIME interface assertion; a compile-time `var _ slog.LogValuer` would report
+its removal as a build failure, which is not an assertion kill. **A fallback
+path silently carries a mechanism you thought you had counted.**
+
 The nonce sweep in `TestNoAuthMaterialReachesErrorsLogsOrContexts` uses a fresh
 random credential for the reason `pgstore` uses one for a DSN: a fixed token is
 indistinguishable from ordinary message text.

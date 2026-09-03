@@ -195,6 +195,13 @@ func TestAuthenticateRequestAcceptsAVerifiedCredential(t *testing.T) {
 			r.Header.Set("Authorization", "bearer token-1")
 			return r
 		}, source: identity.SourceBearer},
+		// RFC 9110 spells the separator 1*SP, so repeated spaces are legal and
+		// are trimmed. Without this row the TrimLeft is unread.
+		{name: "repeated spaces after the scheme", request: func() *http.Request {
+			r := httptest.NewRequest(http.MethodGet, "/v1/sessions", nil)
+			r.Header.Set("Authorization", "Bearer   token-1")
+			return r
+		}, source: identity.SourceBearer},
 		{name: "cookie", request: func() *http.Request {
 			return cookieRequest(identity.DefaultCookieName, "token-1")
 		}, source: identity.SourceCookie},
@@ -289,6 +296,13 @@ func TestAuthenticateRequestRejections(t *testing.T) {
 			r.Header.Set("Authorization", "Bearer token one")
 			return r
 		}, wantErr: "bearer"},
+		// The tab has its own row: dropping the space from ContainsAny is
+		// killed by the case above, dropping the tab is killed by nothing else.
+		{name: "token with an interior tab", claims: validClaims(), request: func() *http.Request {
+			r := httptest.NewRequest(http.MethodGet, "/v1/sessions", nil)
+			r.Header.Set("Authorization", "Bearer token\tone")
+			return r
+		}, wantErr: "bearer"},
 		{name: "glued scheme", claims: validClaims(), request: func() *http.Request {
 			r := httptest.NewRequest(http.MethodGet, "/v1/sessions", nil)
 			r.Header.Set("Authorization", "Bearertoken-1")
@@ -373,6 +387,53 @@ func TestAMalformedAuthorizationHeaderIsNotDowngradedToTheCookie(t *testing.T) {
 	}
 }
 
+// TestAPresentButEmptyAuthorizationHeaderIsNotAnAbsentOne is the header case
+// that made presented's own comment untrue. A client library that always sets
+// the header, and leaves it empty when it holds no token, is ordinary; reading
+// presence as "non-empty" gave exactly that client the fall-through to whatever
+// cookie the browser sent.
+func TestAPresentButEmptyAuthorizationHeaderIsNotAnAbsentOne(t *testing.T) {
+	t.Parallel()
+
+	verifier := &recordingVerifier{claims: validClaims()}
+	a := newTestAuthenticator(t, identity.Config{Verifier: verifier})
+	r := cookieRequest(identity.DefaultCookieName, "cookie-token")
+	r.Header.Set("Authorization", "")
+	if _, err := a.AuthenticateRequest(context.Background(), r); err == nil {
+		t.Fatal("AuthenticateRequest accepted a request whose Authorization header is present and empty")
+	} else if !errors.Is(err, factoryidentity.ErrUnauthenticated) {
+		t.Errorf("error %v does not wrap ErrUnauthenticated", err)
+	}
+	if len(verifier.seen) != 0 {
+		t.Errorf("the verifier saw %d credentials, want none: the cookie must not be reached", len(verifier.seen))
+	}
+	if _, ok := a.CredentialSource(r); ok {
+		t.Error("CredentialSource reports a credential for a request whose header is present and empty")
+	}
+}
+
+// TestTwoAuthorizationHeadersAreRefused holds the same rule one step further
+// out: nothing in Factory may CHOOSE between two presented credentials.
+func TestTwoAuthorizationHeadersAreRefused(t *testing.T) {
+	t.Parallel()
+
+	verifier := &recordingVerifier{claims: validClaims()}
+	a := newTestAuthenticator(t, identity.Config{Verifier: verifier})
+	r := httptest.NewRequest(http.MethodGet, "/v1/sessions", nil)
+	r.Header.Add("Authorization", "Bearer token-1")
+	r.Header.Add("Authorization", "Bearer token-2")
+	_, err := a.AuthenticateRequest(context.Background(), r)
+	if err == nil {
+		t.Fatal("AuthenticateRequest accepted a request carrying two Authorization headers")
+	}
+	if !strings.Contains(err.Error(), "unambiguous") {
+		t.Errorf("error %q does not say why two headers are refused", err)
+	}
+	if len(verifier.seen) != 0 {
+		t.Errorf("the verifier saw %d credentials, want none", len(verifier.seen))
+	}
+}
+
 // TestAnEmptyCredentialIsRejectedBeforeVerification is not only about the
 // answer. It is what makes redactSecrets' empty-secret guard unreachable: the
 // value handed to the verifier, and therefore the value scrubbed out of the
@@ -401,6 +462,77 @@ func TestAuthenticateRequestRejectsANilRequest(t *testing.T) {
 		t.Fatal("AuthenticateRequest(nil) = nil error")
 	} else if !errors.Is(err, factoryidentity.ErrUnauthenticated) {
 		t.Errorf("error %v does not wrap ErrUnauthenticated", err)
+	}
+}
+
+// TestCredentialSourceAgreesWithWhatAuthenticationUsed is the anti-duplication
+// assertion behind exporting it. A1.3's CSRF guard applies to an ambient
+// credential and not to a bearer one, so it needs this answer; if it re-derived
+// "is there an Authorization header" beside the derivation, the two could
+// disagree, and the disagreement would present as CSRF being skipped rather
+// than as an error. The two are therefore driven over one request set and
+// required to match.
+func TestCredentialSourceAgreesWithWhatAuthenticationUsed(t *testing.T) {
+	t.Parallel()
+
+	requests := map[string]struct {
+		request func() *http.Request
+		want    identity.Source
+		present bool
+	}{
+		"bearer": {request: func() *http.Request { return bearerRequest("token-1") }, want: identity.SourceBearer, present: true},
+		"cookie": {request: func() *http.Request { return cookieRequest(identity.DefaultCookieName, "token-1") }, want: identity.SourceCookie, present: true},
+		"header wins": {request: func() *http.Request {
+			r := cookieRequest(identity.DefaultCookieName, "c")
+			r.Header.Set("Authorization", "Bearer token-1")
+			return r
+		}, want: identity.SourceBearer, present: true},
+		"none": {request: func() *http.Request { return httptest.NewRequest(http.MethodGet, "/v1/sessions", nil) }},
+		"malformed header": {request: func() *http.Request {
+			r := cookieRequest(identity.DefaultCookieName, "c")
+			r.Header.Set("Authorization", "Basic x")
+			return r
+		}},
+		"unrelated cookie": {request: func() *http.Request { return cookieRequest("other", "token-1") }},
+	}
+	for _, name := range slices.Sorted(maps.Keys(requests)) {
+		tt := requests[name]
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			verifier := &recordingVerifier{claims: validClaims()}
+			a := newTestAuthenticator(t, identity.Config{Verifier: verifier})
+			r := tt.request()
+			got, ok := a.CredentialSource(r)
+			if ok != tt.present || got != tt.want {
+				t.Errorf("CredentialSource = %q, %t, want %q, %t", got, ok, tt.want, tt.present)
+			}
+			// The cross-check: whatever authentication actually verified must
+			// be what CredentialSource reported, for the same request.
+			_, err := a.AuthenticateRequest(context.Background(), tt.request())
+			if !tt.present {
+				if err == nil {
+					t.Error("AuthenticateRequest succeeded for a request CredentialSource reports no credential for")
+				}
+				if len(verifier.seen) != 0 {
+					t.Errorf("the verifier saw %+v for a request with no credential", verifier.seen)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("AuthenticateRequest: %v", err)
+			}
+			if len(verifier.seen) != 1 {
+				t.Fatalf("the verifier saw %d credentials, want 1", len(verifier.seen))
+			}
+			if verifier.seen[0].Source() != got {
+				t.Errorf("authentication used the %q credential while CredentialSource reported %q",
+					verifier.seen[0].Source(), got)
+			}
+		})
+	}
+	if _, ok := newTestAuthenticator(t, identity.Config{Verifier: constantVerifier(validClaims())}).CredentialSource(nil); ok {
+		t.Error("CredentialSource(nil) reports a credential")
 	}
 }
 
@@ -789,7 +921,7 @@ func TestAuthenticateLink(t *testing.T) {
 func TestOperationContextCarriesOnlyApprovedFields(t *testing.T) {
 	t.Parallel()
 
-	approved := []string{"Principal", "TraceID"}
+	approved := []string{"CredentialSource", "Principal", "TraceID"}
 	typ := reflect.TypeOf(identity.OperationContext{})
 	var got []string
 	for i := range typ.NumField() {
@@ -820,12 +952,16 @@ func TestOperationContextRoundTrips(t *testing.T) {
 	if _, ok := identity.OperationContextFrom(context.Background()); ok {
 		t.Error("a bare context reports an operation context")
 	}
-	ctx := identity.NewOperationContext(context.Background(), r, principal)
+	ctx := identity.NewOperationContext(context.Background(), r, principal, identity.SourceBearer)
 	got, ok := identity.OperationContextFrom(ctx)
 	if !ok {
 		t.Fatal("the derived context reports no operation context")
 	}
-	want := identity.OperationContext{Principal: principal, TraceID: "4bf92f3577b34da6a3ce929d0e0e4736"}
+	want := identity.OperationContext{
+		Principal:        principal,
+		CredentialSource: identity.SourceBearer,
+		TraceID:          "4bf92f3577b34da6a3ce929d0e0e4736",
+	}
 	if got != want {
 		t.Errorf("OperationContextFrom = %+v, want %+v", got, want)
 	}
@@ -834,13 +970,14 @@ func TestOperationContextRoundTrips(t *testing.T) {
 	// still driven: the alternative to answering "" is a panic inside
 	// authentication, which is the worst place in the server to discover a
 	// caller passed nil.
-	if got, ok := identity.OperationContextFrom(identity.NewOperationContext(context.Background(), nil, principal)); !ok || got.TraceID != "" {
+	if got, ok := identity.OperationContextFrom(identity.NewOperationContext(context.Background(), nil, principal, identity.SourceBearer)); !ok || got.TraceID != "" {
 		t.Errorf("NewOperationContext with no request carried %+v (ok %t), want an empty trace", got, ok)
 	}
 
 	link := identity.NewLinkOperationContext(context.Background(), principal)
-	if got, ok := identity.OperationContextFrom(link); !ok || got != (identity.OperationContext{Principal: principal}) {
-		t.Errorf("NewLinkOperationContext carried %+v (ok %t), want only the principal", got, ok)
+	want = identity.OperationContext{Principal: principal, CredentialSource: identity.SourceLink}
+	if got, ok := identity.OperationContextFrom(link); !ok || got != want {
+		t.Errorf("NewLinkOperationContext carried %+v (ok %t), want %+v", got, ok, want)
 	}
 }
 
@@ -870,6 +1007,20 @@ func TestTraceIDIsCopiedOnlyFromAWellFormedTraceparent(t *testing.T) {
 		{name: "non hex trace id", header: "00-" + traceID[:31] + "z-" + parentID + "-01"},
 		{name: "too few fields", header: "00-" + traceID + "-" + parentID},
 		{name: "not a trace parent at all", header: "please log me"},
+		// The version field. Without these two rows the version length and hex
+		// checks are unread: the "ff" row alone is killed by the == "ff" test.
+		{name: "one digit version", header: "0-" + traceID + "-" + parentID + "-01"},
+		{name: "uppercase version", header: "AB-" + traceID + "-" + parentID + "-01"},
+		// The flags field. A mutant that stops reading flags -- or aliases them
+		// to the version, which is "00" and valid -- adopts a trace-id from a
+		// header W3C says to discard.
+		{name: "non hex flags", header: "00-" + traceID + "-" + parentID + "-zz"},
+		{name: "one digit flags", header: "00-" + traceID + "-" + parentID + "-0"},
+		// The length bound. Factory does not own the http.Server, so nothing
+		// guarantees MaxHeaderBytes; a later version may legally carry extra
+		// fields, which is the shape that gets long.
+		{name: "oversized later version", header: "01-" + traceID + "-" + parentID + "-01-" + strings.Repeat("a", 256)},
+		{name: "later version just inside the bound", header: "01-" + traceID + "-" + parentID + "-01-" + strings.Repeat("a", 256-56), want: traceID},
 		{name: "version 1 with a trailing dash", header: "01-" + traceID + "-" + parentID + "-01-"},
 		{name: "version 0 with extra fields", header: "00-" + traceID + "-" + parentID + "-01-extra"},
 	}
@@ -885,7 +1036,7 @@ func TestTraceIDIsCopiedOnlyFromAWellFormedTraceparent(t *testing.T) {
 			if tt.header != "" {
 				r.Header.Set("traceparent", tt.header)
 			}
-			got, ok := identity.OperationContextFrom(identity.NewOperationContext(context.Background(), r, principal))
+			got, ok := identity.OperationContextFrom(identity.NewOperationContext(context.Background(), r, principal, identity.SourceBearer))
 			if !ok {
 				t.Fatal("no operation context")
 			}
@@ -992,7 +1143,7 @@ func TestNoAuthMaterialReachesErrorsLogsOrContexts(t *testing.T) {
 				rendered["unwrapped error"] += unwrapped.Error()
 			}
 		}
-		octx := identity.NewOperationContext(context.Background(), bearerRequest(nonce), principal)
+		octx := identity.NewOperationContext(context.Background(), bearerRequest(nonce), principal, identity.SourceBearer)
 		got, _ := identity.OperationContextFrom(octx)
 		rendered["operation context %#v"] = fmt.Sprintf("%#v", got)
 		rendered["operation context %+v"] = fmt.Sprintf("%+v", got)
@@ -1010,12 +1161,71 @@ func TestNoAuthMaterialReachesErrorsLogsOrContexts(t *testing.T) {
 	}
 }
 
+// TestScrubbingCoversOnlyAVerbatimCredential states the boundary of the
+// redaction mechanism as a measured property rather than as a caveat, because
+// the mechanism is string equality and string equality cannot recognise a
+// derivative it was not given.
+//
+// The negative half is deliberately an assertion and not a comment: a verifier
+// that logs the first sixteen characters of the token puts sixty-four bits of
+// it into an error the caller will log, and whoever writes that verifier should
+// find this test rather than discover it in production. Removing the leak means
+// discarding the verifier's message entirely, which costs the operator the
+// difference between "bad signature" and "issuer unreachable"; this package
+// keeps the message and names the price.
+func TestScrubbingCoversOnlyAVerbatimCredential(t *testing.T) {
+	t.Parallel()
+
+	nonce := randomNonce(t)
+	verbatim := newTestAuthenticator(t, identity.Config{
+		Verifier: verifierFunc(func(_ context.Context, c identity.Credential) (identity.Claims, error) {
+			return identity.Claims{}, fmt.Errorf("introspection failed for %s", c.Value())
+		}),
+	})
+	_, err := verbatim.AuthenticateRequest(context.Background(), bearerRequest(nonce))
+	if err == nil {
+		t.Fatal("the verifier error was not reported")
+	}
+	if strings.Contains(err.Error(), nonce) {
+		t.Errorf("a verbatim credential survived scrubbing: %v", err)
+	}
+	if !strings.Contains(err.Error(), "REDACTED") {
+		t.Errorf("error %q does not show that something was removed", err)
+	}
+
+	// The other side of the same boundary. This is the DOCUMENTED limit, not a
+	// defect being tolerated silently: if a future change makes the derivative
+	// disappear too, this assertion is what says so and must be revisited.
+	prefix := nonce[:16]
+	derived := newTestAuthenticator(t, identity.Config{
+		Verifier: verifierFunc(func(_ context.Context, c identity.Credential) (identity.Claims, error) {
+			return identity.Claims{}, fmt.Errorf("introspection failed for token prefix %s", c.Value()[:16])
+		}),
+	})
+	_, err = derived.AuthenticateRequest(context.Background(), bearerRequest(nonce))
+	if err == nil {
+		t.Fatal("the verifier error was not reported")
+	}
+	if !strings.Contains(err.Error(), prefix) {
+		t.Errorf("error %q no longer carries the verifier's derivative of the credential; "+
+			"the scrubbing limit this test pins has changed and the comments naming it are now wrong", err)
+	}
+}
+
 // TestCredentialRedactsUnderEveryRenderingAConsumerCanReach is the mechanism
 // half of the same requirement, and it is the half that covers code this task
 // does not own: a Credential is handed to a deployer's Verifier, and the most
 // likely way a token reaches a log is that somebody formats the value they were
-// given. Each verb below is defeated by a DIFFERENT method, so no single one
-// covers the others.
+// given.
+//
+// The four methods are not four independent mechanisms, and this test asserts
+// only what deleting each one changes. Deleting GoString or MarshalJSON is
+// caught by %#v and by json; deleting String is caught by every remaining verb.
+// Deleting LogValue is caught by NEITHER -- slog.TextHandler's KindAny path
+// falls back to fmt and reaches String -- so LogValue is held by the interface
+// assertion and the direct call below instead. Counting mechanisms means
+// disabling each and watching the outcome change; a fallback path will
+// otherwise carry one silently and the count will be wrong.
 func TestCredentialRedactsUnderEveryRenderingAConsumerCanReach(t *testing.T) {
 	t.Parallel()
 
@@ -1044,6 +1254,15 @@ func TestCredentialRedactsUnderEveryRenderingAConsumerCanReach(t *testing.T) {
 	slog.New(slog.NewTextHandler(&logs, nil)).Info("verifying", "credential", credential)
 	rendered["slog"] = logs.String()
 
+	// The assertion is a RUNTIME one. A compile-time `var _ slog.LogValuer`
+	// would report a deleted method as a build failure, which is not an
+	// assertion kill and would leave this claim resting on the compiler.
+	if valuer, ok := any(credential).(slog.LogValuer); ok {
+		rendered["LogValue()"] = valuer.LogValue().String()
+	} else {
+		t.Error("Credential does not implement slog.LogValuer, so a handler that reflects over the value rather than formatting it sees the fields")
+	}
+
 	for verb, text := range rendered {
 		if strings.Contains(text, nonce) {
 			t.Errorf("%s renders the credential value: %s", verb, text)
@@ -1071,22 +1290,77 @@ var tenantCarrierSelectors = []string{
 	"PathValue", "Query", "Host", "Referer",
 }
 
+// TestTheDerivationNamesNoTenantCarrier scans EVERY production file of this
+// package, enumerated from the directory rather than named.
+//
+// A version of this pinned to "http.go" passed unchanged when a second file
+// containing r.PathValue("tenant") and r.URL.Query().Get("tenant") was added
+// beside it. Nothing else in the module would have reported that: the walks in
+// import_boundary_test.go examine imports, not selectors. A1.2 and A1.3 both
+// add files here, so the file set has to come from the directory or the
+// structural half of the tenancy claim stops covering the package on the next
+// commit.
 func TestTheDerivationNamesNoTenantCarrier(t *testing.T) {
 	t.Parallel()
 
-	source, err := os.ReadFile("http.go")
+	files := productionFiles(t)
+	if len(files) == 0 {
+		t.Fatal("no production files were found, so this scan proves nothing")
+	}
+	total := 0
+	for _, name := range files {
+		source, err := os.ReadFile(name)
+		if err != nil {
+			t.Fatalf("read %s: %v", name, err)
+		}
+		found, selectors, err := forbiddenSelectors(source)
+		if err != nil {
+			t.Fatalf("parse %s: %v", name, err)
+		}
+		total += selectors
+		if len(found) > 0 {
+			t.Errorf("%s names tenant carriers %v; a tenant may come only from verified claims", name, found)
+		}
+	}
+	if total == 0 {
+		t.Fatal("the production files contain no selector expressions, so this scan proves nothing")
+	}
+}
+
+// productionFiles enumerates this package's compiled files. It is deliberately
+// a directory read rather than a list: a list is what let a new file escape.
+func productionFiles(t *testing.T) []string {
+	t.Helper()
+	entries, err := os.ReadDir(".")
 	if err != nil {
-		t.Fatalf("read http.go: %v", err)
+		t.Fatalf("read the package directory: %v", err)
 	}
-	found, selectors, err := forbiddenSelectors(source)
-	if err != nil {
-		t.Fatalf("parse http.go: %v", err)
+	var files []string
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		files = append(files, name)
 	}
-	if selectors == 0 {
-		t.Fatal("http.go contains no selector expressions, so this scan proves nothing")
+	slices.Sort(files)
+	return files
+}
+
+// TestTheDerivationScanCoversEveryProductionFile is the tripwire for the defect
+// above: the enumeration must actually reach the files, and a file added
+// tomorrow must be in the set without anyone editing this test.
+func TestTheDerivationScanCoversEveryProductionFile(t *testing.T) {
+	t.Parallel()
+
+	files := productionFiles(t)
+	if !slices.Contains(files, "http.go") {
+		t.Fatalf("productionFiles = %v, which does not include http.go", files)
 	}
-	if len(found) > 0 {
-		t.Errorf("http.go names tenant carriers %v; a tenant may come only from verified claims", found)
+	for _, name := range files {
+		if strings.HasSuffix(name, "_test.go") {
+			t.Errorf("productionFiles returned the test file %s", name)
+		}
 	}
 }
 
