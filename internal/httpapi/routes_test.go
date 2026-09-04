@@ -90,6 +90,10 @@ type fakeReader struct {
 	block bool
 	// fail, when set, replaces the answer for every call.
 	fail error
+	// panics, when set, makes the call panic the way a faulty dependency
+	// does. It is a real panic inside the handler goroutine, which is the only
+	// thing Router's recovery can be driven by.
+	panics any
 }
 
 func newFakeReader(sessions ...storedSession) *fakeReader {
@@ -105,9 +109,12 @@ func (f *fakeReader) GetCatalogEntry(ctx context.Context, req sessionstore.GetCa
 	f.requests = append(f.requests, req)
 	_, hasDeadline := ctx.Deadline()
 	f.deadlines = append(f.deadlines, hasDeadline)
-	block, fail, held := f.block, f.fail, f.sessions[storedSession{tenant: req.TenantID, session: req.SessionID}]
+	block, fail, panics, held := f.block, f.fail, f.panics, f.sessions[storedSession{tenant: req.TenantID, session: req.SessionID}]
 	f.mu.Unlock()
 
+	if panics != nil {
+		panic(panics)
+	}
 	if block {
 		<-ctx.Done()
 		return sessionstore.CatalogEntry{}, ctx.Err()
@@ -149,9 +156,10 @@ func (f *fakeReader) snapshot() ([]sessionstore.GetCatalogEntryRequest, []bool) 
 // countingIDs hands out predictable identifiers so a test can tell a minted one
 // from a header the caller supplied.
 type countingIDs struct {
-	mu   sync.Mutex
-	next int
-	fail error
+	mu    sync.Mutex
+	next  int
+	fail  error
+	empty bool
 }
 
 func (c *countingIDs) NewUUID() (string, error) {
@@ -159,6 +167,9 @@ func (c *countingIDs) NewUUID() (string, error) {
 	defer c.mu.Unlock()
 	if c.fail != nil {
 		return "", c.fail
+	}
+	if c.empty {
+		return "", nil
 	}
 	c.next++
 	return fmt.Sprintf("00000000-0000-4000-8000-%012d", c.next), nil
@@ -206,6 +217,38 @@ func withSessions(sessions ...storedSession) fixtureOption {
 
 func withVerifierFailure(err error) fixtureOption {
 	return func(_ *RouterConfig, f *fixture) { f.verify.fail = err }
+}
+
+// withRawVerifier replaces the fixture's verifier entirely, for a test that
+// needs one with behaviour rather than one with a canned answer. It rebuilds
+// the authenticator and the guard around it so the composition stays the real
+// one.
+func withRawVerifier(verifier internalidentity.Verifier) fixtureOption {
+	return func(cfg *RouterConfig, f *fixture) {
+		authenticator, err := internalidentity.NewAuthenticator(internalidentity.Config{
+			Verifier: verifier,
+			Clock:    f.clock,
+		})
+		if err != nil {
+			panic(err)
+		}
+		cfg.Credentials = authenticator
+		f.authn = authenticator
+		guard, err := NewGuard(GuardConfig{
+			CSRF: factoryidentity.CSRFConfig{
+				SharedKey:      []byte("0123456789abcdef0123456789abcdef"),
+				TokenTTL:       time.Hour,
+				TrustedOrigins: []string{fixtureOrigin},
+			},
+			Credentials: authenticator,
+			Clock:       f.clock,
+		})
+		if err != nil {
+			panic(err)
+		}
+		cfg.Guard = guard
+		f.guard = guard
+	}
 }
 
 func withAuthorizer(authorizer Authorizer) fixtureOption {
@@ -372,24 +415,29 @@ func decodeEnvelope(t *testing.T, recorder *httptest.ResponseRecorder) sessionwi
 func TestTheRouteTableServesEveryPathTheSpecNames(t *testing.T) {
 	t.Parallel()
 
+	// HEAD accompanies GET everywhere. RFC 9110 section 9.1 makes GET and HEAD
+	// the two methods a general-purpose server MUST support and every other
+	// method optional -- the same sentence that makes refusing OPTIONS
+	// conformant, so it cannot be read in one direction only.
+	read := []string{http.MethodGet, http.MethodHead}
 	want := map[string][]string{
-		"/v1/agents":                       {http.MethodGet},
-		"/v1/capabilities":                 {http.MethodGet},
-		"/v1/sessions":                     {http.MethodGet, http.MethodPost},
-		"/v1/sessions/{sid}/status":        {http.MethodGet},
-		"/v1/sessions/{sid}/journal":       {http.MethodGet},
-		"/v1/sessions/{sid}/gates":         {http.MethodGet},
+		"/v1/agents":                       read,
+		"/v1/capabilities":                 read,
+		"/v1/sessions":                     {http.MethodGet, http.MethodHead, http.MethodPost},
+		"/v1/sessions/{sid}/status":        read,
+		"/v1/sessions/{sid}/journal":       read,
+		"/v1/sessions/{sid}/gates":         read,
 		"/v1/sessions/{sid}/input":         {http.MethodPost},
 		"/v1/sessions/{sid}/interrupt":     {http.MethodPost},
 		"/v1/sessions/{sid}/restore":       {http.MethodPost},
 		"/v1/sessions/{sid}/gates/{gid}":   {http.MethodPost},
-		"/v1/sessions/{sid}/objects/{oid}": {http.MethodGet},
-		"/v1/realtime":                     {http.MethodGet},
-		"/v1/csrf-token":                   {http.MethodGet},
+		"/v1/sessions/{sid}/objects/{oid}": read,
+		"/v1/realtime":                     read,
+		"/v1/csrf-token":                   read,
 	}
 	got := map[string][]string{}
 	for _, route := range routeTable() {
-		got[route.pattern] = route.methods
+		got[route.pattern] = route.methods()
 	}
 	if !maps.EqualFunc(want, got, slices.Equal) {
 		t.Errorf("the route table serves\n  %v\nthe specification names\n  %v", got, want)
@@ -411,7 +459,7 @@ func TestEveryRouteRefusesEveryMethodItDoesNotDeclare(t *testing.T) {
 	for _, route := range routeTable() {
 		target := concreteTarget(route.pattern)
 		for _, method := range methods {
-			if slices.Contains(route.methods, method) {
+			if slices.Contains(route.methods(), method) {
 				continue
 			}
 			checked++
@@ -424,8 +472,8 @@ func TestEveryRouteRefusesEveryMethodItDoesNotDeclare(t *testing.T) {
 				t.Errorf("%s %s = %d, want 405", method, target, recorder.Code)
 				continue
 			}
-			if got := recorder.Header().Get("Allow"); got != strings.Join(route.methods, ", ") {
-				t.Errorf("%s %s: Allow = %q, want %q", method, target, got, strings.Join(route.methods, ", "))
+			if got := recorder.Header().Get("Allow"); got != strings.Join(route.methods(), ", ") {
+				t.Errorf("%s %s: Allow = %q, want %q", method, target, got, strings.Join(route.methods(), ", "))
 			}
 			if code := decodeEnvelope(t, recorder).Error.Code; code != ErrorCodeMethodNotAllowed {
 				t.Errorf("%s %s: code = %q", method, target, code)
@@ -476,12 +524,7 @@ func TestTheUnimplementedRoutesAreExactlyTheOnesLaterTasksOwn(t *testing.T) {
 	implemented := 0
 	pending := 0
 	for _, route := range routeTable() {
-		target := concreteTarget(route.pattern)
-		var body io.Reader
-		if route.body == bodyJSON {
-			body = strings.NewReader(`{}`)
-		}
-		recorder := f.serve(request(route.methods[0], target, body))
+		recorder := f.driveOnce(route)
 		if route.owner == "" {
 			implemented++
 			if recorder.Code == http.StatusNotImplemented {
@@ -550,6 +593,26 @@ func TestTheCSRFTokenRouteIssuesATokenTheGuardAccepts(t *testing.T) {
 	if got := f.serve(with); got.Code == http.StatusForbidden {
 		t.Errorf("the token this route issued was refused by the guard: %s", got.Body)
 	}
+}
+
+// bodiedMethod reports a method on this route that carries a JSON body, or
+// false when the route serves none.
+func bodiedMethod(entry route) (string, bool) {
+	for _, rule := range entry.rules {
+		if rule.body == bodyJSON {
+			return rule.method, true
+		}
+	}
+	return "", false
+}
+
+// driveOnce sends one request exercising a route: its bodied method if it has
+// one, otherwise its first method.
+func (f *fixture) driveOnce(entry route) *httptest.ResponseRecorder {
+	if method, ok := bodiedMethod(entry); ok {
+		return f.serve(request(method, concreteTarget(entry.pattern), strings.NewReader(`{}`)))
+	}
+	return f.serve(request(entry.methods()[0], concreteTarget(entry.pattern), nil))
 }
 
 // concreteTarget turns a route pattern into a request path by substituting a
@@ -753,6 +816,9 @@ func TestAnUncleanAPIPathIsRefusedRatherThanRedirected(t *testing.T) {
 		"/v1/sessions/../agents",
 		"/v1/../assets/app.js",
 		"/v1//agents",
+		// A trailing slash IS unclean here, unlike in net/http's own
+		// cleanPath: this router registers no "/tree/" pattern, so a trailing
+		// slash on an API path can only name a route that does not exist.
 		"/v1/agents/",
 		// Percent-encoded dot segments: the mux cleans the ESCAPED path, so
 		// these are the constructions that establish the decoded check covers
@@ -779,6 +845,40 @@ func TestAnUncleanAPIPathIsRefusedRatherThanRedirected(t *testing.T) {
 		if recorder.Code != http.StatusNotFound {
 			t.Errorf("GET %s = %d, want 404", target, recorder.Code)
 		}
+	}
+}
+
+// TestAnUncleanAPIPathIsRefusedBeforeAuthentication pins where the refusal
+// sits, which is what makes the trailing-slash rule observable.
+//
+// The refusal happens in the router's own dispatch, ABOVE the API chain, so no
+// credential is verified and no route is consulted for a path that cannot name
+// one. An unauthenticated caller therefore gets 404 for an unclean path and 401
+// for a clean one, and the answer depends only on the shape of the path they
+// sent, which they already know.
+//
+// It is also the reader for cleanRequestPath NOT restoring a trailing slash the
+// way net/http's cleanPath does: with the restoration, /v1/agents/ is clean, so
+// it reaches authentication and this row answers 401 instead.
+func TestAnUncleanAPIPathIsRefusedBeforeAuthentication(t *testing.T) {
+	t.Parallel()
+
+	f := newFixture(t)
+	anonymous := func(target string) int {
+		r := httptest.NewRequest(http.MethodGet, fixtureOrigin+target, nil)
+		r.Host = fixtureHost
+		return f.serve(r).Code
+	}
+	for _, target := range []string{"/v1/agents/", "/v1//agents", "/v1/../assets/app.js", "/v1/sessions/../agents"} {
+		if got := anonymous(target); got != http.StatusNotFound {
+			t.Errorf("anonymous GET %s = %d, want 404: an unclean path must be refused above authentication", target, got)
+		}
+	}
+	// The control: a CLEAN path that names no route still reaches
+	// authentication, so it answers 401. Without this row a router that
+	// answered 404 to everything anonymous would pass.
+	if got := anonymous("/v1/nothing-here"); got != http.StatusUnauthorized {
+		t.Errorf("anonymous GET /v1/nothing-here = %d, want 401", got)
 	}
 }
 
@@ -826,13 +926,42 @@ func TestSecurityHeadersAreOnEveryAPIResponse(t *testing.T) {
 		"X-Frame-Options":         "DENY",
 		"Content-Security-Policy": "default-src 'none'; frame-ancestors 'none'",
 	}
-	for _, target := range []string{"/v1/csrf-token", "/v1/agents", "/v1/nothing-here"} {
+	// The last four are answered by ServeHTTP's own dispatch, BEFORE the API
+	// chain. The headers were once set inside that chain, so every one of these
+	// returned 404 with Referrer-Policy, X-Frame-Options and
+	// Content-Security-Policy empty -- an unclean path is exactly the request
+	// an attacker chooses, so the gap was on the path that mattered most.
+	for _, target := range []string{
+		"/v1/csrf-token", "/v1/agents", "/v1/nothing-here",
+		"/v1/../assets/app.js", "/v1//agents", "/v1/agents/", "/assets/app.js",
+	} {
 		recorder := f.get(target)
 		for name, value := range want {
 			if got := recorder.Header().Get(name); got != value {
-				t.Errorf("GET %s: %s = %q, want %q", target, name, got, value)
+				t.Errorf("GET %s (%d): %s = %q, want %q", target, recorder.Code, name, got, value)
 			}
 		}
+	}
+}
+
+// TestTheSPAIsNotGivenTheAPIContentPolicy is the other side of the same header
+// decision, and it is the reason the middleware wraps the router's OWN answers
+// rather than every response.
+//
+// The API policy is default-src 'none', which forbids a document its own
+// scripts and styles. Applying it to the bundle would serve a blank page. A UI
+// handler sets the policy its own document needs; what the router owes it is
+// not to overwrite that with one meant for JSON.
+func TestTheSPAIsNotGivenTheAPIContentPolicy(t *testing.T) {
+	t.Parallel()
+
+	f := newFixture(t, withUI())
+	recorder := f.serve(httptest.NewRequest(http.MethodGet, fixtureOrigin+"/assets/app.js", nil))
+	if !strings.Contains(recorder.Body.String(), spaMarker) {
+		t.Fatalf("the SPA was not reached: %d %q", recorder.Code, recorder.Body)
+	}
+	if got := recorder.Header().Get("Content-Security-Policy"); got != "" {
+		t.Errorf("the SPA was served with Content-Security-Policy %q, which forbids it its own scripts", got)
 	}
 }
 
@@ -901,17 +1030,33 @@ func TestEveryAPIResponseCarriesAMintedRequestID(t *testing.T) {
 
 // TestAnIdentifierSourceFailureDoesNotFailTheRequest keeps a correlation aid
 // from becoming an availability dependency.
+//
+// Both ways a source can decline are driven: an error, and an EMPTY identifier
+// returned with no error. They are separate cases because an empty header value
+// is not the same thing as an absent one -- Header().Set writes the field, and
+// a caller quoting "" in a support request has quoted something. UUIDSource
+// promises no non-empty result, so the value is checked and not only the error.
 func TestAnIdentifierSourceFailureDoesNotFailTheRequest(t *testing.T) {
 	t.Parallel()
 
-	f := newFixture(t)
-	f.ids.fail = errors.New("no entropy")
-	recorder := f.get("/v1/csrf-token")
-	if recorder.Code != http.StatusOK {
-		t.Errorf("status = %d, want 200: a missing request identifier must not fail the request", recorder.Code)
-	}
-	if got := recorder.Header().Get(RequestIDHeader); got != "" {
-		t.Errorf("%s = %q, want it absent rather than a fabricated value", RequestIDHeader, got)
+	for name, decline := range map[string]func(*countingIDs){
+		"an error":                      func(c *countingIDs) { c.fail = errors.New("no entropy") },
+		"an empty identifier, no error": func(c *countingIDs) { c.empty = true },
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			f := newFixture(t)
+			decline(f.ids)
+			recorder := f.get("/v1/csrf-token")
+			if recorder.Code != http.StatusOK {
+				t.Errorf("status = %d, want 200: a missing request identifier must not fail the request", recorder.Code)
+			}
+			if _, present := recorder.Header()[RequestIDHeader]; present {
+				t.Errorf("%s is present as %q, want the field absent rather than empty",
+					RequestIDHeader, recorder.Header().Get(RequestIDHeader))
+			}
+		})
 	}
 }
 
@@ -922,11 +1067,19 @@ func TestAnIdentifierSourceFailureDoesNotFailTheRequest(t *testing.T) {
 // TestAPanicBecomesAJSONInternalError drives a real panic through the real
 // chain by making the store panic, which is the shape a production fault takes:
 // a dependency, not the router.
+//
+// The first version of this test did not panic at all. It set an error whose
+// Error method panicked, which never ran -- errors.Is and errors.As compare and
+// unwrap without formatting -- so the request took the ordinary unknown-error
+// path, answered 500 for that reason, and the deferred recovery in ServeHTTP
+// was deletable with the suite still green. The fake now panics inside
+// GetCatalogEntry, and TestDeletingTheRecoveryLosesTheEnvelope below is the
+// half that shows what is lost without it.
 func TestAPanicBecomesAJSONInternalError(t *testing.T) {
 	t.Parallel()
 
 	f := newFixture(t, withUI())
-	f.reads.fail = panicError{}
+	f.reads.panics = "deliberate panic from a dependency"
 	recorder := f.get("/v1/sessions/" + string(fixtureSession) + "/status")
 
 	if recorder.Code != http.StatusInternalServerError {
@@ -942,13 +1095,47 @@ func TestAPanicBecomesAJSONInternalError(t *testing.T) {
 	if strings.Contains(envelope.Error.Message, "deliberate") {
 		t.Errorf("the panic value reached the response body: %q", envelope.Error.Message)
 	}
+	// The store really panicked. Without this the test would pass against a
+	// router that answered 500 for some other reason, which is exactly how the
+	// first version of it passed while asserting nothing about recovery.
+	if requests, _ := f.reads.snapshot(); len(requests) != 1 {
+		t.Fatalf("the store recorded %d calls, so the panic did not come from where this test says", len(requests))
+	}
 }
 
-// panicError is an error whose use panics, so the fake store can fail the way a
-// real dependency does without the fake having a panic switch of its own.
-type panicError struct{}
+// TestDeletingTheRecoveryLosesTheEnvelope drives the same panic WITHOUT the
+// router's recovery, and asserts the thing that would then be true: no status,
+// no body, no content type. net/http's own recovery closes the connection and
+// writes nothing, so a panicking A2.2 handler would falsify both "every public
+// failure is one Core ErrorEnvelope" and "an API failure never falls through to
+// something a browser renders".
+func TestDeletingTheRecoveryLosesTheEnvelope(t *testing.T) {
+	t.Parallel()
 
-func (panicError) Error() string { panic("deliberate panic from a dependency") }
+	f := newFixture(t)
+	f.reads.panics = "deliberate panic from a dependency"
+	recorder := httptest.NewRecorder()
+	recorder.Code = 0
+
+	var recovered any
+	func() {
+		defer func() { recovered = recover() }()
+		// The router's own chain, minus the deferred recoverPanic that
+		// ServeHTTP installs.
+		f.router.own.ServeHTTP(&recordingWriter{ResponseWriter: recorder},
+			request(http.MethodGet, "/v1/sessions/"+string(fixtureSession)+"/status", nil))
+	}()
+
+	if recovered == nil {
+		t.Fatal("the panic did not escape the chain, so this test is not measuring what the recovery catches")
+	}
+	if recorder.Code != 0 {
+		t.Errorf("a status %d was written without the recovery", recorder.Code)
+	}
+	if recorder.Body.Len() != 0 {
+		t.Errorf("a body %q was written without the recovery", recorder.Body)
+	}
+}
 
 // TestARecoveredPanicAfterAPartialWriteDoesNotAppendAnEnvelope is the branch a
 // recovery middleware usually gets wrong. Once bytes are on the wire the status
@@ -959,23 +1146,34 @@ func (panicError) Error() string { panic("deliberate panic from a dependency") }
 func TestARecoveredPanicAfterAPartialWriteDoesNotAppendAnEnvelope(t *testing.T) {
 	t.Parallel()
 
-	f := newFixture(t)
 	recorder := httptest.NewRecorder()
+	writer := &recordingWriter{ResponseWriter: recorder}
 	partial := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = io.WriteString(w, `{"partial":`)
 		panic("after the write")
 	})
 
-	writer := &recordingWriter{ResponseWriter: recorder}
 	var recovered any
 	func() {
 		defer func() { recovered = recover() }()
-		f.router.recoverInto(writer, partial).ServeHTTP(writer, request(http.MethodGet, "/v1/agents", nil))
+		func() {
+			defer recoverPanic(writer)
+			partial.ServeHTTP(writer, request(http.MethodGet, "/v1/agents", nil))
+		}()
 	}()
 
-	if !errors.Is(recovered.(error), http.ErrAbortHandler) {
-		t.Fatalf("recovered %v, want http.ErrAbortHandler so the connection is closed", recovered)
+	// The assertion is guarded rather than written as a bare type assertion.
+	// recovered is nil exactly when the mechanism under test has been removed,
+	// and an unguarded recovered.(error) would then kill this test by PANIC --
+	// which is not an assertion kill and would be reported as a false success
+	// by any mutation run.
+	if recovered == nil {
+		t.Fatal("nothing re-panicked, so the recovery answered after a partial write")
+	}
+	err, ok := recovered.(error)
+	if !ok || !errors.Is(err, http.ErrAbortHandler) {
+		t.Fatalf("recovered %v (%T), want http.ErrAbortHandler so the connection is closed", recovered, recovered)
 	}
 	if body := recorder.Body.String(); body != `{"partial":` {
 		t.Errorf("the recovery appended to a partial body: %q", body)
@@ -1168,11 +1366,7 @@ func TestTheStoreIsAlwaysAskedForThePrincipalsOwnTenant(t *testing.T) {
 			continue
 		}
 		driven++
-		var body io.Reader
-		if route.body == bodyJSON {
-			body = strings.NewReader(`{}`)
-		}
-		f.serve(request(route.methods[0], concreteTarget(route.pattern), body))
+		f.driveOnce(route)
 	}
 	if driven == 0 {
 		t.Fatal("no session-scoped route was driven, so this sweep proves nothing")
@@ -1651,83 +1845,324 @@ func TestOmittedLimitsTakeTheDefaults(t *testing.T) {
 // Authorization.
 // ---------------------------------------------------------------------------
 
-// TestEveryRouteAsksForTheDecisionItsRuleNames gives the route table's auth and
-// command columns a reader.
+// TestEveryMethodAsksForTheDecisionItsRuleNames gives the table's auth and
+// command columns a reader, per METHOD rather than per route.
 //
-// Without it, `auth` and `command` are values nothing consults: a route
+// Per method is the whole point. When the columns sat on the route, GET and
+// POST on /v1/sessions shared one rule and the sweep drove one of them, so a
+// create authorized as a list was invisible. Now every (route, method) pair is
+// driven and every one must ask for exactly the decision it declares -- a route
 // downgraded from authControl to authSessionRead, or one whose command kind was
-// copied from the route above it, would answer identically and survive. The
-// sweep is over the WHOLE table, so a route added with the wrong rule is caught
-// without anybody choosing to test that route.
-func TestEveryRouteAsksForTheDecisionItsRuleNames(t *testing.T) {
+// copied from the route above it, is reported without anybody choosing to test
+// that pair.
+func TestEveryMethodAsksForTheDecisionItsRuleNames(t *testing.T) {
 	t.Parallel()
 
+	driven := 0
 	for _, entry := range routeTable() {
-		t.Run(entry.pattern, func(t *testing.T) {
-			t.Parallel()
+		for _, rule := range entry.rules {
+			driven++
+			t.Run(rule.method+" "+entry.pattern, func(t *testing.T) {
+				t.Parallel()
 
-			authorizer := &recordingAuthorizer{}
-			f := newFixture(t, withAuthorizer(authorizer))
-			var body io.Reader
-			if entry.body == bodyJSON {
-				body = strings.NewReader(`{}`)
-			}
-			method := entry.methods[len(entry.methods)-1]
-			f.serve(request(method, concreteTarget(entry.pattern), body))
+				authorizer := &recordingAuthorizer{}
+				f := newFixture(t, withAuthorizer(authorizer))
+				var body io.Reader
+				if rule.body == bodyJSON {
+					body = strings.NewReader(`{}`)
+				}
+				f.serve(request(rule.method, concreteTarget(entry.pattern), body))
 
-			var want []authorizationCall
-			switch entry.auth {
-			case authAuthenticated:
-			case authSessionList:
-				want = []authorizationCall{{operation: "list"}}
-			case authSessionRead:
-				want = []authorizationCall{{operation: "read", session: fixtureSession}}
-			case authControl:
-				want = []authorizationCall{{operation: "control", session: fixtureSession, command: entry.command}}
-			}
-			if got := authorizer.snapshot(); !slices.Equal(got, want) {
-				t.Errorf("%s %s asked for %+v, want %+v", method, entry.pattern, got, want)
-			}
-		})
+				// A route that names no {sid} passes the zero SessionID,
+				// which is what AuthorizeControl's blank parameter makes
+				// harmless -- and is why POST /v1/sessions can be a control
+				// decision at all.
+				var session sessionwire.SessionID
+				if entry.session {
+					session = fixtureSession
+				}
+				var want []authorizationCall
+				switch rule.auth {
+				case authAuthenticated:
+				case authSessionList:
+					want = []authorizationCall{{operation: "list"}}
+				case authSessionRead:
+					want = []authorizationCall{{operation: "read", session: session}}
+				case authControl:
+					want = []authorizationCall{{operation: "control", session: session, command: rule.command}}
+				}
+				if got := authorizer.snapshot(); !slices.Equal(got, want) {
+					t.Errorf("%s %s asked for %+v, want %+v", rule.method, entry.pattern, got, want)
+				}
+			})
+		}
+	}
+	if driven == 0 {
+		t.Fatal("the table declares no method rules, so this sweep proves nothing")
 	}
 }
 
-// TestEveryRouteRuleIsExercisedByTheTable floors the sweep above on the RULE
-// set rather than on the route set: a rule nothing declares is a branch of
-// Router.authorize no test drives.
-func TestEveryRouteRuleIsExercisedByTheTable(t *testing.T) {
+// expectation is an INDEPENDENT restatement of what one (method, route) must
+// declare, written from the specification and from the shape of the operation
+// rather than from routeTable.
+//
+// It exists because three of the table's columns had no observer of their own.
+// Measured before it: dropping body: bodyJSON from /v1/sessions/{sid}/input,
+// and dropping streams from /v1/realtime, each left the entire suite green --
+// the media-type and ceiling tests all drove /v1/sessions, and the streams flag
+// was read only through the objects route. A column nothing restates is a
+// column the table is its own authority for.
+type expectation struct {
+	auth    authRule
+	command sessionstore.CommandKind
+	body    bodyRule
+	session bool
+	streams bool
+	// implemented is true for a route this build serves a handler for. It is
+	// the same fact as an empty owner, stated from the other side.
+	implemented bool
+	// awaitsObjectAuthorization marks a route whose authorization rule is known
+	// to be WEAKER than the operation it will eventually perform. See
+	// TestClearingAnOwnerRequiresAnExplicitSanction.
+	awaitsObjectAuthorization bool
+}
+
+// expectedRoutes is that restatement, keyed "METHOD /path".
+//
+// Reading it as a reviewer: a state-changing operation is authControl under its
+// own command kind and carries a JSON body; a durable read within a tenant is
+// authSessionRead and resolves its session; the tenant's own list is
+// authSessionList; a route describing the deployment rather than a tenant's
+// data is authAuthenticated; and streaming is declared only where cutting the
+// response at a deadline would truncate it.
+func expectedRoutes() map[string]expectation {
+	read := func(auth authRule, session bool) expectation {
+		return expectation{auth: auth, session: session}
+	}
+	control := func(command sessionstore.CommandKind, session bool) expectation {
+		return expectation{auth: authControl, command: command, body: bodyJSON, session: session}
+	}
+	routes := map[string]expectation{
+		// Deployment-wide descriptions: no tenant data, so authentication is
+		// the whole decision.
+		"GET /v1/agents":       read(authAuthenticated, false),
+		"GET /v1/capabilities": read(authAuthenticated, false),
+		// A WebSocket is held open for the life of the connection, so a
+		// handler deadline would close it on a timer.
+		"GET /v1/realtime": expectation{auth: authAuthenticated, streams: true},
+		// The caller's own token, served by this build.
+		"GET /v1/csrf-token": expectation{auth: authAuthenticated, implemented: true},
+		// The tenant's own list, and the create that adds to it. The create is
+		// a state-changing command and is authorized as one: AuthorizeControl
+		// never reads the SessionID, so a session that does not exist yet is no
+		// reason to fall back to the list rule.
+		"GET /v1/sessions":  read(authSessionList, false),
+		"POST /v1/sessions": control(commandCreate, false),
+		// Durable reads within one session.
+		"GET /v1/sessions/{sid}/status":  read(authSessionRead, true),
+		"GET /v1/sessions/{sid}/journal": read(authSessionRead, true),
+		"GET /v1/sessions/{sid}/gates":   read(authSessionRead, true),
+		// An object body is streamed, so no handler deadline. Its rule is the
+		// session read, which is WEAKER than the object read the operation
+		// needs; the route is 501 today and the flag below is what stops that
+		// rule being inherited by the task that implements it.
+		"GET /v1/sessions/{sid}/objects/{oid}": expectation{
+			auth: authSessionRead, session: true, streams: true, awaitsObjectAuthorization: true,
+		},
+		// State-changing commands on an existing session.
+		"POST /v1/sessions/{sid}/input":       control(commandInput, true),
+		"POST /v1/sessions/{sid}/interrupt":   control(commandInterrupt, true),
+		"POST /v1/sessions/{sid}/restore":     control(commandRestore, true),
+		"POST /v1/sessions/{sid}/gates/{gid}": control(commandGateResponse, true),
+	}
+	// HEAD is GET's rule exactly. RFC 9110 section 9.1 makes GET and HEAD the
+	// two methods a general-purpose server MUST support, which is the same
+	// sentence that makes refusing OPTIONS conformant.
+	for key, want := range routes {
+		method, path, _ := strings.Cut(key, " ")
+		if method == http.MethodGet {
+			routes[http.MethodHead+" "+path] = want
+		}
+	}
+	return routes
+}
+
+// TestEveryRouteDeclaresWhatItsShapeRequires compares the table against that
+// restatement in BOTH directions: every declared method rule must be expected,
+// and every expectation must be declared.
+func TestEveryRouteDeclaresWhatItsShapeRequires(t *testing.T) {
 	t.Parallel()
 
-	declared := map[authRule]bool{}
-	commands := map[sessionstore.CommandKind]bool{}
+	want := expectedRoutes()
+	if len(want) == 0 {
+		t.Fatal("nothing is expected, so this comparison is vacuous")
+	}
+	seen := map[string]bool{}
 	for _, entry := range routeTable() {
-		declared[entry.auth] = true
-		if entry.auth == authControl {
-			commands[entry.command] = true
+		for _, rule := range entry.rules {
+			key := rule.method + " " + entry.pattern
+			seen[key] = true
+			expected, ok := want[key]
+			if !ok {
+				t.Errorf("the table serves %s, which the restatement does not expect", key)
+				continue
+			}
+			got := expectation{
+				auth: rule.auth, command: rule.command, body: rule.body,
+				session: entry.session, streams: entry.streams,
+				implemented:               entry.owner == "",
+				awaitsObjectAuthorization: expected.awaitsObjectAuthorization,
+			}
+			if got != expected {
+				t.Errorf("%s declares %+v, the restatement requires %+v", key, got, expected)
+			}
+		}
+	}
+	for key := range want {
+		if !seen[key] {
+			t.Errorf("the restatement expects %s, which the table does not serve", key)
+		}
+	}
+}
+
+// TestTheRestatementIsIndependentOfTheTable is the anti-vacuity check for the
+// comparison above: a restatement derived FROM the table could not disagree
+// with it. Each perturbation below must be reported.
+func TestTheRestatementIsIndependentOfTheTable(t *testing.T) {
+	t.Parallel()
+
+	base := expectedRoutes()
+	for name, key := range map[string]string{
+		"a control route downgraded to a read": "POST /v1/sessions/{sid}/input",
+		"the create downgraded to a list":      "POST /v1/sessions",
+	} {
+		want := base[key]
+		if want.auth != authControl {
+			t.Fatalf("%s: %s is not expected to be a control route, so this probe is wrong", name, key)
+		}
+	}
+	if base["GET /v1/realtime"].streams != true {
+		t.Error("the restatement does not require /v1/realtime to stream, so dropping the flag is unreported")
+	}
+	if base["POST /v1/sessions/{sid}/input"].body != bodyJSON {
+		t.Error("the restatement does not require a body on input, so dropping it is unreported")
+	}
+	if base["GET /v1/sessions"].body != bodyNone {
+		t.Error("the restatement requires a body on the tenant list, which would refuse every first request")
+	}
+	if _, ok := base["HEAD /v1/agents"]; !ok {
+		t.Error("HEAD is not expected anywhere, so refusing it would be unreported")
+	}
+}
+
+// sanctionedImplementedRoutes names every route this build serves a handler
+// for, with the reason it is safe to serve.
+//
+// It is the tripwire for the deferred-route seam. Every route in routeTable
+// carries the task that fills its body in and answers 501 until then, and
+// clearing that owner is a one-word edit in a table -- so nothing stopped a
+// later task shipping a handler on whatever authorization rule the placeholder
+// happened to inherit. Now clearing an owner fails the suite until the route is
+// named HERE, which forces the rule to be re-read by somebody writing down why
+// it is adequate.
+func sanctionedImplementedRoutes() map[string]string {
+	return map[string]string{
+		"/v1/csrf-token": "serves the CALLER their own CSRF token under authAuthenticated; " +
+			"the token is bound to the requesting principal by Guard.IssueToken, so there is " +
+			"no tenant-scoped resource for a stronger rule to protect",
+	}
+}
+
+// TestClearingAnOwnerRequiresAnExplicitSanction couples the two.
+func TestClearingAnOwnerRequiresAnExplicitSanction(t *testing.T) {
+	t.Parallel()
+
+	sanctioned := sanctionedImplementedRoutes()
+	expected := expectedRoutes()
+	implemented := 0
+	for _, entry := range routeTable() {
+		reason, ok := sanctioned[entry.pattern]
+		if entry.owner == "" {
+			implemented++
+			if !ok {
+				t.Errorf("%s serves a handler but is not in sanctionedImplementedRoutes; "+
+					"clearing an owner requires writing down why its authorization rule is adequate", entry.pattern)
+				continue
+			}
+			if reason == "" {
+				t.Errorf("%s is sanctioned with an empty reason", entry.pattern)
+			}
+			for _, rule := range entry.rules {
+				if expected[rule.method+" "+entry.pattern].awaitsObjectAuthorization {
+					t.Errorf("%s serves a handler while still authorizing at a rule weaker than its "+
+						"operation; add the object-read decision before clearing its owner", entry.pattern)
+				}
+			}
+			continue
+		}
+		if ok {
+			t.Errorf("%s is sanctioned as implemented but still names owner %q", entry.pattern, entry.owner)
+		}
+	}
+	if implemented == 0 {
+		t.Fatal("no route is implemented, so the sanction has no subject")
+	}
+	if len(sanctioned) != implemented {
+		t.Errorf("%d routes are sanctioned and %d are implemented", len(sanctioned), implemented)
+	}
+}
+
+// TestTheObjectRouteStillOwesAnObjectDecision states the gap the flag above
+// stands for, so it is a measured fact in the suite rather than a note.
+//
+// AuthorizeObjectRead is declared on this package's Authorizer and implemented
+// in internal/identity, and NOTHING in production calls it: the object route
+// authorizes at the session read because A2.1 parses no ObjectReference. That
+// is sound only while the route answers 501.
+func TestTheObjectRouteStillOwesAnObjectDecision(t *testing.T) {
+	t.Parallel()
+
+	authorizer := &recordingAuthorizer{}
+	f := newFixture(t, withAuthorizer(authorizer))
+	recorder := f.get("/v1/sessions/" + string(fixtureSession) + "/objects/object-a")
+	if recorder.Code != http.StatusNotImplemented {
+		t.Fatalf("the object route answered %d; if it now serves a body it must authorize the OBJECT", recorder.Code)
+	}
+	for _, call := range authorizer.snapshot() {
+		if call.operation == "object" {
+			t.Fatal("the object route now makes an object decision; remove awaitsObjectAuthorization from the restatement")
+		}
+	}
+}
+
+// TestEveryAuthorizationRuleAndCommandKindIsDeclared floors the per-method
+// sweep on the RULE set rather than on the route set: a rule nothing declares
+// is a branch of Router.authorize no test drives, and a command kind nothing
+// declares is a constant with no reader.
+func TestEveryAuthorizationRuleAndCommandKindIsDeclared(t *testing.T) {
+	t.Parallel()
+
+	rules := map[authRule]bool{}
+	commands := map[sessionstore.CommandKind]bool{}
+	bodies := map[bodyRule]bool{}
+	for _, entry := range routeTable() {
+		for _, rule := range entry.rules {
+			rules[rule.auth] = true
+			bodies[rule.body] = true
+			if rule.auth == authControl {
+				commands[rule.command] = true
+			}
 		}
 	}
 	for _, rule := range []authRule{authAuthenticated, authSessionList, authSessionRead, authControl} {
-		if !declared[rule] {
-			t.Errorf("no route declares rule %d, so Router.authorize has a branch nothing drives", rule)
+		if !rules[rule] {
+			t.Errorf("no method declares rule %d, so Router.authorize has a branch nothing drives", rule)
 		}
 	}
-	for _, command := range []sessionstore.CommandKind{commandInput, commandInterrupt, commandRestore, commandGateResponse} {
+	for _, command := range []sessionstore.CommandKind{commandCreate, commandInput, commandInterrupt, commandRestore, commandGateResponse} {
 		if !commands[command] {
-			t.Errorf("no route authorizes under command kind %q", command)
+			t.Errorf("no method authorizes under command kind %q", command)
 		}
-	}
-	// commandCreate belongs to POST /v1/sessions, whose rule is the tenant
-	// list because the session it would create does not exist yet. It is
-	// declared for A3.1 and deliberately has no route reader at this task.
-	if commandCreate == "" {
-		t.Error("commandCreate is empty")
-	}
-	// Both body rules must occur, or one of them is a constant nothing selects
-	// and a route that lost its body requirement would be indistinguishable
-	// from one that never had one.
-	bodies := map[bodyRule]bool{}
-	for _, entry := range routeTable() {
-		bodies[entry.body] = true
 	}
 	if !bodies[bodyNone] || !bodies[bodyJSON] {
 		t.Errorf("the table declares body rules %v, want both bodyNone and bodyJSON", bodies)
@@ -1798,32 +2233,137 @@ func (c *countingReader) Read(p []byte) (int, error) {
 
 // TestASafeMethodOnABodiedRouteNeedsNoBody is what keeps GET /v1/sessions --
 // the request every client makes first -- from answering 415 because the route
-// it shares with create declares a body.
-//
-// It is also the reader for the linkage to guard.go's stateChanging: replacing
-// that predicate with a constant true makes this fail, and replacing it with a
-// constant false makes the empty-body and media-type rows of the failure sweep
-// fail.
+// it shares with create serves a bodied method.
 func TestASafeMethodOnABodiedRouteNeedsNoBody(t *testing.T) {
 	t.Parallel()
 
 	f := newFixture(t)
-	bodied := 0
+	checked := 0
 	for _, entry := range routeTable() {
-		if entry.body != bodyJSON || !slices.Contains(entry.methods, http.MethodGet) {
+		if _, bodied := bodiedMethod(entry); !bodied {
 			continue
 		}
-		bodied++
-		r := httptest.NewRequest(http.MethodGet, fixtureOrigin+concreteTarget(entry.pattern), nil)
-		r.Host = fixtureHost
-		r.Header.Set("Authorization", "Bearer "+fixtureBearer)
-		recorder := f.serve(r)
-		if recorder.Code == http.StatusUnsupportedMediaType || recorder.Code == http.StatusBadRequest {
-			t.Errorf("GET %s = %d; a safe method on a bodied route must not require a body", entry.pattern, recorder.Code)
+		for _, rule := range entry.rules {
+			if rule.body == bodyJSON {
+				continue
+			}
+			checked++
+			r := httptest.NewRequest(rule.method, fixtureOrigin+concreteTarget(entry.pattern), nil)
+			r.Host = fixtureHost
+			r.Header.Set("Authorization", "Bearer "+fixtureBearer)
+			recorder := f.serve(r)
+			if recorder.Code == http.StatusUnsupportedMediaType || recorder.Code == http.StatusBadRequest {
+				t.Errorf("%s %s = %d; a bodiless method on a bodied route must not require a body",
+					rule.method, entry.pattern, recorder.Code)
+			}
 		}
 	}
-	if bodied == 0 {
-		t.Fatal("no route serves both a safe method and a bodied one, so this claim has no subject")
+	if checked == 0 {
+		t.Fatal("no route serves both a bodied and a bodiless method, so this claim has no subject")
+	}
+}
+
+// TestEveryBodiedMethodIsBoundedAndTyped is the behavioural half of the body
+// column's reader, and it sweeps every method that declares one.
+//
+// It used to drive /v1/sessions alone: the media-type table, the ceiling pair,
+// the lying Content-Length and the empty body were all one route, so step 1's
+// content-type and size requirement and step 3's bounded bodies were proved for
+// one of five. Dropping the body rule from /v1/sessions/{sid}/input left the
+// whole suite green. Now every declared bodied method is driven, so a rule
+// dropped anywhere is reported.
+func TestEveryBodiedMethodIsBoundedAndTyped(t *testing.T) {
+	t.Parallel()
+
+	const ceiling = 16
+	driven := 0
+	for _, entry := range routeTable() {
+		for _, rule := range entry.rules {
+			if rule.body != bodyJSON {
+				continue
+			}
+			driven++
+			t.Run(rule.method+" "+entry.pattern, func(t *testing.T) {
+				t.Parallel()
+
+				f := newFixture(t, withLimits(RouteLimits{MaxRequestBytes: ceiling, RequestTimeout: time.Second}))
+				target := concreteTarget(entry.pattern)
+				send := func(contentType string, body string, length int64) *httptest.ResponseRecorder {
+					r := request(rule.method, target, strings.NewReader(body))
+					r.Header.Set("Content-Type", contentType)
+					if length >= 0 {
+						r.ContentLength = length
+					}
+					return f.serve(r)
+				}
+
+				if got := send("text/plain", `{}`, -1); got.Code != http.StatusUnsupportedMediaType {
+					t.Errorf("a text/plain body answered %d, want 415", got.Code)
+				} else if code := decodeEnvelope(t, got).Error.Code; code != ErrorCodeUnsupportedMediaType {
+					t.Errorf("415 code = %q", code)
+				}
+				if got := send("application/json", "", -1); got.Code != http.StatusBadRequest {
+					t.Errorf("an empty body answered %d, want 400", got.Code)
+				}
+				// The ceiling is applied while READING, so a declared length
+				// smaller than the body does not raise it.
+				if got := send("application/json", strings.Repeat("x", 512), 4); got.Code != http.StatusRequestEntityTooLarge {
+					t.Errorf("a lying Content-Length answered %d, want 413", got.Code)
+				} else if code := decodeEnvelope(t, got).Error.Code; code != ErrorCodePayloadTooLarge {
+					t.Errorf("413 code = %q", code)
+				}
+				// Both sides of the inclusive bound, which is what pins the
+				// value rather than the presence of a check.
+				if got := send("application/json", strings.Repeat("x", ceiling), -1); got.Code == http.StatusRequestEntityTooLarge {
+					t.Errorf("a body of exactly %d bytes was refused by a ceiling of %d", ceiling, ceiling)
+				}
+				if got := send("application/json", strings.Repeat("x", ceiling+1), -1); got.Code != http.StatusRequestEntityTooLarge {
+					t.Errorf("a body of %d bytes answered %d under a ceiling of %d, want 413", ceiling+1, got.Code, ceiling)
+				}
+			})
+		}
+	}
+	// The sweep selects on the very column it is testing, so a rule dropped
+	// from the table would silently shrink it to nothing rather than fail. The
+	// floor comes from the independent restatement, which is not selecting on
+	// the table at all.
+	expected := 0
+	for _, want := range expectedRoutes() {
+		if want.body == bodyJSON {
+			expected++
+		}
+	}
+	if expected == 0 {
+		t.Fatal("the restatement expects no bodied method, so this floor is vacuous")
+	}
+	if driven != expected {
+		t.Fatalf("the table declares %d bodied methods, the restatement expects %d", driven, expected)
+	}
+}
+
+// TestABoundedBodyIsStillReadableByTheHandler is the reader for the buffering.
+//
+// The body used to be read and DISCARDED, which made the ceiling real but left
+// A3.1 with a consumed io.ReadCloser and no way to decode the command envelope
+// without changing serveRoute's signature. This drives the production function
+// directly, because at this task the only handler behind it answers 501 and so
+// has nothing to read the body with.
+func TestABoundedBodyIsStillReadableByTheHandler(t *testing.T) {
+	t.Parallel()
+
+	f := newFixture(t)
+	const payload = `{"command_id":"c-1"}`
+	r := request(http.MethodPost, "/v1/sessions", strings.NewReader(payload))
+	recorder := httptest.NewRecorder()
+	if !f.router.readBoundedJSONBody(recorder, r) {
+		t.Fatalf("the body was refused: %d %s", recorder.Code, recorder.Body)
+	}
+	got, err := io.ReadAll(r.Body)
+	if err != nil {
+		t.Fatalf("re-reading the body: %v", err)
+	}
+	if string(got) != payload {
+		t.Errorf("the handler would read %q, want %q", got, payload)
 	}
 }
 
@@ -1853,3 +2393,129 @@ func TestTheVersionSegmentIsMatchedWhole(t *testing.T) {
 		}
 	}
 }
+
+// ---------------------------------------------------------------------------
+// The bound on authentication, and the writer's optional interfaces.
+// ---------------------------------------------------------------------------
+
+// blockingVerifier waits for its context and reports what it saw, which is what
+// lets a test distinguish "the deadline reached the verifier" from "the request
+// happened to finish".
+type blockingVerifier struct {
+	started  chan struct{}
+	deadline chan bool
+	err      chan error
+}
+
+func newBlockingVerifier() *blockingVerifier {
+	return &blockingVerifier{
+		started:  make(chan struct{}, 1),
+		deadline: make(chan bool, 1),
+		err:      make(chan error, 1),
+	}
+}
+
+func (v *blockingVerifier) VerifyCredential(ctx context.Context, _ internalidentity.Credential) (internalidentity.Claims, error) {
+	_, hasDeadline := ctx.Deadline()
+	select {
+	case v.started <- struct{}{}:
+	default:
+	}
+	select {
+	case v.deadline <- hasDeadline:
+	default:
+	}
+	<-ctx.Done()
+	select {
+	case v.err <- ctx.Err():
+	default:
+	}
+	return internalidentity.Claims{}, ctx.Err()
+}
+
+// TestAWedgedCredentialServiceDoesNotParkTheHandler is the reader for the
+// deadline authentication now runs under.
+//
+// Authentication calls a network dependency on EVERY request, and it ran
+// outside RouteLimits.RequestTimeout because the per-route deadline is created
+// after routing. Measured before the fix, at RequestTimeout 50ms: the handler
+// goroutine was still inside VerifyCredential after 500ms, ten runs of ten.
+// http.Server.WriteTimeout closes the connection but does not release the
+// goroutine, so the accumulation was unbounded.
+func TestAWedgedCredentialServiceDoesNotParkTheHandler(t *testing.T) {
+	t.Parallel()
+
+	verifier := newBlockingVerifier()
+	f := newFixture(t,
+		withLimits(RouteLimits{MaxRequestBytes: 1 << 20, RequestTimeout: 30 * time.Millisecond}),
+		withRawVerifier(verifier))
+
+	done := make(chan *httptest.ResponseRecorder, 1)
+	go func() { done <- f.get("/v1/agents") }()
+
+	select {
+	case recorder := <-done:
+		if !<-verifier.deadline {
+			t.Fatal("the verifier was called with a context carrying no deadline")
+		}
+		if recorder.Code != http.StatusGatewayTimeout {
+			t.Fatalf("status = %d, want 504; body %q", recorder.Code, recorder.Body)
+		}
+		if code := decodeEnvelope(t, recorder).Error.Code; code != ErrorCodeTimeout {
+			t.Errorf("code = %q, want %q", code, ErrorCodeTimeout)
+		}
+		if err := <-verifier.err; !errors.Is(err, context.DeadlineExceeded) {
+			t.Errorf("the verifier's context ended with %v, want a deadline", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the request did not return: authentication is running outside the request bound")
+	}
+}
+
+// TestAStreamingRouteIsNotShortenedByTheAuthenticationBound is the limit of the
+// fix above, driven rather than promised. The bound is cancelled as soon as
+// authentication returns, so a route that declares itself streaming still
+// reaches its handler with a context carrying no deadline.
+func TestAStreamingRouteIsNotShortenedByTheAuthenticationBound(t *testing.T) {
+	t.Parallel()
+
+	f := newFixture(t, withLimits(RouteLimits{MaxRequestBytes: 1 << 20, RequestTimeout: 20 * time.Millisecond}))
+	f.get("/v1/sessions/" + string(fixtureSession) + "/objects/object-a")
+	_, deadlines := f.reads.snapshot()
+	if len(deadlines) != 1 {
+		t.Fatalf("the store was called %d times, want 1", len(deadlines))
+	}
+	if deadlines[0] {
+		t.Error("a streaming route inherited a deadline from the authentication bound")
+	}
+}
+
+// TestTheWrapperDoesNotConcealTheWritersOptionalInterfaces is the reader for
+// recordingWriter.Unwrap.
+//
+// Embedding an http.ResponseWriter satisfies the interface and hides every
+// optional one underneath it, so without Unwrap no handler below could flush,
+// hijack or read from a source. A6.1 needs Hijacker for the WebSocket upgrade
+// and A2.4 needs Flusher for object streaming, and the failure would be a nil
+// assertion at run time in a task with no reason to suspect this type.
+func TestTheWrapperDoesNotConcealTheWritersOptionalInterfaces(t *testing.T) {
+	t.Parallel()
+
+	recorder := httptest.NewRecorder()
+	writer := &recordingWriter{ResponseWriter: recorder}
+	if err := http.NewResponseController(writer).Flush(); err != nil {
+		t.Fatalf("Flush through the wrapper: %v", err)
+	}
+	if !recorder.Flushed {
+		t.Error("the flush did not reach the underlying writer")
+	}
+	// Reverting the mechanism must lose the capability, or the assertion above
+	// would pass for a wrapper that never needed one.
+	if err := http.NewResponseController(concealingWriter{recorder}).Flush(); err == nil {
+		t.Error("a wrapper without Unwrap flushed, so this test cannot see the difference")
+	}
+}
+
+// concealingWriter is recordingWriter without Unwrap: the shape the wrapper had
+// before, kept here as the negative control.
+type concealingWriter struct{ http.ResponseWriter }

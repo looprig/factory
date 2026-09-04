@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
-	"slices"
 
 	sessionwire "github.com/looprig/core/sessionwire/v1"
 	"github.com/looprig/factory/identity"
@@ -15,15 +14,22 @@ import (
 
 // Factory's public error codes are Core's ErrorCode vocabulary, extended.
 //
-// Core v0.7.0 names nine codes, and every one of them is a condition about a
-// SESSION or a COMMAND: invalid_request, unsupported_version,
+// Core v0.7.0 names nine codes: invalid_request, unsupported_version,
 // session_not_found, command_rejected, gate_resolved, gate_not_resumable,
-// gate_expired, gate_response_invalid, runtime_unavailable. It names none of
-// the conditions a public HTTP surface answers before it reaches a session --
-// an unauthenticated caller, a denied operation, an unknown route, a wrong
-// method, an oversized body, a fault inside Factory. That is measured, not
-// assumed: `grep` over sessionwire/v1 at v0.7.0 finds one occurrence of
-// "not_found" and none of "unauthorized", "unauthenticated" or "internal".
+// gate_expired, gate_response_invalid, runtime_unavailable. Six of the nine
+// name a gate or a command outcome, one names a missing session, and
+// invalid_request and unsupported_version are general enough to answer a
+// malformed request at any layer -- this package uses invalid_request for four
+// pre-session conditions, so "they are all about a session or a command" would
+// be false and this file would be the counterexample.
+//
+// What is true, and what the extension rests on, is narrower: no Core ErrorCode
+// CONSTANT names an unauthenticated caller, a denied operation, an unknown
+// route, a refused method, an oversized body, an unserved route or a fault
+// inside Factory. coreErrorCodes below is that constant set, enumerated through
+// Core's own identifiers, and it is the measurement -- a grep for the words
+// would not be, since "internal" occurs twenty-two times in non-test files at
+// this version as part of internal_endpoint, and never as an error code.
 //
 // So Factory declares those, and it declares them AS sessionwire.ErrorCode
 // values rather than as a second type. Core's ErrorDetail.Validate requires
@@ -95,12 +101,16 @@ func factoryErrorCodes() []sessionwire.ErrorCode {
 
 // guardErrorCodes projects the origin and CSRF guard's reasons into the public
 // code vocabulary.
+//
+// The order is map order, which is to say unspecified, and nothing sorts it:
+// both readers -- the marshalling sweep and the disjointness check -- are
+// membership tests over the whole set. A sort here would be a line no outcome
+// depends on.
 func guardErrorCodes() []sessionwire.ErrorCode {
 	codes := make([]sessionwire.ErrorCode, 0, len(reasonMessages))
 	for reason := range reasonMessages {
 		codes = append(codes, sessionwire.ErrorCode(reason))
 	}
-	slices.Sort(codes)
 	return codes
 }
 
@@ -138,14 +148,14 @@ func coreErrorCodes() []sessionwire.ErrorCode {
 // apiErrorCodes is every code this package can answer with: its own, plus the
 // Core codes its mappings produce. It is what the marshalling sweep draws from,
 // so a code added to either list is covered without editing a test.
+//
+// The concatenation is unconditional. It once skipped a Core code already
+// present in the Factory set, and that branch could not fire: the two sets are
+// held disjoint by TestACodeCoreNamesIsSpelledWithCoresConstant, which is the
+// reader for the property the deduplication was defending. A duplicate here
+// would in any case only make the sweep marshal one code twice.
 func apiErrorCodes() []sessionwire.ErrorCode {
-	codes := factoryErrorCodes()
-	for _, code := range coreErrorCodes() {
-		if !slices.Contains(codes, code) {
-			codes = append(codes, code)
-		}
-	}
-	return codes
+	return append(factoryErrorCodes(), coreErrorCodes()...)
 }
 
 // apiError is one public failure: the status, the stable code, and the fixed

@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -8,7 +9,6 @@ import (
 	"mime"
 	"net/http"
 	"path"
-	"slices"
 	"strings"
 	"time"
 
@@ -131,11 +131,12 @@ type Router struct {
 	ui          http.Handler
 	limits      RouteLimits
 
-	// api is the composed API chain: security headers, then authentication,
-	// then the guard, then the mux. The guard is INSIDE authentication because
-	// its tokens are principal-bound, and AROUND the mux so a rejected origin
-	// cannot learn which routes exist by comparing a 403 with a 404.
-	api http.Handler
+	// own is every response the router produces itself: the security headers,
+	// then the path split, then authentication, then the guard, then the mux.
+	// The guard is INSIDE authentication because its tokens are
+	// principal-bound, and AROUND the mux so a rejected origin cannot learn
+	// which routes exist by comparing a 403 with a 404.
+	own http.Handler
 }
 
 // NewRouter validates a composition and returns the router. A rejection returns
@@ -185,7 +186,7 @@ func NewRouter(cfg RouterConfig) (*Router, error) {
 		writeAPIError(w, routeNotFound())
 	}))
 
-	router.api = securityHeaders(router.authenticate(cfg.Guard.Wrap(mux)))
+	router.own = securityHeaders(router.dispatch(router.authenticate(cfg.Guard.Wrap(mux))))
 	return router, nil
 }
 
@@ -195,14 +196,46 @@ func NewRouter(cfg RouterConfig) (*Router, error) {
 // SPA's assets are public and the API's routes are not. Everything under the
 // version segment goes through the API chain and can only leave it as JSON;
 // everything else is the SPA's, or a JSON route failure when no SPA is mounted.
+//
+// The security headers are set INSIDE Router.own, which covers every response
+// the router writes itself -- including the two routeNotFound answers dispatch
+// produces before the API chain is reached. They were once set inside the API
+// chain, and that left an unclean path such as /v1/../assets/app.js answering
+// 404 with no Referrer-Policy, no X-Frame-Options and no
+// Content-Security-Policy: the exact request an attacker chooses. They are NOT
+// applied to the SPA, and that is deliberate rather than an omission -- the API
+// policy is default-src 'none', which would forbid the bundle its own scripts.
+// A UI handler sets the policy its own document needs.
 func (rt *Router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	writer := &recordingWriter{ResponseWriter: w}
 	defer recoverPanic(writer)
 	rt.stampRequestID(writer)
 
-	requested := r.URL.Path
-	cleaned := cleanRequestPath(requested)
-	if isAPIPath(requested) || isAPIPath(cleaned) {
+	if rt.ui != nil && !isAPIRequest(r) {
+		rt.ui.ServeHTTP(writer, r)
+		return
+	}
+	rt.own.ServeHTTP(writer, r)
+}
+
+// isAPIRequest reports whether r addresses the API surface under either
+// spelling of its path. The cleaned spelling is consulted as well as the
+// requested one so that //v1/agents -- which the mux would clean into
+// /v1/agents -- cannot be handed to the SPA.
+func isAPIRequest(r *http.Request) bool {
+	return isAPIPath(r.URL.Path) || isAPIPath(cleanRequestPath(r.URL.Path))
+}
+
+// dispatch is everything the router answers itself: the API chain, and the
+// route failures on either side of it.
+func (rt *Router) dispatch(api http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requested := r.URL.Path
+		cleaned := cleanRequestPath(requested)
+		if !isAPIPath(requested) && !isAPIPath(cleaned) {
+			writeAPIError(w, routeNotFound())
+			return
+		}
 		// An unclean API path is refused rather than cleaned, because
 		// http.ServeMux answers a redirect to the cleaned path -- which for
 		// /v1/../assets/app.js leaves the API entirely and lands on the SPA,
@@ -216,8 +249,10 @@ func (rt *Router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// the escaped form unclean is present verbatim in the decoded form as
 		// well. The decoded check therefore refuses a superset of what the mux
 		// would redirect, and adding the escaped spelling beside it changes no
-		// outcome -- it was measured over seven constructions and never fired
-		// alone.
+		// outcome. The argument is the mechanism rather than a count of
+		// probes: an escaped-unclean path is one holding a literal "..", "."
+		// or "//" in its escaped form, and decoding leaves those bytes exactly
+		// where they were, so the decoded form is unclean too.
 		//
 		// The superset costs one request: a path whose segment holds an
 		// encoded slash, such as a session identifier spelled a%2Fb, decodes to
@@ -226,17 +261,11 @@ func (rt *Router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// the mux would in any case have delivered "a/b" as a single path value
 		// -- refusing is the same answer arrived at earlier.
 		if cleaned != requested {
-			writeAPIError(writer, routeNotFound())
+			writeAPIError(w, routeNotFound())
 			return
 		}
-		rt.api.ServeHTTP(writer, r)
-		return
-	}
-	if rt.ui != nil {
-		rt.ui.ServeHTTP(writer, r)
-		return
-	}
-	writeAPIError(writer, routeNotFound())
+		api.ServeHTTP(w, r)
+	})
 }
 
 // isAPIPath reports whether p addresses this router's API surface. It compares
@@ -247,12 +276,20 @@ func isAPIPath(p string) bool {
 	return first == apiVersionSegment
 }
 
-// cleanRequestPath is path.Clean with the trailing-slash and rooting rules
-// net/http's own mux applies. It is the same normalization the mux performs, so
-// a path this reports as unclean is one the mux would have redirected -- but it
-// is applied to the DECODED path, so the converse does not hold and it reports
-// some paths unclean that the mux would have routed; see ServeHTTP for why that
-// direction is the safe one.
+// cleanRequestPath roots a path and applies path.Clean.
+//
+// It deliberately does NOT restore a trailing slash the way net/http's own
+// cleanPath does, so /v1/agents/ is reported unclean and refused. That is a
+// difference from the mux, not an oversight: the mux keeps the trailing slash
+// because a registered "/tree/" pattern means something to it, and this router
+// registers no such pattern, so a trailing slash on an API path can only ever
+// be a request for a route that does not exist. Refusing it here answers the
+// same 404 one step earlier and removes a branch nothing else reads.
+//
+// A path this reports as unclean is one the mux would have redirected or
+// missed. The converse does not hold -- it is applied to the DECODED path, so
+// it reports some paths unclean that the mux would have routed; see ServeHTTP
+// for why that direction is the safe one.
 func cleanRequestPath(p string) string {
 	if p == "" {
 		return "/"
@@ -260,11 +297,7 @@ func cleanRequestPath(p string) string {
 	if p[0] != '/' {
 		p = "/" + p
 	}
-	cleaned := path.Clean(p)
-	if cleaned != "/" && strings.HasSuffix(p, "/") {
-		cleaned += "/"
-	}
-	return cleaned
+	return path.Clean(p)
 }
 
 // stampRequestID mints the identifier and puts it on the response.
@@ -273,6 +306,12 @@ func cleanRequestPath(p string) string {
 // fabricating a value: a correlation aid must not become an availability
 // dependency, and a fabricated identifier is worse than none because it would
 // be indistinguishable from a real one in a log.
+//
+// An EMPTY identifier returned with no error is refused for the same reason and
+// is a separate case, because an empty header value is not the same thing as an
+// absent one: Header().Set writes the field, and a caller quoting "" in a
+// support request has quoted something. UUIDSource does not promise a non-empty
+// result, so the check is on the value rather than on the error alone.
 func (rt *Router) stampRequestID(w http.ResponseWriter) {
 	id, err := rt.ids.NewUUID()
 	if err != nil || id == "" {
@@ -306,11 +345,46 @@ func securityHeaders(next http.Handler) http.Handler {
 //
 // It runs BEFORE routing, so an anonymous caller receives the same 401 for a
 // route that exists and one that does not and cannot enumerate the surface.
+//
+// # Why the deadline is applied here and not only per route
+//
+// Authentication calls the injected Verifier, which a deployment backs with a
+// token introspection endpoint or a shared session table -- a network
+// dependency, and one that runs on EVERY request including the streaming
+// routes. The per-route deadline is created after routing, so without this one
+// a wedged credential service would leave a handler goroutine parked inside
+// VerifyCredential for as long as it takes; http.Server.WriteTimeout closes the
+// connection but does not release the goroutine, so the accumulation is
+// unbounded. Measured before this bound existed: at RequestTimeout 50ms the
+// goroutine was still inside VerifyCredential after 500ms, ten runs of ten.
+//
+// The deadline is cancelled as soon as authentication returns, so it bounds
+// authentication ALONE and does not shorten a streaming route's lifetime. What
+// it can and cannot do is the ordinary contract of a context: a Verifier that
+// honours the one it is given returns at the deadline, and one that ignores it
+// is not bounded by anything here. That is the seam's promise to keep, and it
+// is the same promise every other dependency in this package makes.
 func (rt *Router) authenticate(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		principal, err := rt.credentials.AuthenticateRequest(r.Context(), r)
+		authCtx, cancel := context.WithTimeout(r.Context(), rt.limits.RequestTimeout)
+		principal, err := rt.credentials.AuthenticateRequest(authCtx, r)
+		// The context's own ending is read BEFORE cancel, because cancel
+		// overwrites a deadline with a cancellation.
+		ended := authCtx.Err()
+		cancel()
 		if err != nil {
 			failure := authenticationFailure(err)
+			// A deadline this router imposed is reported as one whatever the
+			// verifier returned. internal/identity deliberately keeps a
+			// verifier error's TEXT and drops its VALUE when it redacts, so
+			// errors.Is cannot see the context error through it -- the reader
+			// has to be the context this middleware created, not the error the
+			// dependency chose.
+			if ended != nil {
+				if timedOut, ok := contextFailure(ended); ok {
+					failure = timedOut
+				}
+			}
 			if failure.status == http.StatusUnauthorized {
 				w.Header().Set("WWW-Authenticate", `Bearer realm="factory"`)
 			}
@@ -342,22 +416,24 @@ func recoverPanic(w *recordingWriter) {
 	writeAPIError(w, internalFailure())
 }
 
-// recoverInto wraps next in this router's panic recovery. It exists so the
-// recovery has a caller a test can drive with a handler of its own; production
-// composition reaches the same code through ServeHTTP's deferred call.
-func (rt *Router) recoverInto(w *recordingWriter, next http.Handler) http.Handler {
-	return http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
-		defer recoverPanic(w)
-		next.ServeHTTP(w, r)
-	})
-}
-
 // recordingWriter remembers whether a status has been sent, which is the fact
 // panic recovery has to branch on and the only fact it records.
 type recordingWriter struct {
 	http.ResponseWriter
 	wrote bool
 }
+
+// Unwrap exposes the wrapped writer to http.ResponseController.
+//
+// Embedding an http.ResponseWriter satisfies the interface and CONCEALS every
+// optional one the real writer implements: without this, no handler below can
+// reach Flusher, Hijacker or ReaderFrom, because a type assertion sees only the
+// wrapper. A6.1's WebSocket upgrade needs Hijacker and A2.4's object streaming
+// needs Flusher, and the failure mode is a nil assertion at run time in a task
+// that has no reason to suspect this type -- so it is settled here rather than
+// discovered there. Unwrap is the whole fix: http.ResponseController follows the
+// chain, which is why re-declaring each optional method would be strictly worse.
+func (w *recordingWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
 
 func (w *recordingWriter) WriteHeader(status int) {
 	w.wrote = true
@@ -379,13 +455,15 @@ type bodyRule int
 const (
 	// bodyNone is a route that reads no body.
 	bodyNone bodyRule = iota
-	// bodyJSON is a route whose STATE-CHANGING methods require a bounded JSON
-	// body. It is keyed to the method rather than to the route because
-	// /v1/sessions serves both a list and a create, and requiring a body on
-	// the list would be a route that answers 400 to the request every client
-	// makes first. The predicate is guard.go's stateChanging, so "which
-	// methods carry a body" and "which methods the CSRF rules apply to" cannot
-	// drift apart into two answers.
+	// bodyJSON is a METHOD that requires a bounded JSON body.
+	//
+	// It sits on the method rather than on the route because /v1/sessions
+	// serves both a list and a create, and requiring a body on the list would
+	// answer 400 to the request every client makes first. It was once a route
+	// column filtered at the call site by guard.go's stateChanging, which
+	// worked but made "which methods carry a body" a derived fact nothing
+	// could state per route; now the only methods that declare it are the ones
+	// that carry one.
 	bodyJSON
 )
 
@@ -421,16 +499,36 @@ const (
 	commandGateResponse sessionstore.CommandKind = "gate_response"
 )
 
+// methodRule is what one METHOD on one route declares.
+//
+// The rules are per method rather than per route because a route can serve two
+// operations: /v1/sessions is a tenant list under GET and a session create
+// under POST, and one rule for both would have to be the weaker of the two. It
+// was authSessionList for both, and that is exactly the defect the split
+// exists to prevent -- a principal authorized only to LIST a tenant could
+// CREATE in it. The "the session does not exist yet" argument for keeping
+// create out of the control rule does not survive contact with the signature:
+// AuthorizeControl takes the SessionID as a blank parameter and never reads it,
+// which A1.2 pins with TestAuthorizerOpaqueSeamParametersAreUnread, so a
+// nonexistent session is no obstacle to the control decision.
+type methodRule struct {
+	method string
+	auth   authRule
+	// command is the kind the control decision is made under. It is meaningful
+	// only when auth is authControl.
+	command sessionstore.CommandKind
+	body    bodyRule
+}
+
 // route is one entry of the public surface.
 type route struct {
 	// pattern is the http.ServeMux pattern, with no method: methods are
 	// matched here so a refusal answers in this package's envelope rather than
-	// in net/http's plain text.
+	// in net/http's plain text, with an Allow header the mux does not write.
 	pattern string
-	methods []string
-	body    bodyRule
-	auth    authRule
-	command sessionstore.CommandKind
+
+	// rules are the methods this route serves, in Allow-header order.
+	rules []methodRule
 
 	// session says the route names a {sid} that must resolve within the
 	// principal's tenant before the handler runs.
@@ -442,37 +540,78 @@ type route struct {
 	streams bool
 
 	// owner is the runbook task that fills this route's body in. An empty
-	// owner is a route implemented here; anything else answers 501 today, and
+	// owner is a route implemented here; anything else answers 501 today.
 	// TestTheUnimplementedRoutesAreExactlyTheOnesLaterTasksOwn holds the two
-	// sets equal to what the table says.
+	// sets equal, and TestClearingAnOwnerRequiresAnExplicitSanction is what
+	// stops a later task shipping a handler on a rule nobody re-read.
 	owner string
 
 	// handle is the route's own answer. It is nil for a route with an owner.
 	handle func(*Router) http.Handler
 }
 
+// methods lists the methods this route serves, which is both the match set and
+// the Allow header.
+func (r route) methods() []string {
+	names := make([]string, 0, len(r.rules))
+	for _, rule := range r.rules {
+		names = append(names, rule.method)
+	}
+	return names
+}
+
+// ruleFor reports the rule for a method, or false when the route does not serve
+// it.
+func (r route) ruleFor(method string) (methodRule, bool) {
+	for _, rule := range r.rules {
+		if rule.method == method {
+			return rule, true
+		}
+	}
+	return methodRule{}, false
+}
+
+// readRules is GET plus HEAD under one authorization rule.
+//
+// HEAD is served wherever GET is, and that is a MUST rather than a
+// convenience: RFC 9110 section 9.1 requires a general-purpose server to
+// support GET and HEAD and makes every other method optional. It is the same
+// sentence that makes refusing OPTIONS conformant, so it has to be read in both
+// directions. It costs nothing to honour -- guard.go's stateChanging already
+// classifies HEAD as safe, so it is CSRF-exempt exactly as GET is, and net/http
+// suppresses the response body for a HEAD request without the handler knowing.
+func readRules(auth authRule) []methodRule {
+	return []methodRule{
+		{method: http.MethodGet, auth: auth},
+		{method: http.MethodHead, auth: auth},
+	}
+}
+
 // routeTable is the public surface of specification section 8.1.
 //
 // It is a function rather than a package variable so no caller can hold a
 // reference that lets it add a route at run time, and so a test reads the same
-// value the router was built from.
+// value the router was built from. Every column here is pinned against an
+// independent restatement by TestEveryRouteDeclaresWhatItsShapeRequires; the
+// table is not its own authority.
 func routeTable() []route {
-	get := []string{http.MethodGet}
-	post := []string{http.MethodPost}
+	control := func(command sessionstore.CommandKind) []methodRule {
+		return []methodRule{{method: http.MethodPost, auth: authControl, command: command, body: bodyJSON}}
+	}
 	return []route{
-		{pattern: "/v1/agents", methods: get, auth: authAuthenticated, owner: "A2.2"},
-		{pattern: "/v1/capabilities", methods: get, auth: authAuthenticated, owner: "A2.2"},
-		{pattern: "/v1/sessions", methods: []string{http.MethodGet, http.MethodPost}, body: bodyJSON, auth: authSessionList, owner: "A2.2/A3.1"},
-		{pattern: "/v1/sessions/{sid}/status", methods: get, session: true, auth: authSessionRead, owner: "A2.3"},
-		{pattern: "/v1/sessions/{sid}/journal", methods: get, session: true, auth: authSessionRead, owner: "A2.3"},
-		{pattern: "/v1/sessions/{sid}/gates", methods: get, session: true, auth: authSessionRead, owner: "A2.3"},
-		{pattern: "/v1/sessions/{sid}/objects/{oid}", methods: get, session: true, streams: true, auth: authSessionRead, owner: "A2.4"},
-		{pattern: "/v1/sessions/{sid}/input", methods: post, body: bodyJSON, session: true, auth: authControl, command: commandInput, owner: "A3.1"},
-		{pattern: "/v1/sessions/{sid}/interrupt", methods: post, body: bodyJSON, session: true, auth: authControl, command: commandInterrupt, owner: "A3.1"},
-		{pattern: "/v1/sessions/{sid}/restore", methods: post, body: bodyJSON, session: true, auth: authControl, command: commandRestore, owner: "A3.1"},
-		{pattern: "/v1/sessions/{sid}/gates/{gid}", methods: post, body: bodyJSON, session: true, auth: authControl, command: commandGateResponse, owner: "A3.1"},
-		{pattern: "/v1/realtime", methods: get, streams: true, auth: authAuthenticated, owner: "A6.1"},
-		{pattern: "/v1/csrf-token", methods: get, auth: authAuthenticated, handle: func(rt *Router) http.Handler { return rt.guard.TokenHandler() }},
+		{pattern: "/v1/agents", rules: readRules(authAuthenticated), owner: "A2.2"},
+		{pattern: "/v1/capabilities", rules: readRules(authAuthenticated), owner: "A2.2"},
+		{pattern: "/v1/sessions", rules: append(readRules(authSessionList), control(commandCreate)...), owner: "A2.2/A3.1"},
+		{pattern: "/v1/sessions/{sid}/status", rules: readRules(authSessionRead), session: true, owner: "A2.3"},
+		{pattern: "/v1/sessions/{sid}/journal", rules: readRules(authSessionRead), session: true, owner: "A2.3"},
+		{pattern: "/v1/sessions/{sid}/gates", rules: readRules(authSessionRead), session: true, owner: "A2.3"},
+		{pattern: "/v1/sessions/{sid}/objects/{oid}", rules: readRules(authSessionRead), session: true, streams: true, owner: "A2.4"},
+		{pattern: "/v1/sessions/{sid}/input", rules: control(commandInput), session: true, owner: "A3.1"},
+		{pattern: "/v1/sessions/{sid}/interrupt", rules: control(commandInterrupt), session: true, owner: "A3.1"},
+		{pattern: "/v1/sessions/{sid}/restore", rules: control(commandRestore), session: true, owner: "A3.1"},
+		{pattern: "/v1/sessions/{sid}/gates/{gid}", rules: control(commandGateResponse), session: true, owner: "A3.1"},
+		{pattern: "/v1/realtime", rules: readRules(authAuthenticated), streams: true, owner: "A6.1"},
+		{pattern: "/v1/csrf-token", rules: readRules(authAuthenticated), handle: func(rt *Router) http.Handler { return rt.guard.TokenHandler() }},
 	}
 }
 
@@ -492,8 +631,9 @@ func (rt *Router) serveRoute(entry route) http.Handler {
 		handler = entry.handle(rt)
 	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !slices.Contains(entry.methods, r.Method) {
-			w.Header().Set("Allow", strings.Join(entry.methods, ", "))
+		rule, served := entry.ruleFor(r.Method)
+		if !served {
+			w.Header().Set("Allow", strings.Join(entry.methods(), ", "))
 			writeAPIError(w, methodNotAllowed())
 			return
 		}
@@ -524,12 +664,12 @@ func (rt *Router) serveRoute(entry route) http.Handler {
 			}
 		}
 
-		if err := rt.authorize(ctx, entry, operation.Principal, session); err != nil {
+		if err := rt.authorize(ctx, rule, operation.Principal, session); err != nil {
 			writeAPIError(w, authorizationFailure(err))
 			return
 		}
 
-		if entry.body == bodyJSON && stateChanging(r.Method) && !rt.readBoundedJSONBody(w, r) {
+		if rule.body == bodyJSON && !rt.readBoundedJSONBody(w, r) {
 			return
 		}
 
@@ -541,19 +681,19 @@ func (rt *Router) serveRoute(entry route) http.Handler {
 	})
 }
 
-// authorize applies the route's declared rule.
+// authorize applies the method's declared rule.
 //
-// Every branch calls the injected Authorizer. There is no route whose rule is
+// Every branch calls the injected Authorizer. There is no rule whose meaning is
 // "no decision": authAuthenticated means the decision was made by
 // authentication, which has already run and refused an unverified caller.
-func (rt *Router) authorize(ctx context.Context, entry route, principal identity.Principal, session sessionwire.SessionID) error {
-	switch entry.auth {
+func (rt *Router) authorize(ctx context.Context, rule methodRule, principal identity.Principal, session sessionwire.SessionID) error {
+	switch rule.auth {
 	case authSessionList:
 		return rt.authorizer.AuthorizeSessionList(ctx, principal)
 	case authSessionRead:
 		return rt.authorizer.AuthorizeSessionRead(ctx, principal, session)
 	case authControl:
-		return rt.authorizer.AuthorizeControl(ctx, principal, session, entry.command)
+		return rt.authorizer.AuthorizeControl(ctx, principal, session, rule.command)
 	default:
 		return nil
 	}
@@ -579,13 +719,18 @@ func (rt *Router) resolveSession(ctx context.Context, w http.ResponseWriter, pri
 	return true
 }
 
-// readBoundedJSONBody applies the media type and the ceiling.
+// readBoundedJSONBody applies the media type and the ceiling, and leaves the
+// body READABLE.
 //
-// The bytes are read and DISCARDED. What this task owns is the three decisions
-// the read produces -- the media type, the ceiling, and an empty body -- and
-// the ceiling is only real if the body is actually read, because a caller can
-// declare any Content-Length it likes. A3.1 owns the envelope and is where the
-// bytes acquire a consumer; retaining them here would be a buffer nothing reads.
+// The ceiling is only real if the body is actually read, because a caller can
+// declare any Content-Length it likes -- but a consumed body cannot be read
+// again, so the bytes are buffered and r.Body is replaced with a reader over
+// them. A3.1 decodes the command envelope from exactly those bytes and needs no
+// signature change to reach them; discarding here would have forced one.
+//
+// The buffer is bounded by the same ceiling that produces the 413, so retaining
+// it costs at most MaxRequestBytes per in-flight request, which is the bound
+// the ceiling exists to state.
 func (rt *Router) readBoundedJSONBody(w http.ResponseWriter, r *http.Request) bool {
 	if !hasJSONContentType(r.Header.Get("Content-Type")) {
 		writeAPIError(w, apiError{
@@ -595,7 +740,7 @@ func (rt *Router) readBoundedJSONBody(w http.ResponseWriter, r *http.Request) bo
 		})
 		return false
 	}
-	read, err := io.Copy(io.Discard, http.MaxBytesReader(w, r.Body, rt.limits.MaxRequestBytes))
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, rt.limits.MaxRequestBytes))
 	var tooLarge *http.MaxBytesError
 	switch {
 	case errors.As(err, &tooLarge):
@@ -612,7 +757,7 @@ func (rt *Router) readBoundedJSONBody(w http.ResponseWriter, r *http.Request) bo
 			message: "the request body could not be read",
 		})
 		return false
-	case read == 0:
+	case len(body) == 0:
 		writeAPIError(w, apiError{
 			status:  http.StatusBadRequest,
 			code:    sessionwire.ErrorCodeInvalidRequest,
@@ -620,6 +765,7 @@ func (rt *Router) readBoundedJSONBody(w http.ResponseWriter, r *http.Request) bo
 		})
 		return false
 	}
+	r.Body = io.NopCloser(bytes.NewReader(body))
 	return true
 }
 

@@ -17,6 +17,21 @@ import (
 )
 
 // Authenticator derives a principal from an inbound HTTP request.
+//
+// Nothing in this package calls it, and that is deliberate rather than an
+// oversight. Router takes the CONCRETE *internalidentity.Authenticator, for the
+// reason GuardConfig.Credentials does: the operation context must record which
+// credential authenticated the request, NewOperationContext is a method so that
+// answer comes from the same derivation the authentication used, and an
+// interface here would be a second place for an edge to state it wrongly -- a
+// wrong answer there is a CSRF guard that skips.
+//
+// What this declaration is FOR is the public seam. A deployer implements
+// factory.Authenticator from outside the module, and
+// TestPublicSeamsAreExactlyTheUnionOfTheirConsumers derives that seam from the
+// narrow interfaces its consumers declare, so this is where
+// AuthenticateRequest's membership in it comes from. Deleting it would silently
+// narrow the public surface a composition (A9.1) has to satisfy.
 type Authenticator interface {
 	// AuthenticateRequest returns the principal the request's verified
 	// credentials name. It never reads a tenant from the body, query or path.

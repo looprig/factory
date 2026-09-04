@@ -319,13 +319,16 @@ indistinguishable from ordinary message text.
 shape.** The origin and CSRF guard used to answer `{"code":…,"message":…}` of
 its own; A2.1 nested that Reason as the envelope's stable code instead, so a
 client decodes once and branches on one member — including the one rejection it
-can act on without a human, `csrf_token_expired`. Core names nine error codes
-and every one of them is about a session or a command, so the conditions a
-public HTTP surface answers *before* it reaches a session — unauthenticated,
-not authorized, unknown route, wrong method, oversized body, an internal fault —
+can act on without a human, `csrf_token_expired`. No Core `ErrorCode` **constant**
+names an unauthenticated caller, a denied operation, an unknown route, a refused
+method, an oversized body, an unserved route or a fault inside Factory, so those
 are declared in `internal/httpapi/errors.go` as further `sessionwire.ErrorCode`
-values. `TestACodeCoreNamesIsSpelledWithCoresConstant` holds the two sets
-disjoint and states its own limit: it cannot see a code a later Core adds.
+values. Note what is *not* claimed: Core's `invalid_request` is general enough
+for a malformed request at any layer and A2.1 uses it for four pre-session
+conditions, so "Core's codes are all about a session or a command" is false and
+this package is the counterexample. `TestACodeCoreNamesIsSpelledWithCoresConstant`
+holds the two sets disjoint and states its own limit: it cannot see a code a
+later Core adds.
 
 **An API failure never falls through to the SPA.** The split is by path segment,
 before authentication, because the bundle's assets are public and the routes are
@@ -349,6 +352,25 @@ bounded: it cannot show the principal a scope was built from is the
 authenticated one, because both are values of the same type — that half is
 behavioural, and its reader compares the tenant the store received against the
 one the *verifier* issued.
+
+**`HEAD` is served wherever `GET` is; `OPTIONS` is refused with 405.** Both come
+from RFC 9110 §9.1 — a general-purpose server MUST support GET and HEAD, and
+every other method is optional. HEAD costs nothing: `stateChanging` already
+classifies it as safe, so it is CSRF-exempt exactly as GET is, and `net/http`
+suppresses the body. OPTIONS is refused because answering a preflight is the
+first half of approving the CORS grant `CSRFHeaderName`'s defence depends on
+never existing.
+
+**Clearing a route's `owner` is not a one-word edit.** Every route in
+`httpapi.routeTable` names the task that fills its body in and answers 501 until
+then, so nothing stopped a later task shipping a handler on whatever
+authorization rule the placeholder inherited. `sanctionedImplementedRoutes` now
+has to name the route and say why its rule is adequate, and `expectedRoutes` is
+an independent restatement of every `(method, route)`'s rule, command kind,
+body, session and streaming columns — written from the operation's shape, not
+from the table. The objects route carries `awaitsObjectAuthorization`, which
+fails the suite the day it serves a body without an object-level decision;
+`AuthorizeObjectRead` has no production caller today.
 
 **Do not add an HTTP method override.** The CSRF guard's subject is `r.Method`.
 A route or middleware honouring `X-HTTP-Method-Override` or a `_method` field
