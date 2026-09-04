@@ -313,11 +313,59 @@ The nonce sweep in `TestNoAuthMaterialReachesErrorsLogsOrContexts` uses a fresh
 random credential for the reason `pgstore` uses one for a DSN: a fixed token is
 indistinguishable from ordinary message text.
 
+## The public error shape, and the tenant boundary
+
+**Every public failure is one Core `ErrorEnvelope`, and there is no second body
+shape.** The origin and CSRF guard used to answer `{"code":…,"message":…}` of
+its own; A2.1 nested that Reason as the envelope's stable code instead, so a
+client decodes once and branches on one member — including the one rejection it
+can act on without a human, `csrf_token_expired`. Core names nine error codes
+and every one of them is about a session or a command, so the conditions a
+public HTTP surface answers *before* it reaches a session — unauthenticated,
+not authorized, unknown route, wrong method, oversized body, an internal fault —
+are declared in `internal/httpapi/errors.go` as further `sessionwire.ErrorCode`
+values. `TestACodeCoreNamesIsSpelledWithCoresConstant` holds the two sets
+disjoint and states its own limit: it cannot see a code a later Core adds.
+
+**An API failure never falls through to the SPA.** The split is by path segment,
+before authentication, because the bundle's assets are public and the routes are
+not. An *unclean* API path is refused outright rather than handed to the mux,
+which would answer a 301 to the cleaned path — for `/v1/../assets/app.js` that
+is a redirect out of the API and into the SPA, with an HTML body.
+
+**A tenant reaches SessionStore only through `scope`.** A1.2's `Authorizer`
+never reads its resource parameters, so "a cross-tenant identifier is
+indistinguishable from a nonexistent one" was true there only *vacuously*:
+existence was never consulted. `internal/httpapi`'s `scope` is where it stops
+being vacuous — the catalog query carries the authenticated principal's tenant,
+so the store reports another tenant's row as missing rather than as forbidden,
+and one `sessionNotFound()` construction serves both cases so the two responses
+cannot drift apart. `TestNoProductionFileBuildsAStoreRequestOutsideTheScope`
+scans every production file of the package, **enumerated from the directory**,
+and refuses a `sessionstore` composite literal, a keyed `TenantID` member and an
+assignment to a `TenantID` field anywhere but a method on `scope`. A2.2 to A2.4
+add their request builders there or that scan fails. What it establishes is
+bounded: it cannot show the principal a scope was built from is the
+authenticated one, because both are values of the same type — that half is
+behavioural, and its reader compares the tenant the store received against the
+one the *verifier* issued.
+
+**Do not add an HTTP method override.** The CSRF guard's subject is `r.Method`.
+A route or middleware honouring `X-HTTP-Method-Override` or a `_method` field
+would let a cross-site page present a POST as a GET: exempted as safe, then
+executed as a write. The note lives beside the allowlist in `guard.go`, where a
+route author will read it.
+
 ## Not implemented yet
 
-Composition seams (A0.2) and identity derivation (A1.1) are done; the HTTP API,
-admission, routing, placement and the realtime engines are later tasks in
-runbook 05. Nothing wires the `Authenticator` into `factory.New` yet -- there is
+Composition seams (A0.2), identity derivation (A1.1) and the route and error
+foundation (A2.1) are done; the read, control, admission, routing, placement and
+realtime handlers are later tasks in runbook 05. Every route in
+`httpapi.routeTable` carries the runbook task that fills its body in, and
+answers 501 until it does;
+`TestTheUnimplementedRoutesAreExactlyTheOnesLaterTasksOwn` holds the two sets
+equal. Nothing composes a `Router` into `factory.New` yet — server composition
+is A9. Nothing wires the `Authenticator` into `factory.New` yet -- there is
 no default authenticator option, because a deployment supplies the `Verifier`
 and there is no credible default for one. `internal/realtime` now exists and holds the ClientLink
 and HostLink seams. `cmd/factory` and `internal/placement/kubernetes` do not

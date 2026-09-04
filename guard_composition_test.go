@@ -230,9 +230,12 @@ func TestTheGuardAdmitsAHandshakeItCannotAuthorize(t *testing.T) {
 }
 
 // authenticateThen is the authentication middleware the guard is mounted
-// inside. It is the composition's own, not production code: A2 owns the real
-// one, and this is the minimum that gives the guard a principal to bind a
-// token to.
+// inside. It is the composition's own, not production code: the real one is
+// httpapi.Router's, added by A2.1, and this is the minimum that gives the guard
+// a principal to bind a token to. It is kept rather than replaced by the router
+// because this file's claim is about the guard and the authorizer meeting, and
+// routing through the whole public surface would put a third component between
+// them.
 func authenticateThen(t *testing.T, authenticator *internalidentity.Authenticator, next http.Handler) http.Handler {
 	t.Helper()
 

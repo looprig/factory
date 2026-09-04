@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	sessionwire "github.com/looprig/core/sessionwire/v1"
 	"github.com/looprig/factory/identity"
 	internalidentity "github.com/looprig/factory/internal/identity"
 )
@@ -382,6 +383,18 @@ func claimsWebSocketUpgrade(r *http.Request) bool {
 // guarded rather than exempt. RFC 9110 also calls TRACE safe and it is
 // deliberately absent: Factory serves no TRACE, so exempting it would be an
 // exemption nothing needs.
+//
+// # Do not add a method override
+//
+// The subject of this allowlist is r.Method, which is the method net/http read
+// from the request line. A route or a middleware that honoured
+// X-HTTP-Method-Override, or a _method form field, would let a cross-site page
+// present a POST as a GET: the override is applied AFTER this check, so the
+// request is exempted as safe and then executed as a write. Nothing in Factory
+// honours one at this revision, and the route table in routes.go dispatches on
+// r.Method directly. If a compatibility shim ever needs one, it has to run
+// OUTSIDE this guard -- rewriting r.Method before the guard sees it -- or the
+// CSRF defence is off for every request that carries the override.
 func stateChanging(method string) bool {
 	switch method {
 	case http.MethodGet, http.MethodHead, http.MethodOptions:
@@ -514,11 +527,6 @@ type tokenResponse struct {
 	ExpiresAt string `json:"expires_at"`
 }
 
-type rejectionResponse struct {
-	Code    string `json:"code"`
-	Message string `json:"message"`
-}
-
 // TokenHandler serves a freshly issued token to the authenticated caller.
 //
 // It is a GET, which stateChanging treats as safe, so a client holding no token
@@ -541,8 +549,23 @@ func (g *Guard) TokenHandler() http.Handler {
 	})
 }
 
+// writeRejection answers a rejected request in the SAME envelope every other
+// public failure uses.
+//
+// It was a body of its own -- {"code":...,"message":...} -- and that was one
+// error shape too many: a client reaching this surface would have had to try
+// two decoders and switch on whichever member turned up. The Reason survives
+// unchanged as the envelope's stable code, so the one rejection a browser acts
+// on without a human, ReasonCSRFExpired, is still the thing it branches on.
+// errors.go's factoryErrorCodes derives the reason set from reasonMessages, so
+// a reason added here is checked against Core's vocabulary without anybody
+// listing it twice.
 func writeRejection(w http.ResponseWriter, reason Reason) {
-	writeJSON(w, http.StatusForbidden, rejectionResponse{Code: string(reason), Message: reasonMessages[reason]})
+	writeAPIError(w, apiError{
+		status:  http.StatusForbidden,
+		code:    sessionwire.ErrorCode(reason),
+		message: reasonMessages[reason],
+	})
 }
 
 // writeJSON writes a body no cache may keep and no browser may sniff. A CSRF

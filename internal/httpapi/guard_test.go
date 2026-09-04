@@ -1012,14 +1012,18 @@ func TestWrapAnswersARejectionItselfAndNeverCallsNext(t *testing.T) {
 	if got := recorder.Header().Get("Content-Type"); got != "application/json" {
 		t.Errorf("Content-Type = %q, want application/json", got)
 	}
-	var body map[string]string
+	// The rejection is a Core ErrorEnvelope, like every other public failure
+	// this module answers: A2.1 unified the shape so a client reaching this
+	// surface decodes once and branches on one member. The Reason is still
+	// that member, which is what keeps ReasonCSRFExpired actionable.
+	var body sessionwire.ErrorEnvelope
 	if err := json.Unmarshal(recorder.Body.Bytes(), &body); err != nil {
 		t.Fatalf("decode the rejection body %q: %v", recorder.Body, err)
 	}
-	if body["code"] != string(httpapi.ReasonOriginNotTrusted) {
-		t.Errorf("code = %q, want %q", body["code"], httpapi.ReasonOriginNotTrusted)
+	if body.Error.Code != sessionwire.ErrorCode(httpapi.ReasonOriginNotTrusted) {
+		t.Errorf("code = %q, want %q", body.Error.Code, httpapi.ReasonOriginNotTrusted)
 	}
-	if body["message"] == "" {
+	if body.Error.Message == "" {
 		t.Error("the rejection carries no message")
 	}
 	if strings.Contains(recorder.Body.String(), "attacker.test") {
