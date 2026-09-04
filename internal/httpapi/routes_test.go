@@ -944,24 +944,47 @@ func TestSecurityHeadersAreOnEveryAPIResponse(t *testing.T) {
 	}
 }
 
-// TestTheSPAIsNotGivenTheAPIContentPolicy is the other side of the same header
-// decision, and it is the reason the middleware wraps the router's OWN answers
-// rather than every response.
+// TestTheSPAIsGivenTheNeutralHeadersAndNotTheAPIOnlyOnes is the other side of
+// the same header decision, and it fails in BOTH directions.
 //
-// The API policy is default-src 'none', which forbids a document its own
-// scripts and styles. Applying it to the bundle would serve a blank page. A UI
-// handler sets the policy its own document needs; what the router owes it is
-// not to overwrite that with one meant for JSON.
-func TestTheSPAIsNotGivenTheAPIContentPolicy(t *testing.T) {
+// The earlier version asserted only that Content-Security-Policy was absent. It
+// could therefore fail one way, and the way it could not fail was the one that
+// mattered: the SPA was served with NO security headers at all -- no nosniff,
+// no Referrer-Policy, no X-Frame-Options -- while a comment justified the
+// omission with an argument about CSP alone. One header's reason had been
+// applied to five, and a test that pins only the true half is what let that
+// stand.
+//
+// So both halves are asserted here. The neutral headers must be PRESENT,
+// because a document's own policy has nothing to say about MIME sniffing,
+// referrer leakage or framing. The API-only ones must be ABSENT, each for its
+// own reason: default-src 'none' would forbid the bundle its own scripts, and
+// no-store on a content-hashed asset re-downloads the whole bundle every load.
+func TestTheSPAIsGivenTheNeutralHeadersAndNotTheAPIOnlyOnes(t *testing.T) {
 	t.Parallel()
 
 	f := newFixture(t, withUI())
-	recorder := f.serve(httptest.NewRequest(http.MethodGet, fixtureOrigin+"/assets/app.js", nil))
-	if !strings.Contains(recorder.Body.String(), spaMarker) {
-		t.Fatalf("the SPA was not reached: %d %q", recorder.Code, recorder.Body)
-	}
-	if got := recorder.Header().Get("Content-Security-Policy"); got != "" {
-		t.Errorf("the SPA was served with Content-Security-Policy %q, which forbids it its own scripts", got)
+	for _, target := range []string{"/assets/app.js", "/index.html", "/sessions/session-a"} {
+		recorder := f.serve(httptest.NewRequest(http.MethodGet, fixtureOrigin+target, nil))
+		if !strings.Contains(recorder.Body.String(), spaMarker) {
+			t.Fatalf("GET %s did not reach the SPA: %d %q", target, recorder.Code, recorder.Body)
+		}
+		for name, value := range map[string]string{
+			"X-Content-Type-Options": "nosniff",
+			"Referrer-Policy":        "no-referrer",
+			"X-Frame-Options":        "DENY",
+		} {
+			if got := recorder.Header().Get(name); got != value {
+				t.Errorf("GET %s: the SPA was served %s = %q, want %q; this header cannot conflict with any document",
+					target, name, got, value)
+			}
+		}
+		if got := recorder.Header().Get("Content-Security-Policy"); got != "" {
+			t.Errorf("GET %s: the SPA was served Content-Security-Policy %q, which forbids it its own scripts", target, got)
+		}
+		if got := recorder.Header().Get("Cache-Control"); got != "" {
+			t.Errorf("GET %s: the SPA was served Cache-Control %q, which re-downloads a hashed bundle every load", target, got)
+		}
 	}
 }
 
@@ -972,32 +995,60 @@ func TestTheSPAIsNotGivenTheAPIContentPolicy(t *testing.T) {
 // the guard's token writer, and both set nosniff and no-store themselves, so
 // deleting either from the middleware changes nothing a route can observe --
 // measured: that mutation survives the whole suite. It will stop being harmless
-// the moment A2.2 writes a success body of its own. The middleware is the
-// durable mechanism, so it is asserted as one: an inner handler that sets no
-// headers at all must still be wrapped in the full set.
+// the moment A2.2 writes a success body of its own. The mechanisms are the
+// durable thing, so they are asserted as ones: a writer nothing has touched
+// must come out of them carrying the full set, split exactly as the two
+// functions declare it.
 func TestSecurityHeadersAreSetByTheMiddlewareItself(t *testing.T) {
 	t.Parallel()
 
-	bare := securityHeaders(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusOK)
-	}))
-	recorder := httptest.NewRecorder()
-	bare.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/v1/anything", nil))
-
-	for name, value := range map[string]string{
-		"X-Content-Type-Options":  "nosniff",
+	neutral := map[string]string{
+		"X-Content-Type-Options": "nosniff",
+		"Referrer-Policy":        "no-referrer",
+		"X-Frame-Options":        "DENY",
+	}
+	apiOnly := map[string]string{
 		"Cache-Control":           "no-store",
-		"Referrer-Policy":         "no-referrer",
-		"X-Frame-Options":         "DENY",
 		"Content-Security-Policy": "default-src 'none'; frame-ancestors 'none'",
-	} {
-		if got := recorder.Header().Get(name); got != value {
-			t.Errorf("%s = %q, want %q", name, got, value)
+	}
+
+	bare := httptest.NewRecorder()
+	setNeutralSecurityHeaders(bare.Header())
+	for name, value := range neutral {
+		if got := bare.Header().Get(name); got != value {
+			t.Errorf("setNeutralSecurityHeaders: %s = %q, want %q", name, got, value)
 		}
+	}
+	for name := range apiOnly {
+		if got := bare.Header().Get(name); got != "" {
+			t.Errorf("setNeutralSecurityHeaders set the API-only %s = %q", name, got)
+		}
+	}
+
+	recorder := httptest.NewRecorder()
+	apiSecurityHeaders(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})).ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/v1/anything", nil))
+	for name, value := range apiOnly {
+		if got := recorder.Header().Get(name); got != value {
+			t.Errorf("apiSecurityHeaders: %s = %q, want %q", name, got, value)
+		}
+	}
+	for name := range neutral {
+		if got := recorder.Header().Get(name); got != "" {
+			t.Errorf("apiSecurityHeaders set the neutral %s = %q; one header, one place", name, got)
+		}
+	}
+
+	// The two sets together are exactly what the end-to-end sweep expects of an
+	// API response, so a header moved between them is still covered and a
+	// header dropped from both is not.
+	if len(neutral)+len(apiOnly) != 5 {
+		t.Fatalf("the two sets hold %d headers between them, want the 5 an API response carries", len(neutral)+len(apiOnly))
 	}
 }
 
-// TestEveryAPIResponseCarriesAMintedRequestID holds two properties at once: the
+// TestEveryAPIResponseCarriesAMintedRequestID holds two properties// TestEveryAPIResponseCarriesAMintedRequestID holds two properties at once: the
 // identifier exists, and it is MINTED rather than echoed. A router that copied
 // the caller's X-Request-Id would put arbitrary caller-controlled text into
 // every log line that later correlates on it.

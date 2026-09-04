@@ -115,6 +115,25 @@ type RouterConfig struct {
 
 	// UI is the optional single-page application. It is served only OUTSIDE
 	// the API version segment; see Router.ServeHTTP.
+	//
+	// # What the router sets on its responses, and what it does not
+	//
+	// The router sets X-Content-Type-Options, Referrer-Policy and
+	// X-Frame-Options before this handler runs, so a bundle server that sets
+	// none of them is still covered. It does NOT set a
+	// Content-Security-Policy: the API's is default-src 'none', which would
+	// forbid a document its own scripts and styles, and there is no policy
+	// this package can write for a bundle it has never seen.
+	//
+	// So a UI handler owes its own Content-Security-Policy. Nothing here can
+	// check that -- this is an http.Handler, and its response is whatever it
+	// writes -- which is why the obligation is stated on the field a composer
+	// supplies rather than left in the middleware.
+	//
+	// Every header above is a DEFAULT rather than a floor. They are written to
+	// the header map before this handler is invoked, and net/http's header map
+	// stays mutable until WriteHeader, so a UI that must be embedded in a
+	// parent application can Set or Del X-Frame-Options itself.
 	UI http.Handler
 
 	// Limits bounds bodies and work. Its zero value takes DefaultRouteLimits.
@@ -186,7 +205,7 @@ func NewRouter(cfg RouterConfig) (*Router, error) {
 		writeAPIError(w, routeNotFound())
 	}))
 
-	router.own = securityHeaders(router.dispatch(router.authenticate(cfg.Guard.Wrap(mux))))
+	router.own = apiSecurityHeaders(router.dispatch(router.authenticate(cfg.Guard.Wrap(mux))))
 	return router, nil
 }
 
@@ -197,19 +216,32 @@ func NewRouter(cfg RouterConfig) (*Router, error) {
 // version segment goes through the API chain and can only leave it as JSON;
 // everything else is the SPA's, or a JSON route failure when no SPA is mounted.
 //
-// The security headers are set INSIDE Router.own, which covers every response
-// the router writes itself -- including the two routeNotFound answers dispatch
-// produces before the API chain is reached. They were once set inside the API
-// chain, and that left an unclean path such as /v1/../assets/app.js answering
-// 404 with no Referrer-Policy, no X-Frame-Options and no
-// Content-Security-Policy: the exact request an attacker chooses. They are NOT
-// applied to the SPA, and that is deliberate rather than an omission -- the API
-// policy is default-src 'none', which would forbid the bundle its own scripts.
-// A UI handler sets the policy its own document needs.
+// The security headers are set in two places, and the split is exactly as wide
+// as the argument for it.
+//
+// setNeutralSecurityHeaders runs HERE, above the split, so it covers every
+// response the router mounts, the SPA's included. apiSecurityHeaders runs
+// inside Router.own, which is every response the router writes itself --
+// including the two routeNotFound answers dispatch produces before the API
+// chain is reached. Both once sat inside the API chain, which left an unclean
+// path such as /v1/../assets/app.js answering 404 with none of them: the exact
+// request an attacker chooses.
+//
+// The API-only half is TWO headers, not five, and each is withheld from the SPA
+// for its own reason. Content-Security-Policy is default-src 'none', which
+// would forbid a bundle its own scripts and styles, and no policy this package
+// could write would suit a document it has never seen. Cache-Control: no-store
+// is right for private session data and wrong for a hashed asset, where it
+// costs a re-download of the whole bundle on every load. The three neutral
+// headers have no such conflict -- a document's own policy has nothing to say
+// about MIME sniffing, referrer leakage or framing -- so withholding them was a
+// sentence about one header applied to five. See RouterConfig.UI for what a
+// composer is left owing.
 func (rt *Router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	writer := &recordingWriter{ResponseWriter: w}
 	defer recoverPanic(writer)
 	rt.stampRequestID(writer)
+	setNeutralSecurityHeaders(writer.Header())
 
 	if rt.ui != nil && !isAPIRequest(r) {
 		rt.ui.ServeHTTP(writer, r)
@@ -230,12 +262,12 @@ func isAPIRequest(r *http.Request) bool {
 // route failures on either side of it.
 func (rt *Router) dispatch(api http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		requested := r.URL.Path
-		cleaned := cleanRequestPath(requested)
-		if !isAPIPath(requested) && !isAPIPath(cleaned) {
+		if !isAPIRequest(r) {
 			writeAPIError(w, routeNotFound())
 			return
 		}
+		requested := r.URL.Path
+		cleaned := cleanRequestPath(requested)
 		// An unclean API path is refused rather than cleaned, because
 		// http.ServeMux answers a redirect to the cleaned path -- which for
 		// /v1/../assets/app.js leaves the API entirely and lands on the SPA,
@@ -320,22 +352,54 @@ func (rt *Router) stampRequestID(w http.ResponseWriter) {
 	w.Header().Set(RequestIDHeader, id)
 }
 
-// securityHeaders sets what every API response carries, before any handler can
-// write, so a header is never missing from the responses that carry data and
-// present only on the ones that carry errors.
+// setNeutralSecurityHeaders sets the headers that cannot conflict with any
+// document a UI handler might serve, so they are applied to every response this
+// router mounts rather than to the API alone.
+//
+// Each is here because a document's own policy has nothing to say about it:
+//
+//   - nosniff makes the declared content type binding. Without it a browser may
+//     MIME-sniff a static asset a bundle server returns, which is the ordinary
+//     route from "serves files" to "executes script".
+//   - no-referrer stops the full console URL travelling in the Referer of every
+//     outbound navigation and subresource. By A2.2 to A2.4's own route shapes
+//     that URL carries a session identifier, so this is not hygiene.
+//   - DENY refuses framing. The API sets frame-ancestors 'none' because a JSON
+//     error rendered inside an attacker's frame is still a document; the
+//     console that approves gates and interrupts sessions is the stronger case
+//     of the same argument, and it is the one a clickjacking attack would aim
+//     at. It is a DEFAULT, not a floor: the header map stays mutable until
+//     WriteHeader, so a UI that must be embedded overrides it. See
+//     RouterConfig.UI.
+//
+// X-Frame-Options rather than a frame-ancestors policy, for the SPA, because
+// this package writes no Content-Security-Policy for a document it has not
+// seen, and a UI that writes its own would then have to remember to restate a
+// framing rule it never set. The API response carries both.
+func setNeutralSecurityHeaders(header http.Header) {
+	header.Set("X-Content-Type-Options", "nosniff")
+	header.Set("Referrer-Policy", "no-referrer")
+	header.Set("X-Frame-Options", "DENY")
+}
+
+// apiSecurityHeaders sets what only an API response carries, before any handler
+// can write, so a header is never missing from the responses that carry data
+// and present only on the ones that carry errors.
 //
 // no-store is not caution: every API response here is either a caller's private
 // session data or a failure about it, and a shared cache holding one would
-// serve it to whoever asks next. The frame and CSP headers are for the failure
-// bodies as much as the successes -- a JSON error rendered inside an attacker's
-// frame is still a document.
-func securityHeaders(next http.Handler) http.Handler {
+// serve it to whoever asks next. It is API-only because it is a real cost
+// elsewhere -- applied to a hashed bundle asset it forces the whole bundle to
+// be fetched again on every load, and a content-hashed URL is already safe to
+// cache forever.
+//
+// The CSP is for the failure bodies as much as the successes, and its
+// frame-ancestors clause is the modern spelling of the DENY that
+// setNeutralSecurityHeaders applies more widely.
+func apiSecurityHeaders(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		header := w.Header()
-		header.Set("X-Content-Type-Options", "nosniff")
 		header.Set("Cache-Control", "no-store")
-		header.Set("Referrer-Policy", "no-referrer")
-		header.Set("X-Frame-Options", "DENY")
 		header.Set("Content-Security-Policy", "default-src 'none'; frame-ancestors 'none'")
 		next.ServeHTTP(w, r)
 	})
