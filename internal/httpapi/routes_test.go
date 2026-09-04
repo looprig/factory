@@ -912,6 +912,108 @@ func TestAnUnauthenticatedRequestCannotEnumerateRoutes(t *testing.T) {
 	}
 }
 
+// The security header table, spelled once.
+//
+// It was spelled three times -- in the API sweep, in the SPA test and in the
+// middleware unit -- and the union of the two halves was asserted by a floor
+// reading len(neutral)+len(apiOnly) != 5. That floor's real subject was
+// CARDINALITY, not membership: it fires on a coordinated four-site deletion,
+// but a header ADDED to setNeutralSecurityHeaders alone left every copy and the
+// floor itself green, because nothing compared the production functions against
+// a list. Both halves are now one table, every reader derives from it, and the
+// middleware unit compares the functions' EMITTED KEY SETS against it exactly,
+// so an addition in production with no entry here is reported by name.
+var (
+	// neutralHeaders go on every response the router mounts, the SPA included:
+	// a document's own policy has nothing to say about MIME sniffing, referrer
+	// leakage or framing.
+	neutralHeaders = map[string]string{
+		"X-Content-Type-Options": "nosniff",
+		"Referrer-Policy":        "no-referrer",
+		"X-Frame-Options":        "DENY",
+	}
+	// apiOnlyHeaders go only on responses the router writes itself. No policy
+	// this package could write suits a document it has never seen, and no-store
+	// on a content-hashed asset re-downloads the whole bundle every load.
+	apiOnlyHeaders = map[string]string{
+		"Cache-Control":           "no-store",
+		"Content-Security-Policy": "default-src 'none'; frame-ancestors 'none'",
+	}
+)
+
+// apiResponseHeaders is the union: what an API response carries. It is built
+// from the two halves rather than listed, so "the two sets together are what an
+// API response carries" holds by construction instead of by a count.
+func apiResponseHeaders() map[string]string {
+	all := make(map[string]string, len(neutralHeaders)+len(apiOnlyHeaders))
+	maps.Copy(all, neutralHeaders)
+	maps.Copy(all, apiOnlyHeaders)
+	return all
+}
+
+// requiredSecurityHeaders is an INDEPENDENT restatement: each header a public
+// authenticated surface must carry, and the threat it answers.
+//
+// It exists because the table above cannot floor itself. Deleting a header from
+// setNeutralSecurityHeaders and from neutralHeaders together leaves every
+// derived reader agreeing about a smaller world -- measured: that coordinated
+// deletion survives the whole suite without this. The cardinality floor it
+// replaces did catch that case, and caught it as "want 5"; this catches it by
+// NAME, and makes deleting a header cost the deletion of a written threat
+// rather than the decrement of a number.
+//
+// It holds no values, so the table above stays the single authority for what
+// each header is set TO. This says only which must exist, and why.
+func requiredSecurityHeaders() map[string]string {
+	return map[string]string{
+		"X-Content-Type-Options": "a browser that MIME-sniffs a served asset can be made to execute it",
+		"Referrer-Policy": "the console URL carries a session identifier, and without this it travels " +
+			"in the Referer of every outbound navigation and subresource",
+		"X-Frame-Options": "the console approves gates and interrupts sessions, so framing it is a " +
+			"clickjacking attack on those controls",
+		"Cache-Control": "an API response is a caller's private session data, which a shared cache " +
+			"must not serve to whoever asks next",
+		"Content-Security-Policy": "a JSON error rendered inside an attacker's frame is still a document",
+	}
+}
+
+// TestTheHeaderTableCarriesEveryHeaderTheThreatsRequire is that floor.
+func TestTheHeaderTableCarriesEveryHeaderTheThreatsRequire(t *testing.T) {
+	t.Parallel()
+
+	required := requiredSecurityHeaders()
+	if len(required) == 0 {
+		t.Fatal("no header is required, so this floor is vacuous")
+	}
+	carried := apiResponseHeaders()
+	for name, threat := range required {
+		if threat == "" {
+			t.Errorf("%s is required with no threat written down", name)
+		}
+		if _, ok := carried[name]; !ok {
+			t.Errorf("no API response carries %s, which is required because %s", name, threat)
+		}
+	}
+	// The other direction: a header in the table with no threat behind it is a
+	// header nobody can say why we send.
+	for name := range carried {
+		if _, ok := required[name]; !ok {
+			t.Errorf("the table declares %s, which requiredSecurityHeaders does not justify", name)
+		}
+	}
+}
+
+// headerNames is the key set of a header table, for an exact comparison against
+// what a production function emits.
+func headerNames(table map[string]string) []string {
+	return slices.Sorted(maps.Keys(table))
+}
+
+// emittedHeaderNames is the key set a recorder actually carries.
+func emittedHeaderNames(recorder *httptest.ResponseRecorder) []string {
+	return slices.Sorted(maps.Keys(recorder.Header()))
+}
+
 // TestSecurityHeadersAreOnEveryAPIResponse sweeps the success answer and a
 // failure answer, because a header set only on the error path is a header the
 // responses that carry private data do not have.
@@ -919,12 +1021,9 @@ func TestSecurityHeadersAreOnEveryAPIResponse(t *testing.T) {
 	t.Parallel()
 
 	f := newFixture(t)
-	want := map[string]string{
-		"X-Content-Type-Options":  "nosniff",
-		"Cache-Control":           "no-store",
-		"Referrer-Policy":         "no-referrer",
-		"X-Frame-Options":         "DENY",
-		"Content-Security-Policy": "default-src 'none'; frame-ancestors 'none'",
+	want := apiResponseHeaders()
+	if len(want) == 0 {
+		t.Fatal("the header table is empty, so this sweep proves nothing")
 	}
 	// The last four are answered by ServeHTTP's own dispatch, BEFORE the API
 	// chain. The headers were once set inside that chain, so every one of these
@@ -969,21 +1068,16 @@ func TestTheSPAIsGivenTheNeutralHeadersAndNotTheAPIOnlyOnes(t *testing.T) {
 		if !strings.Contains(recorder.Body.String(), spaMarker) {
 			t.Fatalf("GET %s did not reach the SPA: %d %q", target, recorder.Code, recorder.Body)
 		}
-		for name, value := range map[string]string{
-			"X-Content-Type-Options": "nosniff",
-			"Referrer-Policy":        "no-referrer",
-			"X-Frame-Options":        "DENY",
-		} {
+		for name, value := range neutralHeaders {
 			if got := recorder.Header().Get(name); got != value {
 				t.Errorf("GET %s: the SPA was served %s = %q, want %q; this header cannot conflict with any document",
 					target, name, got, value)
 			}
 		}
-		if got := recorder.Header().Get("Content-Security-Policy"); got != "" {
-			t.Errorf("GET %s: the SPA was served Content-Security-Policy %q, which forbids it its own scripts", target, got)
-		}
-		if got := recorder.Header().Get("Cache-Control"); got != "" {
-			t.Errorf("GET %s: the SPA was served Cache-Control %q, which re-downloads a hashed bundle every load", target, got)
+		for name := range apiOnlyHeaders {
+			if got := recorder.Header().Get(name); got != "" {
+				t.Errorf("GET %s: the SPA was served the API-only %s = %q", target, name, got)
+			}
 		}
 	}
 }
@@ -1002,26 +1096,19 @@ func TestTheSPAIsGivenTheNeutralHeadersAndNotTheAPIOnlyOnes(t *testing.T) {
 func TestSecurityHeadersAreSetByTheMiddlewareItself(t *testing.T) {
 	t.Parallel()
 
-	neutral := map[string]string{
-		"X-Content-Type-Options": "nosniff",
-		"Referrer-Policy":        "no-referrer",
-		"X-Frame-Options":        "DENY",
-	}
-	apiOnly := map[string]string{
-		"Cache-Control":           "no-store",
-		"Content-Security-Policy": "default-src 'none'; frame-ancestors 'none'",
-	}
-
+	// Each function's EMITTED key set is compared against its half of the
+	// table, exactly. Checking only that the listed headers are present would
+	// leave a header added to production with no entry here unreported, which
+	// is what the old cardinality floor could not see; an exact comparison
+	// reports it, and reports it by name.
 	bare := httptest.NewRecorder()
 	setNeutralSecurityHeaders(bare.Header())
-	for name, value := range neutral {
+	if got, want := emittedHeaderNames(bare), headerNames(neutralHeaders); !slices.Equal(got, want) {
+		t.Errorf("setNeutralSecurityHeaders emits %v, the table declares %v", got, want)
+	}
+	for name, value := range neutralHeaders {
 		if got := bare.Header().Get(name); got != value {
 			t.Errorf("setNeutralSecurityHeaders: %s = %q, want %q", name, got, value)
-		}
-	}
-	for name := range apiOnly {
-		if got := bare.Header().Get(name); got != "" {
-			t.Errorf("setNeutralSecurityHeaders set the API-only %s = %q", name, got)
 		}
 	}
 
@@ -1029,26 +1116,17 @@ func TestSecurityHeadersAreSetByTheMiddlewareItself(t *testing.T) {
 	apiSecurityHeaders(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	})).ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/v1/anything", nil))
-	for name, value := range apiOnly {
+	if got, want := emittedHeaderNames(recorder), headerNames(apiOnlyHeaders); !slices.Equal(got, want) {
+		t.Errorf("apiSecurityHeaders emits %v, the table declares %v; one header, one place", got, want)
+	}
+	for name, value := range apiOnlyHeaders {
 		if got := recorder.Header().Get(name); got != value {
 			t.Errorf("apiSecurityHeaders: %s = %q, want %q", name, got, value)
 		}
 	}
-	for name := range neutral {
-		if got := recorder.Header().Get(name); got != "" {
-			t.Errorf("apiSecurityHeaders set the neutral %s = %q; one header, one place", name, got)
-		}
-	}
-
-	// The two sets together are exactly what the end-to-end sweep expects of an
-	// API response, so a header moved between them is still covered and a
-	// header dropped from both is not.
-	if len(neutral)+len(apiOnly) != 5 {
-		t.Fatalf("the two sets hold %d headers between them, want the 5 an API response carries", len(neutral)+len(apiOnly))
-	}
 }
 
-// TestEveryAPIResponseCarriesAMintedRequestID holds two properties// TestEveryAPIResponseCarriesAMintedRequestID holds two properties at once: the
+// TestEveryAPIResponseCarriesAMintedRequestID holds two properties at once: the
 // identifier exists, and it is MINTED rather than echoed. A router that copied
 // the caller's X-Request-Id would put arbitrary caller-controlled text into
 // every log line that later correlates on it.

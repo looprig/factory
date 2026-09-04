@@ -125,10 +125,28 @@ type RouterConfig struct {
 	// forbid a document its own scripts and styles, and there is no policy
 	// this package can write for a bundle it has never seen.
 	//
-	// So a UI handler owes its own Content-Security-Policy. Nothing here can
-	// check that -- this is an http.Handler, and its response is whatever it
-	// writes -- which is why the obligation is stated on the field a composer
-	// supplies rather than left in the middleware.
+	// So a UI handler owes its own Content-Security-Policy, and this package
+	// DECLINES to interpose rather than being unable to.
+	//
+	// The distinction matters because the earlier wording -- "nothing here can
+	// check that" -- is false at the layer that has the reader. ServeHTTP does
+	// not hand this handler the raw writer; it wraps it in a recordingWriter,
+	// which already implements WriteHeader, so the PRESENCE of a policy this
+	// handler set is observable at that seam with machinery that exists today.
+	//
+	// What no code here can judge is ADEQUACY. A present Content-Security-
+	// Policy may be default-src * and worth nothing, and the policy a bundle
+	// needs is a fact about the bundle's own scripts, styles, fonts and
+	// connect targets -- which this package has never seen. A presence check
+	// would therefore fail a correct deployment that sets its policy at the
+	// edge, in a meta tag, or on the document alone rather than on every asset,
+	// and pass one whose policy is empty of meaning. Refusing at run time is
+	// worse still: it turns a header opinion into an outage.
+	//
+	// Enforcement at COMPOSITION is what would be worth having, and it is not
+	// available -- there is nothing to inspect in an http.Handler before it
+	// serves. So the obligation is stated here, on the field a composer
+	// supplies, which is the earliest place a human reads it.
 	//
 	// Every header above is a DEFAULT rather than a floor. They are written to
 	// the header map before this handler is invoked, and net/http's header map
