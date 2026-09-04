@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"slices"
 	"strconv"
 	"strings"
@@ -93,8 +94,9 @@ func (t LaunchTemplate) Validate() error {
 // agentProbePageLimit bounds the ONE directory page /v1/agents reads per
 // configured pooled template.
 //
-// The bound and its cost are both derived from the mechanism rather than
-// chosen. SessionStore ranks a target's rows by available capacity and drops a
+// The bound's COST is derived from the mechanism; the bound itself is chosen,
+// and the distinction is worth the word because only one of them is defended by
+// a test. SessionStore ranks a target's rows by available capacity and drops a
 // lapsed row from the page it is publishing WITHOUT unranking it -- its
 // ListCompatibleHosts documentation says so, and counts the drops in
 // LapsedSkipped precisely because the row still occupies a position in every
@@ -103,6 +105,16 @@ func (t LaunchTemplate) Validate() error {
 // from /v1/agents. The condition that produces it is an accumulation of lapsed
 // rows, and ReconcileHostTargets -- runbook task A4.1 step 2 -- is the only
 // thing that removes them.
+//
+// What is DEFENDED is the floor, and the floor is TWO, not thirty-two: a
+// one-row probe reports an advertised target absent the moment a single stale
+// row outranks it, and zero is read by the store as its own configured page
+// size, which hands the bound away entirely. Thirty-two is headroom above that
+// floor and nothing anchors it -- raising it to sixteen or lowering it to two
+// changes no test, correctly, because no reader in this module can observe the
+// cost of a larger page. The CEILING is not a judgement: SessionStore refuses a
+// limit above storage.MaxOrderedPageLimit outright, and both fakes enforce that
+// rule so a value past it fails here rather than in production.
 //
 // Paging until a live row appears would trade that for an unbounded read on a
 // public authenticated route, which is the worse failure: an attacker with any
@@ -134,6 +146,23 @@ const agentProbePageLimit = 32
 // authenticated principal. That is asserted rather than assumed, and it is what
 // makes the ETag safe -- a validator over a per-principal body would be a
 // stable per-principal fingerprint.
+//
+// # What the validator saves, and what it does not
+//
+// It saves the CLIENT a re-download. It saves the DEPLOYMENT nothing: the tag
+// is a digest of the body, so a conditional request pays every directory read
+// and the whole marshal and skips only the write. A 304 here costs what a 200
+// costs. That is the honest bound on the optimisation, and it is why the cost
+// below is a cost of the ROUTE rather than of a cache miss.
+//
+// # What one request costs
+//
+// One serial directory round-trip per configured POOLED template, uncached.
+// Bounded by the configuration rather than by the fleet, and every read carries
+// the request deadline -- but a large Department makes this the most expensive
+// read on the surface, and conditional requests do not relieve it. Coalescing
+// the reads, or holding the aggregate behind a short-lived cache, is a
+// composition decision and belongs to A9.1.
 //
 // # What that costs, stated so it is not discovered later
 //
@@ -205,7 +234,6 @@ func (rt *Router) launchableAgents(ctx context.Context, reads scope) (sessionwir
 		runtime string
 	}
 	live := map[identity][]string{}
-	order := []identity{}
 	for _, template := range rt.department {
 		key := identity{agent: template.Key.AgentID, runtime: template.Key.RuntimeCompatibilityID}
 		if template.Key.Placement == sessionwire.HostPlacementPooled {
@@ -217,13 +245,15 @@ func (rt *Router) launchableAgents(ctx context.Context, reads scope) (sessionwir
 				continue
 			}
 		}
-		if _, seen := live[key]; !seen {
-			order = append(order, key)
-		}
 		live[key] = append(live[key], template.Capabilities...)
 	}
-	agents := make([]sessionwire.AgentCapabilitySummary, 0, len(order))
-	for _, key := range order {
+	// Ranged over the MAP, in map order, which is unspecified and does not
+	// matter: the sort below is by exactly (AgentID, RuntimeCompatibilityID),
+	// which is exactly this key, so no insertion order could survive to the
+	// response. Keeping one would have been a slice and a membership guard
+	// whose only reader was each other.
+	agents := make([]sessionwire.AgentCapabilitySummary, 0, len(live))
+	for key := range live {
 		capabilities := live[key]
 		slices.Sort(capabilities)
 		agents = append(agents, sessionwire.AgentCapabilitySummary{
@@ -296,12 +326,16 @@ func (rt *Router) serveSessionList() http.Handler {
 			writeAPIError(w, authenticationFailure(identity.ErrUnauthenticated))
 			return
 		}
-		limit, ok := sessionPageLimit(w, r)
+		// Parsed ONCE. net/url caches nothing, so calling Query twice per
+		// request re-parses and re-allocates the whole query string for a
+		// value already in hand.
+		query := r.URL.Query()
+		limit, ok := sessionPageLimit(w, query)
 		if !ok {
 			return
 		}
 		page, err := rt.reads.ListSessions(r.Context(),
-			newScope(operation.Principal).sessionPage(sessionwire.Cursor(r.URL.Query().Get("cursor")), limit))
+			newScope(operation.Principal).sessionPage(sessionwire.Cursor(query.Get("cursor")), limit))
 		if err != nil {
 			writeAPIError(w, catalogFailure(err))
 			return
@@ -335,8 +369,8 @@ func (rt *Router) serveSessionList() http.Handler {
 // first. Two limits are refused for the same reason: Get would answer with
 // whichever came first, so a caller sending "?limit=1&limit=500" would be
 // served a page size it did not unambiguously ask for.
-func sessionPageLimit(w http.ResponseWriter, r *http.Request) (int, bool) {
-	values := r.URL.Query()["limit"]
+func sessionPageLimit(w http.ResponseWriter, query url.Values) (int, bool) {
+	values := query["limit"]
 	if len(values) == 0 {
 		return 0, true
 	}

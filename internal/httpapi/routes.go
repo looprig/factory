@@ -234,10 +234,10 @@ func NewRouter(cfg RouterConfig) (*Router, error) {
 		authorizer:  cfg.Authorizer,
 		reads:       cfg.Reads,
 		directory:   cfg.Directory,
-		// The caller's slice is COPIED rather than referenced, so a composer
-		// that reuses its configuration buffer after NewRouter returns cannot
+		// The caller's configuration is COPIED rather than referenced, so a
+		// composer that reuses its buffers after NewRouter returns cannot
 		// change what a running router advertises.
-		department: slices.Clone(cfg.Department),
+		department: cloneDepartment(cfg.Department),
 		guard:      cfg.Guard,
 		ids:        cfg.IDs,
 		ui:         cfg.UI,
@@ -1009,6 +1009,29 @@ func notImplemented() apiError {
 		code:    ErrorCodeNotImplemented,
 		message: "this build serves no handler for that route",
 	}
+}
+
+// cloneDepartment copies a configured Department, INCLUDING each template's
+// Capabilities.
+//
+// slices.Clone alone is shallow, and shallow is not a copy of this value:
+// LaunchTemplate.Capabilities is itself a slice, so a cloned entry shares its
+// backing array with the caller's. A composer reusing its buffer could
+// therefore rewrite a live router's published capability strings -- measured,
+// before this existed, from ["gates"] to ["root-shell"] after NewRouter
+// returned -- and would silently move the ETag with them, which is the one
+// validator on this surface that is meant to be a pure function of deployment
+// state.
+//
+// Every configured slice this package retains is copied here, so "the
+// composition is the router's" holds for the whole value rather than for its
+// outermost level.
+func cloneDepartment(department []LaunchTemplate) []LaunchTemplate {
+	copied := slices.Clone(department)
+	for i := range copied {
+		copied[i].Capabilities = slices.Clone(copied[i].Capabilities)
+	}
+	return copied
 }
 
 // launchTargetPage is the scoped read of one launch target's current capacity

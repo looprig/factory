@@ -413,6 +413,28 @@ workload on demand. The probe is one bounded page per pooled template with an
 explicit limit and no continuation; `agentProbePageLimit` states the exact cost
 of that bound and which task removes the condition that produces it.
 
+**Both page-limit constants are floored, ceilinged and unanchored in between,
+and the ceiling is the half that matters.** `Store.pageLimit` refuses any limit
+above `storage.MaxOrderedPageLimit` (**1000**, inclusive) with a typed error, so
+raising `agentProbePageLimit` or `maxSessionPageLimit` past it would put a live
+`internal_error` on a public authenticated route — for the probe, on *every*
+`/v1/agents` request in a deployment with a pooled template. **Both fakes
+therefore enforce the store's rule** (`refusePageLimit`), which is what gives
+the constants a reader at all; a fake looser than the module on the dimension a
+constant feeds is §5 class 4, and it let `32 → 5000` and `200 → 5000` survive
+116 green tests. The floor is derived too (the probe must exceed one lapsed row,
+and must not be zero). The value **between** floor and ceiling is a judgement
+with no mechanical reader — `32 → 16` and `32 → 2` survive, correctly, because
+nothing in this module can observe the cost of a larger page. Do not invent an
+assertion for it.
+
+**The `ETag` saves the client, not the deployment.** The tag is a digest of the
+body, so a conditional request pays every directory read and the whole marshal
+and skips only the write: a 304 costs what a 200 costs. `/v1/agents` is
+O(pooled templates) serial store round-trips per request, uncached and bounded
+by configuration rather than by the fleet. Coalescing or caching the aggregate
+is a composition decision and belongs to A9.1.
+
 **The validator, and what carries one.** `/v1/agents` carries a strong `ETag`
 over the exact response bytes and honours `If-None-Match`; `/v1/sessions` does
 not, because a validator over a tenant's private page is a stable fingerprint of

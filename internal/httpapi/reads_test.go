@@ -74,6 +74,30 @@ type fakeDirectory struct {
 	block       bool
 }
 
+// storePageCeiling is the largest limit SessionStore accepts on ANY page.
+//
+// It is restated here, not imported, because it is not exported by
+// sessionstore: Store.pageLimit refuses limit < 0 || limit >
+// storage.MaxOrderedPageLimit and returns the request's own error vocabulary,
+// and storage.MaxOrderedPageLimit is 1000, inclusive. Measured against the
+// released sessionstore v0.1.0 and storage v0.6.0.
+//
+// Both fakes enforce it, and that is the whole reason the page-limit constants
+// in reads.go have a reader at all. A fake looser than the dependency it stands
+// in for is what let agentProbePageLimit and maxSessionPageLimit be raised to
+// 5000 with the suite green -- which in production is a typed store refusal on
+// every request, mapped to internal_error, on a public authenticated route.
+// This is the class-4 direction: the fake must be no more permissive than the
+// module, checked in the direction that fails closed.
+const storePageCeiling = 1000
+
+// refusePageLimit is the store's own rule. It is shared by both fakes so the
+// two cannot drift into different ideas of how large a page may be, which is
+// the reason sessionstore itself keeps the rule in one place.
+func refusePageLimit(limit int) bool {
+	return limit < 0 || limit > storePageCeiling
+}
+
 func newFakeDirectory(keys ...sessionstore.HostTargetKey) *fakeDirectory {
 	held := make(map[sessionstore.HostTargetKey]int, len(keys))
 	for _, key := range keys {
@@ -87,9 +111,17 @@ func (d *fakeDirectory) Candidates(ctx context.Context, req sessionstore.ListCom
 	d.requests = append(d.requests, req)
 	_, hasDeadline := ctx.Deadline()
 	d.deadlines = append(d.deadlines, hasDeadline)
-	block, fail, count := d.block, d.fail, d.advertised[req.Key]
+	block, fail, lapsedAhead, count := d.block, d.fail, d.lapsedAhead, d.advertised[req.Key]
 	d.mu.Unlock()
 
+	// The store's limit rule, applied FIRST and before anything else can
+	// answer, exactly as Store.pageLimit does: a page limit out of range is a
+	// typed refusal, not a smaller page.
+	if refusePageLimit(req.Limit) {
+		return sessionstore.HostTargetPage{}, &sessionstore.HostTargetError{
+			Code: sessionstore.HostTargetErrorInvalid, Field: "limit",
+		}
+	}
 	if block {
 		<-ctx.Done()
 		return sessionstore.HostTargetPage{}, ctx.Err()
@@ -98,14 +130,14 @@ func (d *fakeDirectory) Candidates(ctx context.Context, req sessionstore.ListCom
 		return sessionstore.HostTargetPage{}, fail
 	}
 	page := sessionstore.HostTargetPage{}
-	if d.lapsedAhead >= req.Limit {
+	if lapsedAhead >= req.Limit {
 		// Every position this page could hold was consumed by a row the store
 		// declined to publish. The count says so; the caller sees no capacity.
 		page.LapsedSkipped = req.Limit
 		return page, nil
 	}
-	page.LapsedSkipped = d.lapsedAhead
-	count = min(count, req.Limit-d.lapsedAhead)
+	page.LapsedSkipped = lapsedAhead
+	count = min(count, req.Limit-lapsedAhead)
 	for i := range count {
 		page.Hosts = append(page.Hosts, sessionwire.HostLinkCapacityReport{
 			Version:                sessionwire.CurrentWireVersion,
@@ -710,29 +742,61 @@ func TestNewRouterRefusesAMalformedLaunchTemplate(t *testing.T) {
 	}
 }
 
-// TestTheDepartmentIsCopiedAtComposition. The composer's slice is its own; a
-// router that referenced it would advertise whatever that slice later held,
-// which for a composer reusing a configuration buffer is an agent list nobody
-// deployed.
+// TestTheDepartmentIsCopiedAtComposition. The composer's configuration is its
+// own; a router that referenced it would advertise whatever those buffers later
+// held, which for a composer reusing them is an agent list nobody deployed.
+//
+// It drives BOTH levels, and the second is the one the first version could not
+// see. Replacing a whole entry is the obvious aliasing bug and slices.Clone
+// stops it; rewriting a retained entry's Capabilities in place is the same bug
+// one level down, and a shallow clone does NOT stop it -- measured, the
+// published capabilities went from ["gates"] to ["root-shell"] after NewRouter
+// returned. A test that only replaced the entry is a fixed fixture defending a
+// "for all" claim about a value with two levels.
+//
+// The ETag is asserted with the body because it is the consequence that is easy
+// to miss: a validator that is supposed to be a pure function of deployment
+// state moved with the caller's buffer.
 func TestTheDepartmentIsCopiedAtComposition(t *testing.T) {
 	t.Parallel()
 
-	supplied := []LaunchTemplate{dedicatedTemplate}
-	f := newFixture(t, func(cfg *RouterConfig, _ *fixture) { cfg.Department = supplied })
-	before := f.get("/v1/agents")
-	if before.Code != http.StatusOK {
-		t.Fatalf("status = %d, want 200", before.Code)
-	}
-	// The caller reuses its buffer for another deployment's agent.
-	supplied[0] = LaunchTemplate{Key: sessionstore.HostTargetKey{
-		AgentID: "agent-somebody-elses", RuntimeCompatibilityID: "runtime-9",
-		Placement: sessionwire.HostPlacementDedicated}}
-	after := f.get("/v1/agents")
-	if diff := responseDifference(before, after); diff != "" {
-		t.Errorf("mutating the composer's slice changed what the router advertises: %s", diff)
-	}
-	if strings.Contains(after.Body.String(), "agent-somebody-elses") {
-		t.Errorf("the router advertises an agent written into the composer's buffer after composition: %q", after.Body)
+	for name, mutate := range map[string]func([]LaunchTemplate){
+		"replacing a whole entry": func(supplied []LaunchTemplate) {
+			supplied[0] = LaunchTemplate{Key: sessionstore.HostTargetKey{
+				AgentID: "agent-somebody-elses", RuntimeCompatibilityID: "runtime-9",
+				Placement: sessionwire.HostPlacementDedicated}}
+		},
+		"rewriting a retained entry's capabilities in place": func(supplied []LaunchTemplate) {
+			supplied[0].Capabilities[0] = "agent-somebody-elses"
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			supplied := []LaunchTemplate{{
+				Key:          dedicatedTemplate.Key,
+				Capabilities: []string{"gates"},
+			}}
+			f := newFixture(t, func(cfg *RouterConfig, _ *fixture) { cfg.Department = supplied })
+			before := f.get("/v1/agents")
+			if before.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200", before.Code)
+			}
+			if !strings.Contains(before.Body.String(), `"gates"`) {
+				t.Fatalf("the fixture published no capability, so mutating one proves nothing: %q", before.Body)
+			}
+			mutate(supplied)
+			after := f.get("/v1/agents")
+			if diff := responseDifference(before, after); diff != "" {
+				t.Errorf("mutating the composer's configuration changed what the router advertises: %s", diff)
+			}
+			if strings.Contains(after.Body.String(), "agent-somebody-elses") {
+				t.Errorf("the router advertises what was written into the composer's buffer after composition: %q", after.Body)
+			}
+			if got, want := after.Header().Get("ETag"), before.Header().Get("ETag"); got != want {
+				t.Errorf("the validator moved with the composer's buffer: %q, want %q", got, want)
+			}
+		})
 	}
 }
 
@@ -993,7 +1057,7 @@ func TestTheSessionListIsTheTenantsOwnDurablePage(t *testing.T) {
 	if got.NextCursor != "cursor-2" {
 		t.Errorf("next_cursor = %q, want the store's continuation", got.NextCursor)
 	}
-	if len(f.targets.requests) != 0 {
+	if requests, _ := f.targets.snapshot(); len(requests) != 0 {
 		t.Error("the session list consulted the target directory")
 	}
 }

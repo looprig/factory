@@ -88,5 +88,22 @@ type Directory interface {
 	// Candidates returns one bounded page of the Hosts currently offering
 	// capacity for one launch target, most free capacity first. A target
 	// nothing advertises is an empty page rather than an error.
+	//
+	// # The error contract, which is part of the signature
+	//
+	// A failure that came from SessionStore must leave a
+	// *sessionstore.HostTargetError reachable by errors.As. This package reads
+	// the code to decide whether the condition is the deployment's -- a
+	// backend outage is a retryable 503 -- or a fault in Factory's own
+	// request, and anything it cannot classify is answered as an internal
+	// fault by DEFAULT, because advertising an unknown condition as retryable
+	// would tell every client to hammer it.
+	//
+	// The consequence for an implementer is the one that is easy to get wrong:
+	// an adapter that wraps the store's error in a type of its own WITHOUT
+	// keeping the original unwrappable turns every directory outage into
+	// internal_error, silently, and no test in this package would see it --
+	// the fake returns store errors directly. Wrap with %w or return the
+	// store's error.
 	Candidates(ctx context.Context, req sessionstore.ListCompatibleHostsRequest) (sessionstore.HostTargetPage, error)
 }

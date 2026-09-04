@@ -149,6 +149,16 @@ func (f *fakeReader) ListSessions(ctx context.Context, req sessionstore.ListSess
 	page := f.pages[req.TenantID]
 	f.mu.Unlock()
 
+	// The store's limit rule, restated in reads_test.go and applied here for
+	// the reason it is applied in fakeDirectory: a fake looser than the module
+	// it stands in for is what lets a ceiling be raised past what the store
+	// accepts with every test still green. Store.pageLimit refuses this before
+	// it looks at anything else, so this does too.
+	if refusePageLimit(req.Limit) {
+		return sessionstore.SessionPage{}, &sessionstore.CatalogError{
+			Code: sessionstore.CatalogErrorInvalid, Field: "limit",
+		}
+	}
 	if panics != nil {
 		panic(panics)
 	}
@@ -1130,16 +1140,29 @@ func emittedHeaderNames(recorder *httptest.ResponseRecorder) []string {
 // here with a floor requiring a success among them, so a header missing from
 // the responses that actually carry data is now reported.
 //
-// It separates THREE of the five and not all five, and the reason is
-// structural rather than an oversight. Referrer-Policy, X-Frame-Options and
-// Content-Security-Policy are set only by the middleware, so a 200 without
-// them is a middleware defect and this reports it. nosniff and Cache-Control
-// are set by writeJSONBytes as well -- deliberately, because it is the single
-// write path for every JSON body this package produces and a response must not
-// acquire a different header set by being written somewhere else -- so
-// deleting either from the middleware alone is still invisible here.
-// TestSecurityHeadersAreSetByTheMiddlewareItself remains their reader, and a
-// 304 is the one response on this surface that goes through NEITHER writer.
+// It separates ALL FIVE, and the 304 leg is what makes that true, so that leg
+// is load-bearing rather than a thoroughness flourish.
+//
+// Three of the five -- Referrer-Policy, X-Frame-Options and
+// Content-Security-Policy -- are set only by the middleware, so any leg here
+// separates them. The other two do not follow from the 200 and 404 legs at all:
+// nosniff and Cache-Control are set by writeJSONBytes as well, deliberately,
+// because it is the single write path for every JSON body this package produces
+// and a response must not acquire a different header set by being written
+// somewhere else. On a 200 or a 404 the second writer supplies them, so
+// deleting either from the middleware alone changes nothing those legs can see.
+//
+// A 304 is written by NEITHER writeAPIError nor writeJSONBytes -- it is
+// WriteHeader and nothing else -- so on that one response the middleware is the
+// sole source of every header in the table. Measured, each mutation sole and
+// compiling: deleting nosniff from setNeutralSecurityHeaders fails here on the
+// 304, deleting Cache-Control from apiSecurityHeaders fails here, and deleting
+// Referrer-Policy fails here.
+//
+// TestSecurityHeadersAreSetByTheMiddlewareItself is not made redundant by that.
+// It asserts each function's EXACT emitted key set, which catches a header
+// added to production with no entry in the table, and it is the reader for the
+// SPA and non-API paths, which no leg of this sweep reaches.
 func TestSecurityHeadersAreOnEveryAPIResponse(t *testing.T) {
 	t.Parallel()
 
@@ -2389,10 +2412,16 @@ func sanctionedImplementedMethods() map[string]string {
 			"is built by scope.sessionPage from principal.Tenant(), so the tenant is the " +
 			"authenticated one and no identifier from the request reaches the query",
 	}
-	for key, reason := range maps.All(sanctioned) {
+	// The GET keys are collected BEFORE anything is inserted. Ranging over a
+	// map while writing to it is defined in Go -- a new key may or may not be
+	// produced -- and every key written here would be skipped anyway because
+	// it is a HEAD, so this is deterministic either way. It is separated
+	// because a reader should not have to establish that.
+	gets := slices.Sorted(maps.Keys(sanctioned))
+	for _, key := range gets {
 		method, path, _ := strings.Cut(key, " ")
 		if method == http.MethodGet {
-			sanctioned[http.MethodHead+" "+path] = reason
+			sanctioned[http.MethodHead+" "+path] = sanctioned[key]
 		}
 	}
 	return sanctioned
