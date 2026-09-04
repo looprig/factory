@@ -361,16 +361,75 @@ suppresses the body. OPTIONS is refused because answering a preflight is the
 first half of approving the CORS grant `CSRFHeaderName`'s defence depends on
 never existing.
 
-**Clearing a route's `owner` is not a one-word edit.** Every route in
+**Clearing a method's `owner` is not a one-word edit.** Every method in
 `httpapi.routeTable` names the task that fills its body in and answers 501 until
 then, so nothing stopped a later task shipping a handler on whatever
-authorization rule the placeholder inherited. `sanctionedImplementedRoutes` now
-has to name the route and say why its rule is adequate, and `expectedRoutes` is
-an independent restatement of every `(method, route)`'s rule, command kind,
-body, session and streaming columns — written from the operation's shape, not
-from the table. The objects route carries `awaitsObjectAuthorization`, which
-fails the suite the day it serves a body without an object-level decision;
-`AuthorizeObjectRead` has no production caller today.
+authorization rule the placeholder inherited. `sanctionedImplementedMethods` now
+has to name the `METHOD /path` and say why its rule is adequate, and
+`expectedRoutes` is an independent restatement of every `(method, route)`'s
+rule, command kind, body, session, streaming and readiness columns — written
+from the operation's shape, not from the table. The objects route carries
+`awaitsObjectAuthorization`, which fails the suite the day it serves a body
+without an object-level decision; `AuthorizeObjectRead` has no production caller
+today.
+
+**`owner` and `handle` are per METHOD, for the reason `auth` is.** A2.1 moved
+authorization onto `methodRule` because `/v1/sessions` is a list and a create
+and one rule for both had to be the weaker. A2.2 moved readiness for the same
+reason: the list is served and the create is A3.1's, and a route-level column
+could only call that route implemented — leaving the create's 501 unmeasured —
+or pending, failing on the list it does serve. `TestARouteMayBePartlyImplemented`
+is the anti-vacuity check: if no route were mixed, the finer column would buy
+nothing.
+
+## `/v1/agents` is a deployment description, not tenant data
+
+`/v1/agents` (and its migration spelling `/v1/capabilities`) is
+`authAuthenticated` and **deliberately not tenant-scoped**, and that is the same
+decision that lets it carry an `ETag`. Its two inputs have no tenant dimension:
+the configured `Department` is deployment configuration, and SessionStore's Host
+target directory is deliberately *not* partitioned by tenant — a pooled target
+may serve several tenants, so a row carries an isolation class and
+`ListCompatibleHostsRequest` has no `TenantID` member for a scope to fill. The
+response is therefore a pure function of configuration and directory state and
+is **byte-identical for every authenticated principal**, which is asserted
+rather than assumed. The accepted cost is written down rather than left to be
+discovered: a deployment whose tenants may launch different agents cannot
+express that here, and every authenticated principal learns every configured
+`AgentID`.
+
+**Membership is configured; launchability is advertised.** SessionStore files a
+target's rows under an ordering scope derived by **digest** from the
+`(AgentID, RuntimeCompatibilityID, Placement)` triple, so a reader can ask
+"which Hosts serve *this* target" and cannot ask "which targets exist" —
+measured against the released `sessionstore v0.1.0`, whose only listing entry
+points are `ListCompatibleHosts` (needs a whole key) and `ReconcileHostTargets`
+(walks the *due* index, i.e. exactly the lapsed rows). So the deployment
+supplies the keys and the directory supplies the liveness. That is what keeps it
+from being the competing static catalogue the specification forbids: a
+configured **pooled** template no Host advertises is **not listed**, while a
+**dedicated** one is listed unconditionally because placement creates its
+workload on demand. The probe is one bounded page per pooled template with an
+explicit limit and no continuation; `agentProbePageLimit` states the exact cost
+of that bound and which task removes the condition that produces it.
+
+**The validator, and what carries one.** `/v1/agents` carries a strong `ETag`
+over the exact response bytes and honours `If-None-Match`; `/v1/sessions` does
+not, because a validator over a tenant's private page is a stable fingerprint of
+that tenant's state which outlives the body in logs, and it would almost never
+hit anyway since every accepted command moves a session's `LastActiveAt`.
+`Cache-Control: no-store` stays on **both**: the validator is for a client
+holding it in its own application state, which is not an HTTP cache, and
+weakening the header the API's threat model rests on to buy a revalidation would
+be the wrong trade.
+
+**`/v1/sessions` never consults the directory.** A session's place in the list is
+a fact about SessionStore's catalog, so an expiring advertisement cannot change
+it — asserted by comparing the *whole* response across four directory states
+*and* by requiring the directory to have been asked nothing, since three
+identical responses would also be produced by a handler that read it and ignored
+it. Recent-first order is enforced by Core's own `SessionPage.Validate` on the
+way out, because Factory forwards Core's type rather than re-projecting it.
 
 **Do not add an HTTP method override.** The CSRF guard's subject is `r.Method`.
 A route or middleware honouring `X-HTTP-Method-Override` or a `_method` field
@@ -380,13 +439,15 @@ route author will read it.
 
 ## Not implemented yet
 
-Composition seams (A0.2), identity derivation (A1.1) and the route and error
-foundation (A2.1) are done; the read, control, admission, routing, placement and
-realtime handlers are later tasks in runbook 05. Every route in
-`httpapi.routeTable` carries the runbook task that fills its body in, and
-answers 501 until it does;
-`TestTheUnimplementedRoutesAreExactlyTheOnesLaterTasksOwn` holds the two sets
-equal. Nothing composes a `Router` into `factory.New` yet — server composition
+Composition seams (A0.2), identity derivation (A1.1), the route and error
+foundation (A2.1) and the agent and session reads (A2.2) are done; the remaining
+read, control, admission, routing, placement and realtime handlers are later
+tasks in runbook 05. Every method in `httpapi.routeTable` carries the runbook
+task that fills its body in, and answers 501 until it does;
+`TestTheUnimplementedMethodsAreExactlyTheOnesLaterTasksOwn` holds the two sets
+equal. `httpapi.Directory` has no production implementation yet — **A4.1 owns
+it**, and until then `/v1/agents` reports every pooled target as unadvertised
+under any composition that supplies a directory answering empty pages. Nothing composes a `Router` into `factory.New` yet — server composition
 is A9. Nothing wires the `Authenticator` into `factory.New` yet -- there is
 no default authenticator option, because a deployment supplies the `Verifier`
 and there is no credible default for one. `internal/realtime` now exists and holds the ClientLink

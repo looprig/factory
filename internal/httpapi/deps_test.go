@@ -81,3 +81,40 @@ func assertMethodSet(t *testing.T, typ reflect.Type, want []string) {
 		}
 	}
 }
+
+// TestTheDirectoryIsTheCandidatePageAndNothingElse pins the target directory
+// seam to the one read /v1/agents makes.
+//
+// It is narrow on purpose. Factory's public Directory also serves an OWNER
+// lookup, which is per-session ownership and is admission's question; a
+// handler on this surface that could ask it would be resolving ownership
+// inside a durable read, which is exactly the Host fan-out these routes must
+// not do.
+func TestTheDirectoryIsTheCandidatePageAndNothingElse(t *testing.T) {
+	t.Parallel()
+
+	assertMethodSet(t, reflect.TypeOf((*httpapi.Directory)(nil)).Elem(), []string{"Candidates"})
+}
+
+// TestTheDirectoryTakesTheStoresOwnRequest keeps the seam spelled in
+// SessionStore's vocabulary rather than in one of this package's own.
+//
+// The point is not the type: it is that the LIMIT and the CURSOR a handler
+// bounds its read with are the store's members, so a bound written here is the
+// bound the store applies, with no adapter in between to lose it.
+func TestTheDirectoryTakesTheStoresOwnRequest(t *testing.T) {
+	t.Parallel()
+
+	method, ok := reflect.TypeOf((*httpapi.Directory)(nil)).Elem().MethodByName("Candidates")
+	if !ok {
+		t.Fatal("Directory declares no Candidates method")
+	}
+	request := reflect.TypeOf(sessionstore.ListCompatibleHostsRequest{})
+	if got := method.Type.In(1); got != request {
+		t.Errorf("Candidates takes %s, want %s", got, request)
+	}
+	page := reflect.TypeOf(sessionstore.HostTargetPage{})
+	if got := method.Type.Out(0); got != page {
+		t.Errorf("Candidates returns %s, want %s", got, page)
+	}
+}

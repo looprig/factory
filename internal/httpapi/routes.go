@@ -9,6 +9,7 @@ import (
 	"mime"
 	"net/http"
 	"path"
+	"slices"
 	"strings"
 	"time"
 
@@ -106,6 +107,22 @@ type RouterConfig struct {
 	// Reads is the durable read plane.
 	Reads SessionReader
 
+	// Directory is the observed Host target directory, read by /v1/agents to
+	// learn which configured launch targets are currently advertised.
+	Directory Directory
+
+	// Department is the launch targets this deployment is configured to offer.
+	//
+	// It may be EMPTY, and an empty Department is a supported composition
+	// rather than a degenerate one: a Factory serving an existing tenant's
+	// durable session history needs no launchable agent at all. It answers
+	// /v1/agents with an empty list, which is the truthful answer.
+	//
+	// Every entry is validated by NewRouter. See LaunchTemplate for why the
+	// deployment supplies these at all, and Router.serveAgents for why the
+	// aggregate they produce is not tenant-scoped.
+	Department []LaunchTemplate
+
 	// Guard is the origin and CSRF guard, mounted around the mux and inside
 	// authentication; see Guard's own documentation for both reasons.
 	Guard *Guard
@@ -163,6 +180,8 @@ type Router struct {
 	credentials *internalidentity.Authenticator
 	authorizer  Authorizer
 	reads       SessionReader
+	directory   Directory
+	department  []LaunchTemplate
 	guard       *Guard
 	ids         IDSource
 	ui          http.Handler
@@ -189,6 +208,14 @@ func NewRouter(cfg RouterConfig) (*Router, error) {
 	if cfg.Reads == nil {
 		return nil, fmt.Errorf("%w: Reads is required", ErrInvalidRouterConfig)
 	}
+	if cfg.Directory == nil {
+		return nil, fmt.Errorf("%w: Directory is required", ErrInvalidRouterConfig)
+	}
+	for i, template := range cfg.Department {
+		if err := template.Validate(); err != nil {
+			return nil, fmt.Errorf("%w (Department entry %d)", err, i)
+		}
+	}
 	if cfg.Guard == nil {
 		return nil, fmt.Errorf("%w: Guard is required", ErrInvalidRouterConfig)
 	}
@@ -206,10 +233,15 @@ func NewRouter(cfg RouterConfig) (*Router, error) {
 		credentials: cfg.Credentials,
 		authorizer:  cfg.Authorizer,
 		reads:       cfg.Reads,
-		guard:       cfg.Guard,
-		ids:         cfg.IDs,
-		ui:          cfg.UI,
-		limits:      cfg.Limits,
+		directory:   cfg.Directory,
+		// The caller's slice is COPIED rather than referenced, so a composer
+		// that reuses its configuration buffer after NewRouter returns cannot
+		// change what a running router advertises.
+		department: slices.Clone(cfg.Department),
+		guard:      cfg.Guard,
+		ids:        cfg.IDs,
+		ui:         cfg.UI,
+		limits:     cfg.Limits,
 	}
 
 	mux := http.NewServeMux()
@@ -600,6 +632,25 @@ type methodRule struct {
 	// only when auth is authControl.
 	command sessionstore.CommandKind
 	body    bodyRule
+
+	// owner is the runbook task that fills this METHOD in. An empty owner is a
+	// method implemented here; anything else answers 501 today.
+	//
+	// It sits beside auth for the reason auth itself moved off route in A2.1:
+	// one route can serve two operations at two readinesses. /v1/sessions is a
+	// tenant list this task implements and a session create A3.1 owns, and a
+	// single route-level owner could only be one of "implemented" or "pending"
+	// -- either marking the create as served or holding the list back. The
+	// column that says which task owes a body has to be as fine-grained as the
+	// bodies are.
+	//
+	// TestTheUnimplementedMethodsAreExactlyTheOnesLaterTasksOwn holds the two
+	// sets equal, and TestClearingAnOwnerRequiresAnExplicitSanction is what
+	// stops a later task shipping a handler on a rule nobody re-read.
+	owner string
+
+	// handle is this method's own answer. It is nil for a method with an owner.
+	handle func(*Router) http.Handler
 }
 
 // route is one entry of the public surface.
@@ -620,16 +671,6 @@ type route struct {
 	// deadline, because cutting it would truncate a body or close a socket the
 	// deadline was never meant to bound.
 	streams bool
-
-	// owner is the runbook task that fills this route's body in. An empty
-	// owner is a route implemented here; anything else answers 501 today.
-	// TestTheUnimplementedRoutesAreExactlyTheOnesLaterTasksOwn holds the two
-	// sets equal, and TestClearingAnOwnerRequiresAnExplicitSanction is what
-	// stops a later task shipping a handler on a rule nobody re-read.
-	owner string
-
-	// handle is the route's own answer. It is nil for a route with an owner.
-	handle func(*Router) http.Handler
 }
 
 // methods lists the methods this route serves, which is both the match set and
@@ -653,7 +694,7 @@ func (r route) ruleFor(method string) (methodRule, bool) {
 	return methodRule{}, false
 }
 
-// readRules is GET plus HEAD under one authorization rule.
+// readRules is GET plus HEAD under one rule.
 //
 // HEAD is served wherever GET is, and that is a MUST rather than a
 // convenience: RFC 9110 section 9.1 requires a general-purpose server to
@@ -662,11 +703,16 @@ func (r route) ruleFor(method string) (methodRule, bool) {
 // directions. It costs nothing to honour -- guard.go's stateChanging already
 // classifies HEAD as safe, so it is CSRF-exempt exactly as GET is, and net/http
 // suppresses the response body for a HEAD request without the handler knowing.
-func readRules(auth authRule) []methodRule {
-	return []methodRule{
-		{method: http.MethodGet, auth: auth},
-		{method: http.MethodHead, auth: auth},
-	}
+//
+// It takes the whole rule rather than an authorization level so that the two
+// methods cannot acquire different owners, handlers, bodies or command kinds:
+// HEAD is GET's rule EXACTLY, and copying the value is what makes that true by
+// construction instead of by two literals staying in step.
+func readRules(rule methodRule) []methodRule {
+	get, head := rule, rule
+	get.method = http.MethodGet
+	head.method = http.MethodHead
+	return []methodRule{get, head}
 }
 
 // routeTable is the public surface of specification section 8.1.
@@ -677,23 +723,32 @@ func readRules(auth authRule) []methodRule {
 // independent restatement by TestEveryRouteDeclaresWhatItsShapeRequires; the
 // table is not its own authority.
 func routeTable() []route {
-	control := func(command sessionstore.CommandKind) []methodRule {
-		return []methodRule{{method: http.MethodPost, auth: authControl, command: command, body: bodyJSON}}
+	control := func(command sessionstore.CommandKind, owner string) []methodRule {
+		return []methodRule{{method: http.MethodPost, auth: authControl, command: command, body: bodyJSON, owner: owner}}
 	}
+	pending := func(auth authRule, owner string) []methodRule {
+		return readRules(methodRule{auth: auth, owner: owner})
+	}
+	served := func(auth authRule, handle func(*Router) http.Handler) []methodRule {
+		return readRules(methodRule{auth: auth, handle: handle})
+	}
+	agents := served(authAuthenticated, func(rt *Router) http.Handler { return rt.serveAgents() })
 	return []route{
-		{pattern: "/v1/agents", rules: readRules(authAuthenticated), owner: "A2.2"},
-		{pattern: "/v1/capabilities", rules: readRules(authAuthenticated), owner: "A2.2"},
-		{pattern: "/v1/sessions", rules: append(readRules(authSessionList), control(commandCreate)...), owner: "A2.2/A3.1"},
-		{pattern: "/v1/sessions/{sid}/status", rules: readRules(authSessionRead), session: true, owner: "A2.3"},
-		{pattern: "/v1/sessions/{sid}/journal", rules: readRules(authSessionRead), session: true, owner: "A2.3"},
-		{pattern: "/v1/sessions/{sid}/gates", rules: readRules(authSessionRead), session: true, owner: "A2.3"},
-		{pattern: "/v1/sessions/{sid}/objects/{oid}", rules: readRules(authSessionRead), session: true, streams: true, owner: "A2.4"},
-		{pattern: "/v1/sessions/{sid}/input", rules: control(commandInput), session: true, owner: "A3.1"},
-		{pattern: "/v1/sessions/{sid}/interrupt", rules: control(commandInterrupt), session: true, owner: "A3.1"},
-		{pattern: "/v1/sessions/{sid}/restore", rules: control(commandRestore), session: true, owner: "A3.1"},
-		{pattern: "/v1/sessions/{sid}/gates/{gid}", rules: control(commandGateResponse), session: true, owner: "A3.1"},
-		{pattern: "/v1/realtime", rules: readRules(authAuthenticated), streams: true, owner: "A6.1"},
-		{pattern: "/v1/csrf-token", rules: readRules(authAuthenticated), handle: func(rt *Router) http.Handler { return rt.guard.TokenHandler() }},
+		{pattern: "/v1/agents", rules: agents},
+		{pattern: "/v1/capabilities", rules: agents},
+		{pattern: "/v1/sessions", rules: append(
+			served(authSessionList, func(rt *Router) http.Handler { return rt.serveSessionList() }),
+			control(commandCreate, "A3.1")...)},
+		{pattern: "/v1/sessions/{sid}/status", rules: pending(authSessionRead, "A2.3"), session: true},
+		{pattern: "/v1/sessions/{sid}/journal", rules: pending(authSessionRead, "A2.3"), session: true},
+		{pattern: "/v1/sessions/{sid}/gates", rules: pending(authSessionRead, "A2.3"), session: true},
+		{pattern: "/v1/sessions/{sid}/objects/{oid}", rules: pending(authSessionRead, "A2.4"), session: true, streams: true},
+		{pattern: "/v1/sessions/{sid}/input", rules: control(commandInput, "A3.1"), session: true},
+		{pattern: "/v1/sessions/{sid}/interrupt", rules: control(commandInterrupt, "A3.1"), session: true},
+		{pattern: "/v1/sessions/{sid}/restore", rules: control(commandRestore, "A3.1"), session: true},
+		{pattern: "/v1/sessions/{sid}/gates/{gid}", rules: control(commandGateResponse, "A3.1"), session: true},
+		{pattern: "/v1/realtime", rules: pending(authAuthenticated, "A6.1"), streams: true},
+		{pattern: "/v1/csrf-token", rules: served(authAuthenticated, func(rt *Router) http.Handler { return rt.guard.TokenHandler() })},
 	}
 }
 
@@ -706,11 +761,19 @@ func routeTable() []route {
 // session; the session resolution runs last because it is the only step that
 // consults durable state.
 func (rt *Router) serveRoute(entry route) http.Handler {
-	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	// Each method's handler is built ONCE, here, rather than per request: a
+	// handler constructed inside the request path would rebuild whatever the
+	// method's chain holds on every call, and the mux already caches nothing.
+	handlers := make(map[string]http.Handler, len(entry.rules))
+	unimplemented := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		writeAPIError(w, notImplemented())
 	}))
-	if entry.handle != nil {
-		handler = entry.handle(rt)
+	for _, rule := range entry.rules {
+		if rule.handle == nil {
+			handlers[rule.method] = unimplemented
+			continue
+		}
+		handlers[rule.method] = rule.handle(rt)
 	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		rule, served := entry.ruleFor(r.Method)
@@ -759,7 +822,7 @@ func (rt *Router) serveRoute(entry route) http.Handler {
 			return
 		}
 
-		handler.ServeHTTP(w, r)
+		handlers[rule.method].ServeHTTP(w, r)
 	})
 }
 
@@ -945,5 +1008,37 @@ func notImplemented() apiError {
 		status:  http.StatusNotImplemented,
 		code:    ErrorCodeNotImplemented,
 		message: "this build serves no handler for that route",
+	}
+}
+
+// launchTargetPage is the scoped read of one launch target's current capacity
+// page.
+//
+// It is the ONE SessionStore request on this surface that must not carry a
+// tenant, and it lives here for exactly that reason. The scan that keeps every
+// other request inside this type would otherwise report it, and the reviewer
+// who followed the report would have to rediscover why it is different:
+// SessionStore's Host target directory is deliberately not partitioned by
+// tenant -- a pooled target may serve several tenants, so a row carries an
+// isolation class instead -- and ListCompatibleHostsRequest therefore has no
+// TenantID member for a tenant to reach. There is nothing to scope, and the
+// type makes that unrepresentable rather than merely unwritten.
+//
+// The scope is still taken by receiver so the call site is identical to every
+// other durable read's, and so this argument is read from the place a tenant
+// would have gone.
+func (s scope) launchTargetPage(key sessionstore.HostTargetKey) sessionstore.ListCompatibleHostsRequest {
+	return sessionstore.ListCompatibleHostsRequest{
+		Key:   key,
+		Limit: agentProbePageLimit,
+	}
+}
+
+// sessionPage is the scoped read of one tenant's recent-first session page.
+func (s scope) sessionPage(cursor sessionwire.Cursor, limit int) sessionstore.ListSessionsRequest {
+	return sessionstore.ListSessionsRequest{
+		TenantID: s.principal.Tenant(),
+		Cursor:   cursor,
+		Limit:    limit,
 	}
 }

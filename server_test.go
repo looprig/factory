@@ -24,7 +24,7 @@ func publicSeams() map[reflect.Type][]reflect.Type {
 		iface[factory.Authorizer]():          {iface[httpapi.Authorizer](), iface[clientlink.Authorizer](), iface[admission.Authorizer]()},
 		iface[factory.SessionReader]():       {iface[httpapi.SessionReader]()},
 		iface[factory.Commands]():            {iface[admission.Commands]()},
-		iface[factory.Directory]():           {iface[admission.Directory]()},
+		iface[factory.Directory]():           {iface[admission.Directory](), iface[httpapi.Directory]()},
 		iface[factory.PlacementController](): {iface[admission.PlacementController]()},
 		// internal/identity declares a Clock with only Now, because expiry is
 		// the only time it reads. Pairing it here is what keeps the union
@@ -106,6 +106,7 @@ func allSeams() []reflect.Type {
 		iface[httpapi.Authenticator](),
 		iface[httpapi.Authorizer](),
 		iface[httpapi.SessionReader](),
+		iface[httpapi.Directory](),
 		iface[clientlink.Authenticator](),
 		iface[clientlink.Authorizer](),
 		iface[admission.Authorizer](),

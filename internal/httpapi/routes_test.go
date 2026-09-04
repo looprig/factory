@@ -83,6 +83,11 @@ type fakeReader struct {
 	// requests records every catalog request the router built, so a test can
 	// assert the tenant it was scoped by rather than only the answer.
 	requests []sessionstore.GetCatalogEntryRequest
+	// listRequests records every tenant page request, for the same reason.
+	listRequests []sessionstore.ListSessionsRequest
+	// pages is the page this fake answers a tenant list with, per tenant. A
+	// tenant with no entry gets the zero page, which is the empty answer.
+	pages map[sessionwire.TenantID]sessionstore.SessionPage
 	// deadlines records whether each call's context carried one.
 	deadlines []bool
 	// block, when set, holds the call until the context ends and returns the
@@ -101,7 +106,7 @@ func newFakeReader(sessions ...storedSession) *fakeReader {
 	for _, s := range sessions {
 		held[s] = true
 	}
-	return &fakeReader{sessions: held}
+	return &fakeReader{sessions: held, pages: map[sessionwire.TenantID]sessionstore.SessionPage{}}
 }
 
 func (f *fakeReader) GetCatalogEntry(ctx context.Context, req sessionstore.GetCatalogEntryRequest) (sessionstore.CatalogEntry, error) {
@@ -131,8 +136,30 @@ func (f *fakeReader) GetCatalogEntry(ctx context.Context, req sessionstore.GetCa
 	}}, nil
 }
 
-func (f *fakeReader) ListSessions(context.Context, sessionstore.ListSessionsRequest) (sessionstore.SessionPage, error) {
-	return sessionstore.SessionPage{}, errors.New("unused by A2.1")
+// ListSessions answers the tenant's page from the fake's own catalogue.
+//
+// It records every request, so a test can assert the tenant the router scoped
+// by, the cursor it forwarded and the limit it clamped -- and can assert HOW
+// MANY times the store was asked, which is what "the bounded tenant page,
+// once" means at this layer.
+func (f *fakeReader) ListSessions(ctx context.Context, req sessionstore.ListSessionsRequest) (sessionstore.SessionPage, error) {
+	f.mu.Lock()
+	f.listRequests = append(f.listRequests, req)
+	block, fail, panics := f.block, f.fail, f.panics
+	page := f.pages[req.TenantID]
+	f.mu.Unlock()
+
+	if panics != nil {
+		panic(panics)
+	}
+	if block {
+		<-ctx.Done()
+		return sessionstore.SessionPage{}, ctx.Err()
+	}
+	if fail != nil {
+		return sessionstore.SessionPage{}, fail
+	}
+	return page, nil
 }
 
 func (f *fakeReader) ReadPublicJournal(context.Context, sessionstore.ReadPublicJournalRequest) (sessionwire.JournalPage, error) {
@@ -151,6 +178,12 @@ func (f *fakeReader) snapshot() ([]sessionstore.GetCatalogEntryRequest, []bool) 
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return slices.Clone(f.requests), slices.Clone(f.deadlines)
+}
+
+func (f *fakeReader) listSnapshot() []sessionstore.ListSessionsRequest {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return slices.Clone(f.listRequests)
 }
 
 // countingIDs hands out predictable identifiers so a test can tell a minted one
@@ -178,6 +211,7 @@ func (c *countingIDs) NewUUID() (string, error) {
 type fixture struct {
 	router  *Router
 	reads   *fakeReader
+	targets *fakeDirectory
 	ids     *countingIDs
 	guard   *Guard
 	clock   fixedClock
@@ -213,6 +247,13 @@ func withSessions(sessions ...storedSession) fixtureOption {
 		f.reads = newFakeReader(sessions...)
 		cfg.Reads = f.reads
 	}
+}
+
+// withVerifierTenant issues the fixture credential for a different tenant, so a
+// test drives two principals through the SAME router shape rather than
+// assembling a principal itself.
+func withVerifierTenant(tenant sessionwire.TenantID) fixtureOption {
+	return func(_ *RouterConfig, f *fixture) { f.verify.tenant = tenant }
 }
 
 func withVerifierFailure(err error) fixtureOption {
@@ -342,18 +383,20 @@ func newFixture(t *testing.T, options ...fixtureOption) *fixture {
 	}
 
 	f := &fixture{
-		reads:  newFakeReader(storedSession{tenant: fixtureTenant, session: fixtureSession}),
-		ids:    &countingIDs{},
-		guard:  guard,
-		clock:  clock,
-		authn:  authenticator,
-		verify: verifier,
-		limits: DefaultRouteLimits(),
+		reads:   newFakeReader(storedSession{tenant: fixtureTenant, session: fixtureSession}),
+		targets: newFakeDirectory(),
+		ids:     &countingIDs{},
+		guard:   guard,
+		clock:   clock,
+		authn:   authenticator,
+		verify:  verifier,
+		limits:  DefaultRouteLimits(),
 	}
 	cfg := RouterConfig{
 		Credentials: authenticator,
 		Authorizer:  internalidentity.Authorizer{},
 		Reads:       f.reads,
+		Directory:   f.targets,
 		Guard:       guard,
 		IDs:         f.ids,
 		Limits:      f.limits,
@@ -362,6 +405,7 @@ func newFixture(t *testing.T, options ...fixtureOption) *fixture {
 		option(&cfg, f)
 	}
 	cfg.Reads = f.reads
+	cfg.Directory = f.targets
 	router, err := NewRouter(cfg)
 	if err != nil {
 		t.Fatalf("NewRouter: %v", err)
@@ -513,39 +557,79 @@ func TestNoCORSPreflightIsAnswered(t *testing.T) {
 	}
 }
 
-// TestTheUnimplementedRoutesAreExactlyTheOnesLaterTasksOwn gives the 501
-// answers a reader. Every route whose body a later runbook task fills in must
-// say so in the table AND answer 501 today; every route this task implements
+// TestTheUnimplementedMethodsAreExactlyTheOnesLaterTasksOwn gives the 501
+// answers a reader. Every METHOD whose body a later runbook task fills in must
+// say so in the table AND answer 501 today; every method this build implements
 // must have no owner recorded and must not answer 501.
-func TestTheUnimplementedRoutesAreExactlyTheOnesLaterTasksOwn(t *testing.T) {
+//
+// It is per method rather than per route because /v1/sessions is now both: a
+// tenant list this task serves and a create A3.1 owns. A route-level split
+// could only call that route implemented -- letting the create's 501 go
+// unmeasured -- or pending, failing on the list it does serve.
+func TestTheUnimplementedMethodsAreExactlyTheOnesLaterTasksOwn(t *testing.T) {
 	t.Parallel()
 
-	f := newFixture(t)
+	f := newFixture(t, withDepartment(pooledTemplate), withAdvertised(pooledTemplate.Key))
 	implemented := 0
 	pending := 0
 	for _, route := range routeTable() {
-		recorder := f.driveOnce(route)
-		if route.owner == "" {
-			implemented++
-			if recorder.Code == http.StatusNotImplemented {
-				t.Errorf("%s claims no later owner but answers 501", route.pattern)
+		for _, rule := range route.rules {
+			key := rule.method + " " + route.pattern
+			recorder := f.driveRule(route, rule)
+			if rule.owner == "" {
+				implemented++
+				if recorder.Code == http.StatusNotImplemented {
+					t.Errorf("%s claims no later owner but answers 501", key)
+				}
+				if rule.handle == nil {
+					t.Errorf("%s claims no later owner and declares no handler", key)
+				}
+				continue
 			}
-			continue
-		}
-		pending++
-		if recorder.Code != http.StatusNotImplemented {
-			t.Errorf("%s is owned by %s but answered %d, want 501", route.pattern, route.owner, recorder.Code)
-			continue
-		}
-		if code := decodeEnvelope(t, recorder).Error.Code; code != ErrorCodeNotImplemented {
-			t.Errorf("%s: code = %q, want %q", route.pattern, code, ErrorCodeNotImplemented)
+			pending++
+			if rule.handle != nil {
+				t.Errorf("%s is owned by %s and also declares a handler", key, rule.owner)
+			}
+			if recorder.Code != http.StatusNotImplemented {
+				t.Errorf("%s is owned by %s but answered %d, want 501", key, rule.owner, recorder.Code)
+				continue
+			}
+			if code := decodeEnvelope(t, recorder).Error.Code; code != ErrorCodeNotImplemented {
+				t.Errorf("%s: code = %q, want %q", key, code, ErrorCodeNotImplemented)
+			}
 		}
 	}
 	if implemented == 0 {
-		t.Fatal("no route is implemented at this task, so the 501 split is vacuous")
+		t.Fatal("no method is implemented at this task, so the 501 split is vacuous")
 	}
 	if pending == 0 {
-		t.Fatal("no route is pending, so the owner column has no reader")
+		t.Fatal("no method is pending, so the owner column has no reader")
+	}
+}
+
+// TestARouteMayBePartlyImplemented is the anti-vacuity check for the split
+// above: if every route were wholly implemented or wholly pending, moving the
+// owner onto the method would have bought nothing and a route-level column
+// would still be correct.
+func TestARouteMayBePartlyImplemented(t *testing.T) {
+	t.Parallel()
+
+	mixed := 0
+	for _, route := range routeTable() {
+		owned, served := 0, 0
+		for _, rule := range route.rules {
+			if rule.owner == "" {
+				served++
+				continue
+			}
+			owned++
+		}
+		if owned > 0 && served > 0 {
+			mixed++
+		}
+	}
+	if mixed == 0 {
+		t.Fatal("no route serves an implemented method beside a pending one, so a per-route owner would still be sufficient")
 	}
 }
 
@@ -613,6 +697,20 @@ func (f *fixture) driveOnce(entry route) *httptest.ResponseRecorder {
 		return f.serve(request(method, concreteTarget(entry.pattern), strings.NewReader(`{}`)))
 	}
 	return f.serve(request(entry.methods()[0], concreteTarget(entry.pattern), nil))
+}
+
+// driveRule sends one request exercising exactly ONE method of a route.
+//
+// It exists because owner and handle moved onto methodRule: /v1/sessions serves
+// a list this task implements and a create A3.1 owns, so a probe that drove
+// "the route" would answer for whichever method it happened to pick and would
+// report the other's readiness as that one's.
+func (f *fixture) driveRule(entry route, rule methodRule) *httptest.ResponseRecorder {
+	var body io.Reader
+	if rule.body == bodyJSON {
+		body = strings.NewReader(`{}`)
+	}
+	return f.serve(request(rule.method, concreteTarget(entry.pattern), body))
 }
 
 // concreteTarget turns a route pattern into a request path by substituting a
@@ -737,7 +835,12 @@ func TestNoAPIFailureFallsThroughToTheSPA(t *testing.T) {
 		},
 		{
 			name: "not implemented", status: http.StatusNotImplemented, code: ErrorCodeNotImplemented,
-			build: func(*fixture) *http.Request { return request(http.MethodGet, "/v1/agents", nil) },
+			// A route a LATER task owns. It was /v1/agents until A2.2 served
+			// one; a case pinned to a route that becomes implemented does not
+			// fail, it silently stops testing the condition it names.
+			build: func(*fixture) *http.Request {
+				return request(http.MethodGet, "/v1/sessions/"+string(fixtureSession)+"/status", nil)
+			},
 		},
 	}
 	for _, row := range cases {
@@ -1017,10 +1120,30 @@ func emittedHeaderNames(recorder *httptest.ResponseRecorder) []string {
 // TestSecurityHeadersAreOnEveryAPIResponse sweeps the success answer and a
 // failure answer, because a header set only on the error path is a header the
 // responses that carry private data do not have.
+//
+// # What A2.2 added, and what it did and did not buy
+//
+// Until this task every response the router produced was a FAILURE, so the
+// sweep could not tell a header the middleware sets from one writeAPIError
+// sets: deleting nosniff or no-store from the middleware changed nothing any
+// route could observe. A2.2 serves three 200s and a 304, and they are swept
+// here with a floor requiring a success among them, so a header missing from
+// the responses that actually carry data is now reported.
+//
+// It separates THREE of the five and not all five, and the reason is
+// structural rather than an oversight. Referrer-Policy, X-Frame-Options and
+// Content-Security-Policy are set only by the middleware, so a 200 without
+// them is a middleware defect and this reports it. nosniff and Cache-Control
+// are set by writeJSONBytes as well -- deliberately, because it is the single
+// write path for every JSON body this package produces and a response must not
+// acquire a different header set by being written somewhere else -- so
+// deleting either from the middleware alone is still invisible here.
+// TestSecurityHeadersAreSetByTheMiddlewareItself remains their reader, and a
+// 304 is the one response on this surface that goes through NEITHER writer.
 func TestSecurityHeadersAreOnEveryAPIResponse(t *testing.T) {
 	t.Parallel()
 
-	f := newFixture(t)
+	f := newFixture(t, withDepartment(dedicatedTemplate))
 	want := apiResponseHeaders()
 	if len(want) == 0 {
 		t.Fatal("the header table is empty, so this sweep proves nothing")
@@ -1030,16 +1153,42 @@ func TestSecurityHeadersAreOnEveryAPIResponse(t *testing.T) {
 	// returned 404 with Referrer-Policy, X-Frame-Options and
 	// Content-Security-Policy empty -- an unclean path is exactly the request
 	// an attacker chooses, so the gap was on the path that mattered most.
-	for _, target := range []string{
-		"/v1/csrf-token", "/v1/agents", "/v1/nothing-here",
+	targets := []string{
+		"/v1/csrf-token", "/v1/agents", "/v1/capabilities", "/v1/sessions", "/v1/nothing-here",
 		"/v1/../assets/app.js", "/v1//agents", "/v1/agents/", "/assets/app.js",
-	} {
+	}
+	statuses := map[int]bool{}
+	for _, target := range targets {
 		recorder := f.get(target)
+		statuses[recorder.Code] = true
 		for name, value := range want {
 			if got := recorder.Header().Get(name); got != value {
 				t.Errorf("GET %s (%d): %s = %q, want %q", target, recorder.Code, name, got, value)
 			}
 		}
+	}
+	// A 304 is written by neither writeAPIError nor writeJSONBytes, so it is
+	// the response on which the middleware is the ONLY source of every header
+	// in the table.
+	conditional := request(http.MethodGet, "/v1/agents", nil)
+	conditional.Header.Set("If-None-Match", "*")
+	notModified := f.serve(conditional)
+	statuses[notModified.Code] = true
+	for name, value := range want {
+		if got := notModified.Header().Get(name); got != value {
+			t.Errorf("a 304 carries %s = %q, want %q", name, got, value)
+		}
+	}
+	// The floor: a sweep of failures alone is what this test used to be, and
+	// it could not see a header missing from a body that carries data.
+	if !statuses[http.StatusOK] {
+		t.Error("no swept response was a 200, so this sweep still cannot see a header missing from a success")
+	}
+	if !statuses[http.StatusNotModified] {
+		t.Error("no swept response was a 304, so no response here is written by the middleware alone")
+	}
+	if len(statuses) < 3 {
+		t.Errorf("the sweep saw only the statuses %v", slices.Sorted(maps.Keys(statuses)))
 	}
 }
 
@@ -1726,7 +1875,7 @@ func TestTheScopeScanCoversEveryProductionFile(t *testing.T) {
 	t.Parallel()
 
 	files := productionSources(t)
-	for _, name := range []string{"routes.go", "errors.go", "guard.go", "deps.go"} {
+	for _, name := range []string{"routes.go", "reads.go", "errors.go", "guard.go", "deps.go"} {
 		if _, ok := files[name]; !ok {
 			t.Errorf("productionSources omits %s; it enumerated %v", name, slices.Sorted(maps.Keys(files)))
 		}
@@ -1917,6 +2066,7 @@ func TestNewRouterRefusesAnIncompleteComposition(t *testing.T) {
 			Credentials: authenticator,
 			Authorizer:  internalidentity.Authorizer{},
 			Reads:       newFakeReader(),
+			Directory:   newFakeDirectory(),
 			Guard:       guard,
 			IDs:         &countingIDs{},
 		}
@@ -1928,6 +2078,7 @@ func TestNewRouterRefusesAnIncompleteComposition(t *testing.T) {
 		"Credentials": func(c *RouterConfig) { c.Credentials = nil },
 		"Authorizer":  func(c *RouterConfig) { c.Authorizer = nil },
 		"Reads":       func(c *RouterConfig) { c.Reads = nil },
+		"Directory":   func(c *RouterConfig) { c.Directory = nil },
 		"Guard":       func(c *RouterConfig) { c.Guard = nil },
 		"IDs":         func(c *RouterConfig) { c.IDs = nil },
 	} {
@@ -2073,9 +2224,11 @@ func expectedRoutes() map[string]expectation {
 	}
 	routes := map[string]expectation{
 		// Deployment-wide descriptions: no tenant data, so authentication is
-		// the whole decision.
-		"GET /v1/agents":       read(authAuthenticated, false),
-		"GET /v1/capabilities": read(authAuthenticated, false),
+		// the whole decision, and this build serves both. They are the SAME
+		// aggregate under two paths -- /v1/capabilities is the migration
+		// spelling section 8.1 keeps -- so they must not differ in any column.
+		"GET /v1/agents":       expectation{auth: authAuthenticated, implemented: true},
+		"GET /v1/capabilities": expectation{auth: authAuthenticated, implemented: true},
 		// A WebSocket is held open for the life of the connection, so a
 		// handler deadline would close it on a timer.
 		"GET /v1/realtime": expectation{auth: authAuthenticated, streams: true},
@@ -2085,7 +2238,7 @@ func expectedRoutes() map[string]expectation {
 		// a state-changing command and is authorized as one: AuthorizeControl
 		// never reads the SessionID, so a session that does not exist yet is no
 		// reason to fall back to the list rule.
-		"GET /v1/sessions":  read(authSessionList, false),
+		"GET /v1/sessions":  expectation{auth: authSessionList, implemented: true},
 		"POST /v1/sessions": control(commandCreate, false),
 		// Durable reads within one session.
 		"GET /v1/sessions/{sid}/status":  read(authSessionRead, true),
@@ -2139,7 +2292,7 @@ func TestEveryRouteDeclaresWhatItsShapeRequires(t *testing.T) {
 			got := expectation{
 				auth: rule.auth, command: rule.command, body: rule.body,
 				session: entry.session, streams: entry.streams,
-				implemented:               entry.owner == "",
+				implemented:               rule.owner == "",
 				awaitsObjectAuthorization: expected.awaitsObjectAuthorization,
 			}
 			if got != expected {
@@ -2182,62 +2335,106 @@ func TestTheRestatementIsIndependentOfTheTable(t *testing.T) {
 	if _, ok := base["HEAD /v1/agents"]; !ok {
 		t.Error("HEAD is not expected anywhere, so refusing it would be unreported")
 	}
+	// The restatement carries the per-method readiness independently of the
+	// table. Without this, moving owner onto methodRule would have added a
+	// column the restatement could not disagree about.
+	if !base["GET /v1/sessions"].implemented {
+		t.Error("the restatement does not expect the tenant list to be served, so withdrawing its handler is unreported")
+	}
+	if base["POST /v1/sessions"].implemented {
+		t.Error("the restatement expects the session create to be served, which A3.1 owns")
+	}
+	if base["GET /v1/agents"] != base["GET /v1/capabilities"] {
+		t.Error("the restatement lets /v1/capabilities differ from /v1/agents, which are one aggregate under two paths")
+	}
 }
 
-// sanctionedImplementedRoutes names every route this build serves a handler
-// for, with the reason it is safe to serve.
+// sanctionedImplementedMethods names every (method, route) this build serves a
+// handler for, with the reason its authorization rule is adequate.
 //
-// It is the tripwire for the deferred-route seam. Every route in routeTable
+// It is the tripwire for the deferred-route seam. Every method in routeTable
 // carries the task that fills its body in and answers 501 until then, and
 // clearing that owner is a one-word edit in a table -- so nothing stopped a
 // later task shipping a handler on whatever authorization rule the placeholder
-// happened to inherit. Now clearing an owner fails the suite until the route is
-// named HERE, which forces the rule to be re-read by somebody writing down why
-// it is adequate.
-func sanctionedImplementedRoutes() map[string]string {
-	return map[string]string{
-		"/v1/csrf-token": "serves the CALLER their own CSRF token under authAuthenticated; " +
+// happened to inherit. Now clearing an owner fails the suite until the method
+// is named HERE, which forces the rule to be re-read by somebody writing down
+// why it is adequate.
+//
+// It is keyed by METHOD and route together because a route can serve one method
+// this task implements and another a later task owns; a route-level key would
+// have sanctioned the create along with the list.
+func sanctionedImplementedMethods() map[string]string {
+	// HEAD is GET's rule exactly, so its sanction is GET's sanction. Writing
+	// it twice would be two places for one argument to be revised in one.
+	sanctioned := map[string]string{
+		"GET /v1/csrf-token": "serves the CALLER their own CSRF token under authAuthenticated; " +
 			"the token is bound to the requesting principal by Guard.IssueToken, so there is " +
 			"no tenant-scoped resource for a stronger rule to protect",
+		"GET /v1/agents": "serves the DEPLOYMENT's launchable agent set under authAuthenticated. " +
+			"Its two inputs have no tenant dimension: the configured Department is deployment " +
+			"configuration, and SessionStore's Host target directory is deliberately not " +
+			"partitioned by tenant because a pooled target may serve several tenants -- so " +
+			"ListCompatibleHostsRequest has no TenantID member for a scope to fill. Authorizer " +
+			"declares no decision covering it because there is no tenant-scoped resource for one " +
+			"to protect. The response is a pure function of configuration and directory state and " +
+			"is byte-identical for every authenticated principal, which is asserted rather than " +
+			"assumed. The accepted cost, written down rather than discovered: a deployment whose " +
+			"tenants may launch different agents cannot express that here, and every authenticated " +
+			"principal learns every configured AgentID -- topology, not tenant data",
+		"GET /v1/capabilities": "is the migration spelling of /v1/agents and serves the identical " +
+			"aggregate under the identical rule; a weaker rule on either would be two answers to " +
+			"one question",
+		"GET /v1/sessions": "serves the principal's OWN tenant's durable session page under " +
+			"authSessionList, which is the decision AuthorizeSessionList exists to make. The page " +
+			"is built by scope.sessionPage from principal.Tenant(), so the tenant is the " +
+			"authenticated one and no identifier from the request reaches the query",
 	}
+	for key, reason := range maps.All(sanctioned) {
+		method, path, _ := strings.Cut(key, " ")
+		if method == http.MethodGet {
+			sanctioned[http.MethodHead+" "+path] = reason
+		}
+	}
+	return sanctioned
 }
 
 // TestClearingAnOwnerRequiresAnExplicitSanction couples the two.
 func TestClearingAnOwnerRequiresAnExplicitSanction(t *testing.T) {
 	t.Parallel()
 
-	sanctioned := sanctionedImplementedRoutes()
+	sanctioned := sanctionedImplementedMethods()
 	expected := expectedRoutes()
 	implemented := 0
 	for _, entry := range routeTable() {
-		reason, ok := sanctioned[entry.pattern]
-		if entry.owner == "" {
+		for _, rule := range entry.rules {
+			key := rule.method + " " + entry.pattern
+			reason, ok := sanctioned[key]
+			if rule.owner != "" {
+				if ok {
+					t.Errorf("%s is sanctioned as implemented but still names owner %q", key, rule.owner)
+				}
+				continue
+			}
 			implemented++
 			if !ok {
-				t.Errorf("%s serves a handler but is not in sanctionedImplementedRoutes; "+
-					"clearing an owner requires writing down why its authorization rule is adequate", entry.pattern)
+				t.Errorf("%s serves a handler but is not in sanctionedImplementedMethods; "+
+					"clearing an owner requires writing down why its authorization rule is adequate", key)
 				continue
 			}
 			if reason == "" {
-				t.Errorf("%s is sanctioned with an empty reason", entry.pattern)
+				t.Errorf("%s is sanctioned with an empty reason", key)
 			}
-			for _, rule := range entry.rules {
-				if expected[rule.method+" "+entry.pattern].awaitsObjectAuthorization {
-					t.Errorf("%s serves a handler while still authorizing at a rule weaker than its "+
-						"operation; add the object-read decision before clearing its owner", entry.pattern)
-				}
+			if expected[key].awaitsObjectAuthorization {
+				t.Errorf("%s serves a handler while still authorizing at a rule weaker than its "+
+					"operation; add the object-read decision before clearing its owner", key)
 			}
-			continue
-		}
-		if ok {
-			t.Errorf("%s is sanctioned as implemented but still names owner %q", entry.pattern, entry.owner)
 		}
 	}
 	if implemented == 0 {
-		t.Fatal("no route is implemented, so the sanction has no subject")
+		t.Fatal("no method is implemented, so the sanction has no subject")
 	}
 	if len(sanctioned) != implemented {
-		t.Errorf("%d routes are sanctioned and %d are implemented", len(sanctioned), implemented)
+		t.Errorf("%d methods are sanctioned and %d are implemented", len(sanctioned), implemented)
 	}
 }
 

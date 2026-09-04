@@ -70,3 +70,23 @@ type SessionReader interface {
 	ReadGates(ctx context.Context, req sessionstore.ReadGatesRequest) (sessionwire.GatePage, error)
 	GetObject(ctx context.Context, req sessionstore.GetObjectRequest) (io.ReadCloser, error)
 }
+
+// Directory is the observed Host target directory.
+//
+// It is how /v1/agents learns which Department launch targets are CURRENTLY
+// advertised. The method takes and returns SessionStore's own types because
+// that is the durable record's shape and Factory's public Directory seam
+// already spells it that way; an adapter here would be a second vocabulary for
+// one fact.
+//
+// Reading it does not connect to a Host. The advertisements are bounded,
+// expiring SessionStore OrderedIndex rows a Host publishes for itself, so a
+// read of this directory is a durable read like every other one on this
+// surface -- which is what lets /v1/agents obey "reads must not fan out across
+// Hosts" while still describing what the fleet can launch.
+type Directory interface {
+	// Candidates returns one bounded page of the Hosts currently offering
+	// capacity for one launch target, most free capacity first. A target
+	// nothing advertises is an empty page rather than an error.
+	Candidates(ctx context.Context, req sessionstore.ListCompatibleHostsRequest) (sessionstore.HostTargetPage, error)
+}
