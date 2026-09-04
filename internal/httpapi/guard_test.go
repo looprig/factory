@@ -717,25 +717,97 @@ func TestTokensAreStatelessAcrossReplicas(t *testing.T) {
 	}
 }
 
+// tokenPrincipalSpace is the space TestATokenIsBoundToItsPrincipal quantifies
+// over. It is ENUMERATED rather than hand-picked, because "no two principals
+// authenticate the same bytes" is a claim about every pair and a fixed pair
+// defends only the one alternative encoding whoever wrote it had in mind.
+//
+// The exotic members are every two-way splitting of one material string, so the
+// principals in a splitting family are exactly those an encoding that loses a
+// field boundary would merge:
+//
+//   - "abc" splits into ("a","bc") and ("ab","c"), which are identical under
+//     BARE CONCATENATION and distinct under a delimiter.
+//   - "a\x00b\x00c" splits four ways, and every one of them is identical under
+//     bare concatenation AND under a NUL-DELIMITED encoding, because the
+//     material already carries the delimiter.
+//
+// Each splitting is taken at both Kinds, so a pair differing only in Kind is in
+// the space too -- an encoding that omits Kind lets an actor's token be
+// presented as a service identity, which is a privilege class and not a naming
+// detail.
+//
+// The ordinary principals are in the space so it is not exotic material alone.
+func tokenPrincipalSpace(t *testing.T) []identity.Principal {
+	t.Helper()
+
+	type triple struct {
+		tenant  string
+		subject string
+	}
+	splittings := []triple{{tenant: "tenant-a", subject: "subject-a"}, {tenant: "tenant-b", subject: "subject-b"}}
+	for _, material := range []string{"abc", "a\x00b\x00c"} {
+		for cut := 1; cut < len(material); cut++ {
+			splittings = append(splittings, triple{tenant: material[:cut], subject: material[cut:]})
+		}
+	}
+	space := make([]identity.Principal, 0, 2*len(splittings))
+	for _, split := range splittings {
+		for _, kind := range []identity.Kind{identity.KindActor, identity.KindService} {
+			principal, err := identity.NewPrincipal(sessionwire.TenantID(split.tenant), split.subject, kind)
+			if err != nil {
+				t.Fatalf("NewPrincipal(%q, %q, %q): %v", split.tenant, split.subject, kind, err)
+			}
+			space = append(space, principal)
+		}
+	}
+	return space
+}
+
+// principalKey is the identity of a principal as far as this test is concerned:
+// the three fields tokenMAC authenticates. It exists so the enumeration can
+// assert its own members are pairwise distinct -- a space holding a duplicate
+// would make one cross-principal row a same-principal row, and that row would
+// pass for the wrong reason.
+type principalKey struct {
+	tenant  sessionwire.TenantID
+	subject string
+	kind    identity.Kind
+}
+
+func keyOfPrincipal(p identity.Principal) principalKey {
+	return principalKey{tenant: p.Tenant(), subject: p.Subject(), kind: p.Kind()}
+}
+
 // TestATokenIsBoundToItsPrincipal is the property that makes a stateless token
 // safe. Without it, an attacker holding any account of their own mints a token
 // with their own credentials and embeds the literal string in the attacking
 // page, and the victim's browser posts it beside the victim's cookie.
 //
-// The two principals below are chosen so that a delimiter-separated encoding of
-// (tenant, subject) would authenticate identical bytes for both. Under the
-// length-prefixed encoding they differ, and this test is what reads that
-// difference.
+// It is an ALL-PAIRS sweep of tokenPrincipalSpace: every principal's own token
+// is accepted, and every other principal in the space is refused it. That is
+// what reads the length prefix -- an encoding that dropped it, or that replaced
+// it with a delimiter, or that omitted a field, merges some pair in the space
+// and that pair's cross row then reports allowed.
 func TestATokenIsBoundToItsPrincipal(t *testing.T) {
 	t.Parallel()
 
 	f := newFixture(t)
-	first := newPrincipal(t, "a", "b\x00c")
-	second := newPrincipal(t, "a\x00b", "c")
+	space := tokenPrincipalSpace(t)
 
-	firstToken, _, err := f.guard.IssueToken(first)
-	if err != nil {
-		t.Fatalf("IssueToken: %v", err)
+	// Anti-vacuity. A sweep over an empty or accidentally collapsed space
+	// asserts nothing, and it would still report PASS.
+	if len(space) < 12 {
+		t.Fatalf("the principal space holds %d principals, want at least 12", len(space))
+	}
+	seen := make(map[principalKey]bool, len(space))
+	for _, principal := range space {
+		key := keyOfPrincipal(principal)
+		if seen[key] {
+			t.Fatalf("the principal space repeats (%q, %q, %q), so a cross-principal row is really a same-principal row",
+				key.tenant, key.subject, key.kind)
+		}
+		seen[key] = true
 	}
 
 	build := func(principal identity.Principal, token string) *http.Request {
@@ -746,18 +818,28 @@ func TestATokenIsBoundToItsPrincipal(t *testing.T) {
 		return f.authenticated(r, principal)
 	}
 
-	if reason, allowed := f.guard.Check(build(first, firstToken)); !allowed {
-		t.Fatalf("the principal the token was issued to was rejected with %q", reason)
-	}
-	if reason, allowed := f.guard.Check(build(second, firstToken)); allowed || reason != httpapi.ReasonCSRFInvalid {
-		t.Errorf("a token issued to (%q, %q) verified for (%q, %q): Check() = (%q, %v)",
-			first.Tenant(), first.Subject(), second.Tenant(), second.Subject(), reason, allowed)
-	}
-
-	// And the ordinary case, so the row above is not passing on the exotic
-	// subject alone.
-	if reason, allowed := f.guard.Check(build(f.other, f.token(t, f.principal))); allowed || reason != httpapi.ReasonCSRFInvalid {
-		t.Errorf("a token issued to another tenant verified: Check() = (%q, %v)", reason, allowed)
+	for _, issuer := range space {
+		token, _, err := f.guard.IssueToken(issuer)
+		if err != nil {
+			t.Fatalf("IssueToken(%q, %q, %q): %v", issuer.Tenant(), issuer.Subject(), issuer.Kind(), err)
+		}
+		for _, presenter := range space {
+			same := keyOfPrincipal(issuer) == keyOfPrincipal(presenter)
+			reason, allowed := f.guard.Check(build(presenter, token))
+			switch {
+			case same && !allowed:
+				t.Errorf("the principal (%q, %q, %q) was refused its own token with %q",
+					issuer.Tenant(), issuer.Subject(), issuer.Kind(), reason)
+			case !same && allowed:
+				t.Errorf("a token issued to (%q, %q, %q) verified for (%q, %q, %q)",
+					issuer.Tenant(), issuer.Subject(), issuer.Kind(),
+					presenter.Tenant(), presenter.Subject(), presenter.Kind())
+			case !same && reason != httpapi.ReasonCSRFInvalid:
+				t.Errorf("a token issued to (%q, %q, %q) was refused for (%q, %q, %q) with %q, want %q",
+					issuer.Tenant(), issuer.Subject(), issuer.Kind(),
+					presenter.Tenant(), presenter.Subject(), presenter.Kind(), reason, httpapi.ReasonCSRFInvalid)
+			}
+		}
 	}
 }
 
