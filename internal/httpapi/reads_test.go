@@ -17,6 +17,8 @@ import (
 	"time"
 
 	sessionwire "github.com/looprig/core/sessionwire/v1"
+	factoryidentity "github.com/looprig/factory/identity"
+	internalidentity "github.com/looprig/factory/internal/identity"
 	"github.com/looprig/sessionstore"
 )
 
@@ -58,10 +60,18 @@ var (
 type fakeDirectory struct {
 	mu         sync.Mutex
 	advertised map[sessionstore.HostTargetKey]int
-	requests   []sessionstore.ListCompatibleHostsRequest
-	deadlines  []bool
-	fail       error
-	block      bool
+	// lapsedAhead is how many rows outrank the live ones and have already
+	// lapsed. It models the store's own behaviour, which is the reason the
+	// probe's page limit is a number rather than a one: SessionStore drops a
+	// lapsed row from the page it PUBLISHES without unranking it, so such a row
+	// still consumes a position under the caller's Limit. A request whose limit
+	// does not exceed this count therefore comes back empty for a target that
+	// is genuinely advertised.
+	lapsedAhead int
+	requests    []sessionstore.ListCompatibleHostsRequest
+	deadlines   []bool
+	fail        error
+	block       bool
 }
 
 func newFakeDirectory(keys ...sessionstore.HostTargetKey) *fakeDirectory {
@@ -88,6 +98,14 @@ func (d *fakeDirectory) Candidates(ctx context.Context, req sessionstore.ListCom
 		return sessionstore.HostTargetPage{}, fail
 	}
 	page := sessionstore.HostTargetPage{}
+	if d.lapsedAhead >= req.Limit {
+		// Every position this page could hold was consumed by a row the store
+		// declined to publish. The count says so; the caller sees no capacity.
+		page.LapsedSkipped = req.Limit
+		return page, nil
+	}
+	page.LapsedSkipped = d.lapsedAhead
+	count = min(count, req.Limit-d.lapsedAhead)
 	for i := range count {
 		page.Hosts = append(page.Hosts, sessionwire.HostLinkCapacityReport{
 			Version:                sessionwire.CurrentWireVersion,
@@ -127,6 +145,11 @@ func withAdvertised(keys ...sessionstore.HostTargetKey) fixtureOption {
 
 func withDirectoryFailure(err error) fixtureOption {
 	return func(_ *RouterConfig, f *fixture) { f.targets.fail = err }
+}
+
+// withLapsedRowsAhead puts n already-lapsed rows above the live ones.
+func withLapsedRowsAhead(n int) fixtureOption {
+	return func(_ *RouterConfig, f *fixture) { f.targets.lapsedAhead = n }
 }
 
 func withBlockingDirectory() fixtureOption {
@@ -300,6 +323,53 @@ func TestTheAgentListConsultsTheDirectoryOncePerPooledTarget(t *testing.T) {
 		if !hasDeadline {
 			t.Error("a directory read ran with no deadline; /v1/agents does not stream")
 		}
+	}
+}
+
+// TestTheProbeBoundSurvivesTheStalenessItIsSizedFor gives the bound's VALUE a
+// reader, which asserting it against its own constant does not.
+//
+// The number is not arbitrary and its cost is not arbitrary either, so both are
+// driven from the mechanism that produces them. SessionStore drops a lapsed row
+// from the page it publishes WITHOUT unranking it, so such a row still consumes
+// a position under the caller's limit -- which is why a one-row probe would
+// report a genuinely advertised target absent the moment a single stale row
+// outranked it, and why zero would be worse still, since the store reads zero
+// as its own configured page size and the bound would stop being this
+// package's at all.
+//
+// So: a target behind one row fewer than the bound is still found, and one
+// behind the bound itself is not. The second half is the honest statement of
+// the cost, and its remedy is the due reconciler A4.1 step 2 owns rather than a
+// larger number here.
+func TestTheProbeBoundSurvivesTheStalenessItIsSizedFor(t *testing.T) {
+	t.Parallel()
+
+	if agentProbePageLimit < 2 {
+		t.Fatalf("the probe bound is %d; a bound of one reports an advertised target absent "+
+			"the moment a single lapsed row outranks it, and zero hands the bound to the store", agentProbePageLimit)
+	}
+	for name, probe := range map[string]struct {
+		lapsed int
+		listed bool
+	}{
+		"no stale rows":                      {lapsed: 0, listed: true},
+		"one stale row":                      {lapsed: 1, listed: true},
+		"one fewer stale row than the bound": {lapsed: agentProbePageLimit - 1, listed: true},
+		"as many stale rows as the bound":    {lapsed: agentProbePageLimit, listed: false},
+		"more stale rows than the bound":     {lapsed: agentProbePageLimit + 5, listed: false},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			f := newFixture(t, withDepartment(pooledTemplate),
+				withAdvertised(pooledTemplate.Key), withLapsedRowsAhead(probe.lapsed))
+			summary := decodeDepartment(t, f.get("/v1/agents"))
+			if got := len(summary.Agents) == 1; got != probe.listed {
+				t.Errorf("with %d lapsed rows ahead the aggregate is %v, want listed=%t",
+					probe.lapsed, agentIdentities(summary), probe.listed)
+			}
+		})
 	}
 }
 
@@ -624,6 +694,79 @@ func TestNewRouterRefusesAMalformedLaunchTemplate(t *testing.T) {
 	if err := dedicatedTemplate.Validate(); err != nil {
 		t.Errorf("a valid dedicated template was refused: %v", err)
 	}
+	// And NewRouter must be the caller. Validate returning an error is worth
+	// nothing if nothing calls it: measured, deleting the loop in NewRouter
+	// left this whole test green.
+	broken := LaunchTemplate{Key: sessionstore.HostTargetKey{
+		RuntimeCompatibilityID: "runtime-1", Placement: sessionwire.HostPlacementPooled}}
+	if err := newRouterWithDepartment(t, valid, broken); !errors.Is(err, ErrInvalidRouterConfig) {
+		t.Errorf("NewRouter accepted a malformed Department entry: %v", err)
+	}
+	if !strings.Contains(fmt.Sprint(newRouterWithDepartment(t, valid, broken)), "entry 1") {
+		t.Errorf("the refusal does not say which entry is wrong: %v", newRouterWithDepartment(t, valid, broken))
+	}
+	if err := newRouterWithDepartment(t, valid, dedicatedTemplate); err != nil {
+		t.Errorf("NewRouter refused a valid Department: %v", err)
+	}
+}
+
+// TestTheDepartmentIsCopiedAtComposition. The composer's slice is its own; a
+// router that referenced it would advertise whatever that slice later held,
+// which for a composer reusing a configuration buffer is an agent list nobody
+// deployed.
+func TestTheDepartmentIsCopiedAtComposition(t *testing.T) {
+	t.Parallel()
+
+	supplied := []LaunchTemplate{dedicatedTemplate}
+	f := newFixture(t, func(cfg *RouterConfig, _ *fixture) { cfg.Department = supplied })
+	before := f.get("/v1/agents")
+	if before.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", before.Code)
+	}
+	// The caller reuses its buffer for another deployment's agent.
+	supplied[0] = LaunchTemplate{Key: sessionstore.HostTargetKey{
+		AgentID: "agent-somebody-elses", RuntimeCompatibilityID: "runtime-9",
+		Placement: sessionwire.HostPlacementDedicated}}
+	after := f.get("/v1/agents")
+	if diff := responseDifference(before, after); diff != "" {
+		t.Errorf("mutating the composer's slice changed what the router advertises: %s", diff)
+	}
+	if strings.Contains(after.Body.String(), "agent-somebody-elses") {
+		t.Errorf("the router advertises an agent written into the composer's buffer after composition: %q", after.Body)
+	}
+}
+
+// newRouterWithDepartment builds a router differing from the fixture's only in
+// its Department, and reports NewRouter's own error.
+func newRouterWithDepartment(t *testing.T, department ...LaunchTemplate) error {
+	t.Helper()
+
+	authenticator, err := internalidentity.NewAuthenticator(internalidentity.Config{Verifier: &fixtureVerifier{}})
+	if err != nil {
+		t.Fatalf("NewAuthenticator: %v", err)
+	}
+	guard, err := NewGuard(GuardConfig{
+		CSRF: factoryidentity.CSRFConfig{
+			SharedKey:      []byte("0123456789abcdef0123456789abcdef"),
+			TokenTTL:       time.Hour,
+			TrustedOrigins: []string{fixtureOrigin},
+		},
+		Credentials: authenticator,
+		Clock:       fixedClock{},
+	})
+	if err != nil {
+		t.Fatalf("NewGuard: %v", err)
+	}
+	_, err = NewRouter(RouterConfig{
+		Credentials: authenticator,
+		Authorizer:  internalidentity.Authorizer{},
+		Reads:       newFakeReader(),
+		Directory:   newFakeDirectory(),
+		Department:  department,
+		Guard:       guard,
+		IDs:         &countingIDs{},
+	})
+	return err
 }
 
 // ---------------------------------------------------------------------------
