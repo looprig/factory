@@ -115,6 +115,10 @@ func (rt *Router) serveObject(metadataOnly bool) http.Handler {
 		}
 		reader := ObjectReader(rt.reads)
 		var unbound sessionstore.SessionBinding
+		// Zero-value comparison is sufficient only because the Summary guard
+		// above ran sessionstore@v0.4.0's canonicalCatalogRecord, which validates
+		// any non-zero binding: a partial binding cannot reach here as a valid
+		// record. If SessionStore ever relaxes that, this test is not enough.
 		if entry.Record.Binding != unbound {
 			if rt.resolveObjectStore == nil {
 				writeAPIError(w, objectUnavailable())
@@ -275,8 +279,12 @@ func verifiedObjectPage(ctx context.Context, stream io.ReadCloser, m sessionwire
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		// One extra byte distinguishes genuine EOF from a prefix ending exactly
-		// at the ceiling. Actual provider reads are bounded by ceiling plus one.
+		// Provider reads are bounded by ceiling plus one byte. That extra byte
+		// and the ceiling arm below are redundant with the size pre-check the
+		// caller already ran: m.SizeBytes > ceiling is refused before any body
+		// I/O, so offset can never approach ceiling. They remain as bounds on a
+		// resolved reader that overruns its own metadata, not as a live
+		// EOF-versus-ceiling distinction.
 		remaining := ceiling - offset + 1
 		window := buf
 		if remaining < uint64(len(window)) {

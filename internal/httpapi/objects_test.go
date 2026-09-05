@@ -214,19 +214,28 @@ func (s objectCatalogOverride) GetCatalogEntry(ctx context.Context, r sessionsto
 	e.Record.Binding = s.binding
 	return e, err
 }
+
+// The statuses are asserted exactly, not as a 500-or-503 disjunction: a partial
+// binding is refused by the Summary canonicalization guard (500) before it can
+// reach a production resolver, while a canonically valid binding with no
+// configured resolver is refused by the fail-closed resolver check (503). A
+// disjunction would let the canonicalization guard be removed silently.
 func TestObjectPartialAndUnknownBindingsNeverFallBack(t *testing.T) {
 	f, m, _ := newObjectFixture(t, "secret")
 	original := f.router.reads
-	for _, b := range []sessionstore.SessionBinding{
-		{ProtocolMode: sessionstore.ProtocolModeDisposition},
-		{ProtocolMode: sessionstore.ProtocolModeLegacy},
-		{StorageBindingID: "only-id"},
-		{StorageBindingID: "id", BindingVersion: "v1", RuntimeSessionID: "runtime", ProtocolMode: "unknown"},
-		{StorageBindingID: "id", BindingVersion: "v1", RuntimeSessionID: "runtime", ProtocolMode: sessionstore.ProtocolModeLegacy},
+	for _, tc := range []struct {
+		binding sessionstore.SessionBinding
+		status  int
+	}{
+		{sessionstore.SessionBinding{ProtocolMode: sessionstore.ProtocolModeDisposition}, 500},
+		{sessionstore.SessionBinding{ProtocolMode: sessionstore.ProtocolModeLegacy}, 500},
+		{sessionstore.SessionBinding{StorageBindingID: "only-id"}, 500},
+		{sessionstore.SessionBinding{StorageBindingID: "id", BindingVersion: "v1", RuntimeSessionID: "runtime", ProtocolMode: "unknown"}, 500},
+		{sessionstore.SessionBinding{StorageBindingID: "id", BindingVersion: "v1", RuntimeSessionID: "runtime", ProtocolMode: sessionstore.ProtocolModeLegacy}, 503},
 	} {
-		f.router.reads = objectCatalogOverride{original, b}
-		if got := f.get(objectTarget(m)); got.Code != 500 && got.Code != 503 {
-			t.Fatalf("binding %+v fell back: %d", b, got.Code)
+		f.router.reads = objectCatalogOverride{original, tc.binding}
+		if got := f.get(objectTarget(m)); got.Code != tc.status {
+			t.Fatalf("binding %+v: %d, want %d", tc.binding, got.Code, tc.status)
 		}
 	}
 }
@@ -375,6 +384,164 @@ func TestObjectPolicyIsNotMetadataExistenceOrCallerKind(t *testing.T) {
 	}
 	if observer.bodyCalls != 0 {
 		t.Fatal("wrong kind opened body")
+	}
+}
+
+// fakeObjectStream is a resolved reader that is NOT a sessionstore.Store: the
+// ObjectReader contract only *requests* whole-object integrity reporting at EOF,
+// so an A9-supplied adapter may simply not verify. Every other corruption test
+// injects beneath a real store, which verifies for itself; these drive Factory's
+// own digest and size checks directly.
+type fakeObjectStream struct {
+	io.Reader
+	closed bool
+}
+
+func (s *fakeObjectStream) Close() error { s.closed = true; return nil }
+
+func TestObjectVerificationRejectsANonVerifyingResolvedReader(t *testing.T) {
+	for _, tc := range []struct{ name, stream, leak string }{
+		{"wrong-bytes", "XXXXXXXXXX", "XX"},
+		{"short", "01234", "01"},
+		{"long", "0123456789extra", "01"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, span := range []string{"", "bytes=0-1"} {
+				f, m, _ := newObjectFixture(t, "0123456789")
+				stream := &fakeObjectStream{Reader: strings.NewReader(tc.stream)}
+				f.router.reads = &objectReadObserver{SessionReader: f.router.reads, body: func(context.Context, sessionstore.GetObjectRequest) (io.ReadCloser, error) { return stream, nil }}
+				req := request("GET", objectTarget(m), nil)
+				if span != "" {
+					req.Header.Set("Range", span)
+				}
+				got := f.serve(req)
+				if got.Code != 500 {
+					t.Fatalf("%q: unverified stream served %d: %s", span, got.Code, got.Body)
+				}
+				if got.Header().Get("X-Object-Digest") != "" || got.Header().Get("X-Object-Size") != "" || got.Header().Get("Content-Range") != "" {
+					t.Fatalf("%q: integrity headers on a rejected page: %v", span, got.Header())
+				}
+				if strings.Contains(got.Body.String(), tc.leak) {
+					t.Fatalf("%q: unverified bytes emitted: %s", span, got.Body)
+				}
+				if !stream.closed {
+					t.Fatalf("%q: rejected stream not closed", span)
+				}
+			}
+		})
+	}
+}
+
+// A resolved reader that answers with a different object's metadata, or with
+// metadata the wire contract rejects, must not become a served response: the
+// reference the caller was authorized for is the only one that may be answered.
+func TestObjectResolvedMetadataMustValidateAndMatchTheAuthorizedReference(t *testing.T) {
+	f, m, store := newObjectFixture(t, "0123456789")
+	other, err := store.PutObject(context.Background(), sessionstore.PutObjectRequest{TenantID: fixtureTenant, SessionID: fixtureSession, Kind: sessionstore.ObjectKindToolResult, SizeBytes: uint64(len("other-object-body")), SHA256: sha256.Sum256([]byte("other-object-body")), Body: strings.NewReader("other-object-body"), MediaType: "text/plain"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if other.Reference == m.Reference {
+		t.Fatal("fixture objects share a reference")
+	}
+	observer := &objectReadObserver{SessionReader: f.router.reads}
+	f.router.reads = observer
+	for _, tc := range []struct {
+		name string
+		meta sessionwire.ObjectMetadata
+	}{
+		{"other-object", other},
+		{"invalid", sessionwire.ObjectMetadata{}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			observer.metadata = func(context.Context, sessionstore.GetObjectMetadataRequest) (sessionwire.ObjectMetadata, error) {
+				return tc.meta, nil
+			}
+			observer.bodyCalls = 0
+			for _, suffix := range []string{"", "/metadata"} {
+				got := f.get(objectTarget(m) + suffix)
+				if got.Code != 500 {
+					t.Fatalf("%s: mismatched metadata served %d: %s", suffix, got.Code, got.Body)
+				}
+				if strings.Contains(got.Body.String(), string(tc.meta.Reference.ObjectID)) && tc.meta.Reference.ObjectID != "" {
+					t.Fatalf("%s: another object's reference leaked: %s", suffix, got.Body)
+				}
+				if strings.Contains(got.Body.String(), "other-object-body") {
+					t.Fatalf("%s: another object's bytes leaked: %s", suffix, got.Body)
+				}
+			}
+			if observer.bodyCalls != 0 {
+				t.Fatalf("%s: mismatched metadata opened the body", tc.name)
+			}
+		})
+	}
+}
+
+// A resolved reader that never makes progress must be abandoned, not spun on.
+type stalledObjectStream struct {
+	reads  int
+	closed bool
+}
+
+func (s *stalledObjectStream) Read([]byte) (int, error) { s.reads++; return 0, nil }
+func (s *stalledObjectStream) Close() error             { s.closed = true; return nil }
+
+func TestObjectStalledResolvedReaderIsAbandonedNotSpunOn(t *testing.T) {
+	f, m, _ := newObjectFixture(t, "0123456789")
+	stream := &stalledObjectStream{}
+	f.router.reads = &objectReadObserver{SessionReader: f.router.reads, body: func(context.Context, sessionstore.GetObjectRequest) (io.ReadCloser, error) { return stream, nil }}
+	got := f.get(objectTarget(m))
+	if got.Code != 500 || got.Header().Get("X-Object-Digest") != "" {
+		t.Fatalf("stalled stream: %d %v %s", got.Code, got.Header(), got.Body)
+	}
+	if stream.reads != 101 || !stream.closed {
+		t.Fatalf("no-progress bound: %d reads, closed %v", stream.reads, stream.closed)
+	}
+}
+
+// A resolved reader is not obliged to report cancellation as a context error.
+// The deferred override is what makes a cancelled read answer 499/504 rather
+// than the provider's own post-Close error, which must also stay redacted.
+type nonContextErrorStream struct {
+	entered, closed chan struct{}
+	once            sync.Once
+}
+
+func (s *nonContextErrorStream) Read([]byte) (int, error) {
+	s.once.Do(func() { close(s.entered) })
+	<-s.closed
+	return 0, errors.New("s3://private/stream?token=password")
+}
+func (s *nonContextErrorStream) Close() error {
+	select {
+	case <-s.closed:
+	default:
+		close(s.closed)
+	}
+	return nil
+}
+
+func TestObjectCancellationOverridesAResolvedReadersOwnError(t *testing.T) {
+	f, m, _ := newObjectFixture(t, "0123456789")
+	stream := &nonContextErrorStream{entered: make(chan struct{}), closed: make(chan struct{})}
+	f.router.reads = &objectReadObserver{SessionReader: f.router.reads, body: func(context.Context, sessionstore.GetObjectRequest) (io.ReadCloser, error) { return stream, nil }}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan *httptest.ResponseRecorder, 1)
+	go func() { done <- f.serve(request("GET", objectTarget(m), nil).WithContext(ctx)) }()
+	select {
+	case <-stream.entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("read never entered")
+	}
+	cancel()
+	select {
+	case got := <-done:
+		if got.Code != 499 || got.Header().Get("X-Object-Digest") != "" || strings.Contains(got.Body.String(), "s3:") || strings.Contains(got.Body.String(), "password") {
+			t.Fatalf("cancelled read: %d %v %s", got.Code, got.Header(), got.Body)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("cancelled read never returned")
 	}
 }
 
