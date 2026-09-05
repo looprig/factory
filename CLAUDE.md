@@ -540,11 +540,14 @@ bypassing the reader entirely, so `?cursor=` was forwarded as **no** cursor and
 the journal's, on the sibling route, milder only because `limit` bounds each
 page into a non-terminating poll rather than a full-history walk.
 `TestEveryQueryParameterIsReadThroughTheGuard` parses the production files and
-reports by name any read of a `url.Values` — `Get` or index — that does not go
-through `singleValue`; the subject is the **value's type**, so a header `Get` is
-not this rule's business and a route added later is covered whatever it is
-called. `TestEveryParameterOnEveryRouteRefusesAnEmptyValue` then drives the
-derived **(route, parameter)** pairs — five, not three — and asserts the guard's
+reports `Get` and index bypasses for its recognized syntactic sources:
+`url.Values` parameters and `Query()` results, assigned or used inline, with
+parentheses ignored. A header `Get` is not one of those sources. This is not
+type or data-flow analysis: arbitrary aliases and helpers returning `url.Values`
+are outside its reach. `TestQueryReadScanRecognizesInlineReceivers` exercises
+both inline read forms, dynamic names and guarded sibling reads, with header
+and guarded-read controls. `TestEveryParameterOnEveryRouteRefusesAnEmptyValue`
+then drives the derived **(route, parameter)** pairs — five, not three — and asserts the guard's
 own *message*. That last part is not decoration: for `limit` and `from_seq` an
 empty value fails downstream anyway in `Atoi`/`ParseUint` with the same 400 and
 the same `invalid_request`, so a status-and-code probe cannot see the guard for

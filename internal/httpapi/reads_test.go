@@ -1585,12 +1585,10 @@ func TestTheAuthenticatedFallbackIsNotReachableThroughTheChain(t *testing.T) {
 //
 // The subject is derived from the parsed production files rather than listed,
 // because a list of parameters is exactly the guard that cannot fail for the
-// parameter added after it was written. A read is found by MECHANISM: an
-// identifier bound to a url.Values -- a parameter of that type, or the result
-// of a Query() call -- consulted by Get or by index. So a header Get, which is
-// not a url.Values, is not this rule's business, and a route added later that
-// reads its parameter any of those ways is reported by name whatever it is
-// called.
+// parameter added after it was written. The syntactic sources recognized are
+// url.Values parameters and Query() results, assigned or inline, consulted by
+// Get or by index. Header reads are not among those sources. A new route using
+// these forms is reported whatever its name; scanFile documents the limits.
 func TestEveryQueryParameterIsReadThroughTheGuard(t *testing.T) {
 	t.Parallel()
 
@@ -1787,6 +1785,59 @@ func TestTheQueryReadScanSeesAParameterNoListWouldHave(t *testing.T) {
 	}
 }
 
+// The receiver may be used directly rather than assigned to a local. A
+// guarded sibling read must not hide a bypass in that same handler.
+func TestQueryReadScanRecognizesInlineReceivers(t *testing.T) {
+	t.Parallel()
+	for name, probe := range map[string]struct {
+		statement string
+		bypass    bool
+		dynamic   bool
+	}{
+		"inline Get":             {statement: `_ = r.URL.Query().Get("extra")`, bypass: true},
+		"inline index":           {statement: `_ = r.URL.Query()["extra"]`, bypass: true},
+		"parenthesized Get":      {statement: `_ = ((r.URL.Query())).Get("extra")`, bypass: true},
+		"parenthesized index":    {statement: `_ = ((r.URL.Query()))["extra"]`, bypass: true},
+		"parenthesized callee":   {statement: `_ = (r.URL.Query)().Get("extra")`, bypass: true},
+		"wrapped local":          {statement: `q := (r.URL.Query)(); _ = (q).Get("extra")`, bypass: true},
+		"inline dynamic Get":     {statement: `_ = r.URL.Query().Get(parameter)`, dynamic: true},
+		"inline dynamic index":   {statement: `_ = r.URL.Query()[parameter]`, dynamic: true},
+		"header Get control":     {statement: `_ = (r.Header).Get("extra")`},
+		"header index control":   {statement: `_ = r.Header["extra"]`},
+		"guarded inline control": {statement: `_, _ = singleValue(w, r.URL.Query(), "extra")`},
+	} {
+		t.Run(name, func(t *testing.T) {
+			source := `package httpapi
+func (rt *Router) serveProbe() http.Handler {
+ return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+  _, _ = singleValue(w, r.URL.Query(), "sibling")
+  ` + probe.statement + `
+ })
+}`
+			report := newQueryReadReport()
+			if err := report.scanFile("inline.go", []byte(source)); err != nil {
+				t.Fatal(err)
+			}
+			var want []string
+			if probe.bypass {
+				want = []string{"extra"}
+			}
+			if got := report.bypassed["serveProbe"]; !slices.Equal(got, want) {
+				t.Errorf("bypasses = %v, want %v", got, want)
+			}
+			if got := report.dynamic["serveProbe"]; got != probe.dynamic {
+				t.Errorf("dynamic = %v, want %v", got, probe.dynamic)
+			}
+			if !slices.Contains(report.guarded["serveProbe"], "sibling") {
+				t.Fatal("guarded sibling was not scanned")
+			}
+			if probe.bypass && !slices.Contains(report.parametersOf("serveProbe"), "extra") {
+				t.Error("inline bypass missing from route parameter inventory")
+			}
+		})
+	}
+}
+
 // queryReadReport is what the production files say about how query parameters
 // are read.
 type queryReadReport struct {
@@ -1863,10 +1914,10 @@ func (r *queryReadReport) parametersOf(function string) []string {
 
 // scanFile records one file's query reads.
 //
-// The subject is a url.Values VALUE, found two ways: a parameter declared as
-// one, and an identifier assigned the result of a Query() call. Everything read
-// off one of those, by Get or by index, is a query parameter read; a Get on
-// anything else -- a header, say -- is not.
+// The syntactic sources are url.Values parameters and Query() results, either
+// assigned or used inline. Get and index reads share that receiver check.
+// This is not Go type or data-flow analysis: arbitrary aliases and helpers
+// returning url.Values are outside its reach.
 func (r *queryReadReport) scanFile(name string, source []byte) error {
 	file, err := parser.ParseFile(token.NewFileSet(), name, source, 0)
 	if err != nil {
@@ -1885,7 +1936,7 @@ func (r *queryReadReport) scanFile(name string, source []byte) error {
 		ast.Inspect(function.Body, func(node ast.Node) bool {
 			switch expression := node.(type) {
 			case *ast.CallExpr:
-				switch fun := expression.Fun.(type) {
+				switch fun := ast.Unparen(expression.Fun).(type) {
 				case *ast.Ident:
 					if fun.Name == "singleValue" {
 						r.record(owner, expression.Args, 2, true)
@@ -1896,12 +1947,12 @@ func (r *queryReadReport) scanFile(name string, source []byte) error {
 					if fun.Sel.Name != "Get" {
 						return true
 					}
-					if receiver, ok := fun.X.(*ast.Ident); ok && values[receiver.Name] {
+					if isQueryValue(fun.X, values) {
 						r.record(owner, expression.Args, 0, false)
 					}
 				}
 			case *ast.IndexExpr:
-				if receiver, ok := expression.X.(*ast.Ident); ok && values[receiver.Name] {
+				if isQueryValue(expression.X, values) {
 					r.record(owner, []ast.Expr{expression.Index}, 0, false)
 				}
 			}
@@ -1909,6 +1960,20 @@ func (r *queryReadReport) scanFile(name string, source []byte) error {
 		})
 	}
 	return nil
+}
+
+// isQueryValue recognizes the same receiver forms for Get, indexing and local
+// assignments. Parentheses do not change the receiver's identity.
+func isQueryValue(expression ast.Expr, values map[string]bool) bool {
+	switch expression := ast.Unparen(expression).(type) {
+	case *ast.Ident:
+		return values[expression.Name]
+	case *ast.CallExpr:
+		selector, ok := ast.Unparen(expression.Fun).(*ast.SelectorExpr)
+		return ok && selector.Sel.Name == "Query" && len(expression.Args) == 0
+	default:
+		return false
+	}
 }
 
 // record files one read under the function that made it.
@@ -1951,12 +2016,7 @@ func queryValueIdents(function *ast.FuncDecl) map[string]bool {
 			return true
 		}
 		for i, right := range assignment.Rhs {
-			call, ok := right.(*ast.CallExpr)
-			if !ok {
-				continue
-			}
-			selector, ok := call.Fun.(*ast.SelectorExpr)
-			if !ok || selector.Sel.Name != "Query" || i >= len(assignment.Lhs) {
+			if !isQueryValue(right, nil) || i >= len(assignment.Lhs) {
 				continue
 			}
 			if ident, ok := assignment.Lhs[i].(*ast.Ident); ok {

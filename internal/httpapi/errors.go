@@ -335,8 +335,8 @@ func catalogFailure(err error) apiError {
 }
 
 // storeUnavailable maps a SessionStore that is not accepting work onto the
-// retryable answer, and it is consulted by EVERY durable mapping on this
-// surface.
+// retryable answer. catalogFailure and directoryFailure consult it directly;
+// journalFailure reaches it through its delegation to catalogFailure.
 //
 // admitForeground refuses every public read with *StoreClosedError once Close
 // has started, and that error is a bare struct: it wraps nothing, carries no
