@@ -1087,19 +1087,20 @@ func (s scope) sessionPage(cursor sessionwire.Cursor, limit int) sessionstore.Li
 
 // journalPage is the scoped read of one bounded public journal page.
 //
-// Cursor and fromSeq are both taken, and the store refuses them together; the
-// handler refuses that combination before the read, so what arrives here is one
-// or the other. See serveSessionJournal.
+// Cursor, fromSeq and tail describe mutually exclusive positions. The handler
+// validates caller positions before selecting Tail for an initial view.
 func (s scope) journalPage(
 	session sessionwire.SessionID,
 	cursor sessionwire.Cursor,
 	fromSeq uint64,
 	limit int,
+	tail bool,
 ) sessionstore.ReadPublicJournalRequest {
 	return sessionstore.ReadPublicJournalRequest{
 		TenantID:  s.principal.Tenant(),
 		SessionID: session,
 		FromSeq:   fromSeq,
+		Tail:      tail,
 		Cursor:    cursor,
 		Limit:     limit,
 	}

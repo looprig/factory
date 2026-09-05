@@ -473,17 +473,23 @@ most n records, so the page limit can never cut it short by itself, and a tail
 that is mostly private records comes back short rather than walking further back
 to fill itself.
 
-**The tail costs two bounded reads, and the second one cannot be avoided.** A
-tail has to be anchored on a tip, and the only trustworthy tip is the one the
-store captures for the walk that reports it. `journalTipProbeSeq` positions a
-read above every sequence a journal can hold; SessionStore's walk begins with "if
-the start is past the captured tip, return nothing", so that read costs a tip
-lookup and never opens the ledger. The catalog record's `LastJournalSeq` was the
-free alternative and was rejected: it is a **separate durable write** from the
-journal append, so a Host that has committed records and not yet updated the
-catalog leaves it low — silently turning the tail into a middle page — and one
-that ran ahead would anchor the window above the tip and answer an active session
-with an empty history.
+**The tail uses one SessionStore `Tail` request, available since v0.2.0.**
+SessionStore captures one tip and derives the sequence window from it. The former
+probe-then-read design could capture two different tips: with 100 records at the
+probe and 1,000 private appends before the page read, a 64-position request read
+1,064 sequences and reported the newer tip. `TestHTTPJournalTailUsesOneTipAcrossPrivateAppends`
+reproduces that interleaving through HTTP and the real store, then requires one
+tip capture, 64 cursor advances, and the original tip. A later all-private tail
+still costs 64 advances. Including session resolution, the initial journal
+request now makes two store calls: one catalog lookup and one journal read.
+The catalog's `LastJournalSeq` remains unsuitable for positioning because it is
+updated separately from journal appends.
+
+**A byte-limited tail may continue with an ordinary cursor request.** Factory
+forwards the cursor unchanged with `Tail=false`; explicit `from_seq`, including
+zero, also disables Tail. `TestHTTPJournalTailByteBudgetCursorPreservesCapturedTip`
+uses bodies exceeding the real store's page budget, appends another record,
+then checks that cursor pages finish the original window at its original tip.
 
 **Private records only advance the watermark.** SessionStore withholds every
 non-public record from the public projection and closes its sequence position
@@ -522,7 +528,7 @@ about the
 surface rather than about parsing: `?x=` is a parameter the caller *sent*, and
 no position or bound here means the empty string. The concrete failure it
 prevents is `?cursor=`, which SessionStore reads as **no** cursor while Factory
-had already treated the request as positioned — skipping the tip probe and
+had already treated the request as positioned — selecting a forward read and
 walking from sequence one. Measured on a 3000-record journal: `?cursor=`
 returned events 1–95 where naming no cursor returned 2938–2999. The client that
 reaches it is doing the obvious thing: Core declares `next_cursor` `omitempty`,
@@ -583,12 +589,12 @@ second exists because the first missed a measured case: `const
 probeObjectChunkSize = 5000` passed as a `Limit:` value at five times the real
 ceiling, invisible to the suffix rule in both directions.
 
-**State the use rule's reach plainly: it covers one of the five limits.** Every
+**State the use rule's reach plainly: it covers one of the four limits.** Every
 `sessionstore` request literal on this surface lives in `routes.go`'s `scope`
-helpers, and four of the five constants reach one through a **parameter** —
+helpers, and three of the four constants reach one through a **parameter** —
 which the scan skips, deliberately, since a bound on a parameter is at whatever
 assigned it. Exactly one, `agentProbePageLimit`, is written into a literal and
-therefore covered by the use-derived rule; the other four are held by the suffix
+therefore covered by the use-derived rule; the other three are held by the suffix
 convention alone. The scan is not extended to follow the parameter because that
 is inter-procedural value tracking, and a scan that guessed at it would be a
 guard whose *own* reach nobody could state. What the use rule buys is the

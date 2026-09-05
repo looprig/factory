@@ -155,7 +155,7 @@ func absenceLayouts() []storeLayout {
 // ReadPublicJournal walks the fake's journal the way the released store walks a
 // real one.
 //
-// It restates four rules of sessionstore v0.1.0 deliberately, because each one
+// It restates the positioning rules of sessionstore v0.2.0 because each one
 // is a rule Factory's paging depends on and a fake looser than any of them
 // would leave the corresponding production line unread:
 //
@@ -163,8 +163,8 @@ func absenceLayouts() []storeLayout {
 //   - a limit of zero means the store's own page size, so Factory learns nothing
 //     about how large the page was;
 //   - a start ABOVE the captured tip returns no events at all and a watermark at
-//     the tip, which is walkJournal's first statement and is what makes a tip
-//     probe cost a tip read rather than a scan;
+//     the tip, which is walkJournal's first statement;
+//   - Tail derives the last Limit sequence positions from the captured tip;
 //   - a private record contributes nothing to the page and still advances
 //     CoveredThrough, including past the record limit.
 func (f *fakeReader) ReadPublicJournal(ctx context.Context, req sessionstore.ReadPublicJournalRequest) (sessionwire.JournalPage, error) {
@@ -173,12 +173,6 @@ func (f *fakeReader) ReadPublicJournal(ctx context.Context, req sessionstore.Rea
 	block, fail, panics, leak := f.block, f.fail, f.panics, f.leak
 	if fail == nil {
 		fail = f.journalFail
-	}
-	// The tip probe is positioned above every sequence, so failing everything
-	// EXCEPT it is how a test reaches the tail read's failure branch after a
-	// successful probe.
-	if fail == nil && req.FromSeq != journalTipProbeSeq {
-		fail = f.journalTailFail
 	}
 	held := f.sessions[storedSession{tenant: req.TenantID, session: req.SessionID}]
 	records := slices.Clone(f.journals[storedSession{tenant: req.TenantID, session: req.SessionID}])
@@ -189,6 +183,9 @@ func (f *fakeReader) ReadPublicJournal(ctx context.Context, req sessionstore.Rea
 	}
 	if req.Cursor != "" && req.FromSeq != 0 {
 		return sessionwire.JournalPage{}, &sessionstore.JournalError{Code: sessionstore.JournalErrorInvalid, Field: "cursor"}
+	}
+	if req.Tail && (req.Cursor != "" || req.FromSeq != 0) {
+		return sessionwire.JournalPage{}, &sessionstore.JournalError{Code: sessionstore.JournalErrorInvalid, Field: "tail"}
 	}
 	if panics != nil {
 		panic(panics)
@@ -210,6 +207,9 @@ func (f *fakeReader) ReadPublicJournal(ctx context.Context, req sessionstore.Rea
 	}
 	tip := uint64(len(records))
 	from, capturedTip := req.FromSeq, tip
+	if req.Tail && tip > uint64(limit) {
+		from = tip - uint64(limit) + 1
+	}
 	if req.Cursor != "" {
 		position, ok := decodeFakeJournalCursor(string(req.Cursor), req.TenantID, req.SessionID)
 		if !ok || position.capturedTip > tip {
@@ -728,7 +728,7 @@ func TestTheInitialJournalViewIsABoundedTailAtTheCapturedTip(t *testing.T) {
 // is that the probe can see the thing it forbids.
 //
 // It can see three different failures, each with its own reader: a request
-// positioned at the first sequence (FromSeq), a page that begins at sequence
+// lacking Tail positioning, a page that begins at sequence
 // one (the events), and a handler that walks the whole journal by following its
 // own cursor (the call count). A replay from zero fails all three.
 func TestTheInitialJournalViewNeverReplaysFromTheFirstSequence(t *testing.T) {
@@ -741,13 +741,11 @@ func TestTheInitialJournalViewNeverReplaysFromTheFirstSequence(t *testing.T) {
 	if len(requests) == 0 {
 		t.Fatal("the journal was never read, so this probe proves nothing")
 	}
-	// The reading request -- the one that returned the events -- must be
-	// positioned near the tip. A request AT the first sequence with a bounded
-	// limit is exactly the "unbounded replay from sequence 0" step 3 forbids,
-	// because the page it returns is the journal's oldest.
+	// Tail selects the window at the store's captured tip. An ordinary
+	// unpositioned forward read would return the journal's oldest events.
 	reading := requests[len(requests)-1]
-	if reading.FromSeq <= 1 {
-		t.Errorf("the reading request was positioned at from_seq %d, which replays from the beginning", reading.FromSeq)
+	if !reading.Tail || reading.FromSeq != 0 || reading.Cursor != "" {
+		t.Errorf("initial request did not select only Tail: %+v", reading)
 	}
 	if reading.Limit <= 0 {
 		t.Errorf("the reading request carried limit %d, which hands the bound to the store", reading.Limit)
@@ -757,37 +755,23 @@ func TestTheInitialJournalViewNeverReplaysFromTheFirstSequence(t *testing.T) {
 	}
 	// No walk. A handler that followed its own NextCursor to exhaustion would
 	// read this journal hundreds of times and is bounded by nothing.
-	if len(requests) > 2 {
-		t.Errorf("the initial view read the journal %d times; it is bounded at two", len(requests))
+	if len(requests) != 1 {
+		t.Errorf("the initial view read the journal %d times; want one Tail request", len(requests))
 	}
 }
 
-// TestTheJournalProbeIsATipReadAndNothingElse states what the extra read costs.
-//
-// The tail cannot be positioned without a tip, and the only tip Factory may
-// trust is the one the store captures for the walk itself. So the initial view
-// is two bounded reads: one positioned ABOVE any sequence, which the store
-// answers from its tip without opening the ledger at all, and one that reads
-// the tail below it.
-func TestTheJournalProbeIsATipReadAndNothingElse(t *testing.T) {
+// TestTheInitialJournalViewRequestsOneTail keeps window selection in the store.
+func TestTheInitialJournalViewRequestsOneTail(t *testing.T) {
 	t.Parallel()
-
 	f := newFixture(t, withSessions(), withJournal(fixtureTenant, fixtureSession, longJournal(500)...))
 	f.get(journalTarget(fixtureSession))
-
 	requests := f.journalSnapshot()
-	if len(requests) != 2 {
-		t.Fatalf("the initial view made %d journal reads, want a probe and a tail", len(requests))
+	if len(requests) != 1 {
+		t.Fatalf("initial view made %d journal reads, want one Tail request", len(requests))
 	}
-	probe := requests[0]
-	if probe.FromSeq <= 500 {
-		t.Errorf("the probe was positioned at %d, which is inside the journal and therefore scans it", probe.FromSeq)
-	}
-	if probe.Cursor != "" {
-		t.Errorf("the probe carried cursor %q", probe.Cursor)
-	}
-	if probe.Limit != 1 {
-		t.Errorf("the probe asked for a limit of %d, want the smallest legal page", probe.Limit)
+	req := requests[0]
+	if !req.Tail || req.FromSeq != 0 || req.Cursor != "" || req.Limit != 64 {
+		t.Errorf("initial request = %+v, want Tail with limit 64 and no other position", req)
 	}
 }
 
@@ -900,8 +884,7 @@ func TestAnExplicitFirstPositionIsNotTheSameRequestAsNamingNone(t *testing.T) {
 	if seqs[0] != 1 {
 		t.Errorf("from_seq=0 began at %d, want the journal's first record", seqs[0])
 	}
-	// One read, not two: a named position needs no tip probe, and paying for
-	// one would be a durable round trip whose answer is discarded.
+	// A named position requires one forward request with Tail disabled.
 	if requests := f.journalSnapshot(); len(requests) != 1 {
 		t.Errorf("an explicitly positioned read made %d journal reads, want 1", len(requests))
 	}
@@ -1756,10 +1739,10 @@ func TestEveryPageLimitIsCheckedAgainstTheStoreCeiling(t *testing.T) {
 		}
 	}
 	// The use rule's REACH, stated rather than implied: every sessionstore
-	// request literal on this surface is a scope helper in routes.go, and four
-	// of the five limits arrive at one through a PARAMETER, which the skip
+	// request literal on this surface is a scope helper in routes.go, and three
+	// of the four limits arrive at one through a PARAMETER, which the skip
 	// above passes over. So exactly one constant is covered by use today, and
-	// the other four rest on the suffix convention. Asserting that one is here
+	// the other three rest on the suffix convention. Asserting that one is here
 	// so the rule cannot quietly reach nothing; extending the scan to follow a
 	// parameter would be inter-procedural value tracking, and a scan that
 	// guessed at it would be a guard whose own reach nobody could state.
@@ -1780,7 +1763,7 @@ func TestEveryPageLimitIsCheckedAgainstTheStoreCeiling(t *testing.T) {
 	// rather than silently shrinking the subject.
 	for _, want := range []string{
 		"agentProbePageLimit", "maxSessionPageLimit",
-		"maxJournalPageLimit", "defaultJournalPageLimit", "journalTipProbePageLimit",
+		"maxJournalPageLimit", "defaultJournalPageLimit",
 	} {
 		if !limits[want] {
 			t.Errorf("the scan did not find %s; it found %v", want, slices.Sorted(maps.Keys(limits)))
@@ -2153,43 +2136,6 @@ type foreignModuleSeam interface {
 	Due(ctx context.Context) (storage.Due, error)
 }
 
-// TestTheTailWindowIsFlooredRatherThanConverted is the reader for
-// journalTailStart's floor.
-//
-// The floor is unreachable through the handler -- journalPositionOf refuses a
-// limit below one -- so nothing driving HTTP can execute it, and a line nothing
-// executes is a line that is free to be wrong. What it prevents is specific: an
-// int below one converted to uint64 becomes an enormous window, the window
-// swallows the journal, and the tail silently becomes the replay from the first
-// sequence step 3 forbids. The wrong answer is the one that looks like a
-// legitimate short journal.
-func TestTheTailWindowIsFlooredRatherThanConverted(t *testing.T) {
-	t.Parallel()
-
-	for _, probe := range []struct {
-		tip   uint64
-		limit int
-		want  uint64
-	}{
-		// A limit at or below zero must not widen the window. Anything other
-		// than a one-record window at the tip means the conversion happened.
-		{tip: 3000, limit: 0, want: 3000},
-		{tip: 3000, limit: -1, want: 3000},
-		{tip: 3000, limit: -4096, want: 3000},
-		// The ordinary arithmetic, at its boundaries.
-		{tip: 3000, limit: 1, want: 3000},
-		{tip: 3000, limit: 64, want: 2937},
-		{tip: 64, limit: 64, want: 0},
-		{tip: 65, limit: 64, want: 2},
-		{tip: 63, limit: 64, want: 0},
-		{tip: 0, limit: 64, want: 0},
-	} {
-		if got := journalTailStart(probe.tip, probe.limit); got != probe.want {
-			t.Errorf("journalTailStart(%d, %d) = %d, want %d", probe.tip, probe.limit, got, probe.want)
-		}
-	}
-}
-
 // TestAKeyspaceFaultIsNotAMissingSession is the other direction of the absence
 // mapping, and it is what keeps the new branch narrow.
 //
@@ -2243,8 +2189,8 @@ func withStaleCatalogTip(tenant sessionwire.TenantID, session sessionwire.Sessio
 	}
 }
 
-// TestTheTailIsAnchoredOnTheStoresTipAndNotTheCatalogsRecord is the reader for
-// the design decision journalTipProbeSeq is written to justify.
+// TestTheTailIsAnchoredOnTheStoresTipAndNotTheCatalogsRecord ensures Tail does
+// not use the catalog's independently updated journal summary.
 //
 // The catalog record is right there in the resolved entry and carries a
 // LastJournalSeq, so anchoring the tail on it would cost no extra read at all.
@@ -2483,20 +2429,18 @@ func TestADrainingStoreIsRetryableRatherThanAFault(t *testing.T) {
 			t.Errorf("the agent list answered %d, want 503", recorder.Code)
 		}
 	})
-	// The journal reaches it on the read that FOLLOWS a successful one, which
-	// is a different code path from the probe failing: the tail's mapping has
-	// to carry the arm too.
-	t.Run("the journal tail after a successful probe", func(t *testing.T) {
+	// The journal error follows a successful catalog lookup.
+	t.Run("the journal tail after resolving the session", func(t *testing.T) {
 		t.Parallel()
 
 		f := newFixture(t, withSessions(), withJournal(fixtureTenant, fixtureSession, longJournal(20)...))
-		f.reads.journalTailFail = &sessionstore.StoreClosedError{}
+		f.reads.journalFail = &sessionstore.StoreClosedError{}
 		recorder := f.get(journalTarget(fixtureSession))
 		if recorder.Code != http.StatusServiceUnavailable {
 			t.Fatalf("the journal tail answered %d, want 503; body was %q", recorder.Code, recorder.Body)
 		}
-		if reads := f.journalSnapshot(); len(reads) != 2 {
-			t.Errorf("the tail failure was reached after %d journal reads, want 2", len(reads))
+		if reads := f.journalSnapshot(); len(reads) != 1 {
+			t.Errorf("the tail failure was reached after %d journal reads, want 1", len(reads))
 		}
 	})
 	// The control: a draining store is separated from a fault rather than
@@ -2508,42 +2452,26 @@ func TestADrainingStoreIsRetryableRatherThanAFault(t *testing.T) {
 	}
 }
 
-// TestTheTipProbeFailureIsAnsweredRatherThanCarriedForward is the reader for
-// the FIRST of the journal's two reads.
-//
-// serveSessionJournal makes the tip probe and then the page read, and the two
-// have separate error branches. Every existing failure probe reached one of
-// them: the global lever fails resolveSession's catalog read before either, and
-// journalTailFail deliberately spares the probe so the tail's branch can be
-// reached after a success. Nothing failed the probe itself, which is what
-// journalFail is for -- and without it, answering the probe's failure with
-// internalFailure instead of journalFailure changed no test.
-//
-// The COUNT is asserted as well as the answer. The other compiling mutation of
-// this branch is to ignore the error and carry a zero page forward: the tail
-// then anchors on a captured tip of zero and fails identically, so only "the
-// request stopped at one read" separates the two.
-func TestTheTipProbeFailureIsAnsweredRatherThanCarriedForward(t *testing.T) {
+// TestTheTailReadFailureIsAnsweredRatherThanCarriedForward checks both the
+// error mapping and that a failed Tail request is not retried as another read.
+func TestTheTailReadFailureIsAnsweredRatherThanCarriedForward(t *testing.T) {
 	t.Parallel()
-
 	f := newFixture(t, withSessions(), withJournal(fixtureTenant, fixtureSession, longJournal(20)...))
 	f.reads.journalFail = &sessionstore.StoreClosedError{}
 	recorder := f.get(journalTarget(fixtureSession))
 	if recorder.Code != http.StatusServiceUnavailable {
-		t.Fatalf("a failed tip probe answered %d, want 503; body was %q", recorder.Code, recorder.Body)
+		t.Fatalf("failed tail answered %d, want 503; body=%q", recorder.Code, recorder.Body)
 	}
 	if code := decodeEnvelope(t, recorder).Error.Code; code != ErrorCodeUnavailable {
 		t.Errorf("code = %q, want %q", code, ErrorCodeUnavailable)
 	}
 	if reads := f.journalSnapshot(); len(reads) != 1 {
-		t.Errorf("the request made %d journal reads, want 1: a failed probe is answered, not carried forward", len(reads))
+		t.Errorf("request made %d journal reads, want 1", len(reads))
 	}
-	// The control: the branch reports the failure it was given rather than one
-	// fixed answer. A journal code the caller can act on keeps its own 400.
 	cursor := newFixture(t, withSessions(), withJournal(fixtureTenant, fixtureSession, longJournal(20)...))
 	cursor.reads.journalFail = &sessionstore.JournalError{Code: sessionstore.JournalErrorCursor, Field: "cursor"}
 	if got := cursor.get(journalTarget(fixtureSession)); got.Code != http.StatusBadRequest {
-		t.Errorf("a refused cursor on the probe answered %d, want 400", got.Code)
+		t.Errorf("refused cursor answered %d, want 400", got.Code)
 	}
 }
 

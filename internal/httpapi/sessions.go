@@ -3,7 +3,6 @@ package httpapi
 import (
 	"context"
 	"errors"
-	"math"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -105,11 +104,9 @@ func (rt *Router) serveSessionStatus() http.Handler {
 // it exists because of something the session list does not have to decide. A
 // missing limit on the tenant list is forwarded as zero, which SessionStore
 // reads as its own configured page size; that is fine there because the store
-// also chooses the position. HERE Factory computes the position FROM the limit
-// -- the tail is the last window of sequences below the captured tip -- so a
-// limit only the store knows would leave the tail unanchored. Every journal
-// read this package makes therefore carries a limit this package chose, which
-// is why the two are one rule rather than two.
+// also chooses the position. The journal route instead promises a default
+// window of 64 sequence positions, so it supplies that explicit limit with
+// Tail and lets SessionStore derive the start from the same captured tip.
 const (
 	maxJournalPageLimit     = 100
 	defaultJournalPageLimit = 64
@@ -120,32 +117,6 @@ const (
 	_ = uint(storePageCeiling - maxJournalPageLimit)
 	_ = uint(storePageCeiling - defaultJournalPageLimit)
 )
-
-// journalTipProbeSeq positions a read ABOVE every sequence a journal can hold.
-//
-// It is how this surface learns the tip it must anchor a tail on, and it is
-// exact rather than an estimate. SessionStore captures the journal's tip as
-// part of planning ANY public read and reports it as JournalPage.CapturedTip;
-// its walk then begins with "if the start is past the captured tip, return
-// nothing", so a read positioned here costs the tip read and does not open the
-// ledger at all. Measured against the released sessionstore v0.1.0, where that
-// early return is walkJournal's first statement.
-//
-// The alternative was the catalog record's LastJournalSeq, which this handler
-// already holds and which would have cost no extra read. It was rejected
-// because it is a SEPARATE durable write from the journal append: a Host that
-// has committed records and not yet updated the catalog leaves it low, which
-// silently turns the tail into a middle page, and a record whose sequence ran
-// ahead of the journal would anchor the window above the tip and answer an
-// active session with an empty history. An anchor for a tail has to come from
-// the same read that reports the tail.
-const journalTipProbeSeq = uint64(math.MaxUint64)
-
-// journalTipProbePageLimit is the smallest page the store accepts. Zero would
-// mean the store's own page size, and the probe is meant to return nothing.
-const journalTipProbePageLimit = 1
-
-const _ = uint(storePageCeiling - journalTipProbePageLimit)
 
 // serveSessionJournal answers a bounded page of a session's public events.
 //
@@ -160,8 +131,11 @@ const _ = uint(storePageCeiling - journalTipProbePageLimit)
 // an unbounded read on an authenticated route that any credential could
 // trigger.
 //
-// It costs two bounded reads: journalTipProbeSeq explains why, and why the
-// second one cannot be avoided by reusing the catalog's tip.
+// One Tail request captures the tip and derives the sequence window inside
+// SessionStore. A separate tip probe would race with appends: the second read
+// could capture a newer tip and scan arbitrarily many private records beyond
+// the intended window. The catalog's tip is also unsuitable because updating
+// the catalog is a separate durable write from appending journal records.
 //
 // # Everything else is one read at a position the caller names
 //
@@ -198,18 +172,8 @@ func (rt *Router) serveSessionJournal() http.Handler {
 		reads := newScope(operation.Principal)
 		session := entry.Record.SessionID
 
-		from := position.fromSeq
-		if !position.positioned {
-			probe, err := rt.reads.ReadPublicJournal(r.Context(),
-				reads.journalPage(session, "", journalTipProbeSeq, journalTipProbePageLimit))
-			if err != nil {
-				writeAPIError(w, journalFailure(err))
-				return
-			}
-			from = journalTailStart(probe.CapturedTip, position.limit)
-		}
 		page, err := rt.reads.ReadPublicJournal(r.Context(),
-			reads.journalPage(session, position.cursor, from, position.limit))
+			reads.journalPage(session, position.cursor, position.fromSeq, position.limit, !position.positioned))
 		if err != nil {
 			writeAPIError(w, journalFailure(err))
 			return
@@ -228,36 +192,6 @@ func (rt *Router) serveSessionJournal() http.Handler {
 		}
 		writeJSONBytes(w, http.StatusOK, body)
 	})
-}
-
-// journalTailStart is the first sequence of the last window below tip.
-//
-// The window is a span of SEQUENCES, not a count of events, and the difference
-// is the whole reason it is safe: a span of n sequences holds at most n
-// records, so a page limit of n can never cut it short by itself, and the
-// events it yields are however many of those positions are public. A journal
-// whose tail happens to be mostly private records therefore returns a short
-// page rather than a page that walked further back to fill itself -- which
-// would be a read whose cost depended on data the caller cannot see.
-//
-// A journal no longer than the window starts at the beginning, which is zero:
-// SessionStore reads zero as "the first record", so the tail of a short journal
-// is the whole of it.
-func journalTailStart(tip uint64, limit int) uint64 {
-	// A limit below one is unreachable -- journalPositionOf refuses one and its
-	// default is positive -- and it is floored here anyway rather than
-	// converted, because the conversion is the failure. A negative int becomes
-	// an enormous uint64, the window swallows the journal, and the tail becomes
-	// the replay from the first sequence that step 3 exists to forbid: the one
-	// wrong answer of the two available, arrived at silently.
-	window := uint64(1)
-	if limit > 1 {
-		window = uint64(limit)
-	}
-	if tip <= window {
-		return 0
-	}
-	return tip - window + 1
 }
 
 // journalPosition is one caller's request for a page: where to start and how
@@ -285,7 +219,7 @@ type journalPosition struct {
 // A present-but-empty parameter is refused by singleValue, which for the
 // position is not a formality. SessionStore reads an empty cursor as NO cursor
 // and a start below one as sequence one, so a request carrying "?cursor=" would
-// be positioned -- skipping the tip probe -- and would then walk from the
+// be positioned -- selecting a forward read -- and would then walk from the
 // journal's FIRST record. Measured before this was refused: on a
 // three-thousand-record journal "?cursor=" returned events 1 through 95 while
 // naming no cursor at all returned 2938 through 2999.

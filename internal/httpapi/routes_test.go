@@ -122,8 +122,8 @@ type fakeReader struct {
 	//
 	// They exist because fail is global and resolveSession's catalog read comes
 	// FIRST, so with fail alone no test can reach the failure branch of any
-	// durable read a request makes after that one: the gate read, and both of
-	// the journal's. That is not a missing convenience -- it is the exact
+	// durable read a request makes after that one: the gate or journal read.
+	// That is not a missing convenience -- it is the exact
 	// structural hole the A2.1 absence defect lived in, and two mutations of
 	// serveSessionGates's error branch survived the whole suite because of it.
 	//
@@ -134,9 +134,6 @@ type fakeReader struct {
 	// where two do the work.
 	journalFail error
 	gateFail    error
-	// journalTailFail replaces the answer for every journal read EXCEPT the
-	// tip probe, so a test can fail the read that follows a successful one.
-	journalTailFail error
 	// nextRecords is the record GetCatalogEntry answers with from its SECOND
 	// call onward. A handler that re-read the catalog rather than using the
 	// record the chain resolved renders THIS one, which is what makes the
