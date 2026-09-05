@@ -126,7 +126,7 @@ func TestHTTPJournalTailUsesOneTipAcrossPrivateAppends(t *testing.T) {
 	if page.CapturedTip != 100 || page.CoveredThrough != 100 || page.NextCursor != "" || len(page.Events) != 64 {
 		t.Errorf("tail tip=%d covered=%d cursor=%q events=%d, want 100/100/empty/64", page.CapturedTip, page.CoveredThrough, page.NextCursor, len(page.Events))
 	}
-	if len(reader.requests) != 1 || !reader.requests[0].Tail || reader.requests[0].FromSeq != 0 || reader.requests[0].Cursor != "" {
+	if len(reader.requests) != 1 || !reader.requests[0].Tail || reader.requests[0].FromSeq != 0 || reader.requests[0].Cursor != "" || reader.requests[0].ScanLimit != 64 {
 		t.Fatalf("initial requests = %+v, want one unpositioned Tail request", reader.requests)
 	}
 	// The late appends really landed. A subsequent tail consists entirely of
@@ -186,5 +186,79 @@ func TestHTTPJournalTailByteBudgetCursorPreservesCapturedTip(t *testing.T) {
 		if req.Tail || req.Cursor != "" || req.Limit != 1 {
 			t.Errorf("explicit from_seq=%s request changed positioning: %+v", position, req)
 		}
+	}
+}
+
+// The public event limit is not a work limit: private records consume work but
+// no event slots. Factory's policy is one examined sequence per requested limit
+// unit on Tail, explicit and cursor reads. A private-only page may therefore be
+// empty while its coverage and continuation still advance.
+func TestHTTPJournalForwardPagesBoundPrivateScanWork(t *testing.T) {
+	for _, cursorStart := range []bool{false, true} {
+		t.Run(fmt.Sprintf("cursor=%t", cursorStart), func(t *testing.T) {
+			count := 1 // the journal-opening fence is itself private
+			if cursorStart {
+				count = 3 // two public records let the real store issue a cursor
+			}
+			f, writer, ledger, reader := newRealTailFixture(t, count, `{"value":1}`)
+			for i := 0; i < 10000; i++ {
+				appendTailRecord(t, writer, sessionstore.Envelope{
+					Kind: sessionstore.EnvelopeKindRuntimeControl, RecordID: fmt.Sprintf("private-%d", i),
+					Runtime: sessionstore.BodySlot{Inline: []byte(`{"secret":"must-not-leak"}`)},
+				})
+			}
+			target := journalTarget(fixtureSession) + "?from_seq=1&limit=1"
+			wantFirstCovered := uint64(1)
+			if cursorStart {
+				seed, err := reader.Store.ReadPublicJournal(context.Background(), sessionstore.ReadPublicJournalRequest{
+					TenantID: fixtureTenant, SessionID: fixtureSession, FromSeq: 2, Limit: 1,
+				})
+				if err != nil || seed.NextCursor == "" {
+					t.Fatalf("real store did not issue seed cursor: page=%+v err=%v", seed, err)
+				}
+				target = journalTarget(fixtureSession) + "?cursor=" + string(seed.NextCursor) + "&limit=1"
+				wantFirstCovered = 3
+			}
+			ledger.tips, ledger.next, ledger.starts = 0, 0, nil
+			page := decodeJournalPage(t, f.get(target))
+			if ledger.next != 1 || page.CoveredThrough != wantFirstCovered || page.NextCursor == "" {
+				t.Fatalf("first forward page advances=%d covered=%d cursor=%q, want 1/%d/nonempty", ledger.next, page.CoveredThrough, page.NextCursor, wantFirstCovered)
+			}
+			originalTip := uint64(count + 10000)
+			if page.CapturedTip != originalTip {
+				t.Fatalf("first captured tip=%d, want %d", page.CapturedTip, originalTip)
+			}
+			// A new public event must not move the tip of this existing walk.
+			appendTailRecord(t, writer, sessionstore.Envelope{
+				Kind: sessionstore.EnvelopeKindPublicEvent, EventID: "after-capture",
+				Public: sessionstore.BodySlot{Inline: []byte(`{"late":true}`)},
+			})
+			for rounds := 0; page.NextCursor != ""; rounds++ {
+				if rounds >= 200 {
+					t.Fatal("private-only continuation did not terminate")
+				}
+				previousCoverage := page.CoveredThrough
+				ledger.next = 0
+				// Omitted and oversized limits exercise Factory's default and
+				// clamp policy on the continuation path as well as explicit 1.
+				query, budget := "", uint64(64)
+				if rounds%2 != 0 {
+					query, budget = "&limit=100000", 100
+				}
+				page = decodeJournalPage(t, f.get(journalTarget(fixtureSession)+"?cursor="+string(page.NextCursor)+query))
+				wantCovered := min(originalTip, previousCoverage+budget)
+				if ledger.next != int(wantCovered-previousCoverage) || page.CoveredThrough != wantCovered || page.CapturedTip != originalTip || len(page.Events) != 0 {
+					t.Fatalf("continuation advances=%d covered=%d tip=%d events=%d, want %d/%d/%d/0", ledger.next, page.CoveredThrough, page.CapturedTip, len(page.Events), wantCovered-previousCoverage, wantCovered, originalTip)
+				}
+			}
+			if page.CoveredThrough != originalTip {
+				t.Errorf("walk terminated at %d, want %d", page.CoveredThrough, originalTip)
+			}
+			for _, req := range reader.requests {
+				if req.Tail || req.ScanLimit != req.Limit || req.ScanLimit < 1 || req.ScanLimit > 100 {
+					t.Errorf("forward request lost the server-chosen work budget: %+v", req)
+				}
+			}
+		})
 	}
 }

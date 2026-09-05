@@ -139,6 +139,12 @@ const (
 //
 // # Everything else is one read at a position the caller names
 //
+// Every positioning mode supplies ScanLimit equal to the chosen event limit.
+// A private record consumes this scan budget without adding an event. A page
+// can therefore have no events and still advance covered_through and issue a
+// continuation. Only the cursor's absence means the captured walk is complete.
+// A caller's limit is defaulted and clamped before it becomes either budget.
+//
 // A cursor is the store's own opaque token: it is handed out and handed back
 // unread, because possessing one authorizes nothing and parsing one would make
 // this package a second authority on a grammar SessionStore owns. from_seq is

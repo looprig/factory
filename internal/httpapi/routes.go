@@ -1089,6 +1089,8 @@ func (s scope) sessionPage(cursor sessionwire.Cursor, limit int) sessionstore.Li
 //
 // Cursor, fromSeq and tail describe mutually exclusive positions. The handler
 // validates caller positions before selecting Tail for an initial view.
+// Every request, including a cursor continuation, caps examined records at its
+// chosen page limit. Private records use this work budget without adding events.
 func (s scope) journalPage(
 	session sessionwire.SessionID,
 	cursor sessionwire.Cursor,
@@ -1101,6 +1103,7 @@ func (s scope) journalPage(
 		SessionID: session,
 		FromSeq:   fromSeq,
 		Tail:      tail,
+		ScanLimit: limit,
 		Cursor:    cursor,
 		Limit:     limit,
 	}

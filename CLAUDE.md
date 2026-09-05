@@ -491,6 +491,19 @@ zero, also disables Tail. `TestHTTPJournalTailByteBudgetCursorPreservesCapturedT
 uses bodies exceeding the real store's page budget, appends another record,
 then checks that cursor pages finish the original window at its original tip.
 
+**Every journal request also bounds scanned records, including private ones.**
+SessionStore v0.3.0's `ScanLimit` is set to the chosen `limit` in the shared
+scope helper for Tail, explicit `from_seq`, and cursor reads: default 64,
+maximum 100. An event limit alone did not establish that bound: a forward
+`limit=1` over an opening fence and 10,000 private records made 10,001 cursor
+advances. `TestHTTPJournalForwardPagesBoundPrivateScanWork` reproduces that
+case and a real cursor positioned before the same private suffix. It requires
+one advance for `limit=1`, then drives default/clamped cursor continuations to
+completion at the original captured tip despite a later public append.
+Private-only pages may be empty with a nonempty cursor; clients continue from
+the cursor and coverage, not from the number of returned events. The scan
+budget is applied again on each request because it is not encoded in the cursor.
+
 **Private records only advance the watermark.** SessionStore withholds every
 non-public record from the public projection and closes its sequence position
 through `covered_through` alone; Factory forwards Core's `JournalPage` whole, so

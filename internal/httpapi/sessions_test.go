@@ -155,7 +155,7 @@ func absenceLayouts() []storeLayout {
 // ReadPublicJournal walks the fake's journal the way the released store walks a
 // real one.
 //
-// It restates the positioning rules of sessionstore v0.2.0 because each one
+// It restates the positioning rules of sessionstore v0.3.0 because each one
 // is a rule Factory's paging depends on and a fake looser than any of them
 // would leave the corresponding production line unread:
 //
@@ -165,8 +165,10 @@ func absenceLayouts() []storeLayout {
 //   - a start ABOVE the captured tip returns no events at all and a watermark at
 //     the tip, which is walkJournal's first statement;
 //   - Tail derives the last Limit sequence positions from the captured tip;
+//   - ScanLimit bounds examined records, including private ones, and a budget
+//     stop issues a cursor after the last covered sequence;
 //   - a private record contributes nothing to the page and still advances
-//     CoveredThrough, including past the record limit.
+//     CoveredThrough without consuming a public-event slot, while scan budget remains.
 func (f *fakeReader) ReadPublicJournal(ctx context.Context, req sessionstore.ReadPublicJournalRequest) (sessionwire.JournalPage, error) {
 	f.mu.Lock()
 	f.journalRequests = append(f.journalRequests, req)
@@ -180,6 +182,9 @@ func (f *fakeReader) ReadPublicJournal(ctx context.Context, req sessionstore.Rea
 
 	if refusePageLimit(req.Limit) {
 		return sessionwire.JournalPage{}, &sessionstore.JournalError{Code: sessionstore.JournalErrorInvalid, Field: "limit"}
+	}
+	if refusePageLimit(req.ScanLimit) {
+		return sessionwire.JournalPage{}, &sessionstore.JournalError{Code: sessionstore.JournalErrorInvalid, Field: "scan_limit"}
 	}
 	if req.Cursor != "" && req.FromSeq != 0 {
 		return sessionwire.JournalPage{}, &sessionstore.JournalError{Code: sessionstore.JournalErrorInvalid, Field: "cursor"}
@@ -225,6 +230,10 @@ func (f *fakeReader) ReadPublicJournal(ctx context.Context, req sessionstore.Rea
 	page := sessionwire.JournalPage{CapturedTip: capturedTip}
 	truncatedAt := uint64(0)
 	for seq := from; seq <= capturedTip; seq++ {
+		if req.ScanLimit > 0 && seq-from >= uint64(req.ScanLimit) {
+			truncatedAt = seq
+			break
+		}
 		record := records[seq-1]
 		if record.public || leak {
 			if uint64(len(page.Events)) >= uint64(limit) {
@@ -770,8 +779,8 @@ func TestTheInitialJournalViewRequestsOneTail(t *testing.T) {
 		t.Fatalf("initial view made %d journal reads, want one Tail request", len(requests))
 	}
 	req := requests[0]
-	if !req.Tail || req.FromSeq != 0 || req.Cursor != "" || req.Limit != 64 {
-		t.Errorf("initial request = %+v, want Tail with limit 64 and no other position", req)
+	if !req.Tail || req.FromSeq != 0 || req.Cursor != "" || req.Limit != 64 || req.ScanLimit != 64 {
+		t.Errorf("initial request = %+v, want Tail with event/scan limits 64 and no other position", req)
 	}
 }
 
@@ -852,8 +861,8 @@ func TestAnOlderPageIsAddressedByItsOwnPosition(t *testing.T) {
 
 	older := decodeJournalPage(t, f.get(journalTarget(fixtureSession)+"?from_seq=1&limit=10"))
 	seqs := eventSequences(older)
-	if len(seqs) != 10 {
-		t.Fatalf("the older page carried %d events, want 10", len(seqs))
+	if !slices.Equal(seqs, []uint64{1, 2, 4, 5, 7, 8, 10}) || older.CoveredThrough != 10 || older.NextCursor == "" {
+		t.Fatalf("older page sequences=%v covered=%d cursor=%q, want public subset of positions 1..10 and continuation", seqs, older.CoveredThrough, older.NextCursor)
 	}
 	if seqs[0] != 1 {
 		t.Errorf("an explicitly positioned page began at %d, want 1", seqs[0])
