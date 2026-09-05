@@ -382,6 +382,24 @@ or pending, failing on the list it does serve. `TestARouteMayBePartlyImplemented
 is the anti-vacuity check: if no route were mixed, the finer column would buy
 nothing.
 
+## `/v1/bootstrap` reports identity; it does not select it
+
+`GET /v1/bootstrap` is an `authAuthenticated` read whose complete response is
+`{"tenant_id":"…"}`. The tenant is the bounded opaque `sessionwire.TenantID`
+from `OperationContext.Principal`; it is never read from a header, query, path
+or body, and the response contains no credential, subject or principal kind.
+The response is a Factory-owned browser DTO rather than a Core session-wire
+contract because it describes the authenticated HTTP caller, not a session or
+runtime exchange.
+
+The route accepts no query parameters, performs no durable or runtime read and
+remains available while SessionStore is draining. A browser may call it with
+an ambient cookie without a CSRF token because GET is safe; authentication,
+the ordinary request deadline, error envelope and API security headers still
+come from the same route chain as every other endpoint. In particular,
+`Cache-Control: no-store` applies to both its successful identity document and
+all authentication failures.
+
 ## `/v1/agents` is a deployment description, not tenant data
 
 `/v1/agents` (and its migration spelling `/v1/capabilities`) is
@@ -637,8 +655,9 @@ route author will read it.
 ## Not implemented yet
 
 Composition seams (A0.2), identity derivation (A1.1), the route and error
-foundation (A2.1), the agent and session reads (A2.2) and the cold session
-reads — status, journal and gates (A2.3) — are done; the remaining read,
+foundation (A2.1), the agent and session reads (A2.2), the cold session
+reads — status, journal and gates (A2.3) — and the browser identity bootstrap
+are done; the remaining read,
 control, admission, routing, placement and realtime handlers are later tasks in
 runbook 05. Every method in `httpapi.routeTable` carries the runbook
 task that fills its body in, and answers 501 until it does;

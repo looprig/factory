@@ -734,6 +734,7 @@ func routeTable() []route {
 	}
 	agents := served(authAuthenticated, func(rt *Router) http.Handler { return rt.serveAgents() })
 	return []route{
+		{pattern: "/v1/bootstrap", rules: served(authAuthenticated, func(rt *Router) http.Handler { return rt.serveBootstrap() })},
 		{pattern: "/v1/agents", rules: agents},
 		{pattern: "/v1/capabilities", rules: agents},
 		{pattern: "/v1/sessions", rules: append(

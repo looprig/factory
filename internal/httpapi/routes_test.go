@@ -536,6 +536,7 @@ func TestTheRouteTableServesEveryPathTheSpecNames(t *testing.T) {
 	// conformant, so it cannot be read in one direction only.
 	read := []string{http.MethodGet, http.MethodHead}
 	want := map[string][]string{
+		"/v1/bootstrap":                    read,
 		"/v1/agents":                       read,
 		"/v1/capabilities":                 read,
 		"/v1/sessions":                     {http.MethodGet, http.MethodHead, http.MethodPost},
@@ -2336,6 +2337,9 @@ func expectedRoutes() map[string]expectation {
 		return expectation{auth: authControl, command: command, body: bodyJSON, session: session}
 	}
 	routes := map[string]expectation{
+		// The caller's authenticated tenant identity, with no caller-selected
+		// resource and no durable read.
+		"GET /v1/bootstrap": expectation{auth: authAuthenticated, implemented: true},
 		// Deployment-wide descriptions: no tenant data, so authentication is
 		// the whole decision, and this build serves both. They are the SAME
 		// aggregate under two paths -- /v1/capabilities is the migration
@@ -2482,6 +2486,11 @@ func sanctionedImplementedMethods() map[string]string {
 	// HEAD is GET's rule exactly, so its sanction is GET's sanction. Writing
 	// it twice would be two places for one argument to be revised in one.
 	sanctioned := map[string]string{
+		"GET /v1/bootstrap": "serves the CALLER their own bounded tenant identity under " +
+			"authAuthenticated. The value comes only from the Principal the credential verifier " +
+			"placed in the operation context; the route accepts no query parameters, has no path " +
+			"parameter and does not read a request body, so there is no caller-selected resource " +
+			"for a stronger authorization rule to protect",
 		"GET /v1/csrf-token": "serves the CALLER their own CSRF token under authAuthenticated; " +
 			"the token is bound to the requesting principal by Guard.IssueToken, so there is " +
 			"no tenant-scoped resource for a stronger rule to protect",
