@@ -368,10 +368,9 @@ authorization rule the placeholder inherited. `sanctionedImplementedMethods` now
 has to name the `METHOD /path` and say why its rule is adequate, and
 `expectedRoutes` is an independent restatement of every `(method, route)`'s
 rule, command kind, body, session, streaming and readiness columns — written
-from the operation's shape, not from the table. The objects route carries
-`awaitsObjectAuthorization`, which fails the suite the day it serves a body
-without an object-level decision; `AuthorizeObjectRead` has no production caller
-today.
+from the operation's shape, not from the table. Both object routes now require
+`AuthorizeObjectRead` before catalog lookup, then a configured committed-reference
+policy before metadata or bytes. Missing policy fails closed with 503.
 
 **`owner` and `handle` are per METHOD, for the reason `auth` is.** A2.1 moved
 authorization onto `methodRule` because `/v1/sessions` is a list and a create
@@ -653,6 +652,26 @@ executed as a write. The note lives beside the allowlist in `guard.go`, where a
 route author will read it.
 
 ## Not implemented yet
+
+A2.4 implements `/objects/{oid}` and `/objects/{oid}/metadata` in the internal
+router. The metadata response is Core's immutable index projection, not proof
+that the blob still exists. Byte GET accepts one explicit inclusive Range and
+returns exact 206/Content-Range only after whole-object EOF, digest/size checks
+and Close succeed. Full GET is supported only up to one page. Defaults and hard
+ceilings are 1 MiB retained page and 64 MiB verification, using a 32 KiB buffer
+and the existing 30-second request deadline. Range requests reread the entire
+object; larger objects require another protocol. Invalid/multipart/open/suffix
+ranges are 400; an end outside the object is 416 without clipping.
+
+`ObjectPolicy` must establish committed-reference permission and trusted kind;
+index existence and the tenant-only default Authorizer cannot do that. The
+resolver consumes the exact catalog binding, including runtime identity and
+protocol mode. Only a canonical unbound legacy record may use the existing
+reader; all explicit bindings require a resolver. Requests retain authenticated
+tenant and canonical session scope; runtime namespace translation is the trusted
+adapter's responsibility. Tests exercise two real independent stores, but A9
+still owes production policy, frozen configuration resolution and public server
+composition. This does not activate independent-store Host execution.
 
 Composition seams (A0.2), identity derivation (A1.1), the route and error
 foundation (A2.1), the agent and session reads (A2.2), the cold session

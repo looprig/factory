@@ -6,5 +6,7 @@ github.com/looprig/sessionstore v0.2.0 h1:mN/kfelkGVzIGRcbaYYlkTY9KTi6PT0XAvUSMe
 github.com/looprig/sessionstore v0.2.0/go.mod h1:RfNdvqn4Cj+I2g0HDUb0bHMbPCoK8Ai6pz10BLwbnhM=
 github.com/looprig/sessionstore v0.3.0 h1:dX/BgQUmKJY6OBsfLjeT2TNVhSPoT1YaBwgQlkGaZnI=
 github.com/looprig/sessionstore v0.3.0/go.mod h1:RfNdvqn4Cj+I2g0HDUb0bHMbPCoK8Ai6pz10BLwbnhM=
+github.com/looprig/sessionstore v0.4.0 h1:YOTfiTFZ4bQDEJqAPTv/nAdt7TznDGD7jL3VnoY9LaU=
+github.com/looprig/sessionstore v0.4.0/go.mod h1:RfNdvqn4Cj+I2g0HDUb0bHMbPCoK8Ai6pz10BLwbnhM=
 github.com/looprig/storage v0.6.0 h1:e/FyPftK8e0rmeRc5YceV0QR9m46CKi/0/DM87Y+cXw=
 github.com/looprig/storage v0.6.0/go.mod h1:cA0IN/Xn3iMUojKkcfhQZApTtrjg/mdISijL0NtlxUA=

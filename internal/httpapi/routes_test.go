@@ -241,6 +241,9 @@ func (f *fakeReader) ListSessions(ctx context.Context, req sessionstore.ListSess
 	return page, nil
 }
 
+func (f *fakeReader) GetObjectMetadata(context.Context, sessionstore.GetObjectMetadataRequest) (sessionwire.ObjectMetadata, error) {
+	return sessionwire.ObjectMetadata{}, errors.New("object metadata unavailable")
+}
 func (f *fakeReader) GetObject(context.Context, sessionstore.GetObjectRequest) (io.ReadCloser, error) {
 	return nil, errors.New("unused by A2.1")
 }
@@ -536,20 +539,21 @@ func TestTheRouteTableServesEveryPathTheSpecNames(t *testing.T) {
 	// conformant, so it cannot be read in one direction only.
 	read := []string{http.MethodGet, http.MethodHead}
 	want := map[string][]string{
-		"/v1/bootstrap":                    read,
-		"/v1/agents":                       read,
-		"/v1/capabilities":                 read,
-		"/v1/sessions":                     {http.MethodGet, http.MethodHead, http.MethodPost},
-		"/v1/sessions/{sid}/status":        read,
-		"/v1/sessions/{sid}/journal":       read,
-		"/v1/sessions/{sid}/gates":         read,
-		"/v1/sessions/{sid}/input":         {http.MethodPost},
-		"/v1/sessions/{sid}/interrupt":     {http.MethodPost},
-		"/v1/sessions/{sid}/restore":       {http.MethodPost},
-		"/v1/sessions/{sid}/gates/{gid}":   {http.MethodPost},
-		"/v1/sessions/{sid}/objects/{oid}": read,
-		"/v1/realtime":                     read,
-		"/v1/csrf-token":                   read,
+		"/v1/bootstrap":                             read,
+		"/v1/agents":                                read,
+		"/v1/capabilities":                          read,
+		"/v1/sessions":                              {http.MethodGet, http.MethodHead, http.MethodPost},
+		"/v1/sessions/{sid}/status":                 read,
+		"/v1/sessions/{sid}/journal":                read,
+		"/v1/sessions/{sid}/gates":                  read,
+		"/v1/sessions/{sid}/input":                  {http.MethodPost},
+		"/v1/sessions/{sid}/interrupt":              {http.MethodPost},
+		"/v1/sessions/{sid}/restore":                {http.MethodPost},
+		"/v1/sessions/{sid}/gates/{gid}":            {http.MethodPost},
+		"/v1/sessions/{sid}/objects/{oid}":          read,
+		"/v1/sessions/{sid}/objects/{oid}/metadata": read,
+		"/v1/realtime":                              read,
+		"/v1/csrf-token":                            read,
 	}
 	got := map[string][]string{}
 	for _, route := range routeTable() {
@@ -1662,24 +1666,21 @@ func TestARequestDeadlineBoundsHandlerWork(t *testing.T) {
 	}
 }
 
-// TestAStreamingRouteCarriesNoHandlerDeadline is the other half. A deadline on
-// a route that streams an object or holds a WebSocket open would cut the
-// response off in the middle, so the exemption is behaviour rather than
-// preference -- and it is read through the same store call.
-func TestAStreamingRouteCarriesNoHandlerDeadline(t *testing.T) {
+// Object pages verify before emission, so their durable work has a deadline.
+func TestTheObjectRouteCarriesAVerificationDeadline(t *testing.T) {
 	t.Parallel()
 
 	f := newFixture(t, withLimits(RouteLimits{MaxRequestBytes: 1 << 20, RequestTimeout: 20 * time.Millisecond}))
 	recorder := f.get("/v1/sessions/" + string(fixtureSession) + "/objects/object-a")
-	if recorder.Code != http.StatusNotImplemented {
-		t.Fatalf("status = %d, want 501; body %q", recorder.Code, recorder.Body)
+	if recorder.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503; body %q", recorder.Code, recorder.Body)
 	}
 	_, deadlines := f.reads.snapshot()
 	if len(deadlines) != 1 {
 		t.Fatalf("the store was called %d times, want 1", len(deadlines))
 	}
-	if deadlines[0] {
-		t.Error("the object route imposed a handler deadline, which would truncate a stream")
+	if !deadlines[0] {
+		t.Error("the object route did not bound whole-object verification")
 	}
 }
 
@@ -2282,6 +2283,8 @@ func TestEveryMethodAsksForTheDecisionItsRuleNames(t *testing.T) {
 					want = []authorizationCall{{operation: "list"}}
 				case authSessionRead:
 					want = []authorizationCall{{operation: "read", session: session}}
+				case authObjectRead:
+					want = []authorizationCall{{operation: "object", session: session}}
 				case authControl:
 					want = []authorizationCall{{operation: "control", session: session, command: rule.command}}
 				}
@@ -2315,10 +2318,6 @@ type expectation struct {
 	// implemented is true for a route this build serves a handler for. It is
 	// the same fact as an empty owner, stated from the other side.
 	implemented bool
-	// awaitsObjectAuthorization marks a route whose authorization rule is known
-	// to be WEAKER than the operation it will eventually perform. See
-	// TestClearingAnOwnerRequiresAnExplicitSanction.
-	awaitsObjectAuthorization bool
 }
 
 // expectedRoutes is that restatement, keyed "METHOD /path".
@@ -2363,13 +2362,12 @@ func expectedRoutes() map[string]expectation {
 		"GET /v1/sessions/{sid}/status":  read(authSessionRead, true),
 		"GET /v1/sessions/{sid}/journal": read(authSessionRead, true),
 		"GET /v1/sessions/{sid}/gates":   read(authSessionRead, true),
-		// An object body is streamed, so no handler deadline. Its rule is the
-		// session read, which is WEAKER than the object read the operation
-		// needs; the route is 501 today and the flag below is what stops that
-		// rule being inherited by the task that implements it.
+		// Object decisions precede catalog resolution and trusted reference
+		// policy precedes metadata or bytes. Verification has a deadline.
 		"GET /v1/sessions/{sid}/objects/{oid}": expectation{
-			auth: authSessionRead, session: true, streams: true, awaitsObjectAuthorization: true,
+			auth: authObjectRead, session: true, implemented: true,
 		},
+		"GET /v1/sessions/{sid}/objects/{oid}/metadata": read(authObjectRead, true),
 		// State-changing commands on an existing session.
 		"POST /v1/sessions/{sid}/input":       control(commandInput, true),
 		"POST /v1/sessions/{sid}/interrupt":   control(commandInterrupt, true),
@@ -2411,8 +2409,7 @@ func TestEveryRouteDeclaresWhatItsShapeRequires(t *testing.T) {
 			got := expectation{
 				auth: rule.auth, command: rule.command, body: rule.body,
 				session: entry.session, streams: entry.streams,
-				implemented:               rule.owner == "",
-				awaitsObjectAuthorization: expected.awaitsObjectAuthorization,
+				implemented: rule.owner == "",
 			}
 			if got != expected {
 				t.Errorf("%s declares %+v, the restatement requires %+v", key, got, expected)
@@ -2486,6 +2483,8 @@ func sanctionedImplementedMethods() map[string]string {
 	// HEAD is GET's rule exactly, so its sanction is GET's sanction. Writing
 	// it twice would be two places for one argument to be revised in one.
 	sanctioned := map[string]string{
+		"GET /v1/sessions/{sid}/objects/{oid}":          "requires an object decision before catalog lookup and trusted committed-reference policy before metadata/body; frozen catalog binding selects the reader; success follows whole-object EOF and Close",
+		"GET /v1/sessions/{sid}/objects/{oid}/metadata": "requires the same object and committed-reference decisions as bytes; exposes only Core metadata, which is not current blob-presence proof",
 		"GET /v1/bootstrap": "serves the CALLER their own bounded tenant identity under " +
 			"authAuthenticated. The value comes only from the Principal the credential verifier " +
 			"placed in the operation context; the route accepts no query parameters, has no path " +
@@ -2553,7 +2552,6 @@ func TestClearingAnOwnerRequiresAnExplicitSanction(t *testing.T) {
 	t.Parallel()
 
 	sanctioned := sanctionedImplementedMethods()
-	expected := expectedRoutes()
 	implemented := 0
 	for _, entry := range routeTable() {
 		for _, rule := range entry.rules {
@@ -2574,10 +2572,6 @@ func TestClearingAnOwnerRequiresAnExplicitSanction(t *testing.T) {
 			if reason == "" {
 				t.Errorf("%s is sanctioned with an empty reason", key)
 			}
-			if expected[key].awaitsObjectAuthorization {
-				t.Errorf("%s serves a handler while still authorizing at a rule weaker than its "+
-					"operation; add the object-read decision before clearing its owner", key)
-			}
 		}
 	}
 	if implemented == 0 {
@@ -2588,26 +2582,18 @@ func TestClearingAnOwnerRequiresAnExplicitSanction(t *testing.T) {
 	}
 }
 
-// TestTheObjectRouteStillOwesAnObjectDecision states the gap the flag above
-// stands for, so it is a measured fact in the suite rather than a note.
-//
-// AuthorizeObjectRead is declared on this package's Authorizer and implemented
-// in internal/identity, and NOTHING in production calls it: the object route
-// authorizes at the session read because A2.1 parses no ObjectReference. That
-// is sound only while the route answers 501.
-func TestTheObjectRouteStillOwesAnObjectDecision(t *testing.T) {
+// The object decision runs even when reference policy is not yet configured.
+func TestTheObjectRouteMakesAnObjectDecision(t *testing.T) {
 	t.Parallel()
 
 	authorizer := &recordingAuthorizer{}
 	f := newFixture(t, withAuthorizer(authorizer))
 	recorder := f.get("/v1/sessions/" + string(fixtureSession) + "/objects/object-a")
-	if recorder.Code != http.StatusNotImplemented {
-		t.Fatalf("the object route answered %d; if it now serves a body it must authorize the OBJECT", recorder.Code)
+	if recorder.Code != http.StatusServiceUnavailable {
+		t.Fatalf("without policy the object route answered %d, want 503", recorder.Code)
 	}
-	for _, call := range authorizer.snapshot() {
-		if call.operation == "object" {
-			t.Fatal("the object route now makes an object decision; remove awaitsObjectAuthorization from the restatement")
-		}
+	if got := authorizer.snapshot(); len(got) != 1 || got[0].operation != "object" {
+		t.Fatalf("object decision missing: %+v", got)
 	}
 }
 
@@ -2630,7 +2616,7 @@ func TestEveryAuthorizationRuleAndCommandKindIsDeclared(t *testing.T) {
 			}
 		}
 	}
-	for _, rule := range []authRule{authAuthenticated, authSessionList, authSessionRead, authControl} {
+	for _, rule := range []authRule{authAuthenticated, authSessionList, authSessionRead, authObjectRead, authControl} {
 		if !rules[rule] {
 			t.Errorf("no method declares rule %d, so Router.authorize has a branch nothing drives", rule)
 		}
@@ -2948,11 +2934,8 @@ func TestAWedgedCredentialServiceDoesNotParkTheHandler(t *testing.T) {
 	}
 }
 
-// TestAStreamingRouteIsNotShortenedByTheAuthenticationBound is the limit of the
-// fix above, driven rather than promised. The bound is cancelled as soon as
-// authentication returns, so a route that declares itself streaming still
-// reaches its handler with a context carrying no deadline.
-func TestAStreamingRouteIsNotShortenedByTheAuthenticationBound(t *testing.T) {
+// Object verification receives its own deadline after authentication.
+func TestObjectVerificationGetsItsOwnPostAuthenticationBound(t *testing.T) {
 	t.Parallel()
 
 	f := newFixture(t, withLimits(RouteLimits{MaxRequestBytes: 1 << 20, RequestTimeout: 20 * time.Millisecond}))
@@ -2961,8 +2944,8 @@ func TestAStreamingRouteIsNotShortenedByTheAuthenticationBound(t *testing.T) {
 	if len(deadlines) != 1 {
 		t.Fatalf("the store was called %d times, want 1", len(deadlines))
 	}
-	if deadlines[0] {
-		t.Error("a streaming route inherited a deadline from the authentication bound")
+	if !deadlines[0] {
+		t.Error("object verification has no post-authentication deadline")
 	}
 }
 
@@ -2972,7 +2955,7 @@ func TestAStreamingRouteIsNotShortenedByTheAuthenticationBound(t *testing.T) {
 // Embedding an http.ResponseWriter satisfies the interface and hides every
 // optional one underneath it, so without Unwrap no handler below could flush,
 // hijack or read from a source. A6.1 needs Hijacker for the WebSocket upgrade
-// and A2.4 needs Flusher for object streaming, and the failure would be a nil
+// and the failure would be a nil
 // assertion at run time in a task with no reason to suspect this type.
 func TestTheWrapperDoesNotConcealTheWritersOptionalInterfaces(t *testing.T) {
 	t.Parallel()

@@ -106,6 +106,15 @@ type RouterConfig struct {
 
 	// Reads is the durable read plane.
 	Reads SessionReader
+	// ObjectPolicy proves committed-reference permission; nil fails closed.
+	ObjectPolicy ObjectPolicy
+	// ResolveObjectStore consumes the full immutable catalog pin, including
+	// RuntimeSessionID and ProtocolMode, and must refuse unknown configurations.
+	// Reads stay in canonical authenticated tenant/session scope. Any runtime
+	// namespace translation belongs to the resolved adapter, never this handler.
+	// Production resolver/public server composition remains A9's obligation.
+	ResolveObjectStore func(context.Context, sessionstore.SessionBinding) (ObjectReader, error)
+	ObjectLimits       ObjectLimits
 
 	// Directory is the observed Host target directory, read by /v1/agents to
 	// learn which configured launch targets are currently advertised.
@@ -177,15 +186,18 @@ type RouterConfig struct {
 
 // Router is Factory's public HTTP surface.
 type Router struct {
-	credentials *internalidentity.Authenticator
-	authorizer  Authorizer
-	reads       SessionReader
-	directory   Directory
-	department  []LaunchTemplate
-	guard       *Guard
-	ids         IDSource
-	ui          http.Handler
-	limits      RouteLimits
+	credentials        *internalidentity.Authenticator
+	authorizer         Authorizer
+	reads              SessionReader
+	directory          Directory
+	department         []LaunchTemplate
+	guard              *Guard
+	ids                IDSource
+	ui                 http.Handler
+	limits             RouteLimits
+	objectPolicy       ObjectPolicy
+	resolveObjectStore func(context.Context, sessionstore.SessionBinding) (ObjectReader, error)
+	objectLimits       ObjectLimits
 
 	// own is every response the router produces itself: the security headers,
 	// then the path split, then authentication, then the guard, then the mux.
@@ -228,6 +240,12 @@ func NewRouter(cfg RouterConfig) (*Router, error) {
 	if err := cfg.Limits.Validate(); err != nil {
 		return nil, err
 	}
+	if cfg.ObjectLimits == (ObjectLimits{}) {
+		cfg.ObjectLimits = DefaultObjectLimits()
+	}
+	if err := cfg.ObjectLimits.Validate(); err != nil {
+		return nil, err
+	}
 
 	router := &Router{
 		credentials: cfg.Credentials,
@@ -237,11 +255,14 @@ func NewRouter(cfg RouterConfig) (*Router, error) {
 		// The caller's configuration is COPIED rather than referenced, so a
 		// composer that reuses its buffers after NewRouter returns cannot
 		// change what a running router advertises.
-		department: cloneDepartment(cfg.Department),
-		guard:      cfg.Guard,
-		ids:        cfg.IDs,
-		ui:         cfg.UI,
-		limits:     cfg.Limits,
+		department:         cloneDepartment(cfg.Department),
+		guard:              cfg.Guard,
+		ids:                cfg.IDs,
+		ui:                 cfg.UI,
+		limits:             cfg.Limits,
+		objectPolicy:       cfg.ObjectPolicy,
+		resolveObjectStore: cfg.ResolveObjectStore,
+		objectLimits:       cfg.ObjectLimits,
 	}
 
 	mux := http.NewServeMux()
@@ -263,7 +284,8 @@ func NewRouter(cfg RouterConfig) (*Router, error) {
 //
 // The split is by path and it is made HERE, before authentication, because the
 // SPA's assets are public and the API's routes are not. Everything under the
-// version segment goes through the API chain and can only leave it as JSON;
+// version segment goes through the API chain; errors are JSON, and authorized
+// object bodies are bounded binary responses;
 // everything else is the SPA's, or a JSON route failure when no SPA is mounted.
 //
 // The security headers are set in two places, and the split is exactly as wide
@@ -542,8 +564,8 @@ type recordingWriter struct {
 // Embedding an http.ResponseWriter satisfies the interface and CONCEALS every
 // optional one the real writer implements: without this, no handler below can
 // reach Flusher, Hijacker or ReaderFrom, because a type assertion sees only the
-// wrapper. A6.1's WebSocket upgrade needs Hijacker and A2.4's object streaming
-// needs Flusher, and the failure mode is a nil assertion at run time in a task
+// wrapper. A6.1's WebSocket upgrade needs Hijacker, and the failure mode is a
+// nil assertion at run time in a task
 // that has no reason to suspect this type -- so it is settled here rather than
 // discovered there. Unwrap is the whole fix: http.ResponseController follows the
 // chain, which is why re-declaring each optional method would be strictly worse.
@@ -595,6 +617,7 @@ const (
 	authSessionList
 	// authSessionRead is a durable read within the principal's tenant.
 	authSessionRead
+	authObjectRead
 	// authControl is a state-changing command within the principal's tenant.
 	authControl
 )
@@ -749,7 +772,8 @@ func routeTable() []route {
 		{pattern: "/v1/sessions/{sid}/gates",
 			rules:   served(authSessionRead, func(rt *Router) http.Handler { return rt.serveSessionGates() }),
 			session: true},
-		{pattern: "/v1/sessions/{sid}/objects/{oid}", rules: pending(authSessionRead, "A2.4"), session: true, streams: true},
+		{pattern: "/v1/sessions/{sid}/objects/{oid}", rules: served(authObjectRead, func(rt *Router) http.Handler { return rt.serveObject(false) }), session: true},
+		{pattern: "/v1/sessions/{sid}/objects/{oid}/metadata", rules: served(authObjectRead, func(rt *Router) http.Handler { return rt.serveObject(true) }), session: true},
 		{pattern: "/v1/sessions/{sid}/input", rules: control(commandInput, "A3.1"), session: true},
 		{pattern: "/v1/sessions/{sid}/interrupt", rules: control(commandInterrupt, "A3.1"), session: true},
 		{pattern: "/v1/sessions/{sid}/restore", rules: control(commandRestore, "A3.1"), session: true},
@@ -816,8 +840,19 @@ func (rt *Router) serveRoute(entry route) http.Handler {
 			}
 		}
 
-		if err := rt.authorize(ctx, rule, operation.Principal, session); err != nil {
-			writeAPIError(w, authorizationFailure(err))
+		var authorizationErr error
+		if rule.auth == authObjectRead {
+			ref := sessionwire.ObjectReference{ObjectID: r.PathValue("oid")}
+			if ref.Validate() != nil {
+				writeAPIError(w, invalidObjectRequest())
+				return
+			}
+			authorizationErr = rt.authorizer.AuthorizeObjectRead(ctx, operation.Principal, session, ref)
+		} else {
+			authorizationErr = rt.authorize(ctx, rule, operation.Principal, session)
+		}
+		if authorizationErr != nil {
+			writeAPIError(w, authorizationFailure(authorizationErr))
 			return
 		}
 
@@ -982,6 +1017,12 @@ func newScope(principal identity.Principal) scope {
 }
 
 // catalogEntry is the scoped read of one session's catalog record.
+func (s scope) objectMetadata(session sessionwire.SessionID, ref sessionwire.ObjectReference, kind sessionstore.ObjectKind) sessionstore.GetObjectMetadataRequest {
+	return sessionstore.GetObjectMetadataRequest{TenantID: s.principal.Tenant(), SessionID: session, ExpectedKind: kind, Reference: ref}
+}
+func (s scope) objectBody(session sessionwire.SessionID, m sessionwire.ObjectMetadata, kind sessionstore.ObjectKind) sessionstore.GetObjectRequest {
+	return sessionstore.GetObjectRequest{TenantID: s.principal.Tenant(), SessionID: session, ExpectedKind: kind, Metadata: m}
+}
 func (s scope) catalogEntry(session sessionwire.SessionID) sessionstore.GetCatalogEntryRequest {
 	return sessionstore.GetCatalogEntryRequest{
 		TenantID:  s.principal.Tenant(),

@@ -69,6 +69,7 @@ type SessionReader interface {
 	ReadPublicJournal(ctx context.Context, req sessionstore.ReadPublicJournalRequest) (sessionwire.JournalPage, error)
 	ReadGates(ctx context.Context, req sessionstore.ReadGatesRequest) (sessionwire.GatePage, error)
 	GetObject(ctx context.Context, req sessionstore.GetObjectRequest) (io.ReadCloser, error)
+	GetObjectMetadata(ctx context.Context, req sessionstore.GetObjectMetadataRequest) (sessionwire.ObjectMetadata, error)
 }
 
 // Directory is the observed Host target directory.

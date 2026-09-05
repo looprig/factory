@@ -61,6 +61,9 @@ func (FakeSeams) ReadGates(context.Context, sessionstore.ReadGatesRequest) (sess
 	return sessionwire.GatePage{}, nil
 }
 
+func (FakeSeams) GetObjectMetadata(context.Context, sessionstore.GetObjectMetadataRequest) (sessionwire.ObjectMetadata, error) {
+	return sessionwire.ObjectMetadata{}, nil
+}
 func (FakeSeams) GetObject(context.Context, sessionstore.GetObjectRequest) (io.ReadCloser, error) {
 	return nil, nil
 }
