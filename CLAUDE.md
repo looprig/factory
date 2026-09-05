@@ -516,14 +516,44 @@ route still pays a second catalog read, because `ReadGates` re-reads the record
 it projects and restating that projection here is how two readers of one record
 come to disagree; coalescing durable reads across a request belongs to A9.1.
 
+**A query parameter that is present must carry a value.** `singleValue` refuses
+`?x=` for every parameter this surface reads, and that is a rule about the
+surface rather than about parsing: `?x=` is a parameter the caller *sent*, and
+no position or bound here means the empty string. The concrete failure it
+prevents is `?cursor=`, which SessionStore reads as **no** cursor while Factory
+had already treated the request as positioned — skipping the tip probe and
+walking from sequence one. Measured on a 3000-record journal: `?cursor=`
+returned events 1–95 where naming no cursor returned 2938–2999. The client that
+reaches it is doing the obvious thing: Core declares `next_cursor` `omitempty`,
+so a client written as `cursor=${page.next_cursor ?? ""}` sends an empty cursor
+exactly on reaching the tip, is thrown back to the head, and walks the journal
+forward again — an unbounded read loop on an authenticated route. Refusing is
+chosen over treating it as absent because both possible answers are guesses
+about what the caller meant and one of them is the loop.
+
+**A draining store is 503 and retryable, not a fault.** `admitForeground`
+refuses every read with `*StoreClosedError` once `Close` begins; it is a bare
+struct that wraps nothing and matches no typed arm, so it fell to
+`internalFailure` and made an ordinary graceful shutdown answer every read with
+`500 retryable:false` — telling clients to stop retrying at the moment another
+replica would serve them. `storeUnavailable` is consulted by all three durable
+mappings. Its stated limit: a read already *in flight* when `Close` begins is
+cancelled through the returned context and arrives as `context.Canceled`, which
+is indistinguishable here from the caller going away.
+
 **Every page limit is checked against `storage.MaxOrderedPageLimit` at compile
 time.** `storePageCeiling` names the storage constant directly rather than
 restating 1000, so a release that moved it is a build fact rather than a live
 500, and `const _ = uint(storePageCeiling - n)` beside each limit fails the
 *build* rather than a test. `TestEveryPageLimitIsCheckedAgainstTheStoreCeiling`
-parses the package's own production files for constants named `*PageLimit` and
-requires each to have one, because no constant expression can notice a limit
-that has no check.
+parses the package's own production files and requires each to have one, because
+no constant expression can notice a limit that has no check. It derives its
+subject **twice**: constants named `*PageLimit` (a convention, load-bearing only
+while it is followed) and — the rule that does not depend on a name — every
+identifier written as the `Limit` member of a `sessionstore` request literal. The
+second exists because the first missed a measured case: `const
+probeObjectChunkSize = 5000` passed as a `Limit:` value at five times the real
+ceiling, invisible to the suffix rule in both directions.
 
 **Do not add an HTTP method override.** The CSRF guard's subject is `r.Method`.
 A route or middleware honouring `X-HTTP-Method-Override` or a `_method` field

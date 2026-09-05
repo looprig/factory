@@ -309,6 +309,9 @@ func catalogFailure(err error) apiError {
 	if failure, ok := contextFailure(err); ok {
 		return failure
 	}
+	if failure, ok := storeUnavailable(err); ok {
+		return failure
+	}
 	var keyspace *sessionstore.KeyspaceError
 	if errors.As(err, &keyspace) && keyspace.Code == sessionstore.KeyspaceBindingNotFound {
 		return sessionNotFound()
@@ -329,6 +332,42 @@ func catalogFailure(err error) apiError {
 	default:
 		return internalFailure()
 	}
+}
+
+// storeUnavailable maps a SessionStore that is not accepting work onto the
+// retryable answer, and it is consulted by EVERY durable mapping on this
+// surface.
+//
+// admitForeground refuses every public read with *StoreClosedError once Close
+// has started, and that error is a bare struct: it wraps nothing, carries no
+// code, and is neither a CatalogError nor a JournalError nor a HostTargetError.
+// So without this arm it fell to internalFailure, and an ordinary graceful
+// shutdown answered every read on the draining replica with 500 internal_error
+// and retryable:false -- telling a client not to retry at exactly the moment
+// retrying reaches another replica, and paging an operator for a planned
+// rollout.
+//
+// It is 503 for the reason directoryFailure already gives for a backend
+// outage: this is the DEPLOYMENT's condition rather than the caller's, and
+// reporting it as a fault makes a routine operation look like a Factory bug.
+// The condition is transient by construction -- a closing store is being
+// replaced -- which is what retryable is for.
+//
+// What it does NOT cover, said rather than implied: a read already IN FLIGHT
+// when Close begins is cancelled through the context admitForeground returned,
+// so it arrives here as context.Canceled and contextFailure answers it as the
+// caller's own. That is indistinguishable at this layer -- the two are the same
+// error value -- and closing it needs a signal sessionstore does not publish.
+func storeUnavailable(err error) (apiError, bool) {
+	var closed *sessionstore.StoreClosedError
+	if !errors.As(err, &closed) {
+		return apiError{}, false
+	}
+	return apiError{
+		status:  http.StatusServiceUnavailable,
+		code:    ErrorCodeUnavailable,
+		message: "this deployment cannot read durable state at the moment",
+	}, true
 }
 
 // contextFailure separates the two ways a context ends, because they need

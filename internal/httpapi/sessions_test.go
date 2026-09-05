@@ -171,6 +171,15 @@ func (f *fakeReader) ReadPublicJournal(ctx context.Context, req sessionstore.Rea
 	f.mu.Lock()
 	f.journalRequests = append(f.journalRequests, req)
 	block, fail, panics, leak := f.block, f.fail, f.panics, f.leak
+	if fail == nil {
+		fail = f.journalFail
+	}
+	// The tip probe is positioned above every sequence, so failing everything
+	// EXCEPT it is how a test reaches the tail read's failure branch after a
+	// successful probe.
+	if fail == nil && req.FromSeq != journalTipProbeSeq {
+		fail = f.journalTailFail
+	}
 	held := f.sessions[storedSession{tenant: req.TenantID, session: req.SessionID}]
 	records := slices.Clone(f.journals[storedSession{tenant: req.TenantID, session: req.SessionID}])
 	f.mu.Unlock()
@@ -277,6 +286,9 @@ func (f *fakeReader) ReadGates(ctx context.Context, req sessionstore.ReadGatesRe
 	f.mu.Lock()
 	f.gateRequests = append(f.gateRequests, req)
 	block, fail, panics, leak := f.block, f.fail, f.panics, f.leak
+	if fail == nil {
+		fail = f.gateFail
+	}
 	key := storedSession{tenant: req.TenantID, session: req.SessionID}
 	held, record := f.sessions[key], f.records[key]
 	f.mu.Unlock()
@@ -343,6 +355,18 @@ func withRecord(tenant sessionwire.TenantID, session sessionwire.SessionID, reco
 		key := storedSession{tenant: tenant, session: session}
 		f.reads.sessions[key] = true
 		f.reads.records[key] = record
+	}
+}
+
+// withSuccessorRecord makes the store answer a DIFFERENT record from its second
+// catalog read onward, which is what lets a test tell a handler that carries
+// the resolved record from one that reads the catalog again.
+func withSuccessorRecord(tenant sessionwire.TenantID, session sessionwire.SessionID, record sessionstore.CatalogRecord) fixtureOption {
+	return func(_ *RouterConfig, f *fixture) {
+		record.TenantID, record.SessionID = tenant, session
+		key := storedSession{tenant: tenant, session: session}
+		f.reads.sessions[key] = true
+		f.reads.nextRecords[key] = record
 	}
 }
 
@@ -1256,6 +1280,12 @@ func TestTheJournalPositionIsValidatedBeforeTheStore(t *testing.T) {
 		"a position that is not a number":  "?from_seq=early",
 		"a negative position":              "?from_seq=-1",
 		"two cursors":                      "?cursor=a&cursor=b",
+		// The empty-value cases. The table had nine rows and not one of them
+		// sent a parameter with no value, which is how "?cursor=" reached the
+		// store as no cursor at all and turned the tail into a replay.
+		"an empty cursor":   "?cursor=",
+		"an empty position": "?from_seq=",
+		"an empty limit":    "?limit=",
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
@@ -1407,20 +1437,56 @@ func TestTheResolvedRecordIsReadOnceAndReusedByTheStatus(t *testing.T) {
 }
 
 // TestTheResolvedRecordIsCarriedToTheHandlerNotRebuilt shows the seam carries
-// the record the chain read, rather than the handler re-deriving one. It is
-// driven by making the store answer a DIFFERENT record on a second call, which
-// a handler that read again would render.
+// the record the chain read, rather than the handler re-deriving one.
+//
+// It is driven by making the store answer a DIFFERENT record from its second
+// call onward, so the two behaviours produce different bodies. Without that
+// divergence the test asserted only that the status matches the one record the
+// fake held -- which is one of the thirty-two cells the state grid already
+// covers, and which a handler that discarded the carried entry and re-read the
+// catalog PASSES. Measured: that mutation ran this test alone, green.
+//
+// The divergence is not a contrivance. The two reads are separate round trips
+// with nothing holding a lock across them, so a session whose state moves
+// between them is ordinary; the point of carrying the record is that the
+// existence decision and the body describe the same instant.
 func TestTheResolvedRecordIsCarriedToTheHandlerNotRebuilt(t *testing.T) {
 	t.Parallel()
 
+	resolved := coldRecord(sessionwire.SessionStateRunning, sessionwire.SessionResidencyResident)
+	successor := coldRecord(sessionwire.SessionStateFailed, sessionwire.SessionResidencyCold)
 	f := newFixture(t, withSessions(),
-		withRecord(fixtureTenant, fixtureSession, coldRecord(sessionwire.SessionStateRunning, sessionwire.SessionResidencyResident)))
+		withRecord(fixtureTenant, fixtureSession, resolved),
+		withSuccessorRecord(fixtureTenant, fixtureSession, successor))
+
 	status := decodeStatus(t, f.get(statusTarget(fixtureSession)))
 	if status.State != sessionwire.SessionStateRunning {
-		t.Errorf("state = %q, want the resolved record's %q", status.State, sessionwire.SessionStateRunning)
+		t.Errorf("state = %q, want the RESOLVED record's %q; %q is the record a second read would return",
+			status.State, sessionwire.SessionStateRunning, sessionwire.SessionStateFailed)
 	}
 	if status.Residency != sessionwire.SessionResidencyResident {
-		t.Errorf("residency = %q", status.Residency)
+		t.Errorf("residency = %q, want the resolved record's %q", status.Residency, sessionwire.SessionResidencyResident)
+	}
+	// The control: the fake really does answer differently the second time, so
+	// the assertion above is about which record was rendered rather than about
+	// a store that could only ever give one answer.
+	second := newFixture(t, withSessions(),
+		withRecord(fixtureTenant, fixtureSession, resolved),
+		withSuccessorRecord(fixtureTenant, fixtureSession, successor))
+	if _, err := second.reads.GetCatalogEntry(context.Background(), sessionstore.GetCatalogEntryRequest{
+		TenantID: fixtureTenant, SessionID: fixtureSession,
+	}); err != nil {
+		t.Fatalf("the control's first read failed: %v", err)
+	}
+	entry, err := second.reads.GetCatalogEntry(context.Background(), sessionstore.GetCatalogEntryRequest{
+		TenantID: fixtureTenant, SessionID: fixtureSession,
+	})
+	if err != nil {
+		t.Fatalf("the control's second read failed: %v", err)
+	}
+	if entry.Record.State != sessionwire.SessionStateFailed {
+		t.Fatalf("the fake answered %q on its second call, so the divergence this test rests on does not exist",
+			entry.Record.State)
 	}
 }
 
@@ -1603,21 +1669,50 @@ func TestEveryPageLimitIsCheckedAgainstTheStoreCeiling(t *testing.T) {
 	if len(files) == 0 {
 		t.Fatal("no production files were found, so this scan proves nothing")
 	}
-	limits, checked := map[string]bool{}, map[string]bool{}
+	limits, checked, constants, used := map[string]bool{}, map[string]bool{}, map[string]bool{}, map[string]bool{}
 	for name, source := range files {
-		fileLimits, fileChecks, err := scanPageLimits(name, source)
+		report, err := scanPageLimits(name, source)
 		if err != nil {
 			t.Fatalf("parse %s: %v", name, err)
 		}
-		for _, limit := range fileLimits {
+		for _, limit := range report.limits {
 			limits[limit] = true
 		}
-		for _, check := range fileChecks {
+		for _, check := range report.checks {
 			checked[check] = true
+		}
+		for _, constant := range report.constants {
+			constants[constant] = true
+		}
+		for _, use := range report.limitUses {
+			used[use] = true
 		}
 	}
 	if len(limits) == 0 {
 		t.Fatal("the production files declare no page limit, so this scan proves nothing")
+	}
+	// The second derivation, and the one that does not depend on a name. Every
+	// CONSTANT this package hands to SessionStore as a page bound must be
+	// checked, whatever it is called. Without it the subject was the naming
+	// convention rather than the behaviour: a limit named anything else was
+	// invisible in both directions, and a `const probeObjectChunkSize = 5000`
+	// passed as a Limit: value sailed through at five times the real ceiling.
+	if len(used) == 0 {
+		t.Fatal("no identifier is passed to SessionStore as a page limit, so the use-derived rule reads nothing")
+	}
+	for name := range used {
+		if !constants[name] {
+			// A parameter or a local carries a value from somewhere else; the
+			// bound on it is at whatever assigned it, and this rule is about
+			// constants written into a request.
+			continue
+		}
+		if !checked[name] {
+			t.Errorf("%s is passed to SessionStore as a page limit and has no ceiling check; add const _ = uint(storePageCeiling - %s)", name, name)
+		}
+	}
+	if !used["agentProbePageLimit"] {
+		t.Errorf("the use-derived scan found %v, which does not include the one constant written into a request literal", slices.Sorted(maps.Keys(used)))
 	}
 	for limit := range limits {
 		if !checked[limit] {
@@ -1648,50 +1743,107 @@ func TestThePageLimitScanReportsALimitWithNoCheck(t *testing.T) {
 	t.Parallel()
 
 	const unchecked = "package httpapi\n\nconst newlyAddedPageLimit = 5000\n"
-	limits, checks, err := scanPageLimits("unchecked.go", []byte(unchecked))
+	report, err := scanPageLimits("unchecked.go", []byte(unchecked))
 	if err != nil {
 		t.Fatalf("parse: %v", err)
 	}
-	if !slices.Contains(limits, "newlyAddedPageLimit") {
-		t.Errorf("the scan found limits %v, want newlyAddedPageLimit", limits)
+	if !slices.Contains(report.limits, "newlyAddedPageLimit") {
+		t.Errorf("the scan found limits %v, want newlyAddedPageLimit", report.limits)
 	}
-	if len(checks) != 0 {
-		t.Errorf("the scan found checks %v in a source that declares none", checks)
+	if len(report.checks) != 0 {
+		t.Errorf("the scan found checks %v in a source that declares none", report.checks)
 	}
 
 	const checkedSource = "package httpapi\n\nconst newlyAddedPageLimit = 5000\n\nconst _ = uint(storePageCeiling - newlyAddedPageLimit)\n"
-	_, checks, err = scanPageLimits("checked.go", []byte(checkedSource))
+	report, err = scanPageLimits("checked.go", []byte(checkedSource))
 	if err != nil {
 		t.Fatalf("parse: %v", err)
 	}
-	if !slices.Contains(checks, "newlyAddedPageLimit") {
-		t.Errorf("the scan found checks %v, want newlyAddedPageLimit", checks)
+	if !slices.Contains(report.checks, "newlyAddedPageLimit") {
+		t.Errorf("the scan found checks %v, want newlyAddedPageLimit", report.checks)
 	}
 	// A subtraction that is not the ceiling check is not a check. Without this
 	// the rule would be satisfied by any arithmetic mentioning the name.
 	const wrongCeiling = "package httpapi\n\nconst newlyAddedPageLimit = 5000\n\nconst _ = uint(64 - newlyAddedPageLimit)\n"
-	_, checks, err = scanPageLimits("wrong.go", []byte(wrongCeiling))
+	report, err = scanPageLimits("wrong.go", []byte(wrongCeiling))
 	if err != nil {
 		t.Fatalf("parse: %v", err)
 	}
-	if len(checks) != 0 {
-		t.Errorf("a subtraction from something other than storePageCeiling was read as a check: %v", checks)
+	if len(report.checks) != 0 {
+		t.Errorf("a subtraction from something other than storePageCeiling was read as a check: %v", report.checks)
+	}
+
+	// The use-derived rule, at the construct the suffix rule cannot see: a
+	// constant named nothing like a page limit, written into a SessionStore
+	// request as one. This is the shape that passed cleanly at five times the
+	// real ceiling before the rule was derived from use.
+	const misnamed = "package httpapi\n\nconst probeObjectChunkSize = 5000\n\n" +
+		"func (s scope) objects() sessionstore.ListObjectsRequest {\n" +
+		"\treturn sessionstore.ListObjectsRequest{Limit: probeObjectChunkSize}\n}\n"
+	report, err = scanPageLimits("misnamed.go", []byte(misnamed))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if len(report.limits) != 0 {
+		t.Errorf("the suffix rule claimed %v for a constant named nothing like a page limit", report.limits)
+	}
+	if !slices.Contains(report.constants, "probeObjectChunkSize") {
+		t.Errorf("the scan did not record probeObjectChunkSize as a constant; it found %v", report.constants)
+	}
+	if !slices.Contains(report.limitUses, "probeObjectChunkSize") {
+		t.Errorf("the scan did not see probeObjectChunkSize passed as a page limit; it saw %v", report.limitUses)
+	}
+	// A Limit: on something that is not a SessionStore request is not this
+	// rule's business, or the scan would report every local struct with a
+	// bound in it.
+	const foreign = "package httpapi\n\nconst somethingElse = 5000\n\n" +
+		"func f() any { return elsewhere.Request{Limit: somethingElse} }\n"
+	report, err = scanPageLimits("foreign.go", []byte(foreign))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if len(report.limitUses) != 0 {
+		t.Errorf("a Limit: on a foreign type was read as a SessionStore page limit: %v", report.limitUses)
 	}
 }
 
-// scanPageLimits reports the page-limit constants a file declares and the
-// ceiling checks it carries for them.
+// pageLimitReport is what one file says about page limits.
+type pageLimitReport struct {
+	// limits are constants NAMED as page limits: the suffix convention.
+	limits []string
+	// checks are the ceiling checks the file carries.
+	checks []string
+	// constants is every constant the file declares, which is what tells a
+	// misnamed limit from a function parameter at a use site.
+	constants []string
+	// limitUses are the identifiers the file passes to SessionStore as a page
+	// bound, which is the subject derived from USE rather than from spelling.
+	limitUses []string
+}
+
+// scanPageLimits reports the page limits a file declares, the ceiling checks it
+// carries, and the identifiers it hands SessionStore as a bound.
 //
-// A limit is a constant whose name ends in PageLimit, which is this package's
-// naming rule for "a number sent to SessionStore as a page bound". A check is
-// exactly the constant expression uint(storePageCeiling - <name>), read from
-// the parsed tree rather than matched in text, because a text match cannot tell
-// an expression from a comment quoting one.
-func scanPageLimits(name string, source []byte) (limits, checks []string, err error) {
+// It derives its subject two ways, and the second exists because the first is a
+// CONVENTION. The suffix rule -- a constant whose name ends in PageLimit -- is
+// this package's naming rule and is load-bearing only while everybody follows
+// it; a limit named otherwise is invisible to it in both directions, and a
+// const probeObjectChunkSize = 5000 written into a request was measured passing
+// at five times the store's real ceiling. So the scan also collects every
+// identifier appearing as the Limit member of a sessionstore request literal,
+// which is what a page bound IS rather than what it is called.
+//
+// A check is exactly the constant expression uint(storePageCeiling - <name>),
+// read from the parsed tree rather than matched in text, because a text match
+// cannot tell an expression from a comment quoting one. The request literal is
+// recognised the same way: by its type expression naming the sessionstore
+// package, so a Limit member on some other type is not this rule's business.
+func scanPageLimits(name string, source []byte) (pageLimitReport, error) {
 	file, err := parser.ParseFile(token.NewFileSet(), name, source, 0)
 	if err != nil {
-		return nil, nil, err
+		return pageLimitReport{}, err
 	}
+	var report pageLimitReport
 	for _, declaration := range file.Decls {
 		general, ok := declaration.(*ast.GenDecl)
 		if !ok || general.Tok != token.CONST {
@@ -1703,18 +1855,54 @@ func scanPageLimits(name string, source []byte) (limits, checks []string, err er
 				continue
 			}
 			for _, ident := range value.Names {
+				if ident.Name == "_" {
+					continue
+				}
+				report.constants = append(report.constants, ident.Name)
 				if strings.HasSuffix(ident.Name, "PageLimit") {
-					limits = append(limits, ident.Name)
+					report.limits = append(report.limits, ident.Name)
 				}
 			}
 			for _, expression := range value.Values {
 				if checked, ok := ceilingCheckSubject(expression); ok {
-					checks = append(checks, checked)
+					report.checks = append(report.checks, checked)
 				}
 			}
 		}
 	}
-	return limits, checks, nil
+	ast.Inspect(file, func(node ast.Node) bool {
+		literal, ok := node.(*ast.CompositeLit)
+		if !ok || !isSessionStoreType(literal.Type) {
+			return true
+		}
+		for _, element := range literal.Elts {
+			keyed, ok := element.(*ast.KeyValueExpr)
+			if !ok {
+				continue
+			}
+			key, ok := keyed.Key.(*ast.Ident)
+			if !ok || key.Name != "Limit" {
+				continue
+			}
+			if ident, ok := keyed.Value.(*ast.Ident); ok {
+				report.limitUses = append(report.limitUses, ident.Name)
+			}
+		}
+		return true
+	})
+	return report, nil
+}
+
+// isSessionStoreType reports whether a composite literal's type is one of
+// SessionStore's, which is what makes a Limit member a page bound rather than
+// some local struct's field of the same name.
+func isSessionStoreType(expression ast.Expr) bool {
+	selector, ok := expression.(*ast.SelectorExpr)
+	if !ok {
+		return false
+	}
+	pkg, ok := selector.X.(*ast.Ident)
+	return ok && pkg.Name == "sessionstore"
 }
 
 // ceilingCheckSubject reports the limit a uint(storePageCeiling - x) expression
@@ -2121,6 +2309,13 @@ func TestAJournalFailureMapsToOneStablePublicAnswer(t *testing.T) {
 			t.Errorf("%s mapped to %+v, want the one sessionNotFound construction", layout.name, got)
 		}
 	}
+	// A closing store reaches the retryable answer THROUGH the delegation.
+	// There is no storeUnavailable arm in journalFailure, deliberately, so
+	// this is the reader for the fact that the delegation is what carries it.
+	closing := journalFailure(&sessionstore.StoreClosedError{})
+	if closing.status != http.StatusServiceUnavailable || closing.code != ErrorCodeUnavailable {
+		t.Errorf("a closing store mapped to %+v, want the retryable 503", closing)
+	}
 	// A keyspace fault is still a fault, so the delegation did not widen the
 	// 404 on its way through.
 	if got := journalFailure(&sessionstore.KeyspaceError{Code: sessionstore.KeyspaceHashCollision}); got != internalFailure() {
@@ -2136,5 +2331,213 @@ func TestAJournalFailureMapsToOneStablePublicAnswer(t *testing.T) {
 	// An error of no type this package knows is a fault by default, not a 404.
 	if got := journalFailure(errors.New("the backend is confused")); got != internalFailure() {
 		t.Errorf("an untyped error mapped to %+v, want the internal fault", got)
+	}
+}
+
+// TestAnEmptyCursorDoesNotBecomeAReplayFromTheFirstRecord is M1's own reader,
+// separate from the position table because what matters is not only the status
+// but WHICH history an accepted empty cursor would have served.
+//
+// A table row asserting 400 dies if the refusal is removed, but it says nothing
+// about the failure that made the refusal necessary. This drives the three
+// shapes side by side, so the record is what the answers actually were.
+func TestAnEmptyCursorDoesNotBecomeAReplayFromTheFirstRecord(t *testing.T) {
+	t.Parallel()
+
+	journal := func() fixtureOption {
+		return withJournal(fixtureTenant, fixtureSession, longJournal(3000)...)
+	}
+	// The refusal.
+	empty := newFixture(t, withSessions(), journal()).get(journalTarget(fixtureSession) + "?cursor=")
+	if empty.Code != http.StatusBadRequest {
+		t.Fatalf("an empty cursor answered %d, want 400; body was %q", empty.Code, empty.Body)
+	}
+	if code := decodeEnvelope(t, empty).Error.Code; code != sessionwire.ErrorCodeInvalidRequest {
+		t.Errorf("code = %q, want %q", code, sessionwire.ErrorCodeInvalidRequest)
+	}
+	// It is refused BEFORE the store, like every other malformed position.
+	refused := newFixture(t, withSessions(), journal())
+	refused.get(journalTarget(fixtureSession) + "?cursor=")
+	if reads := refused.journalSnapshot(); len(reads) != 0 {
+		t.Errorf("an empty cursor reached the store as %+v", reads)
+	}
+	// And the answer it is NOT: naming no cursor at all is the tail. This is
+	// the comparison the refusal exists to prevent collapsing -- an accepted
+	// empty cursor served this route's oldest events under a parameter that
+	// means "continue from where I was".
+	tail := decodeJournalPage(t, newFixture(t, withSessions(), journal()).get(journalTarget(fixtureSession)))
+	seqs := eventSequences(tail)
+	if len(seqs) == 0 || seqs[0] < 2900 {
+		t.Fatalf("the unpositioned control began at %v, so it is not a tail", seqs)
+	}
+	// The three parameters answer an empty value the same way, which is the
+	// property that stops the next one added being the one that does not.
+	for _, parameter := range []string{"cursor", "from_seq", "limit"} {
+		f := newFixture(t, withSessions(), journal())
+		recorder := f.get(journalTarget(fixtureSession) + "?" + parameter + "=")
+		if recorder.Code != http.StatusBadRequest {
+			t.Errorf("an empty %s answered %d, want 400", parameter, recorder.Code)
+		}
+	}
+	// The tenant list shares the reader, so the rule reaches it too rather
+	// than being fixed on one route.
+	list := newFixture(t).get("/v1/sessions?limit=")
+	if list.Code != http.StatusBadRequest {
+		t.Errorf("an empty limit on the session list answered %d, want 400", list.Code)
+	}
+}
+
+// TestADrainingStoreIsRetryableRatherThanAFault is M2's reader.
+//
+// SessionStore refuses every public read with *StoreClosedError once Close has
+// begun. It is a bare struct that wraps nothing and carries no code, so it
+// matches none of the typed arms and used to fall to the internal fault: every
+// read on a draining replica answered 500 with retryable:false, which tells a
+// client not to retry at exactly the moment another replica would serve it.
+func TestADrainingStoreIsRetryableRatherThanAFault(t *testing.T) {
+	t.Parallel()
+
+	for route, target := range coldReadTargets(fixtureSession) {
+		t.Run(route, func(t *testing.T) {
+			t.Parallel()
+
+			f := newFixture(t, withSessions(), withJournal(fixtureTenant, fixtureSession, longJournal(20)...))
+			f.reads.fail = &sessionstore.StoreClosedError{}
+			recorder := f.get(target)
+			if recorder.Code != http.StatusServiceUnavailable {
+				t.Fatalf("a draining store answered %d, want 503; body was %q", recorder.Code, recorder.Body)
+			}
+			envelope := decodeEnvelope(t, recorder)
+			if envelope.Error.Code != ErrorCodeUnavailable {
+				t.Errorf("code = %q, want %q", envelope.Error.Code, ErrorCodeUnavailable)
+			}
+			if !envelope.Error.Retryable {
+				t.Error("a draining store was reported as not retryable, so a client is told to stop asking")
+			}
+		})
+	}
+	// The tenant list and the agent list reach it through their own mappings,
+	// which are separate functions: the rule is the surface's, not one route's.
+	t.Run("the tenant session list", func(t *testing.T) {
+		t.Parallel()
+
+		f := newFixture(t)
+		f.reads.fail = &sessionstore.StoreClosedError{}
+		if recorder := f.get("/v1/sessions"); recorder.Code != http.StatusServiceUnavailable {
+			t.Errorf("the session list answered %d, want 503", recorder.Code)
+		}
+	})
+	t.Run("the agent list", func(t *testing.T) {
+		t.Parallel()
+
+		f := newFixture(t, withDepartment(pooledTemplate), withDirectoryFailure(&sessionstore.StoreClosedError{}))
+		if recorder := f.get("/v1/agents"); recorder.Code != http.StatusServiceUnavailable {
+			t.Errorf("the agent list answered %d, want 503", recorder.Code)
+		}
+	})
+	// The journal reaches it on the read that FOLLOWS a successful one, which
+	// is a different code path from the probe failing: the tail's mapping has
+	// to carry the arm too.
+	t.Run("the journal tail after a successful probe", func(t *testing.T) {
+		t.Parallel()
+
+		f := newFixture(t, withSessions(), withJournal(fixtureTenant, fixtureSession, longJournal(20)...))
+		f.reads.journalTailFail = &sessionstore.StoreClosedError{}
+		recorder := f.get(journalTarget(fixtureSession))
+		if recorder.Code != http.StatusServiceUnavailable {
+			t.Fatalf("the journal tail answered %d, want 503; body was %q", recorder.Code, recorder.Body)
+		}
+		if reads := f.journalSnapshot(); len(reads) != 2 {
+			t.Errorf("the tail failure was reached after %d journal reads, want 2", len(reads))
+		}
+	})
+	// The control: a draining store is separated from a fault rather than
+	// every failure becoming 503.
+	f := newFixture(t, withSessions())
+	f.reads.fail = &sessionstore.CatalogError{Code: sessionstore.CatalogErrorBackend, Field: "get"}
+	if recorder := f.get(statusTarget(fixtureSession)); recorder.Code != http.StatusInternalServerError {
+		t.Errorf("a backend fault answered %d, want 500", recorder.Code)
+	}
+}
+
+// TestAGateReadFailureIsAnsweredRatherThanSwallowed closes the branch two
+// mutations survived.
+//
+// serveSessionGates makes the SECOND durable read of its request, and the fake
+// used to carry one global failure lever that resolveSession's catalog read
+// consumed first -- so nothing could fail the gate read, and both "map it
+// through internalFailure instead of catalogFailure" and "ignore the error and
+// answer 200 with a zero page" survived the whole suite. The second is the one
+// that matters: a session blocked on a gate whose gate read faults would report
+// no open gates at all, which a client cannot tell from a session that has
+// none.
+func TestAGateReadFailureIsAnsweredRatherThanSwallowed(t *testing.T) {
+	t.Parallel()
+
+	const secret = "postgres://user:hunter2@db.internal:5432/sessions"
+	record := coldRecord(sessionwire.SessionStateWaitingOnGate, sessionwire.SessionResidencyCold)
+	record.LastJournalSeq = 40
+	record.OpenGates = []sessionwire.GateProjection{openGate("gate-a", 3)}
+
+	t.Run("a backend fault is a fault, redacted", func(t *testing.T) {
+		t.Parallel()
+
+		f := newFixture(t, withSessions(), withRecord(fixtureTenant, fixtureSession, record))
+		f.reads.gateFail = &sessionstore.CatalogError{Code: sessionstore.CatalogErrorBackend, Field: secret}
+		recorder := f.get(gatesTarget(fixtureSession))
+		if recorder.Code != http.StatusInternalServerError {
+			t.Fatalf("status = %d, want 500; body was %q", recorder.Code, recorder.Body)
+		}
+		// The swallowing mutation's signature: a 200 whose body says there are
+		// no gates. Asserting the status alone would not separate them if the
+		// mapping ever moved.
+		if strings.Contains(recorder.Body.String(), `"gates"`) {
+			t.Errorf("a failed gate read answered with a gate page: %q", recorder.Body)
+		}
+		if strings.Contains(recorder.Body.String(), "hunter2") || strings.Contains(recorder.Body.String(), "db.internal") {
+			t.Errorf("the body carries a dependency's diagnostic: %q", recorder.Body)
+		}
+	})
+
+	t.Run("absence is the one 404 construction", func(t *testing.T) {
+		t.Parallel()
+
+		// The session resolves -- the catalog read succeeds -- and the GATE
+		// read then reports it gone, which is the deleted-between-two-reads
+		// race. Every way the store says so must produce the same answer as a
+		// session that was never there.
+		for _, layout := range absenceLayouts() {
+			f := newFixture(t, withSessions(), withRecord(fixtureTenant, fixtureSession, record))
+			f.reads.gateFail = layout.absence()
+			got := f.get(gatesTarget(fixtureSession))
+
+			absent := newFixture(t, withSessions(), withStoreLayout(layout))
+			want := absent.get(gatesTarget(fixtureSession))
+			if got.Code != http.StatusNotFound {
+				t.Fatalf("%s: the gate read answered %d, want 404; body was %q", layout.name, got.Code, got.Body)
+			}
+			if diff := responseDifference(got, want); diff != "" {
+				t.Errorf("%s: a session that vanished between the two reads is distinguishable from one that never existed: %s",
+					layout.name, diff)
+			}
+		}
+	})
+
+	t.Run("a draining store is still retryable here", func(t *testing.T) {
+		t.Parallel()
+
+		f := newFixture(t, withSessions(), withRecord(fixtureTenant, fixtureSession, record))
+		f.reads.gateFail = &sessionstore.StoreClosedError{}
+		if recorder := f.get(gatesTarget(fixtureSession)); recorder.Code != http.StatusServiceUnavailable {
+			t.Errorf("status = %d, want 503", recorder.Code)
+		}
+	})
+
+	// The control: with no lever set the same fixture serves the gate, so the
+	// refusals above are caused by the lever rather than by the fixture.
+	f := newFixture(t, withSessions(), withRecord(fixtureTenant, fixtureSession, record))
+	page := decodeGatePage(t, f.get(gatesTarget(fixtureSession)))
+	if len(page.Gates) != 1 {
+		t.Fatalf("the control served %d gates, want 1", len(page.Gates))
 	}
 }

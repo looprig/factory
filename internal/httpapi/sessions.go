@@ -265,11 +265,33 @@ type journalPosition struct {
 // refusal it can make before the store is touched.
 //
 // Presence is read from the parsed values rather than from Query().Get for the
-// reason sessionPageLimit gives: Get cannot tell "?limit=" from an absent
-// parameter, and answers a repeated parameter with whichever came first, so a
-// caller sending two would be served a page it did not unambiguously ask for.
-// Here that matters twice over, because a repeated cursor and a repeated
-// from_seq are two different positions in one request.
+// reason singleValue gives, and it matters twice over here: a repeated cursor
+// and a repeated from_seq are two different positions in one request.
+//
+// # An EMPTY cursor is refused, and the reason is a client bug this invites
+//
+// A present-but-empty parameter is refused by singleValue, which for the
+// position is not a formality. SessionStore reads an empty cursor as NO cursor
+// and a start below one as sequence one, so a request carrying "?cursor=" would
+// be positioned -- skipping the tip probe -- and would then walk from the
+// journal's FIRST record. Measured before this was refused: on a
+// three-thousand-record journal "?cursor=" returned events 1 through 95 while
+// naming no cursor at all returned 2938 through 2999.
+//
+// That is the replay this route exists to forbid, and the client that reaches
+// it is doing the obvious thing rather than something perverse. Core declares
+// next_cursor omitempty, so the LAST page of a walk carries none; a client
+// written as cursor=${page.next_cursor ?? ""} therefore sends an empty cursor
+// exactly when it reaches the tip, is thrown back to sequence one, and walks
+// the whole journal forward again -- an unbounded read loop on an
+// authenticated route, driven by a client that believes it is paging normally.
+//
+// Refusing is chosen over silently treating it as absent because the two
+// answers a client could get from an empty cursor -- the tail, or the head --
+// are both guesses about what it meant, and one of them is the loop. A 400
+// tells it at the first request rather than after it has walked the journal. It
+// is also what from_seq already did, through ParseUint, so the two positions
+// answer an empty value the same way.
 func journalPositionOf(w http.ResponseWriter, query url.Values) (journalPosition, bool) {
 	cursor, ok := singleValue(w, query, "cursor")
 	if !ok {
@@ -304,48 +326,14 @@ func journalPositionOf(w http.ResponseWriter, query url.Values) (journalPosition
 		}
 		out.fromSeq = fromSeq
 	}
-	limit, ok := singleValue(w, query, "limit")
+	limit, present, ok := boundedPageLimit(w, query, maxJournalPageLimit)
 	if !ok {
 		return journalPosition{}, false
 	}
-	if limit.present {
-		value, err := strconv.Atoi(limit.value)
-		if err != nil || value < 1 {
-			writeAPIError(w, apiError{
-				status:  http.StatusBadRequest,
-				code:    sessionwire.ErrorCodeInvalidRequest,
-				message: "limit must be a positive whole number",
-			})
-			return journalPosition{}, false
-		}
-		out.limit = min(value, maxJournalPageLimit)
+	if present {
+		out.limit = limit
 	}
 	return out, true
-}
-
-// queryValue is one query parameter's presence and value.
-type queryValue struct {
-	present bool
-	value   string
-}
-
-// singleValue reads a parameter that may appear at most once, answering a
-// repeat as a 400 rather than choosing between the two.
-func singleValue(w http.ResponseWriter, query url.Values, name string) (queryValue, bool) {
-	values := query[name]
-	switch len(values) {
-	case 0:
-		return queryValue{}, true
-	case 1:
-		return queryValue{present: true, value: values[0]}, true
-	default:
-		writeAPIError(w, apiError{
-			status:  http.StatusBadRequest,
-			code:    sessionwire.ErrorCodeInvalidRequest,
-			message: name + " was given more than once",
-		})
-		return queryValue{}, false
-	}
 }
 
 // ---------------------------------------------------------------------------
@@ -422,11 +410,18 @@ func (rt *Router) serveSessionGates() http.Handler {
 // answered as faults by DEFAULT rather than by enumeration, which keeps a code
 // sessionstore adds later off the "the caller can fix this" path.
 //
-// What it does NOT decide is absence. A journal read verifies the session's
-// binding before it reads anything, so it can report a session that does not
-// exist, and it reports it with the SAME errors the catalog read does -- so
-// that decision is made in one place, by catalogFailure, and this delegates to
-// it rather than restating three codes.
+// What it does NOT decide is absence, and it does not decide a CLOSING store
+// either. A journal read verifies the session's binding before it reads
+// anything, so it can report a session that does not exist; and admitForeground
+// refuses every read the same way once Close begins. Both arrive as the same
+// errors the catalog read produces, so both decisions are made in one place, by
+// catalogFailure, and this delegates rather than restating them.
+//
+// That delegation is why there is no storeUnavailable call here. Adding one was
+// measured EQUIVALENT: deleting it again left the whole suite green, because
+// *StoreClosedError is not a *JournalError, falls past the arm above, and is
+// answered by catalogFailure. A second copy would have been a line with no
+// reader sitting beside the one that decides.
 func journalFailure(err error) apiError {
 	if failure, ok := contextFailure(err); ok {
 		return failure

@@ -379,44 +379,113 @@ func (rt *Router) serveSessionList() http.Handler {
 	})
 }
 
-// sessionPageLimit reads the caller's page size.
+// sessionPageLimit reads the caller's page size for the tenant session list.
 //
 // An ABSENT limit is zero, which SessionStore reads as its own configured page
 // size; that is the store's default and this package does not second-guess it.
-// A limit that is PRESENT and unusable is a 400 rather than a silent clamp,
-// because a caller that asked for -1, for "many" or for nothing at all has a
-// bug and a clamped answer hides it. A limit above the ceiling IS clamped,
-// because that caller asked a well-formed question this deployment answers more
-// narrowly.
-//
-// Presence is read from the parsed values rather than from Query().Get, which
-// cannot tell "?limit=" from an absent parameter and would silently accept the
-// first. Two limits are refused for the same reason: Get would answer with
-// whichever came first, so a caller sending "?limit=1&limit=500" would be
-// served a page size it did not unambiguously ask for.
+// The journal deliberately does NOT do that -- see defaultJournalPageLimit --
+// because it computes a position from the limit and a page size only the store
+// knows would leave that position unanchored. This route computes nothing, so
+// the store's default is the right answer and is the only difference between
+// the two call sites.
 func sessionPageLimit(w http.ResponseWriter, query url.Values) (int, bool) {
-	values := query["limit"]
-	if len(values) == 0 {
+	limit, present, ok := boundedPageLimit(w, query, maxSessionPageLimit)
+	if !ok {
+		return 0, false
+	}
+	if !present {
 		return 0, true
 	}
-	if len(values) > 1 {
+	return limit, true
+}
+
+// ---------------------------------------------------------------------------
+// Query parameters.
+//
+// These are shared by every read on this surface, and they are shared rather
+// than restated because two of them used to be written twice: the tenant list
+// and the journal each parsed their own "limit" and each produced the byte-
+// identical strings "limit was given more than once" and "limit must be a
+// positive whole number" from independent code. Two implementations agreeing on
+// a caller-visible message by coincidence of wording is one edit away from two
+// routes answering the same malformed request differently -- and it is two
+// places for a rule like the empty-value refusal to be fixed in one.
+// ---------------------------------------------------------------------------
+
+// queryValue is one query parameter's presence and value.
+type queryValue struct {
+	present bool
+	value   string
+}
+
+// singleValue reads a parameter that may appear at most once and, when it
+// appears, must carry a value.
+//
+// A REPEAT is refused rather than resolved: url.Values.Get answers with
+// whichever came first, so a caller sending "?limit=1&limit=500" would be
+// served a page size it did not unambiguously ask for, and a caller sending two
+// positions would be served one of them.
+//
+// An EMPTY value is refused for a reason the repeat case does not cover, and it
+// is a rule about this surface rather than about parsing. "?x=" is a parameter
+// the caller SENT, so treating it as absent means answering a request the
+// caller did not make; every parameter this surface reads is a position or a
+// bound, and there is no position or bound whose meaning is the empty string.
+// The concrete failure it prevents is in journalPositionOf, where an empty
+// cursor is read by SessionStore as no cursor and turns the tail into a replay
+// from the first record. Refusing it here rather than at each call site is what
+// makes that true of every parameter rather than of the one that was noticed.
+func singleValue(w http.ResponseWriter, query url.Values, name string) (queryValue, bool) {
+	values := query[name]
+	switch {
+	case len(values) == 0:
+		return queryValue{}, true
+	case len(values) > 1:
 		writeAPIError(w, apiError{
 			status:  http.StatusBadRequest,
 			code:    sessionwire.ErrorCodeInvalidRequest,
-			message: "limit was given more than once",
+			message: name + " was given more than once",
 		})
-		return 0, false
+		return queryValue{}, false
+	case values[0] == "":
+		writeAPIError(w, apiError{
+			status:  http.StatusBadRequest,
+			code:    sessionwire.ErrorCodeInvalidRequest,
+			message: name + " was given with no value; omit it instead",
+		})
+		return queryValue{}, false
+	default:
+		return queryValue{present: true, value: values[0]}, true
 	}
-	limit, err := strconv.Atoi(values[0])
-	if err != nil || limit < 1 {
+}
+
+// boundedPageLimit reads a caller's page size and clamps it to a ceiling.
+//
+// A limit that is PRESENT and unusable is a 400 rather than a silent clamp,
+// because a caller that asked for -1 or for "many" has a bug and a clamped
+// answer hides it. A limit ABOVE the ceiling IS clamped, because that caller
+// asked a well-formed question this deployment answers more narrowly.
+//
+// The ceiling is the caller's, so the two routes keep their own; what they
+// share is the parsing and the two messages a malformed limit produces.
+func boundedPageLimit(w http.ResponseWriter, query url.Values, ceiling int) (limit int, present, ok bool) {
+	value, ok := singleValue(w, query, "limit")
+	if !ok {
+		return 0, false, false
+	}
+	if !value.present {
+		return 0, false, true
+	}
+	parsed, err := strconv.Atoi(value.value)
+	if err != nil || parsed < 1 {
 		writeAPIError(w, apiError{
 			status:  http.StatusBadRequest,
 			code:    sessionwire.ErrorCodeInvalidRequest,
 			message: "limit must be a positive whole number",
 		})
-		return 0, false
+		return 0, false, false
 	}
-	return min(limit, maxSessionPageLimit), true
+	return min(parsed, ceiling), true, true
 }
 
 // ---------------------------------------------------------------------------
@@ -474,6 +543,9 @@ func matchesEntityTag(fields []string, etag string) bool {
 // A context ending keeps its own answer, as everywhere else.
 func directoryFailure(err error) apiError {
 	if failure, ok := contextFailure(err); ok {
+		return failure
+	}
+	if failure, ok := storeUnavailable(err); ok {
 		return failure
 	}
 	var target *sessionstore.HostTargetError

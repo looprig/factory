@@ -118,6 +118,28 @@ type fakeReader struct {
 	block bool
 	// fail, when set, replaces the answer for every call.
 	fail error
+	// catalogFail, journalFail and gateFail replace the answer for ONE kind of
+	// read.
+	//
+	// They exist because fail is global and resolveSession's catalog read comes
+	// first, so with fail alone no test can reach the failure branch of the
+	// SECOND durable read a request makes -- the gate read, and the journal's
+	// tail after its probe. That is not a missing convenience: it is the exact
+	// structural hole the A2.1 absence defect lived in, and two mutations of
+	// serveSessionGates's error branch survived the whole suite because of it.
+	catalogFail error
+	journalFail error
+	gateFail    error
+	// journalTailFail replaces the answer for every journal read EXCEPT the
+	// tip probe, so a test can fail the read that follows a successful one.
+	journalTailFail error
+	// nextRecords is the record GetCatalogEntry answers with from its SECOND
+	// call onward. A handler that re-read the catalog rather than using the
+	// record the chain resolved renders THIS one, which is what makes the
+	// difference between carrying and re-reading observable at all.
+	nextRecords map[storedSession]sessionstore.CatalogRecord
+	// catalogReads counts calls, so nextRecords can be applied from the second.
+	catalogReads int
 	// panics, when set, makes the call panic the way a faulty dependency
 	// does. It is a real panic inside the handler goroutine, which is the only
 	// thing Router's recovery can be driven by.
@@ -130,20 +152,31 @@ func newFakeReader(sessions ...storedSession) *fakeReader {
 		held[s] = true
 	}
 	return &fakeReader{
-		sessions: held,
-		records:  map[storedSession]sessionstore.CatalogRecord{},
-		journals: map[storedSession][]fakeJournalRecord{},
-		pages:    map[sessionwire.TenantID]sessionstore.SessionPage{},
-		absent:   layoutMultiTenant.absence,
+		sessions:    held,
+		records:     map[storedSession]sessionstore.CatalogRecord{},
+		nextRecords: map[storedSession]sessionstore.CatalogRecord{},
+		journals:    map[storedSession][]fakeJournalRecord{},
+		pages:       map[sessionwire.TenantID]sessionstore.SessionPage{},
+		absent:      layoutMultiTenant.absence,
 	}
 }
 
 func (f *fakeReader) GetCatalogEntry(ctx context.Context, req sessionstore.GetCatalogEntryRequest) (sessionstore.CatalogEntry, error) {
+	key := storedSession{tenant: req.TenantID, session: req.SessionID}
 	f.mu.Lock()
 	f.requests = append(f.requests, req)
+	f.catalogReads++
+	reads := f.catalogReads
 	_, hasDeadline := ctx.Deadline()
 	f.deadlines = append(f.deadlines, hasDeadline)
-	block, fail, panics, held := f.block, f.fail, f.panics, f.sessions[storedSession{tenant: req.TenantID, session: req.SessionID}]
+	block, fail, panics, held := f.block, f.fail, f.panics, f.sessions[key]
+	if fail == nil {
+		fail = f.catalogFail
+	}
+	record, hasRecord := f.records[key]
+	if successor, ok := f.nextRecords[key]; ok && reads > 1 {
+		record, hasRecord = successor, true
+	}
 	f.mu.Unlock()
 
 	if panics != nil {
@@ -159,9 +192,6 @@ func (f *fakeReader) GetCatalogEntry(ctx context.Context, req sessionstore.GetCa
 	if !held {
 		return sessionstore.CatalogEntry{}, f.absence()
 	}
-	f.mu.Lock()
-	record, hasRecord := f.records[storedSession{tenant: req.TenantID, session: req.SessionID}]
-	f.mu.Unlock()
 	if !hasRecord {
 		record = sessionstore.CatalogRecord{TenantID: req.TenantID, SessionID: req.SessionID}
 	}
