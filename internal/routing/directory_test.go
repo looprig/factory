@@ -227,6 +227,73 @@ func TestOwnerComesOnlyFromTheLiveSessionRegistry(t *testing.T) {
 	}
 }
 
+func TestOwnerClassifiesStoreErrors(t *testing.T) {
+	tenant, session := sessionwire.TenantID("tenant-a"), sessionwire.SessionID("session-a")
+	backendCause := errors.New("backend unavailable")
+	backendErr := &sessionstore.RegistryError{
+		Code:  sessionstore.RegistryErrorBackend,
+		Field: "registration",
+		Cause: backendCause,
+	}
+	nonRegistryErr := errors.New("unexpected store failure")
+	tests := []struct {
+		name     string
+		storeErr error
+		absent   bool
+	}{
+		{name: "not found is absence", storeErr: &sessionstore.RegistryError{Code: sessionstore.RegistryErrorNotFound}, absent: true},
+		{name: "expired is absence", storeErr: &sessionstore.RegistryError{Code: sessionstore.RegistryErrorExpired}, absent: true},
+		{name: "released is absence", storeErr: &sessionstore.RegistryError{Code: sessionstore.RegistryErrorReleased}, absent: true},
+		{name: "backend failure is propagated", storeErr: backendErr},
+		{name: "non-registry failure is propagated", storeErr: nonRegistryErr},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			directory := mustDirectory(t, &recordingStore{ownerErr: test.storeErr}, DefaultLimits())
+			owner, ok, err := directory.Owner(context.Background(), tenant, session)
+			if owner != (sessionwire.HostLinkRegistryObservation{}) || ok {
+				t.Fatalf("Owner = %+v, %v, %v; want no routable owner", owner, ok, err)
+			}
+			if test.absent {
+				if err != nil {
+					t.Fatalf("Owner error = %v, want absence", err)
+				}
+				return
+			}
+			if err != test.storeErr {
+				t.Fatalf("Owner error = %v, want exact store error %v", err, test.storeErr)
+			}
+			if test.storeErr == backendErr {
+				var registryErr *sessionstore.RegistryError
+				if !errors.As(err, &registryErr) || registryErr.Code != sessionstore.RegistryErrorBackend || !errors.Is(err, backendCause) {
+					t.Fatalf("Owner error lost its typed classification or cause: %v", err)
+				}
+			}
+		})
+	}
+}
+
+func TestOwnerPropagatesMalformedObservation(t *testing.T) {
+	tenant, session := sessionwire.TenantID("tenant-a"), sessionwire.SessionID("session-a")
+	store := &recordingStore{owner: sessionstore.HostRegistrationEntry{Registration: sessionstore.HostRegistration{
+		TenantID: tenant, SessionID: session, LeaseEpoch: 1,
+		ObservedAt: directoryNow, ExpiresAt: directoryNow.Add(time.Minute),
+		Route: &sessionstore.HostRoute{
+			HostID: "host-a", HostGeneration: 1, AgentID: "agent-a", RuntimeCompatibilityID: "runtime-v1",
+			Placement: sessionwire.HostPlacementPooled, Residency: sessionwire.SessionResidencyResident, Accepting: true,
+		},
+	}}}
+	directory := mustDirectory(t, store, DefaultLimits())
+	owner, ok, err := directory.Owner(context.Background(), tenant, session)
+	if owner != (sessionwire.HostLinkRegistryObservation{}) || ok || err == nil {
+		t.Fatalf("Owner = %+v, %v, %v; want malformed observation failure", owner, ok, err)
+	}
+	var registryErr *sessionstore.RegistryError
+	if !errors.As(err, &registryErr) || registryErr.Code != sessionstore.RegistryErrorInvalid {
+		t.Fatalf("Owner error = %v, want typed invalid registry error", err)
+	}
+}
+
 func openDirectoryStore(t *testing.T) (*sessionstore.Store, *movableClock) {
 	t.Helper()
 	clock := &movableClock{now: directoryNow}
