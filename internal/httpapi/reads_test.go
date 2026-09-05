@@ -5,6 +5,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"maps"
 	"net/http"
 	"net/http/httptest"
@@ -1563,4 +1566,454 @@ func TestTheAuthenticatedFallbackIsNotReachableThroughTheChain(t *testing.T) {
 	if got := f.get("/v1/sessions").Code; got != http.StatusOK {
 		t.Errorf("the composed session list answered %d, want 200", got)
 	}
+}
+
+// ---------------------------------------------------------------------------
+// The query-parameter guard, and its derived subject.
+// ---------------------------------------------------------------------------
+
+// TestEveryQueryParameterIsReadThroughTheGuard is singleValue's structural
+// half, and it is the half a behavioural test cannot supply.
+//
+// singleValue's doc claims the empty-value and repeat refusals hold for "every
+// parameter this surface reads". That is a claim about CALL SITES, and nothing
+// inside singleValue can establish it: a route reading its own parameter with
+// query.Get is simply not covered, and the claim was FALSE when it was written
+// -- serveSessionList read its cursor as sessionwire.Cursor(query.Get("cursor")),
+// so "?cursor=" reached SessionStore as no cursor and "?cursor=a&cursor=b" was
+// served the first of two positions. Measured before the fix: both answered 200.
+//
+// The subject is derived from the parsed production files rather than listed,
+// because a list of parameters is exactly the guard that cannot fail for the
+// parameter added after it was written. A read is found by MECHANISM: an
+// identifier bound to a url.Values -- a parameter of that type, or the result
+// of a Query() call -- consulted by Get or by index. So a header Get, which is
+// not a url.Values, is not this rule's business, and a route added later that
+// reads its parameter any of those ways is reported by name whatever it is
+// called.
+func TestEveryQueryParameterIsReadThroughTheGuard(t *testing.T) {
+	t.Parallel()
+
+	report := scanProductionQueryReads(t)
+	if len(report.guarded) == 0 {
+		t.Fatal("no production function was found reading a query parameter, so this scan proves nothing")
+	}
+	for _, function := range slices.Sorted(maps.Keys(report.bypassed)) {
+		t.Errorf("%s reads %v straight off a url.Values; route it through singleValue, or the empty-value and repeat refusals do not cover it",
+			function, report.bypassed[function])
+	}
+	// The one function allowed to read a parameter whose NAME it does not know
+	// is the shared reader itself. Any other is a read the literal-name scan
+	// above cannot see, so it is reported rather than assumed benign.
+	if got := slices.Sorted(maps.Keys(report.dynamic)); !slices.Equal(got, []string{"singleValue"}) {
+		t.Errorf("the functions reading a url.Values under a non-literal name are %v, want only singleValue", got)
+	}
+}
+
+// TestEveryParameterOnEveryRouteRefusesAnEmptyValue is the behavioural half,
+// over the subject the scan derives.
+//
+// The pair it exists for is (route, parameter), not parameter: the tenant list
+// and the journal both read "cursor" and they used to answer it differently.
+// A hard-coded {"cursor", "from_seq", "limit"} driven at one route covers four
+// of the five pairs, and the pair it omits was exactly the broken one.
+//
+// The MESSAGE is asserted, not only the status and the code. For "limit" and
+// "from_seq" an empty value is refused downstream anyway -- strconv.Atoi("")
+// and ParseUint("") both fail -- with the same 400 and the same invalid_request
+// code, so a probe reading only those two cannot see the guard at all for them.
+// Measured: scoping singleValue's empty case to `values[0] == "" && name ==
+// "cursor"` left the whole package green before this test existed.
+func TestEveryParameterOnEveryRouteRefusesAnEmptyValue(t *testing.T) {
+	t.Parallel()
+
+	report := scanProductionQueryReads(t)
+	// The route each handler is reachable at. It is checked against the derived
+	// handler set below rather than trusted, so a later handler that reads a
+	// parameter and is not named here fails this test by name.
+	targets := map[string]string{
+		"serveSessionList":    "/v1/sessions",
+		"serveSessionJournal": journalTarget(fixtureSession),
+	}
+	reading := map[string][]string{}
+	for handler := range report.handlers {
+		if names := report.parametersOf(handler); len(names) > 0 {
+			reading[handler] = names
+		}
+	}
+	if len(reading) == 0 {
+		t.Fatal("no route handler was found reading a query parameter, so this sweep proves nothing")
+	}
+	for _, handler := range slices.Sorted(maps.Keys(reading)) {
+		if _, named := targets[handler]; !named {
+			t.Errorf("%s reads %v and this test names no route for it; add one", handler, reading[handler])
+		}
+	}
+	for handler := range targets {
+		if _, found := reading[handler]; !found {
+			t.Errorf("this test names a route for %s, which the scan does not report as reading any parameter", handler)
+		}
+	}
+	pairs := 0
+	for handler, names := range reading {
+		target, named := targets[handler]
+		if !named {
+			continue
+		}
+		for _, name := range names {
+			pairs++
+			t.Run(handler+"/"+name, func(t *testing.T) {
+				t.Parallel()
+
+				f := newFixture(t, withSessions(), withJournal(fixtureTenant, fixtureSession, longJournal(20)...))
+				recorder := f.get(target + "?" + name + "=")
+				if recorder.Code != http.StatusBadRequest {
+					t.Fatalf("an empty %s answered %d; body was %q", name, recorder.Code, recorder.Body)
+				}
+				envelope := decodeEnvelope(t, recorder)
+				if envelope.Error.Code != sessionwire.ErrorCodeInvalidRequest {
+					t.Errorf("code = %q, want %q", envelope.Error.Code, sessionwire.ErrorCodeInvalidRequest)
+				}
+				// The guard's own message. Without this the parameters that are
+				// refused downstream anyway -- limit and from_seq -- assert
+				// nothing about the guard, and the two do not in fact answer
+				// alike without it: "?limit=" produced "limit must be a
+				// positive whole number" while the guard was scoped away.
+				want := name + " was given with no value; omit it instead"
+				if envelope.Error.Message != want {
+					t.Errorf("message = %q, want %q", envelope.Error.Message, want)
+				}
+			})
+			t.Run(handler+"/"+name+" given twice", func(t *testing.T) {
+				t.Parallel()
+
+				f := newFixture(t, withSessions(), withJournal(fixtureTenant, fixtureSession, longJournal(20)...))
+				recorder := f.get(target + "?" + name + "=1&" + name + "=2")
+				if recorder.Code != http.StatusBadRequest {
+					t.Fatalf("a repeated %s answered %d; body was %q", name, recorder.Code, recorder.Body)
+				}
+				want := name + " was given more than once"
+				if got := decodeEnvelope(t, recorder).Error.Message; got != want {
+					t.Errorf("message = %q, want %q", got, want)
+				}
+			})
+		}
+	}
+	if pairs < 5 {
+		t.Errorf("the sweep drove %d (route, parameter) pairs; the surface has five", pairs)
+	}
+}
+
+// TestTheQueryReadScanSeesAParameterNoListWouldHave is the scan's other
+// direction, and the anti-vacuity check for both tests above.
+//
+// Without it "every read goes through the guard" is equally explicable by a
+// scan that finds no reads at all, and "every parameter is driven" by one that
+// reports the three somebody remembered.
+func TestTheQueryReadScanSeesAParameterNoListWouldHave(t *testing.T) {
+	t.Parallel()
+
+	// A handler reading a parameter no existing list names, two helper calls
+	// away from the handler itself -- which is how limit is read today, and is
+	// the shape a scan that looked only at handler bodies would miss.
+	const added = "package httpapi\n\n" +
+		"func (rt *Router) serveSomethingNew() http.Handler {\n" +
+		"\treturn http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {\n" +
+		"\t\tquery := r.URL.Query()\n" +
+		"\t\t_, _ = windowOf(w, query)\n" +
+		"\t})\n}\n\n" +
+		"func windowOf(w http.ResponseWriter, query url.Values) (int, bool) {\n" +
+		"\treturn spanOf(w, query)\n}\n\n" +
+		"func spanOf(w http.ResponseWriter, query url.Values) (int, bool) {\n" +
+		"\t_, ok := singleValue(w, query, \"before_seq\")\n\treturn 0, ok\n}\n"
+	report := newQueryReadReport()
+	if err := report.scanFile("added.go", []byte(added)); err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if !report.handlers["serveSomethingNew"] {
+		t.Errorf("a method on *Router returning http.Handler was not recognised as one; the handlers found were %v",
+			slices.Sorted(maps.Keys(report.handlers)))
+	}
+	if got := report.parametersOf("serveSomethingNew"); !slices.Equal(got, []string{"before_seq"}) {
+		t.Errorf("the handler's parameters were %v, want [before_seq] reached through two helpers", got)
+	}
+	if len(report.bypassed) != 0 {
+		t.Errorf("a read that DOES go through singleValue was reported as a bypass: %v", report.bypassed)
+	}
+
+	// The bypass, which is the shape the tenant list actually shipped.
+	const bypass = "package httpapi\n\n" +
+		"func (rt *Router) serveOld() http.Handler {\n" +
+		"\treturn http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {\n" +
+		"\t\tquery := r.URL.Query()\n" +
+		"\t\t_ = sessionwire.Cursor(query.Get(\"cursor\"))\n" +
+		"\t\t_ = query[\"page\"]\n" +
+		"\t})\n}\n"
+	report = newQueryReadReport()
+	if err := report.scanFile("bypass.go", []byte(bypass)); err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if got := report.bypassed["serveOld"]; !slices.Equal(got, []string{"cursor", "page"}) {
+		t.Errorf("the bypasses found were %v, want [cursor page] -- Get and the index form both", got)
+	}
+
+	// A Get on something that is not a url.Values is not a query read, or the
+	// rule would report every header the surface consults. This is the control
+	// that makes the bypass report above mean something.
+	const header = "package httpapi\n\n" +
+		"func (rt *Router) serveHeaders() http.Handler {\n" +
+		"\treturn http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {\n" +
+		"\t\t_ = r.Header.Get(\"Content-Type\")\n" +
+		"\t\theaders := r.Header\n\t\t_ = headers.Get(\"If-None-Match\")\n" +
+		"\t})\n}\n"
+	report = newQueryReadReport()
+	if err := report.scanFile("header.go", []byte(header)); err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if len(report.bypassed) != 0 {
+		t.Errorf("a header read was counted as a query parameter read: %v", report.bypassed)
+	}
+
+	// A read under a name that is not a literal is reported separately rather
+	// than silently missed, because the literal scan cannot see it.
+	const dynamic = "package httpapi\n\n" +
+		"func pick(query url.Values, name string) string {\n\treturn query.Get(name)\n}\n"
+	report = newQueryReadReport()
+	if err := report.scanFile("dynamic.go", []byte(dynamic)); err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if !report.dynamic["pick"] {
+		t.Error("a Get under a non-literal name was not reported as a dynamic read")
+	}
+}
+
+// queryReadReport is what the production files say about how query parameters
+// are read.
+type queryReadReport struct {
+	// guarded maps a function to the parameter names it reads through
+	// singleValue.
+	guarded map[string][]string
+	// bypassed maps a function to the parameter names it reads straight off a
+	// url.Values, which is the construction this rule exists to report.
+	bypassed map[string][]string
+	// dynamic is the set of functions reading a url.Values under a name that is
+	// not a literal. The shared reader is one by construction; anything else is
+	// a read the name scan cannot see.
+	dynamic map[string]bool
+	// calls maps a function to the package-level functions it calls, so a
+	// parameter read two helpers below a handler still belongs to the handler.
+	calls map[string][]string
+	// handlers is the set of functions that BUILD a route handler: a method on
+	// *Router returning an http.Handler. It is derived from the signature
+	// rather than from a name prefix.
+	handlers map[string]bool
+}
+
+func newQueryReadReport() *queryReadReport {
+	return &queryReadReport{
+		guarded:  map[string][]string{},
+		bypassed: map[string][]string{},
+		dynamic:  map[string]bool{},
+		calls:    map[string][]string{},
+		handlers: map[string]bool{},
+	}
+}
+
+// scanProductionQueryReads runs the scan over the package's own production
+// files, enumerated from the directory rather than listed.
+func scanProductionQueryReads(t *testing.T) *queryReadReport {
+	t.Helper()
+
+	files := productionSources(t)
+	if len(files) == 0 {
+		t.Fatal("no production files were found, so this scan proves nothing")
+	}
+	report := newQueryReadReport()
+	for name, source := range files {
+		if err := report.scanFile(name, source); err != nil {
+			t.Fatalf("parse %s: %v", name, err)
+		}
+	}
+	return report
+}
+
+// parametersOf is the transitive parameter set of one function: what it reads
+// itself, plus what everything it calls reads.
+func (r *queryReadReport) parametersOf(function string) []string {
+	names, seen := map[string]bool{}, map[string]bool{}
+	var walk func(string)
+	walk = func(fn string) {
+		if seen[fn] {
+			return
+		}
+		seen[fn] = true
+		for _, name := range r.guarded[fn] {
+			names[name] = true
+		}
+		for _, name := range r.bypassed[fn] {
+			names[name] = true
+		}
+		for _, called := range r.calls[fn] {
+			walk(called)
+		}
+	}
+	walk(function)
+	return slices.Sorted(maps.Keys(names))
+}
+
+// scanFile records one file's query reads.
+//
+// The subject is a url.Values VALUE, found two ways: a parameter declared as
+// one, and an identifier assigned the result of a Query() call. Everything read
+// off one of those, by Get or by index, is a query parameter read; a Get on
+// anything else -- a header, say -- is not.
+func (r *queryReadReport) scanFile(name string, source []byte) error {
+	file, err := parser.ParseFile(token.NewFileSet(), name, source, 0)
+	if err != nil {
+		return err
+	}
+	for _, declaration := range file.Decls {
+		function, ok := declaration.(*ast.FuncDecl)
+		if !ok || function.Body == nil {
+			continue
+		}
+		owner := function.Name.Name
+		if isRouterHandlerBuilder(function) {
+			r.handlers[owner] = true
+		}
+		values := queryValueIdents(function)
+		ast.Inspect(function.Body, func(node ast.Node) bool {
+			switch expression := node.(type) {
+			case *ast.CallExpr:
+				switch fun := expression.Fun.(type) {
+				case *ast.Ident:
+					if fun.Name == "singleValue" {
+						r.record(owner, expression.Args, 2, true)
+						return true
+					}
+					r.calls[owner] = append(r.calls[owner], fun.Name)
+				case *ast.SelectorExpr:
+					if fun.Sel.Name != "Get" {
+						return true
+					}
+					if receiver, ok := fun.X.(*ast.Ident); ok && values[receiver.Name] {
+						r.record(owner, expression.Args, 0, false)
+					}
+				}
+			case *ast.IndexExpr:
+				if receiver, ok := expression.X.(*ast.Ident); ok && values[receiver.Name] {
+					r.record(owner, []ast.Expr{expression.Index}, 0, false)
+				}
+			}
+			return true
+		})
+	}
+	return nil
+}
+
+// record files one read under the function that made it.
+func (r *queryReadReport) record(owner string, args []ast.Expr, at int, guarded bool) {
+	if len(args) <= at {
+		return
+	}
+	name, ok := stringLiteral(args[at])
+	if !ok {
+		// A read whose name is computed. The literal scan cannot see it, so it
+		// is reported as its own class rather than dropped.
+		r.dynamic[owner] = true
+		return
+	}
+	if guarded {
+		r.guarded[owner] = append(r.guarded[owner], name)
+		return
+	}
+	r.bypassed[owner] = append(r.bypassed[owner], name)
+}
+
+// queryValueIdents is the set of identifiers in one function that hold a
+// url.Values: its parameters of that type, and anything assigned a Query()
+// result.
+func queryValueIdents(function *ast.FuncDecl) map[string]bool {
+	values := map[string]bool{}
+	if function.Type.Params != nil {
+		for _, field := range function.Type.Params.List {
+			if !isURLValuesType(field.Type) {
+				continue
+			}
+			for _, ident := range field.Names {
+				values[ident.Name] = true
+			}
+		}
+	}
+	ast.Inspect(function.Body, func(node ast.Node) bool {
+		assignment, ok := node.(*ast.AssignStmt)
+		if !ok {
+			return true
+		}
+		for i, right := range assignment.Rhs {
+			call, ok := right.(*ast.CallExpr)
+			if !ok {
+				continue
+			}
+			selector, ok := call.Fun.(*ast.SelectorExpr)
+			if !ok || selector.Sel.Name != "Query" || i >= len(assignment.Lhs) {
+				continue
+			}
+			if ident, ok := assignment.Lhs[i].(*ast.Ident); ok {
+				values[ident.Name] = true
+			}
+		}
+		return true
+	})
+	return values
+}
+
+// isURLValuesType reports whether a type expression is url.Values.
+func isURLValuesType(expression ast.Expr) bool {
+	selector, ok := expression.(*ast.SelectorExpr)
+	if !ok || selector.Sel.Name != "Values" {
+		return false
+	}
+	pkg, ok := selector.X.(*ast.Ident)
+	return ok && pkg.Name == "url"
+}
+
+// isRouterHandlerBuilder reports whether a declaration is a method on *Router
+// returning an http.Handler, which is what a route handler on this surface IS.
+func isRouterHandlerBuilder(function *ast.FuncDecl) bool {
+	if function.Recv == nil || len(function.Recv.List) != 1 {
+		return false
+	}
+	star, ok := function.Recv.List[0].Type.(*ast.StarExpr)
+	if !ok {
+		return false
+	}
+	receiver, ok := star.X.(*ast.Ident)
+	if !ok || receiver.Name != "Router" {
+		return false
+	}
+	results := function.Type.Results
+	if results == nil || len(results.List) != 1 {
+		return false
+	}
+	selector, ok := results.List[0].Type.(*ast.SelectorExpr)
+	if !ok || selector.Sel.Name != "Handler" {
+		return false
+	}
+	pkg, ok := selector.X.(*ast.Ident)
+	return ok && pkg.Name == "http"
+}
+
+// stringLiteral reports an expression's value when it is an untagged string
+// literal.
+func stringLiteral(expression ast.Expr) (string, bool) {
+	literal, ok := expression.(*ast.BasicLit)
+	if !ok || literal.Kind != token.STRING {
+		return "", false
+	}
+	unquoted, err := strconv.Unquote(literal.Value)
+	if err != nil {
+		return "", false
+	}
+	return unquoted, true
 }

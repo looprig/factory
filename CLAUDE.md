@@ -517,7 +517,8 @@ it projects and restating that projection here is how two readers of one record
 come to disagree; coalescing durable reads across a request belongs to A9.1.
 
 **A query parameter that is present must carry a value.** `singleValue` refuses
-`?x=` for every parameter this surface reads, and that is a rule about the
+`?x=` and a repeat for every parameter this surface reads, and that is a rule
+about the
 surface rather than about parsing: `?x=` is a parameter the caller *sent*, and
 no position or bound here means the empty string. The concrete failure it
 prevents is `?cursor=`, which SessionStore reads as **no** cursor while Factory
@@ -531,13 +532,37 @@ forward again — an unbounded read loop on an authenticated route. Refusing is
 chosen over treating it as absent because both possible answers are guesses
 about what the caller meant and one of them is the loop.
 
+**"Every parameter" is a claim about call sites, and it is held by a derived
+guard rather than by `singleValue`.** It was *false* as first written: the
+tenant list read its own cursor as `sessionwire.Cursor(query.Get("cursor"))`,
+bypassing the reader entirely, so `?cursor=` was forwarded as **no** cursor and
+`?cursor=a&cursor=b` served the first of two positions — the same client bug as
+the journal's, on the sibling route, milder only because `limit` bounds each
+page into a non-terminating poll rather than a full-history walk.
+`TestEveryQueryParameterIsReadThroughTheGuard` parses the production files and
+reports by name any read of a `url.Values` — `Get` or index — that does not go
+through `singleValue`; the subject is the **value's type**, so a header `Get` is
+not this rule's business and a route added later is covered whatever it is
+called. `TestEveryParameterOnEveryRouteRefusesAnEmptyValue` then drives the
+derived **(route, parameter)** pairs — five, not three — and asserts the guard's
+own *message*. That last part is not decoration: for `limit` and `from_seq` an
+empty value fails downstream anyway in `Atoi`/`ParseUint` with the same 400 and
+the same `invalid_request`, so a status-and-code probe cannot see the guard for
+them at all, and scoping it to `cursor` alone was measured leaving the package
+green. The old reader was a hard-coded `{"cursor", "from_seq", "limit"}` at one
+route: four of the five pairs, omitting exactly the broken one.
+
 **A draining store is 503 and retryable, not a fault.** `admitForeground`
 refuses every read with `*StoreClosedError` once `Close` begins; it is a bare
 struct that wraps nothing and matches no typed arm, so it fell to
 `internalFailure` and made an ordinary graceful shutdown answer every read with
 `500 retryable:false` — telling clients to stop retrying at the moment another
-replica would serve them. `storeUnavailable` is consulted by all three durable
-mappings. Its stated limit: a read already *in flight* when `Close` begins is
+replica would serve them. `storeUnavailable` is consulted by **two** of the
+three durable mappings, `catalogFailure` and `directoryFailure`;
+`journalFailure` reaches it by *delegating* to `catalogFailure`, and adding a
+copy there was measured equivalent, because `*StoreClosedError` is not a
+`*JournalError` and falls past the typed arm to the delegation. Its stated
+limit: a read already *in flight* when `Close` begins is
 cancelled through the returned context and arrives as `context.Canceled`, which
 is indistinguishable here from the caller going away.
 
@@ -554,6 +579,32 @@ identifier written as the `Limit` member of a `sessionstore` request literal. Th
 second exists because the first missed a measured case: `const
 probeObjectChunkSize = 5000` passed as a `Limit:` value at five times the real
 ceiling, invisible to the suffix rule in both directions.
+
+**State the use rule's reach plainly: it covers one of the five limits.** Every
+`sessionstore` request literal on this surface lives in `routes.go`'s `scope`
+helpers, and four of the five constants reach one through a **parameter** —
+which the scan skips, deliberately, since a bound on a parameter is at whatever
+assigned it. Exactly one, `agentProbePageLimit`, is written into a literal and
+therefore covered by the use-derived rule; the other four are held by the suffix
+convention alone. The scan is not extended to follow the parameter because that
+is inter-procedural value tracking, and a scan that guessed at it would be a
+guard whose *own* reach nobody could state. What the use rule buys is the
+construct the convention cannot see at all — a page bound named nothing like
+one — and the test asserts `agentProbePageLimit` is in its result so the rule
+cannot quietly reach nothing.
+
+**The two ceilings are different numbers, and that is what gives
+`boundedPageLimit`'s `ceiling` parameter a reader.** `maxJournalPageLimit` is
+**100** and `maxSessionPageLimit` is **200**; while both were 200 the parameter
+received the identical value from both call sites, so swapping one constant for
+the other survived the whole suite — *a parameter every call site passes
+identically is untested by construction*, and asserting the clamp against the
+constant that produced it cannot see the constant move either. The difference is
+derived from what one row costs: a session summary is a fixed set of members
+Core's vocabulary bounds, while a `JournalEvent.Body` is arbitrary stored JSON,
+so a page of each differs in byte cost by orders of magnitude. Each clamp is now
+asserted against a **literal**, and `TestTheTwoPageCeilingsAreNotTheSameNumber`
+fails if a later edit collapses them back onto one number.
 
 **Do not add an HTTP method override.** The CSRF guard's subject is `r.Method`.
 A route or middleware honouring `X-HTTP-Method-Override` or a `_method` field

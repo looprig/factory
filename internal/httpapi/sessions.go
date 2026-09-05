@@ -89,6 +89,18 @@ func (rt *Router) serveSessionStatus() http.Handler {
 // and the cost of a large one is paid by the store and by Factory's memory
 // rather than by the caller.
 //
+// It is HALF the tenant list's ceiling, and the difference is derived from what
+// one row of each page costs rather than chosen for variety. A session summary
+// is a fixed set of scalar members whose sizes Core's vocabulary bounds, so a
+// page of two hundred has a size this package can predict. A journal event
+// carries JournalEvent.Body -- the stored canonical public body, forwarded as
+// raw JSON -- whose size is whatever a Host wrote, so the byte cost of a page
+// is bounded only by the record count times an unbounded per-record term. Two
+// surfaces whose per-row costs differ by orders of magnitude and whose ceilings
+// agree have a ceiling derived from neither, and while the two numbers WERE
+// equal nothing could observe boundedPageLimit keeping them apart: passing
+// either constant at either call site was measured to survive the whole suite.
+//
 // defaultJournalPageLimit is the window used when a caller names no limit, and
 // it exists because of something the session list does not have to decide. A
 // missing limit on the tenant list is forwarded as zero, which SessionStore
@@ -99,7 +111,7 @@ func (rt *Router) serveSessionStatus() http.Handler {
 // read this package makes therefore carries a limit this package chose, which
 // is why the two are one rule rather than two.
 const (
-	maxJournalPageLimit     = 200
+	maxJournalPageLimit     = 100
 	defaultJournalPageLimit = 64
 )
 

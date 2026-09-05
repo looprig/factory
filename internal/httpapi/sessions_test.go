@@ -1324,6 +1324,50 @@ func TestTheJournalLimitIsClampedRatherThanRefused(t *testing.T) {
 	if sent != maxJournalPageLimit {
 		t.Errorf("the clamped limit was %d, want this surface's ceiling %d", sent, maxJournalPageLimit)
 	}
+	// Against a LITERAL as well as against the constant, because asserting a
+	// clamp against the constant that produced it cannot see the constant
+	// moving. This one is the journal's own number and no other surface's.
+	if sent != 100 {
+		t.Errorf("the journal's ceiling is now %d; it was 100, and the tenant list's is 200", sent)
+	}
+}
+
+// TestTheTwoPageCeilingsAreNotTheSameNumber gives boundedPageLimit's ceiling
+// parameter a reader.
+//
+// "The ceiling is the caller's, so the two routes keep their own" is what
+// boundedPageLimit's doc claims, and while maxJournalPageLimit and
+// maxSessionPageLimit were BOTH 200 nothing could observe it: the parameter
+// received the identical value from both call sites, so swapping one constant
+// for the other at either site was measured surviving the whole suite -- a
+// parameter every call site passes identically is untested by construction.
+//
+// The numbers differ now for a reason derived from what a row costs, not for
+// the sake of differing: a session summary is bounded by Core's vocabulary and
+// a journal event carries an arbitrary stored body. This is the assertion that
+// keeps them apart, so a later edit collapsing them onto one number is reported
+// here rather than silently re-blinding the clamp tests.
+func TestTheTwoPageCeilingsAreNotTheSameNumber(t *testing.T) {
+	t.Parallel()
+
+	if maxJournalPageLimit == maxSessionPageLimit {
+		t.Fatalf("both ceilings are %d, so nothing can observe boundedPageLimit keeping the two routes' bounds apart",
+			maxJournalPageLimit)
+	}
+	// And each surface really is clamped to its OWN: the journal's clamp is
+	// asserted above, so this is the tenant list's, driven at a limit above
+	// both ceilings so the two answers are distinguishable.
+	f := newFixture(t)
+	if recorder := f.get("/v1/sessions?limit=100000"); recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body was %q", recorder.Code, recorder.Body)
+	}
+	requests := f.reads.listSnapshot()
+	if len(requests) != 1 {
+		t.Fatalf("%d page reads, want 1", len(requests))
+	}
+	if requests[0].Limit != 200 {
+		t.Errorf("the tenant list clamped to %d, want 200 -- the journal's ceiling is 100", requests[0].Limit)
+	}
 }
 
 // TestACrossTenantColdReadIsIndistinguishableFromAbsence is A2.1's obligation
@@ -1711,6 +1755,14 @@ func TestEveryPageLimitIsCheckedAgainstTheStoreCeiling(t *testing.T) {
 			t.Errorf("%s is passed to SessionStore as a page limit and has no ceiling check; add const _ = uint(storePageCeiling - %s)", name, name)
 		}
 	}
+	// The use rule's REACH, stated rather than implied: every sessionstore
+	// request literal on this surface is a scope helper in routes.go, and four
+	// of the five limits arrive at one through a PARAMETER, which the skip
+	// above passes over. So exactly one constant is covered by use today, and
+	// the other four rest on the suffix convention. Asserting that one is here
+	// so the rule cannot quietly reach nothing; extending the scan to follow a
+	// parameter would be inter-procedural value tracking, and a scan that
+	// guessed at it would be a guard whose own reach nobody could state.
 	if !used["agentProbePageLimit"] {
 		t.Errorf("the use-derived scan found %v, which does not include the one constant written into a request literal", slices.Sorted(maps.Keys(used)))
 	}
@@ -2370,21 +2422,17 @@ func TestAnEmptyCursorDoesNotBecomeAReplayFromTheFirstRecord(t *testing.T) {
 	if len(seqs) == 0 || seqs[0] < 2900 {
 		t.Fatalf("the unpositioned control began at %v, so it is not a tail", seqs)
 	}
-	// The three parameters answer an empty value the same way, which is the
-	// property that stops the next one added being the one that does not.
-	for _, parameter := range []string{"cursor", "from_seq", "limit"} {
-		f := newFixture(t, withSessions(), journal())
-		recorder := f.get(journalTarget(fixtureSession) + "?" + parameter + "=")
-		if recorder.Code != http.StatusBadRequest {
-			t.Errorf("an empty %s answered %d, want 400", parameter, recorder.Code)
-		}
-	}
-	// The tenant list shares the reader, so the rule reaches it too rather
-	// than being fixed on one route.
-	list := newFixture(t).get("/v1/sessions?limit=")
-	if list.Code != http.StatusBadRequest {
-		t.Errorf("an empty limit on the session list answered %d, want 400", list.Code)
-	}
+	// "Every parameter answers an empty value the same way" is NOT asserted
+	// here any more, and the reason is worth the paragraph. It used to be a
+	// hard-coded {"cursor", "from_seq", "limit"} driven at this route plus one
+	// "?limit=" at the tenant list: four of the surface's five (route,
+	// parameter) pairs, and the pair it omitted -- the tenant list's cursor --
+	// was precisely the one that was not refused at all. A fixed fixture cannot
+	// defend a "for all X" property; the enumeration has to come from the
+	// mechanism. TestEveryParameterOnEveryRouteRefusesAnEmptyValue derives the
+	// pairs by parsing the production files and asserts the guard's own MESSAGE
+	// on each, which is what a status-only probe could not do for the two
+	// parameters an empty value fails downstream anyway.
 }
 
 // TestADrainingStoreIsRetryableRatherThanAFault is M2's reader.
@@ -2457,6 +2505,45 @@ func TestADrainingStoreIsRetryableRatherThanAFault(t *testing.T) {
 	f.reads.fail = &sessionstore.CatalogError{Code: sessionstore.CatalogErrorBackend, Field: "get"}
 	if recorder := f.get(statusTarget(fixtureSession)); recorder.Code != http.StatusInternalServerError {
 		t.Errorf("a backend fault answered %d, want 500", recorder.Code)
+	}
+}
+
+// TestTheTipProbeFailureIsAnsweredRatherThanCarriedForward is the reader for
+// the FIRST of the journal's two reads.
+//
+// serveSessionJournal makes the tip probe and then the page read, and the two
+// have separate error branches. Every existing failure probe reached one of
+// them: the global lever fails resolveSession's catalog read before either, and
+// journalTailFail deliberately spares the probe so the tail's branch can be
+// reached after a success. Nothing failed the probe itself, which is what
+// journalFail is for -- and without it, answering the probe's failure with
+// internalFailure instead of journalFailure changed no test.
+//
+// The COUNT is asserted as well as the answer. The other compiling mutation of
+// this branch is to ignore the error and carry a zero page forward: the tail
+// then anchors on a captured tip of zero and fails identically, so only "the
+// request stopped at one read" separates the two.
+func TestTheTipProbeFailureIsAnsweredRatherThanCarriedForward(t *testing.T) {
+	t.Parallel()
+
+	f := newFixture(t, withSessions(), withJournal(fixtureTenant, fixtureSession, longJournal(20)...))
+	f.reads.journalFail = &sessionstore.StoreClosedError{}
+	recorder := f.get(journalTarget(fixtureSession))
+	if recorder.Code != http.StatusServiceUnavailable {
+		t.Fatalf("a failed tip probe answered %d, want 503; body was %q", recorder.Code, recorder.Body)
+	}
+	if code := decodeEnvelope(t, recorder).Error.Code; code != ErrorCodeUnavailable {
+		t.Errorf("code = %q, want %q", code, ErrorCodeUnavailable)
+	}
+	if reads := f.journalSnapshot(); len(reads) != 1 {
+		t.Errorf("the request made %d journal reads, want 1: a failed probe is answered, not carried forward", len(reads))
+	}
+	// The control: the branch reports the failure it was given rather than one
+	// fixed answer. A journal code the caller can act on keeps its own 400.
+	cursor := newFixture(t, withSessions(), withJournal(fixtureTenant, fixtureSession, longJournal(20)...))
+	cursor.reads.journalFail = &sessionstore.JournalError{Code: sessionstore.JournalErrorCursor, Field: "cursor"}
+	if got := cursor.get(journalTarget(fixtureSession)); got.Code != http.StatusBadRequest {
+		t.Errorf("a refused cursor on the probe answered %d, want 400", got.Code)
 	}
 }
 

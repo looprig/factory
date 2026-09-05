@@ -118,16 +118,20 @@ type fakeReader struct {
 	block bool
 	// fail, when set, replaces the answer for every call.
 	fail error
-	// catalogFail, journalFail and gateFail replace the answer for ONE kind of
-	// read.
+	// journalFail and gateFail replace the answer for ONE kind of read.
 	//
 	// They exist because fail is global and resolveSession's catalog read comes
-	// first, so with fail alone no test can reach the failure branch of the
-	// SECOND durable read a request makes -- the gate read, and the journal's
-	// tail after its probe. That is not a missing convenience: it is the exact
+	// FIRST, so with fail alone no test can reach the failure branch of any
+	// durable read a request makes after that one: the gate read, and both of
+	// the journal's. That is not a missing convenience -- it is the exact
 	// structural hole the A2.1 absence defect lived in, and two mutations of
 	// serveSessionGates's error branch survived the whole suite because of it.
-	catalogFail error
+	//
+	// There is deliberately no catalogFail. A lever failing the catalog read
+	// would be fail with extra steps, since the catalog read is the first one
+	// and fail already stops the request there; it existed, was never assigned
+	// by any test, and its presence made the comment above claim three levers
+	// where two do the work.
 	journalFail error
 	gateFail    error
 	// journalTailFail replaces the answer for every journal read EXCEPT the
@@ -170,9 +174,6 @@ func (f *fakeReader) GetCatalogEntry(ctx context.Context, req sessionstore.GetCa
 	_, hasDeadline := ctx.Deadline()
 	f.deadlines = append(f.deadlines, hasDeadline)
 	block, fail, panics, held := f.block, f.fail, f.panics, f.sessions[key]
-	if fail == nil {
-		fail = f.catalogFail
-	}
 	record, hasRecord := f.records[key]
 	if successor, ok := f.nextRecords[key]; ok && reads > 1 {
 		record, hasRecord = successor, true

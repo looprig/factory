@@ -355,12 +355,25 @@ func (rt *Router) serveSessionList() http.Handler {
 		// request re-parses and re-allocates the whole query string for a
 		// value already in hand.
 		query := r.URL.Query()
+		// The cursor goes through the SAME reader the journal's does. It used
+		// to be query.Get("cursor"), which is the one read on this surface
+		// that bypassed singleValue -- so "?cursor=" was forwarded as no
+		// cursor and "?cursor=a&cursor=b" was served the first of two
+		// positions, on the route whose page type declares next_cursor
+		// omitempty. That is the same client bug the journal's refusal exists
+		// to prevent, one route over: a client written
+		// cursor=${page.next_cursor ?? ""} is thrown back to page one on
+		// reaching the tail and re-pages forever.
+		cursor, ok := singleValue(w, query, "cursor")
+		if !ok {
+			return
+		}
 		limit, ok := sessionPageLimit(w, query)
 		if !ok {
 			return
 		}
 		page, err := rt.reads.ListSessions(r.Context(),
-			newScope(operation.Principal).sessionPage(sessionwire.Cursor(query.Get("cursor")), limit))
+			newScope(operation.Principal).sessionPage(sessionwire.Cursor(cursor.value), limit))
 		if err != nil {
 			writeAPIError(w, catalogFailure(err))
 			return
@@ -388,15 +401,15 @@ func (rt *Router) serveSessionList() http.Handler {
 // knows would leave that position unanchored. This route computes nothing, so
 // the store's default is the right answer and is the only difference between
 // the two call sites.
+// "Absent is zero" is therefore not a BRANCH here. boundedPageLimit's only
+// not-present return is (0, false, true), so an explicit `if !present { return
+// 0, true }` would be three lines that cannot produce a value the fall-through
+// does not -- a line whose deletion nothing can observe. The presence flag is
+// discarded rather than read, which is the honest spelling of "this route does
+// not distinguish the two".
 func sessionPageLimit(w http.ResponseWriter, query url.Values) (int, bool) {
-	limit, present, ok := boundedPageLimit(w, query, maxSessionPageLimit)
-	if !ok {
-		return 0, false
-	}
-	if !present {
-		return 0, true
-	}
-	return limit, true
+	limit, _, ok := boundedPageLimit(w, query, maxSessionPageLimit)
+	return limit, ok
 }
 
 // ---------------------------------------------------------------------------
@@ -435,6 +448,17 @@ type queryValue struct {
 // cursor is read by SessionStore as no cursor and turns the tail into a replay
 // from the first record. Refusing it here rather than at each call site is what
 // makes that true of every parameter rather than of the one that was noticed.
+//
+// "Every parameter this surface reads" is a claim about CALL SITES, not about
+// this function, and this function cannot establish it: a route that reads its
+// own parameter with query.Get is unaffected by anything written here. It was
+// false when first written -- the tenant list read its cursor with
+// query.Get("cursor"), so "?cursor=" was forwarded as no cursor and
+// "?cursor=a&cursor=b" served the first of two positions, the same client bug
+// on the sibling route. TestEveryQueryParameterIsReadThroughTheGuard is what
+// makes the claim checkable: it parses the package's production files, finds
+// every read of a url.Values, and reports by name any that does not go through
+// here.
 func singleValue(w http.ResponseWriter, query url.Values, name string) (queryValue, bool) {
 	values := query[name]
 	switch {
