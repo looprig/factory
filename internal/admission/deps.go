@@ -16,17 +16,13 @@ import (
 	"github.com/looprig/sessionstore"
 )
 
-// Authorizer decides the one operation that is not a tenant operation.
-//
-// It declares ONLY the sweep, and that is a statement about where authorization
-// happens rather than an omission: a command reaches admission already
-// authorized, at the httpapi or clientlink edge that accepted it. The
-// consequence is worth stating before A2 wires anything here -- a THIRD caller
-// of this package, one that is not one of those two edges, would admit an
-// unauthorized command, because nothing in admission would refuse it. Such a
-// caller needs its own authorization at its own edge, or this interface needs
-// the operation added to it.
+// Authorizer decides both tenant command admission and the service sweep.
+// Admission repeats the edge's control decision deliberately: it is a durable
+// mutation boundary that can later be called by transports other than HTTP and
+// ClientLink, and no such caller may acquire an authorization-free path.
 type Authorizer interface {
+	AuthorizeControl(ctx context.Context, principal identity.Principal, session sessionwire.SessionID, kind sessionstore.CommandKind) error
+
 	// AuthorizeServiceSweep covers the cross-tenant due-work sweep over the
 	// service-control shards. It is never reachable by a tenant principal and
 	// its records never become a cross-tenant public response.
