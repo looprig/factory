@@ -453,6 +453,78 @@ identical responses would also be produced by a handler that read it and ignored
 it. Recent-first order is enforced by Core's own `SessionPage.Validate` on the
 way out, because Factory forwards Core's type rather than re-projecting it.
 
+## The cold session reads
+
+**Status, journal and gates are answerable while every Host is stopped**, and
+that is the property, not a side effect: every member each of them answers is a
+SessionStore record member, so none of them consults the target directory and
+none of them can. The three are asserted together wherever a rule is stated over
+"the cold reads", because a rule proved on one of them is a rule the other two
+are free to break.
+
+**The journal's initial view is the END of the journal.** A request naming no
+position gets the last `defaultJournalPageLimit` *sequences* below the tip the
+store captured; older pages are separate, equally bounded reads addressed by
+`from_seq`, and a forward `cursor` is SessionStore's own opaque token, handed out
+and handed back unread. Nothing here follows a cursor on the caller's behalf, so
+no credential buys an unbounded read. The window is a span of **sequences**, not
+a count of events, which is what makes it safe: a span of n positions holds at
+most n records, so the page limit can never cut it short by itself, and a tail
+that is mostly private records comes back short rather than walking further back
+to fill itself.
+
+**The tail costs two bounded reads, and the second one cannot be avoided.** A
+tail has to be anchored on a tip, and the only trustworthy tip is the one the
+store captures for the walk that reports it. `journalTipProbeSeq` positions a
+read above every sequence a journal can hold; SessionStore's walk begins with "if
+the start is past the captured tip, return nothing", so that read costs a tip
+lookup and never opens the ledger. The catalog record's `LastJournalSeq` was the
+free alternative and was rejected: it is a **separate durable write** from the
+journal append, so a Host that has committed records and not yet updated the
+catalog leaves it low — silently turning the tail into a middle page — and one
+that ran ahead would anchor the window above the tip and answer an active session
+with an empty history.
+
+**Private records only advance the watermark.** SessionStore withholds every
+non-public record from the public projection and closes its sequence position
+through `covered_through` alone; Factory forwards Core's `JournalPage` whole, so
+`JournalEvent.Body` reaches the client as the **bytes the store holds**. Decoding
+and re-encoding would reorder members and rewrite escapes — a body no longer
+matching the one its writer canonicalized — and would need a vocabulary only
+Harness defines, which this module may not name.
+`TestTheReadPlaneNamesNoPrivateBearingStoreMethod` derives the forbidden set
+rather than listing it: a method of the released `*sessionstore.Store` whose
+**results** can transitively reach a stored `Envelope` is one that can hand back
+private bytes, and `SessionReader` declares none of them.
+
+**Absence is not always a catalog code.** Outside the legacy single-tenant
+layout SessionStore verifies a session's collision witnesses *before* it reads a
+record, so a session that is not there fails with `*KeyspaceError` /
+`binding_not_found` and never reaches a `CatalogError` at all — sessionstore's
+own `noSuchSession` names exactly that set. `catalogFailure` read only the
+catalog codes until A2.3, which meant **every nonexistent and every cross-tenant
+session answered 500 in a multi-tenant deployment**, on the very path the
+byte-identical 404 exists to serve. The cross-tenant/absent comparison is now
+driven across all four ways the store says "there is no such session".
+
+**`resolveSession` carries the record it read.** It used to discard the entry,
+because A2.1 owned only the existence decision. The status is a projection of
+exactly that record, so reading it again would be a second durable round trip on
+the most polled route on the surface *and* a second instant — the existence
+decision made against one record and the body rendered from another. The gates
+route still pays a second catalog read, because `ReadGates` re-reads the record
+it projects and restating that projection here is how two readers of one record
+come to disagree; coalescing durable reads across a request belongs to A9.1.
+
+**Every page limit is checked against `storage.MaxOrderedPageLimit` at compile
+time.** `storePageCeiling` names the storage constant directly rather than
+restating 1000, so a release that moved it is a build fact rather than a live
+500, and `const _ = uint(storePageCeiling - n)` beside each limit fails the
+*build* rather than a test. `TestEveryPageLimitIsCheckedAgainstTheStoreCeiling`
+parses the package's own production files for constants named `*PageLimit` and
+requires each to have one, because no constant expression can notice a limit
+that has no check.
+
 **Do not add an HTTP method override.** The CSRF guard's subject is `r.Method`.
 A route or middleware honouring `X-HTTP-Method-Override` or a `_method` field
 would let a cross-site page present a POST as a GET: exempted as safe, then
@@ -462,9 +534,10 @@ route author will read it.
 ## Not implemented yet
 
 Composition seams (A0.2), identity derivation (A1.1), the route and error
-foundation (A2.1) and the agent and session reads (A2.2) are done; the remaining
-read, control, admission, routing, placement and realtime handlers are later
-tasks in runbook 05. Every method in `httpapi.routeTable` carries the runbook
+foundation (A2.1), the agent and session reads (A2.2) and the cold session
+reads — status, journal and gates (A2.3) — are done; the remaining read,
+control, admission, routing, placement and realtime handlers are later tasks in
+runbook 05. Every method in `httpapi.routeTable` carries the runbook
 task that fills its body in, and answers 501 until it does;
 `TestTheUnimplementedMethodsAreExactlyTheOnesLaterTasksOwn` holds the two sets
 equal. `httpapi.Directory` has no production implementation yet — **A4.1 owns

@@ -16,7 +16,28 @@ import (
 	"github.com/looprig/factory/identity"
 	internalidentity "github.com/looprig/factory/internal/identity"
 	"github.com/looprig/sessionstore"
+	"github.com/looprig/storage"
 )
+
+// storePageCeiling is the largest page SessionStore accepts on ANY read.
+//
+// It is IMPORTED rather than restated. SessionStore does not export the rule --
+// Store.pageLimit refuses a limit above it and answers in each caller's own
+// error vocabulary -- but the value is storage.MaxOrderedPageLimit, which
+// storage does export, and which sessionstore's own comment says it reuses
+// deliberately so that a journal page and a catalog page cannot disagree about
+// how large one page may be. Naming that constant is the difference between a
+// number this package believes and the number the dependency enforces: a
+// storage release that moved it would be adopted here as a compile-time fact
+// rather than discovered as a 500 on a live route.
+//
+// Every page limit this package sends is checked against it BELOW ITS OWN
+// DECLARATION, as a constant expression: uint(storePageCeiling - n) does not
+// compile when n exceeds the ceiling. That is a build failure rather than a
+// test failure, so it cannot be reached by a deployment at all.
+// TestEveryPageLimitIsCheckedAgainstTheStoreCeiling is what keeps a limit added
+// later from being the one without a check.
+const storePageCeiling = storage.MaxOrderedPageLimit
 
 // ---------------------------------------------------------------------------
 // The configured Department.
@@ -120,6 +141,8 @@ func (t LaunchTemplate) Validate() error {
 // public authenticated route, which is the worse failure: an attacker with any
 // credential could make Factory walk a whole target's history on demand.
 const agentProbePageLimit = 32
+
+const _ = uint(storePageCeiling - agentProbePageLimit)
 
 // ---------------------------------------------------------------------------
 // GET /v1/agents and GET /v1/capabilities.
@@ -299,6 +322,8 @@ func (rt *Router) targetIsAdvertised(ctx context.Context, reads scope, key sessi
 // is well above what a picker renders and well below anything that makes one
 // request expensive.
 const maxSessionPageLimit = 200
+
+const _ = uint(storePageCeiling - maxSessionPageLimit)
 
 // serveSessionList answers the tenant's recent-first durable session page.
 //

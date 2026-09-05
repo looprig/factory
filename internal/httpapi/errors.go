@@ -284,12 +284,34 @@ func authorizationFailure(err error) apiError {
 // tenant or session does not match the one asked for, which is precisely the
 // cross-tenant case that must be indistinguishable from absence.
 //
+// # Absence is not always a catalog code, and reading only the catalog was wrong
+//
+// A fourth answer means the same thing and arrives as a different TYPE. Outside
+// the legacy single-tenant layout, SessionStore verifies the session's
+// collision witnesses BEFORE it reads a record -- readCatalogEntry calls
+// verifySessionScope first -- and an unbound session fails there with a
+// *KeyspaceError whose code is binding_not_found. sessionstore's own
+// noSuchSession states exactly this set: not_found, deleted, or
+// binding_not_found. Handling only the catalog codes therefore answered EVERY
+// nonexistent and every cross-tenant session with 500 internal_error in a
+// multi-tenant deployment -- pageing an operator for the most ordinary
+// condition on the surface, and doing it on the path A2.1's byte-identical 404
+// exists to serve. Measured against the released sessionstore v0.1.0.
+//
+// Every other keyspace code stays a fault, and correctly: a hash collision, an
+// ambiguous marker or a layout mismatch is the deployment disagreeing with
+// itself, not a session that is not there.
+//
 // Everything else is 500 by DEFAULT rather than by enumeration, so a code
 // sessionstore adds later lands on the safe answer instead of falling through
 // to a 404 that would report a session absent because the store misbehaved.
 func catalogFailure(err error) apiError {
 	if failure, ok := contextFailure(err); ok {
 		return failure
+	}
+	var keyspace *sessionstore.KeyspaceError
+	if errors.As(err, &keyspace) && keyspace.Code == sessionstore.KeyspaceBindingNotFound {
+		return sessionNotFound()
 	}
 	var catalog *sessionstore.CatalogError
 	if !errors.As(err, &catalog) {

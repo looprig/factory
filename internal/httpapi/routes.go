@@ -739,9 +739,15 @@ func routeTable() []route {
 		{pattern: "/v1/sessions", rules: append(
 			served(authSessionList, func(rt *Router) http.Handler { return rt.serveSessionList() }),
 			control(commandCreate, "A3.1")...)},
-		{pattern: "/v1/sessions/{sid}/status", rules: pending(authSessionRead, "A2.3"), session: true},
-		{pattern: "/v1/sessions/{sid}/journal", rules: pending(authSessionRead, "A2.3"), session: true},
-		{pattern: "/v1/sessions/{sid}/gates", rules: pending(authSessionRead, "A2.3"), session: true},
+		{pattern: "/v1/sessions/{sid}/status",
+			rules:   served(authSessionRead, func(rt *Router) http.Handler { return rt.serveSessionStatus() }),
+			session: true},
+		{pattern: "/v1/sessions/{sid}/journal",
+			rules:   served(authSessionRead, func(rt *Router) http.Handler { return rt.serveSessionJournal() }),
+			session: true},
+		{pattern: "/v1/sessions/{sid}/gates",
+			rules:   served(authSessionRead, func(rt *Router) http.Handler { return rt.serveSessionGates() }),
+			session: true},
 		{pattern: "/v1/sessions/{sid}/objects/{oid}", rules: pending(authSessionRead, "A2.4"), session: true, streams: true},
 		{pattern: "/v1/sessions/{sid}/input", rules: control(commandInput, "A3.1"), session: true},
 		{pattern: "/v1/sessions/{sid}/interrupt", rules: control(commandInterrupt, "A3.1"), session: true},
@@ -818,8 +824,12 @@ func (rt *Router) serveRoute(entry route) http.Handler {
 			return
 		}
 
-		if entry.session && !rt.resolveSession(ctx, w, operation.Principal, session) {
-			return
+		if entry.session {
+			resolved, ok := rt.resolveSession(w, r, operation.Principal, session)
+			if !ok {
+				return
+			}
+			r = resolved
 		}
 
 		handlers[rule.method].ServeHTTP(w, r)
@@ -845,23 +855,32 @@ func (rt *Router) authorize(ctx context.Context, rule methodRule, principal iden
 }
 
 // resolveSession establishes that the session exists WITHIN the principal's
-// tenant, and answers 404 when it does not.
+// tenant, answers 404 when it does not, and CARRIES the record it read forward
+// on the request.
 //
-// The entry itself is discarded. This task owns the existence decision and the
-// answer to a caller who may not have one; the record's projection into a
-// status, a journal page or a gate list is A2.2 to A2.4's, and returning a
-// value nothing reads would be surface with no consumer.
+// The entry used to be discarded, because A2.1 owned only the existence
+// decision. It is carried now because the record it read is the same record the
+// status projects, and reading it twice would be a second durable round trip on
+// the most polled route on the surface AND a second instant: the existence
+// decision made against one record and the answer rendered from another. A
+// handler that does not want it ignores it.
 //
 // The 404 it writes is the same construction absence produces, which is what
 // makes a session in another tenant indistinguishable from one that was never
 // created: the query is scoped by the principal's tenant, so the store reports
 // the cross-tenant row as missing rather than as forbidden.
-func (rt *Router) resolveSession(ctx context.Context, w http.ResponseWriter, principal identity.Principal, session sessionwire.SessionID) bool {
-	if _, err := rt.reads.GetCatalogEntry(ctx, newScope(principal).catalogEntry(session)); err != nil {
+func (rt *Router) resolveSession(
+	w http.ResponseWriter,
+	r *http.Request,
+	principal identity.Principal,
+	session sessionwire.SessionID,
+) (*http.Request, bool) {
+	entry, err := rt.reads.GetCatalogEntry(r.Context(), newScope(principal).catalogEntry(session))
+	if err != nil {
 		writeAPIError(w, catalogFailure(err))
-		return false
+		return r, false
 	}
-	return true
+	return withResolvedSession(r, entry), true
 }
 
 // readBoundedJSONBody applies the media type and the ceiling, and leaves the
@@ -1063,5 +1082,34 @@ func (s scope) sessionPage(cursor sessionwire.Cursor, limit int) sessionstore.Li
 		TenantID: s.principal.Tenant(),
 		Cursor:   cursor,
 		Limit:    limit,
+	}
+}
+
+// journalPage is the scoped read of one bounded public journal page.
+//
+// Cursor and fromSeq are both taken, and the store refuses them together; the
+// handler refuses that combination before the read, so what arrives here is one
+// or the other. See serveSessionJournal.
+func (s scope) journalPage(
+	session sessionwire.SessionID,
+	cursor sessionwire.Cursor,
+	fromSeq uint64,
+	limit int,
+) sessionstore.ReadPublicJournalRequest {
+	return sessionstore.ReadPublicJournalRequest{
+		TenantID:  s.principal.Tenant(),
+		SessionID: session,
+		FromSeq:   fromSeq,
+		Cursor:    cursor,
+		Limit:     limit,
+	}
+}
+
+// gates is the scoped read of one session's open public gates. It carries no
+// position because the store's read has none.
+func (s scope) gates(session sessionwire.SessionID) sessionstore.ReadGatesRequest {
+	return sessionstore.ReadGatesRequest{
+		TenantID:  s.principal.Tenant(),
+		SessionID: session,
 	}
 }

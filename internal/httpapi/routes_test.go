@@ -80,6 +80,29 @@ type storedSession struct {
 type fakeReader struct {
 	mu       sync.Mutex
 	sessions map[storedSession]bool
+	// records is the catalog record each held session projects. A session
+	// registered without one gets the minimal record below, which is what the
+	// routing tests want; the read tests register a whole one.
+	records map[storedSession]sessionstore.CatalogRecord
+	// journals is each session's durable journal, public and private records
+	// alike. See fakeJournalRecord: the private ones are what "private bytes
+	// never leave SessionStore" is asserted against, so they are HELD here and
+	// the read below is what refuses to publish them.
+	journals map[storedSession][]fakeJournalRecord
+	// journalRequests and gateRequests record what the router asked for, so a
+	// test can assert the position, the bound and the CALL COUNT rather than
+	// only the answer.
+	journalRequests []sessionstore.ReadPublicJournalRequest
+	gateRequests    []sessionstore.ReadGatesRequest
+	// absent produces the error the store answers a session it holds no
+	// binding for with. It is a FUNCTION because the answer is layout
+	// dependent -- see storeLayout -- and the layout is the axis the
+	// "no such session" answer must be identical along.
+	absent func() error
+	// leak makes the fake publish private material through the public reads.
+	// Nothing in production can turn it on: it is the control that shows the
+	// private-material assertions can observe a failure at all.
+	leak bool
 	// requests records every catalog request the router built, so a test can
 	// assert the tenant it was scoped by rather than only the answer.
 	requests []sessionstore.GetCatalogEntryRequest
@@ -106,7 +129,13 @@ func newFakeReader(sessions ...storedSession) *fakeReader {
 	for _, s := range sessions {
 		held[s] = true
 	}
-	return &fakeReader{sessions: held, pages: map[sessionwire.TenantID]sessionstore.SessionPage{}}
+	return &fakeReader{
+		sessions: held,
+		records:  map[storedSession]sessionstore.CatalogRecord{},
+		journals: map[storedSession][]fakeJournalRecord{},
+		pages:    map[sessionwire.TenantID]sessionstore.SessionPage{},
+		absent:   layoutMultiTenant.absence,
+	}
 }
 
 func (f *fakeReader) GetCatalogEntry(ctx context.Context, req sessionstore.GetCatalogEntryRequest) (sessionstore.CatalogEntry, error) {
@@ -128,12 +157,24 @@ func (f *fakeReader) GetCatalogEntry(ctx context.Context, req sessionstore.GetCa
 		return sessionstore.CatalogEntry{}, fail
 	}
 	if !held {
-		return sessionstore.CatalogEntry{}, &sessionstore.CatalogError{Code: sessionstore.CatalogErrorNotFound, Field: "record"}
+		return sessionstore.CatalogEntry{}, f.absence()
 	}
-	return sessionstore.CatalogEntry{Record: sessionstore.CatalogRecord{
-		TenantID:  req.TenantID,
-		SessionID: req.SessionID,
-	}}, nil
+	f.mu.Lock()
+	record, hasRecord := f.records[storedSession{tenant: req.TenantID, session: req.SessionID}]
+	f.mu.Unlock()
+	if !hasRecord {
+		record = sessionstore.CatalogRecord{TenantID: req.TenantID, SessionID: req.SessionID}
+	}
+	return sessionstore.CatalogEntry{Record: record, Revision: 3}, nil
+}
+
+// absence is the store's "there is no such session" error under the layout this
+// fake is standing in for.
+func (f *fakeReader) absence() error {
+	f.mu.Lock()
+	produce := f.absent
+	f.mu.Unlock()
+	return produce()
 }
 
 // ListSessions answers the tenant's page from the fake's own catalogue.
@@ -170,14 +211,6 @@ func (f *fakeReader) ListSessions(ctx context.Context, req sessionstore.ListSess
 		return sessionstore.SessionPage{}, fail
 	}
 	return page, nil
-}
-
-func (f *fakeReader) ReadPublicJournal(context.Context, sessionstore.ReadPublicJournalRequest) (sessionwire.JournalPage, error) {
-	return sessionwire.JournalPage{}, errors.New("unused by A2.1")
-}
-
-func (f *fakeReader) ReadGates(context.Context, sessionstore.ReadGatesRequest) (sessionwire.GatePage, error) {
-	return sessionwire.GatePage{}, errors.New("unused by A2.1")
 }
 
 func (f *fakeReader) GetObject(context.Context, sessionstore.GetObjectRequest) (io.ReadCloser, error) {
@@ -743,6 +776,31 @@ func concreteTarget(pattern string) string {
 	return strings.Join(segments, "/")
 }
 
+// aPendingReadTarget is a concrete path for some GET a later runbook task still
+// owns. It panics when there is none, because at that point every case built on
+// it is testing nothing and the caller must be told rather than passed an empty
+// string.
+func aPendingReadTarget() string {
+	for _, route := range routeTable() {
+		for _, rule := range route.rules {
+			if rule.method == http.MethodGet && rule.owner != "" {
+				return concreteTarget(route.pattern)
+			}
+		}
+	}
+	panic("no route serves a pending GET, so the not-implemented case has no subject")
+}
+
+func TestAPendingReadTargetIsReallyPending(t *testing.T) {
+	t.Parallel()
+
+	target := aPendingReadTarget()
+	f := newFixture(t)
+	if recorder := f.get(target); recorder.Code != http.StatusNotImplemented {
+		t.Fatalf("%s answered %d, want 501", target, recorder.Code)
+	}
+}
+
 func TestConcreteTargetSubstitutesEveryWildcard(t *testing.T) {
 	t.Parallel()
 
@@ -845,11 +903,14 @@ func TestNoAPIFailureFallsThroughToTheSPA(t *testing.T) {
 		},
 		{
 			name: "not implemented", status: http.StatusNotImplemented, code: ErrorCodeNotImplemented,
-			// A route a LATER task owns. It was /v1/agents until A2.2 served
-			// one; a case pinned to a route that becomes implemented does not
-			// fail, it silently stops testing the condition it names.
+			// A route a LATER task owns, DERIVED from the table rather than
+			// named. It was /v1/agents until A2.2 served one and the session
+			// status until A2.3 did; a case pinned to a route that becomes
+			// implemented does not fail, it silently stops testing the
+			// condition it names. Deriving it means the case moves itself, and
+			// the day nothing is pending it fails loudly instead.
 			build: func(*fixture) *http.Request {
-				return request(http.MethodGet, "/v1/sessions/"+string(fixtureSession)+"/status", nil)
+				return request(http.MethodGet, aPendingReadTarget(), nil)
 			},
 		},
 	}
@@ -1647,10 +1708,11 @@ func TestACrossTenantSessionIsIndistinguishableFromOneThatDoesNotExist(t *testin
 func TestASessionInThePrincipalsOwnTenantIsReached(t *testing.T) {
 	t.Parallel()
 
-	f := newFixture(t, withSessions(storedSession{tenant: fixtureTenant, session: fixtureSession}))
+	f := newFixture(t, withSessions(),
+		withRecord(fixtureTenant, fixtureSession, coldRecord(sessionwire.SessionStateIdle, sessionwire.SessionResidencyCold)))
 	recorder := f.get("/v1/sessions/" + string(fixtureSession) + "/status")
-	if recorder.Code != http.StatusNotImplemented {
-		t.Fatalf("status = %d, want 501: the session resolved and the body is A2.3's; got %q", recorder.Code, recorder.Body)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200: the session resolved and the status is served; got %q", recorder.Code, recorder.Body)
 	}
 }
 
@@ -1898,7 +1960,7 @@ func TestTheScopeScanCoversEveryProductionFile(t *testing.T) {
 	t.Parallel()
 
 	files := productionSources(t)
-	for _, name := range []string{"routes.go", "reads.go", "errors.go", "guard.go", "deps.go"} {
+	for _, name := range []string{"routes.go", "reads.go", "sessions.go", "errors.go", "guard.go", "deps.go"} {
 		if _, ok := files[name]; !ok {
 			t.Errorf("productionSources omits %s; it enumerated %v", name, slices.Sorted(maps.Keys(files)))
 		}
@@ -2240,7 +2302,7 @@ type expectation struct {
 // response at a deadline would truncate it.
 func expectedRoutes() map[string]expectation {
 	read := func(auth authRule, session bool) expectation {
-		return expectation{auth: auth, session: session}
+		return expectation{auth: auth, session: session, implemented: true}
 	}
 	control := func(command sessionstore.CommandKind, session bool) expectation {
 		return expectation{auth: authControl, command: command, body: bodyJSON, session: session}
@@ -2263,7 +2325,9 @@ func expectedRoutes() map[string]expectation {
 		// reason to fall back to the list rule.
 		"GET /v1/sessions":  expectation{auth: authSessionList, implemented: true},
 		"POST /v1/sessions": control(commandCreate, false),
-		// Durable reads within one session.
+		// Durable reads within one session, all three served by this build.
+		// They are replay-free projections of durable state, so each remains
+		// answerable while every Host is stopped.
 		"GET /v1/sessions/{sid}/status":  read(authSessionRead, true),
 		"GET /v1/sessions/{sid}/journal": read(authSessionRead, true),
 		"GET /v1/sessions/{sid}/gates":   read(authSessionRead, true),
@@ -2407,6 +2471,26 @@ func sanctionedImplementedMethods() map[string]string {
 		"GET /v1/capabilities": "is the migration spelling of /v1/agents and serves the identical " +
 			"aggregate under the identical rule; a weaker rule on either would be two answers to " +
 			"one question",
+		"GET /v1/sessions/{sid}/status": "serves the durable replay-free projection of ONE session " +
+			"under authSessionRead, which is the decision AuthorizeSessionRead exists to make. The " +
+			"record is the one serveRoute resolved through scope.catalogEntry from principal.Tenant(), " +
+			"so the session was established to exist within the authenticated tenant before this " +
+			"handler ran, and a session in another tenant is answered by the same sessionNotFound() " +
+			"construction absence produces. It reads no Host and consults no directory: every member " +
+			"it answers is a catalog record member",
+		"GET /v1/sessions/{sid}/journal": "serves one BOUNDED page of a session's public events under " +
+			"authSessionRead, the same decision the status makes and over the same resource. Its " +
+			"position is either a cursor SessionStore issued for this session or an absolute sequence, " +
+			"and neither is authority: the tenant comes from the principal through scope.journalPage, " +
+			"so a cursor or position from another tenant reaches a query scoped to the caller's own. " +
+			"The page is bounded by maxJournalPageLimit whatever the caller asks for, and a view with " +
+			"no position is a bounded TAIL rather than a replay, so no credential buys an unbounded read",
+		"GET /v1/sessions/{sid}/gates": "serves the session's open public gates under authSessionRead, " +
+			"the same decision over the same resource. Core's GateProjection is the complete public " +
+			"view of an open gate -- presentation-safe prompt data, never a submitted answer, a private " +
+			"prepared payload, a credential or a signed URL -- and the page is SessionStore's, " +
+			"forwarded whole, so there is no member for a stronger rule to protect that this one does " +
+			"not already cover",
 		"GET /v1/sessions": "serves the principal's OWN tenant's durable session page under " +
 			"authSessionList, which is the decision AuthorizeSessionList exists to make. The page " +
 			"is built by scope.sessionPage from principal.Tenant(), so the tenant is the " +

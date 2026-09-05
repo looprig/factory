@@ -74,23 +74,14 @@ type fakeDirectory struct {
 	block       bool
 }
 
-// storePageCeiling is the largest limit SessionStore accepts on ANY page.
+// The page ceiling both fakes enforce is the production constant, which names
+// storage.MaxOrderedPageLimit directly. It used to be restated here as a
+// literal 1000, on the grounds that sessionstore does not export the rule --
+// true, and irrelevant: Store.pageLimit refuses a limit above
+// storage.MaxOrderedPageLimit, and storage exports that. A restatement is a
+// second authority for one number, and the number belongs to a module this one
+// already pins.
 //
-// It is restated here, not imported, because it is not exported by
-// sessionstore: Store.pageLimit refuses limit < 0 || limit >
-// storage.MaxOrderedPageLimit and returns the request's own error vocabulary,
-// and storage.MaxOrderedPageLimit is 1000, inclusive. Measured against the
-// released sessionstore v0.1.0 and storage v0.6.0.
-//
-// Both fakes enforce it, and that is the whole reason the page-limit constants
-// in reads.go have a reader at all. A fake looser than the dependency it stands
-// in for is what let agentProbePageLimit and maxSessionPageLimit be raised to
-// 5000 with the suite green -- which in production is a typed store refusal on
-// every request, mapped to internal_error, on a public authenticated route.
-// This is the class-4 direction: the fake must be no more permissive than the
-// module, checked in the direction that fails closed.
-const storePageCeiling = 1000
-
 // refusePageLimit is the store's own rule. It is shared by both fakes so the
 // two cannot drift into different ideas of how large a page may be, which is
 // the reason sessionstore itself keeps the rule in one place.
