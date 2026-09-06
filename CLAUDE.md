@@ -681,8 +681,20 @@ of 256 — which would have configured a 256-**byte** budget and closed
 essentially every connection on its first event. The only thing that enforces it
 is `centrifuge.Config.ClientQueueMaxSize`, which is bytes
 (`centrifuge@v0.38.0/config.go:58-61`). It is measured by execution, both ways:
-64 publications of 4 KiB kill a stalled consumer at a 4 KiB budget with 3008 and
-do not at 16 MiB.
+**1,024** publications of 4 KiB kill a stalled consumer at a 4 KiB budget with
+3008 and do not at 16 MiB. The number is 1,024 and not 64 because 64 (256 KiB)
+was measured *surviving* — a stalled consumer's socket and read buffers absorb a
+few hundred kibibytes before the server's queue grows at all — and the load was
+raised rather than the assertion loosened.
+
+**The measurement depends on releasing the consumer BEFORE taking the verdict,
+and the first version did not.** The server's close is issued from the publish
+path but cannot unwind while the transport's write is blocked on a socket
+nobody is draining, so a helper that waited for the disconnect event first
+reported "survived" in 8 of 14 clean runs with the hub holding *zero*
+connections. The order is: publish the whole load, release the consumer, then
+decide — and a "survived" verdict is now refused outright when the hub is
+empty, so the harness cannot report the opposite of what happened.
 
 `MaxChannelsPerConnection` exists because the transport defaults
 `ClientChannelLimit` to **128 silently** (`node.go:135-136`), and one browser
@@ -725,6 +737,21 @@ credential must send an `Origin`, and it runs before this handler in the
 composed chain. A second answer here is a second place for that rule to be
 stated wrongly.
 
+**That ordering is now measured, not deferred.**
+`TestTheGuardDecidesOriginBeforeTheClientLinkUpgrade` wraps the real
+`clientlink.Handler` in the real `httpapi.Guard` and writes three WebSocket
+handshakes by hand over a socket, because the answer is the STATUS LINE and
+because importing a websocket client would promote `gorilla/websocket` from an
+indirect requirement to a direct one. The deployment's own origin is **upgraded
+(101)** — the control, without which a chain refusing everything would pass —
+while another site's origin and an ambient-credential upgrade carrying no
+`Origin` are both **403 before the handler is entered**, naming
+`origin_not_trusted` and `websocket_origin_missing`. Removing `guard.Wrap` from
+the chain answers **101** to the cross-origin handshake and the request reaches
+the link, so the guard is what decides. A6.1 recorded this as blocked on A9.1;
+it was not. `NewGuard`, `Wrap` and `NewHandler` are exported, and a composition
+seam is not the same thing as composition code.
+
 **`internal/command` is a vocabulary, not a seam.** The five
 `sessionstore.CommandKind` values are shared by `internal/httpapi` and
 `internal/realtime/clientlink` because §8.1 makes the REST controls and the
@@ -733,6 +760,22 @@ would satisfy every test either package could write while letting an RPC be
 admitted under a kind no route serves. The strings are pinned once, as absolute
 literals, in that package's own test — every other reader names the constant, so
 nothing else could notice a value change.
+
+**`internal/admission` was the second copy, and the claim above was false until
+A6.1's gate found it.** It declared all five as its own absolute literals while
+being precisely the package both the REST controls and the ClientLink RPCs are
+routed into — the exact hazard the vocabulary package was created to remove,
+sitting in its most important consumer. It now holds aliases, as
+`internal/httpapi` already did.
+`TestTheCommandVocabularyIsSpelledInExactlyOnePlace` is what makes the claim
+checkable rather than reviewed: it enumerates every **production** file with
+`modfiles`, parses it, and reports any `CommandKind`-typed constant, variable or
+conversion whose value is a string literal outside `internal/command/kind.go`.
+A guard naming the packages it knew about could not have caught this one, so it
+derives its subject from the module; it is driven against a fixture carrying
+both shapes and two controls, because on a clean tree it passes whether it works
+or not. Test files are outside its subject on purpose — `kind_test.go` must
+state all five absolutely, since nothing else could notice a value changing.
 
 **Per-binding repair is not delegated to the transport, and A6.1 does not
 assume it is.** One `messageWriter` per `Client` and no per-channel queue
