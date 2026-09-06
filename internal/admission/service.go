@@ -9,15 +9,24 @@ import (
 
 	sessionwire "github.com/looprig/core/sessionwire/v1"
 	"github.com/looprig/factory/identity"
+	"github.com/looprig/factory/internal/command"
 	"github.com/looprig/sessionstore"
 )
 
+// The kinds this service admits.
+//
+// They are ALIASES of internal/command's, not a private copy, and this package
+// is the one where that matters most: the REST control routes and the ClientLink
+// RPCs are two spellings of one admission contract (specification section 8.1),
+// and both are routed here. Two private copies would satisfy every test either
+// package could write while letting an RPC be authorized under one spelling and
+// admitted under another. They were a private copy until A6.1's gate found it.
 const (
-	CommandCreate       sessionstore.CommandKind = "create"
-	CommandInput        sessionstore.CommandKind = "input"
-	CommandInterrupt    sessionstore.CommandKind = "interrupt"
-	CommandRestore      sessionstore.CommandKind = "restore"
-	CommandGateResponse sessionstore.CommandKind = "gate_response"
+	CommandCreate       = command.KindCreateSession
+	CommandInput        = command.KindInput
+	CommandInterrupt    = command.KindInterrupt
+	CommandRestore      = command.KindRestore
+	CommandGateResponse = command.KindGateResponse
 )
 
 // ErrPayloadProtocolUnavailable reports an input that cannot be admitted by
