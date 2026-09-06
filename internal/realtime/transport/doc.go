@@ -150,11 +150,22 @@
 // the result as a network fault.
 //
 // A stalled consumer costs its WHOLE connection, and this is structural rather
-// than a missing feature. centrifuge v0.38.0 has exactly one outbound queue per
-// Client (client.go:247, one *writer per connection) and no per-channel queue
-// exists anywhere in the library, so selective reset of one subscription is not
-// unimplemented -- there is no structure that could carry it. A7.3's per-binding
-// backpressure repair therefore cannot be delegated to the transport; it must be
+// than a missing feature. centrifuge v0.38.0 has exactly one BOUNDED outbound
+// queue per Client (client.go:247, one *writer per connection). A per-channel
+// structure does exist and this doc previously denied it: client.go:248 holds a
+// *perChannelWriter (client_experimental.go:249), built only when the node sets
+// the experimental Config.GetChannelBatchConfig (client.go:2701-2702,
+// config.go:134). It is not a second queue, though -- it is a batching
+// aggregator with no bound of its own. Each channelWriter accumulates into a
+// plain slice (client_experimental.go:138-146, field buffer) and flushes through
+// Client.writeQueueItems (client_experimental.go:109-117), which enqueues into
+// the single messageWriter and, when THAT overflows, closes the whole
+// connection. So the precise claim is that no per-channel outbound queue BOUND
+// exists anywhere in the library: turning batching on adds an unbounded buffer
+// in front of the one bound, it does not give a channel a failure domain. This
+// is why selective reset of one subscription is not merely unimplemented --
+// there is no structure that could carry it. A7.3's per-binding backpressure
+// repair therefore cannot be delegated to the transport; it must be
 // Factory-owned, above a transport whose only backpressure verb is "drop the
 // connection".
 package transport
