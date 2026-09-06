@@ -215,3 +215,84 @@ func assertRejected(t *testing.T, err error, limits any, wantErr string) {
 		t.Errorf("error %q does not name %q", err, wantErr)
 	}
 }
+
+// TestClientLinkPingIntervalMustSurviveTheWire is the inherited A5.1 finding
+// turned into a guard.
+//
+// The wire carries the ping cadence as a WHOLE NUMBER OF SECONDS:
+// centrifuge@v0.38.0/client.go:2466 computes res.Ping =
+// uint32(c.pingInterval.Seconds()), so anything under a second truncates to 0.
+// A client told Ping == 0 takes the res.Pong assignment inside
+// `if res.Ping > 0` (centrifuge-go@v0.12.0/client.go:1467-1474) and therefore
+// never pongs at all, so the server closes a HEALTHY connection with
+// DisconnectNoPong every pong timeout. Silently flooring the value would leave
+// the deployer reading that reconnect loop as a network fault, so the
+// composition refuses it instead.
+//
+// Every row here keeps PongTimeout and WriteTimeout coherent with the interval,
+// which is the whole reason this is a separate case: with the DEFAULT ten
+// second pong deadline, a 500ms interval is already refused by the
+// PongTimeout-before-PingInterval rule, and a row that leaned on that would
+// pass against a validator that had never heard of the wire at all.
+func TestClientLinkPingIntervalMustSurviveTheWire(t *testing.T) {
+	t.Parallel()
+
+	// coherent builds limits whose pong deadline and write timeout are both
+	// well inside interval, so PingInterval is the only field under test.
+	coherent := func(interval time.Duration) ClientLinkLimits {
+		limits := DefaultClientLinkLimits()
+		limits.PingInterval = interval
+		limits.PongTimeout = interval / 3
+		limits.WriteTimeout = interval / 4
+		return limits
+	}
+
+	t.Run("rejected below one second", func(t *testing.T) {
+		t.Parallel()
+
+		// Absolute literals. 999ms is the last value below the boundary and
+		// 500ms is the value the finding was measured at.
+		for _, interval := range []time.Duration{time.Millisecond, 500 * time.Millisecond, 999 * time.Millisecond} {
+			limits := coherent(interval)
+			err := limits.Validate()
+			assertRejected(t, err, limits, "PingInterval")
+			if err == nil {
+				continue
+			}
+			// The ordering rules are the near neighbours this rejection must
+			// not be confused with. Naming PingInterval is not enough on its
+			// own: the PongTimeout-before-PingInterval message names it too.
+			if strings.Contains(err.Error(), "PongTimeout") {
+				t.Errorf("PingInterval = %v was refused by a message blaming PongTimeout: %q", interval, err)
+			}
+			if !strings.Contains(err.Error(), "1s") {
+				t.Errorf("error %q for PingInterval = %v does not name the 1s floor", err, interval)
+			}
+		}
+	})
+
+	t.Run("accepted at one second and above", func(t *testing.T) {
+		t.Parallel()
+
+		// One second is the boundary itself, written as an absolute literal
+		// rather than as MinClientLinkPingInterval: a fixture built from the
+		// constant would move with it and pin nothing.
+		for _, interval := range []time.Duration{time.Second, 1500 * time.Millisecond, 25 * time.Second} {
+			limits := coherent(interval)
+			if err := limits.Validate(); err != nil {
+				t.Errorf("PingInterval = %v was rejected: %v", interval, err)
+			}
+		}
+	})
+}
+
+// TestMinClientLinkPingIntervalIsOneSecond pins the exported boundary itself.
+// Without it the constant could move and every row above would move with the
+// behaviour it describes.
+func TestMinClientLinkPingIntervalIsOneSecond(t *testing.T) {
+	t.Parallel()
+
+	if MinClientLinkPingInterval != time.Second {
+		t.Errorf("MinClientLinkPingInterval = %v, want 1s", MinClientLinkPingInterval)
+	}
+}

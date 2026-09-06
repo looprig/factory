@@ -351,6 +351,26 @@ type ClientLinkLimits struct {
 	PongTimeout time.Duration
 }
 
+// MinClientLinkPingInterval is the shortest ping cadence the ClientLink wire
+// can carry.
+//
+// It is one second because the connect reply expresses the cadence as a WHOLE
+// NUMBER OF SECONDS -- centrifuge@v0.38.0/client.go:2466 computes
+// res.Ping = uint32(c.pingInterval.Seconds()) -- so every sub-second value
+// arrives as 0. That is not merely imprecise. The Go client assigns
+// c.sendPong = res.Pong INSIDE `if res.Ping > 0`
+// (centrifuge-go@v0.12.0/client.go:1467-1474), so a client told 0 is never
+// asked to pong at all, and the server then closes a perfectly healthy
+// connection with DisconnectNoPong (3012) every pong timeout. The deployment
+// sees a reconnect loop and reads it as a network fault.
+//
+// Truncation ABOVE the floor is harmless in the other direction and is
+// therefore allowed: an interval of 1500ms is advertised as 1s, which only
+// makes the client's own liveness deadline stricter than the server's cadence,
+// and the client adds MaxServerPingDelay (10s by default,
+// centrifuge-go@v0.12.0/client.go:165-166, 791) on top of it.
+const MinClientLinkPingInterval = time.Second
+
 // DefaultClientLinkLimits is the configuration a composition gets if it names
 // none. MaxConnections is sized for the 1,000-5,000 connection scale a Factory
 // replica is expected to hold.
@@ -375,7 +395,10 @@ func (l ClientLinkLimits) Validate() error {
 	if err := positive("ClientLinkLimits.WriteTimeout", l.WriteTimeout); err != nil {
 		return err
 	}
-	if err := positive("ClientLinkLimits.PingInterval", l.PingInterval); err != nil {
+	// The floor subsumes the positivity check, and it is a REFUSAL rather than
+	// a floor applied silently: see MinClientLinkPingInterval for why a value
+	// below it takes healthy connections down and reads as a network fault.
+	if err := atLeastDuration("ClientLinkLimits.PingInterval", l.PingInterval, MinClientLinkPingInterval); err != nil {
 		return err
 	}
 	if err := positive("ClientLinkLimits.PongTimeout", l.PongTimeout); err != nil {
@@ -457,6 +480,15 @@ func (l HostLinkLimits) Validate() error {
 func positive(name string, d time.Duration) error {
 	if d <= 0 {
 		return fmt.Errorf("%w: %s is %v, want a positive duration", ErrInvalidLimits, name, d)
+	}
+	return nil
+}
+
+// atLeastDuration is positive() with a floor above zero, for a value whose
+// small-but-positive range is not merely unhelpful but broken.
+func atLeastDuration(name string, d, floor time.Duration) error {
+	if d < floor {
+		return fmt.Errorf("%w: %s is %v, want at least %v", ErrInvalidLimits, name, d, floor)
 	}
 	return nil
 }

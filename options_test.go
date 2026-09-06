@@ -543,3 +543,31 @@ func TestAValidDefaultTenantComposes(t *testing.T) {
 		t.Errorf("composed default tenant = %q, want %q", server.cfg.defaultTenant, "tenant-default")
 	}
 }
+
+// TestNewRejectsASubSecondPingInterval carries the wire-truncation refusal
+// through the composition, and asserts the STRUCTURED answer rather than the
+// message: New must return an *OptionError naming the option that carried the
+// value, so a deployer is told which of its calls to change.
+func TestNewRejectsASubSecondPingInterval(t *testing.T) {
+	t.Parallel()
+
+	limits := DefaultClientLinkLimits()
+	limits.PingInterval = 500 * time.Millisecond
+	limits.PongTimeout = 150 * time.Millisecond
+	limits.WriteTimeout = 100 * time.Millisecond
+
+	server, err := New(append(RequiredOptions(), WithClientLinkLimits(limits))...)
+	if err == nil {
+		t.Fatalf("New() with a 500ms ping interval = %+v, want an error", server)
+	}
+	var optionErr *OptionError
+	if !errors.As(err, &optionErr) {
+		t.Fatalf("error %v is %T, want an *OptionError", err, err)
+	}
+	if optionErr.Option != "WithClientLinkLimits" {
+		t.Errorf("OptionError.Option = %q, want %q", optionErr.Option, "WithClientLinkLimits")
+	}
+	if !errors.Is(err, ErrInvalidLimits) {
+		t.Errorf("error %v does not wrap ErrInvalidLimits", err)
+	}
+}
