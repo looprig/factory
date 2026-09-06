@@ -380,3 +380,84 @@ func TestTheComposedAuthorizerDecidesTheSessionList(t *testing.T) {
 	}
 	decodeError(t, recorder)
 }
+
+// tenantlessVerifier asserts the one credential shape WithDefaultTenant changes
+// the answer for: an ACTOR that names no tenant of its own. It accepts the same
+// single credential value FakeVerifier does, so "the composition authenticated"
+// stays distinguishable from "the composition authenticated nothing".
+type tenantlessVerifier struct{}
+
+func (tenantlessVerifier) VerifyCredential(_ context.Context, credential identity.Credential) (identity.Claims, error) {
+	if credential.Value() != factory.FakeCredentialValue {
+		return identity.Claims{}, identity.ErrUnauthenticated
+	}
+	return identity.Claims{
+		Subject: factory.FakeSubject,
+		Kind:    identity.KindActor,
+		// Relative to the wall clock, because this composition uses the system
+		// clock; an hour outlasts any run and depends on no fixture instant.
+		ExpiresAt: time.Now().Add(time.Hour),
+	}, nil
+}
+
+// bootstrapTenant is the tenant the composed bootstrap document reports.
+func bootstrapTenant(t *testing.T, recorder *httptest.ResponseRecorder) string {
+	t.Helper()
+
+	var document struct {
+		Tenant string `json:"tenant_id"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &document); err != nil {
+		t.Fatalf("the bootstrap body is not JSON (%v): %q", err, recorder.Body)
+	}
+	return document.Tenant
+}
+
+// TestTheComposedDefaultTenantScopesATenantlessActor holds WithDefaultTenant
+// reaching the authenticator, by the tenant a response CARRIES.
+//
+// The literal below is not FakeTenant and is not derived from anything the
+// composition computes, so the assertion cannot be satisfied by a composition
+// that reached some other tenant. Nothing else in this file reads this seam:
+// every other case authenticates a credential that names its own tenant, for
+// which the default is never consulted.
+func TestTheComposedDefaultTenantScopesATenantlessActor(t *testing.T) {
+	t.Parallel()
+
+	server, err := factory.New(append(factory.RequiredOptionsExcept("WithCredentialVerifier"),
+		factory.WithCredentialVerifier(tenantlessVerifier{}),
+		factory.WithDefaultTenant("tenant-default"),
+	)...)
+	if err != nil {
+		t.Fatalf("New() = %v", err)
+	}
+	recorder := serveHandler(t, server.Handler(), apiRequest(t, http.MethodGet, "/v1/bootstrap"))
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("GET /v1/bootstrap for a tenantless actor = %d, want 200; body %q", recorder.Code, recorder.Body)
+	}
+	if got := bootstrapTenant(t, recorder); got != "tenant-default" {
+		t.Errorf("tenant_id = %q, want the composed default %q", got, "tenant-default")
+	}
+}
+
+// TestATenantlessActorIsRefusedWithoutADefaultTenant is the other side, and it
+// is what makes the case above mean something: the default is CONFIGURED, never
+// synthesised, so the same credential with the option absent authenticates
+// nobody rather than acquiring some fallback scope.
+func TestATenantlessActorIsRefusedWithoutADefaultTenant(t *testing.T) {
+	t.Parallel()
+
+	server, err := factory.New(append(factory.RequiredOptionsExcept("WithCredentialVerifier"),
+		factory.WithCredentialVerifier(tenantlessVerifier{}),
+	)...)
+	if err != nil {
+		t.Fatalf("New() = %v", err)
+	}
+	recorder := serveHandler(t, server.Handler(), apiRequest(t, http.MethodGet, "/v1/bootstrap"))
+
+	if recorder.Code != http.StatusUnauthorized {
+		t.Fatalf("a tenantless actor with no default tenant = %d, want 401; body %q", recorder.Code, recorder.Body)
+	}
+	decodeError(t, recorder)
+}

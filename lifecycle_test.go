@@ -263,3 +263,41 @@ func TestServeAppliesTheComposedHeaderReadTimeout(t *testing.T) {
 		}
 	}
 }
+
+// TestServeReportsAListenerFailure is the other half of Serve's contract, and
+// the half a passing suite is otherwise blind to.
+//
+// Serve reports a deliberate Stop as success, deliberately, so that a caller
+// does not have to classify the ordinary ending. Everything else it must
+// report AS IT WAS. Without this case a Serve that swallowed every listener
+// error and returned nil would pass the whole suite, and a supervisor would
+// read a server that never accepted a connection as a clean shutdown.
+//
+// A listener closed before Serve takes it is the cheapest real failure: the
+// first Accept fails and there is nothing to tear down afterwards.
+func TestServeReportsAListenerFailure(t *testing.T) {
+	t.Parallel()
+
+	server, err := factory.New(factory.RequiredOptions()...)
+	if err != nil {
+		t.Fatalf("New() = %v", err)
+	}
+	ln := listen(t)
+	if err := ln.Close(); err != nil {
+		t.Fatalf("closing the listener before Serve: %v", err)
+	}
+
+	err = awaitServe(t, served(t, server, ln), "report the listener's failure")
+	if err == nil {
+		t.Fatal("Serve() over a closed listener = nil, want the listener's error reported")
+	}
+	// The two lifecycle refusals are the errors this Server could return
+	// WITHOUT ever reaching the listener, so a case that accepted either would
+	// pass on a Serve that never tried to accept anything.
+	if errors.Is(err, factory.ErrServerStopped) || errors.Is(err, factory.ErrAlreadyServing) {
+		t.Fatalf("Serve() = %v, which is a lifecycle refusal rather than the listener's failure", err)
+	}
+	if !errors.Is(err, net.ErrClosed) {
+		t.Errorf("Serve() = %v, want the closed listener's error (net.ErrClosed)", err)
+	}
+}

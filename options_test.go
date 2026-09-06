@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	sessionwire "github.com/looprig/core/sessionwire/v1"
 	"github.com/looprig/factory/identity"
 )
 
@@ -471,5 +472,74 @@ func TestMissingSeamsAreAlwaysReportedInSortedOrder(t *testing.T) {
 		if !slices.Equal(missing.Options, want) {
 			t.Fatalf("dropping %v: Options = %v, want %v", dropped, missing.Options, want)
 		}
+	}
+}
+
+// TestNewRejectsAnInvalidDefaultTenant holds the validation composeRouter does
+// AHEAD of NewAuthenticator, and holds it by its attribution rather than by the
+// fact that something was refused.
+//
+// The whole point of validating here is that the deployer is told which option
+// carried the offending value. NewAuthenticator validates the same field, so
+// deleting this block still refuses an invalid tenant -- it just blames
+// WithSessionCookieName, the one rejection composeRouter's comment reasons that
+// NewAuthenticator has left. That is why the assertion below is on the
+// OptionError's Option field and not on the presence of an error.
+func TestNewRejectsAnInvalidDefaultTenant(t *testing.T) {
+	t.Parallel()
+
+	// Both values are absolute literals rather than derived from what the
+	// production code checks. The length limit is named only to keep the
+	// second row honest if Core ever raises it.
+	if sessionwire.MaxIDBytes >= 257 {
+		t.Fatalf("sessionwire.MaxIDBytes is %d; the 257-byte literal below is no longer over-long",
+			sessionwire.MaxIDBytes)
+	}
+	tests := []struct {
+		name   string
+		tenant sessionwire.TenantID
+		code   sessionwire.IDValidationCode
+	}{
+		{name: "not valid UTF-8", tenant: "tenant-\xff", code: sessionwire.IDValidationCodeInvalidUTF8},
+		{name: "longer than an identity may be", tenant: sessionwire.TenantID(strings.Repeat("t", 257)),
+			code: sessionwire.IDValidationCodeTooLong},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			server, err := New(append(RequiredOptions(), WithDefaultTenant(tt.tenant))...)
+			if err == nil {
+				t.Fatalf("New() with a %s default tenant = %+v, want an error", tt.name, server)
+			}
+			var optionErr *OptionError
+			if !errors.As(err, &optionErr) {
+				t.Fatalf("New() = %v, want an *OptionError", err)
+			}
+			if optionErr.Option != "WithDefaultTenant" {
+				t.Errorf("the rejection is attributed to %q, want %q", optionErr.Option, "WithDefaultTenant")
+			}
+			var idErr *sessionwire.IDValidationError
+			if !errors.As(err, &idErr) {
+				t.Fatalf("New() = %v, want it to wrap a *sessionwire.IDValidationError", err)
+			}
+			if idErr.Code != tt.code {
+				t.Errorf("validation code = %q, want %q", idErr.Code, tt.code)
+			}
+		})
+	}
+}
+
+// TestAValidDefaultTenantComposes is what keeps the case above from passing on
+// a composition that refused every default tenant.
+func TestAValidDefaultTenantComposes(t *testing.T) {
+	t.Parallel()
+
+	server, err := New(append(RequiredOptions(), WithDefaultTenant("tenant-default"))...)
+	if err != nil {
+		t.Fatalf("New() with a valid default tenant = %v, want no error", err)
+	}
+	if server.cfg.defaultTenant != "tenant-default" {
+		t.Errorf("composed default tenant = %q, want %q", server.cfg.defaultTenant, "tenant-default")
 	}
 }
