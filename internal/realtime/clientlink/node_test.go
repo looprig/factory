@@ -284,12 +284,20 @@ func TestTheConnectionLabelIsTheSubjectNotTheTenant(t *testing.T) {
 // in 8 of 14 clean runs and 4 of 4 in isolation, and in a failing run the hub
 // held ZERO connections -- the close had happened and the harness missed it.
 // The load is published in full, THEN the consumer is released, THEN the
-// verdict is taken. Releasing after the last publication cannot change the
-// outcome, because the overflow decision is made during the loop.
+// verdict is taken. Releasing after the last publication does not decide the
+// outcome: node.Publish is asynchronous, so a release could in principle
+// interleave with the tail of the enqueue path, but the load is 4 MiB against a
+// 4 KiB budget -- a margin of 1,000x, reached within the first handful of
+// messages. That margin, not the ordering, is what makes the release safe here,
+// and it is what would have to be re-argued if the load were ever reduced
+// towards the budget.
 //
-// The connection count is returned so a "survived" verdict is checkable against
-// something other than the event plumbing that just failed to see the close;
-// the helper refuses to return that verdict when the two disagree.
+// A second, independent witness is kept so a "survived" verdict is checkable
+// against something other than the event plumbing that just failed to see the
+// close: the number of times the SERVER accepted a connection, counted on the
+// OnConnect path. The helper refuses to return "survived" when that witness
+// disagrees -- see survivalRefusal, and the case above it for why the hub's
+// population could not do this job.
 func stalledConsumer(t *testing.T, queueBytes, publications, payloadBytes int) (centrifuge.DisconnectEvent, bool, int) {
 	t.Helper()
 
@@ -314,12 +322,14 @@ func stalledConsumer(t *testing.T, queueBytes, publications, payloadBytes int) (
 		t.Fatalf("NewHandler: %v", err)
 	}
 
+	var connects atomic.Int64
 	disconnects := make(chan centrifuge.DisconnectEvent, 8)
 	// The node's own disconnect event is the SERVER's answer. The client's is
 	// not usable here: a stalled consumer's event loop is stuck inside the
 	// blocking callback and cannot report anything, which is itself part of the
 	// blast radius A5.1 recorded.
 	handler.node.OnConnect(func(client *centrifuge.Client) {
+		connects.Add(1)
 		handler.connected(client)
 		client.OnDisconnect(func(e centrifuge.DisconnectEvent) {
 			select {
@@ -428,14 +438,85 @@ func stalledConsumer(t *testing.T, queueBytes, publications, payloadBytes int) (
 	}
 
 	connections := handler.Connections()
-	// A "survived" verdict with an empty hub is the failure this helper was
-	// rewritten to make impossible to report. It is not a system finding and
-	// must not be dressed as one.
-	if connections == 0 {
-		t.Fatalf("no disconnect event was observed but the hub holds 0 connections after %d publications of %d bytes: the harness missed the close",
-			publications, payloadBytes)
+	// A "survived" verdict the second witness contradicts is the failure this
+	// helper was rewritten to make impossible to report. It is not a system
+	// finding and must not be dressed as one.
+	if refusal := survivalRefusal(connects.Load(), connections); refusal != "" {
+		t.Fatalf("no disconnect event was observed but %s, after %d publications of %d bytes: the harness missed the close",
+			refusal, publications, payloadBytes)
 	}
 	return centrifuge.DisconnectEvent{}, false, connections
+}
+
+// survivalRefusal reports why a "survived" verdict is not credible, or "" when
+// it is. connects is how many times the SERVER accepted a connection from this
+// client; connections is the hub's population when the verdict is taken.
+//
+// The connect count is the load-bearing half, and the population alone is not
+// enough -- see TestASurvivedVerdictIsRefusedWhenTheCloseIsOnlyVISIBLEAsAReconnect
+// for the mechanism. A survivor is accepted exactly ONCE and is still in the
+// hub; anything else is a close this harness did not see.
+func survivalRefusal(connects int64, connections int) string {
+	if connects != 1 {
+		return fmt.Sprintf("the server accepted %d connections from this client, so the first one was closed and re-established", connects)
+	}
+	if connections == 0 {
+		return "the hub holds 0 connections"
+	}
+	return ""
+}
+
+// TestASurvivedVerdictIsRefusedWhenTheCloseIsOnlyVISIBLEAsAReconnect is the
+// reader survivalRefusal's first version did not have, and the case it did not
+// survive.
+//
+// A6.1's re-gate sabotaged the disconnect plumbing alone -- exactly the failure
+// mode the refusal names -- and the helper still reported "survived ... the hub
+// still holds 1 connection(s)". Server-side instrumentation of that probe read
+// `connects=2 lastDisconnectCode=3008 connections=1`: the close DID happen.
+//
+// The mechanism is the reconnect band A5.1 measured and this package documents
+// at centrifuge_test.go:424-436. DisconnectSlow is 3008, which satisfies
+// centrifuge-go's `code < 3500` (transport_websocket.go:29), so the client
+// RECONNECTS -- and it lands well inside this helper's 30s wait, so the hub's
+// population is back to 1 by the time it is read. The second witness therefore
+// corroborated the false verdict instead of catching it, and raising the wait
+// from 5s to 30s in the same commit is what disarmed it: the "in a failing run
+// the hub held ZERO connections" observation was true only of the OLD 5s
+// window, before the reconnect had landed.
+//
+// A population cannot be the witness, because a reconnect restores it. The
+// number of times the server ACCEPTED a connection cannot be restored: a
+// survivor is accepted exactly once, and every close of the sole connection
+// leaves either an empty hub or a second accept behind it. The counter is fed
+// from OnConnect, so the sabotage of OnDisconnect cannot silence it.
+func TestASurvivedVerdictIsRefusedWhenTheCloseIsOnlyVISIBLEAsAReconnect(t *testing.T) {
+	t.Parallel()
+
+	for _, tt := range []struct {
+		name        string
+		connects    int64
+		connections int
+		refused     bool
+	}{
+		// The only shape a genuine survivor can have: accepted once, still here.
+		{"a genuine survivor", 1, 1, false},
+		// The old 5s window's shape: observed before the reconnect landed.
+		{"the close was missed and the hub is empty", 1, 0, true},
+		// The re-gate's MEASURED shape, and the one the first version passed.
+		{"the close was missed and the client reconnected", 2, 1, true},
+		{"the close was missed, reconnected, and gone again", 2, 0, true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			refusal := survivalRefusal(tt.connects, tt.connections)
+			if refused := refusal != ""; refused != tt.refused {
+				t.Fatalf("survivalRefusal(connects=%d, connections=%d) = %q, so refused = %t, want refused = %t",
+					tt.connects, tt.connections, refusal, refused, tt.refused)
+			}
+		})
+	}
 }
 
 // TestLimitsValidate is the table for the second validation, the one that

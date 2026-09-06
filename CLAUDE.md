@@ -693,8 +693,19 @@ path but cannot unwind while the transport's write is blocked on a socket
 nobody is draining, so a helper that waited for the disconnect event first
 reported "survived" in 8 of 14 clean runs with the hub holding *zero*
 connections. The order is: publish the whole load, release the consumer, then
-decide — and a "survived" verdict is now refused outright when the hub is
-empty, so the harness cannot report the opposite of what happened.
+decide — and a "survived" verdict is refused unless a second witness agrees.
+
+**That witness may not be the hub's population, and the first version's was.**
+`DisconnectSlow` is 3008, which is inside centrifuge-go's reconnect band
+(`transport_websocket.go:29`), so a client closed for the queue budget
+reconnects well inside the helper's 30s wait and the hub reads 1 again: a
+harness that missed the close was *corroborated* by its own second witness
+(measured, with the disconnect plumbing sabotaged: `connects=2
+lastDisconnectCode=3008 connections=1`). The witness is now the number of times
+the server ACCEPTED a connection, which a reconnect cannot restore — a survivor
+is accepted exactly once — so the harness cannot report a survival it did not
+see. This bounds a false RED only; a true survivor always has a live
+connection.
 
 `MaxChannelsPerConnection` exists because the transport defaults
 `ClientChannelLimit` to **128 silently** (`node.go:135-136`), and one browser
