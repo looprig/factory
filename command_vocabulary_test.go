@@ -41,10 +41,20 @@ type commandKindLiteral struct {
 // The selector's PACKAGE qualifier is deliberately not matched: an import alias
 // would defeat that, and no other CommandKind is in play in this module.
 //
-// Test files are excluded on purpose. internal/command/kind_test.go must state
-// all five as absolute literals -- that is the only thing that could notice a
-// value changing -- and several suites legitimately drive the wire strings
-// directly.
+// Test files are excluded on purpose, and the exclusion is not free. Its cost,
+// stated so a later reader does not have to rediscover it: a vocabulary copy
+// declared in an INTERNAL test file of a production package would not be
+// reported. No such copy exists today.
+//
+// It cannot simply be dropped. internal/command/kind_test.go must state all
+// five as absolute literals -- that is the only thing that could notice a value
+// changing -- and other suites legitimately drive the wire strings directly in
+// a shape this detector recognises: guard_composition_test.go:175 converts
+// `sessionstore.CommandKind("input")` to exercise the seam with a value the
+// production code is not allowed to invent. Scanning test files would report
+// those as copies, which would make the guard's output noise rather than a
+// finding. The exclusion buys a true signal at the price of that one blind
+// spot, and the blind spot is a test file, which cannot admit an RPC.
 func findCommandKindLiterals(t *testing.T, root string) []commandKindLiteral {
 	t.Helper()
 
