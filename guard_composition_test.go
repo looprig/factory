@@ -1,11 +1,15 @@
 package factory_test
 
 import (
+	"bufio"
 	"context"
 	"errors"
+	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -28,12 +32,19 @@ import (
 //
 // What is real here and what is not, stated rather than implied: the guard, the
 // authenticator, the authorizer and the operation context are production code.
-// The LINK is not -- Factory's ClientLink engine is a later task -- so the
-// object below carries the handshake's outcome and nothing else, and calls the
-// production authorizer through the interface clientlink declares for itself.
-// That is the strongest form available today, and its limit is that it cannot
-// prove a future engine consults the authorizer; it proves that the handshake
-// hands a subscription nothing that would let it skip one.
+// In the first three cases the LINK is not -- the object below carries the
+// handshake's outcome and nothing else, and calls the production authorizer
+// through the interface clientlink declares for itself -- and the limit of that
+// form is that it cannot prove an engine consults the authorizer; it proves
+// that the handshake hands a subscription nothing that would let it skip one.
+//
+// TestTheGuardDecidesOriginBeforeTheClientLinkUpgrade, added after A6.1, does
+// use the real clientlink.Handler. A6.1 had deferred that composition to A9.1
+// on the belief that it needed production wiring; it does not, because
+// httpapi.NewGuard, Guard.Wrap and clientlink.NewHandler are all exported and
+// the chain is three lines. Composition seams are not the same thing as
+// composition CODE, and a claim provable at the test level should not wait for
+// the wiring that will later state it in production.
 
 const composedOrigin = "https://app.example.com"
 
@@ -308,4 +319,184 @@ func TestMountingTheGuardOutsideAuthenticationFailsLoudly(t *testing.T) {
 	if body := recorder.Body.String(); !strings.Contains(body, string(httpapi.ReasonUnauthenticated)) {
 		t.Errorf("rejection body %q does not name %q", body, httpapi.ReasonUnauthenticated)
 	}
+}
+
+// TestTheGuardDecidesOriginBeforeTheClientLinkUpgrade is the composition A6.1
+// deferred to A9.1 and did not have to.
+//
+// `clientlink`'s WebsocketConfig.CheckOrigin admits everything on purpose, and
+// node_test.go asserts that deliberate hole. What it cannot show is the half
+// that makes the hole safe: that something else decided origin FIRST. That is
+// not a claim about either component -- the guard knows nothing about
+// websockets beyond the upgrade headers, and the link cannot see what ran
+// before it -- so it is asserted here, over the REAL guard wrapped around the
+// REAL clientlink.Handler, with no production wiring required. `httpapi.NewGuard`
+// and `Guard.Wrap` are exported, `clientlink.NewHandler` returns an
+// http.Handler, and that is the whole composition.
+//
+// The handshake is written by hand over a socket rather than dialled with a
+// client library, for two reasons: the answer being measured is the STATUS LINE
+// (101 against 403), and `gorilla/websocket` is an INDIRECT dependency of this
+// module which a test importing it would make direct.
+//
+// Three rows, and the first is the control that makes the other two mean
+// something. Without it, a chain that refused every handshake would pass.
+func TestTheGuardDecidesOriginBeforeTheClientLinkUpgrade(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 9, 3, 12, 0, 0, 0, time.UTC)
+	authenticator, err := internalidentity.NewAuthenticator(internalidentity.Config{
+		Verifier: composedVerifier{tenant: "tenant-a", subject: "subject-a", expiry: now.Add(time.Hour)},
+		Clock:    composedClock{now: now},
+	})
+	if err != nil {
+		t.Fatalf("NewAuthenticator: %v", err)
+	}
+	link, err := clientlink.NewHandler(clientlink.Config{
+		// The production Authenticator already IS clientlink's seam: it declares
+		// AuthenticateLink over the same Verifier, which is what makes a link
+		// credential and a bearer credential the same material.
+		Authenticator: authenticator,
+		Authorizer:    internalidentity.Authorizer{},
+		Limits: clientlink.Limits{
+			MaxConnections:           16,
+			MaxChannelsPerConnection: 32,
+			PerConnectionQueueBytes:  1 << 20,
+			WriteTimeout:             5 * time.Second,
+			PingInterval:             25 * time.Second,
+			PongTimeout:              10 * time.Second,
+		},
+		Version: "v-composed",
+	})
+	if err != nil {
+		t.Fatalf("clientlink.NewHandler: %v", err)
+	}
+
+	// reached counts requests that got PAST the guard. A status code alone
+	// cannot separate "the guard refused" from "the link refused", and the
+	// ordering is the claim.
+	var reached atomic.Int64
+	counted := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		reached.Add(1)
+		link.ServeHTTP(w, r)
+	})
+
+	// The trusted origin cannot be known until the listener has a port, and the
+	// guard's host rule compares against exactly that authority, so the server
+	// is started around an indirection and the chain is installed once the
+	// address exists. Nothing serves a request in between.
+	var composed http.Handler
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		composed.ServeHTTP(w, r)
+	}))
+	t.Cleanup(server.Close)
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		_ = link.Shutdown(ctx)
+	})
+
+	guard, err := httpapi.NewGuard(httpapi.GuardConfig{
+		CSRF: factoryidentity.CSRFConfig{
+			SharedKey:      []byte("0123456789abcdef0123456789abcdef"),
+			TokenTTL:       time.Hour,
+			TrustedOrigins: []string{server.URL},
+		},
+		Credentials: authenticator,
+		Clock:       composedClock{now: now},
+	})
+	if err != nil {
+		t.Fatalf("NewGuard: %v", err)
+	}
+	composed = authenticateThen(t, authenticator, guard.Wrap(counted))
+
+	for _, tt := range []struct {
+		name string
+		// origin is sent only when present.
+		origin     string
+		sendOrigin bool
+		wantStatus int
+		// wantReason is the guard's stable code, empty when the handshake is
+		// expected to be upgraded.
+		wantReason string
+		wantPassed bool
+	}{
+		{
+			name:       "the deployment's own origin is upgraded",
+			origin:     server.URL,
+			sendOrigin: true,
+			wantStatus: http.StatusSwitchingProtocols,
+			wantPassed: true,
+		},
+		{
+			name:       "another site's origin never reaches the link",
+			origin:     "https://evil.example.com",
+			sendOrigin: true,
+			wantStatus: http.StatusForbidden,
+			wantReason: string(httpapi.ReasonOriginNotTrusted),
+		},
+		{
+			name:       "an upgrade with an ambient credential and no origin never reaches the link",
+			wantStatus: http.StatusForbidden,
+			wantReason: string(httpapi.ReasonUpgradeOriginMissing),
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			before := reached.Load()
+			status, body := rawHandshake(t, server.Listener.Addr().String(), tt.origin, tt.sendOrigin)
+			if status != tt.wantStatus {
+				t.Errorf("the handshake was answered %d, want %d (body %q)", status, tt.wantStatus, body)
+			}
+			if tt.wantReason != "" && !strings.Contains(body, tt.wantReason) {
+				t.Errorf("the refusal body %q does not name %q, so it is not the guard's decision", body, tt.wantReason)
+			}
+			if passed := reached.Load() > before; passed != tt.wantPassed {
+				t.Errorf("the request reached the clientlink handler = %v, want %v", passed, tt.wantPassed)
+			}
+		})
+	}
+}
+
+// rawHandshake writes one WebSocket handshake and returns its status and body.
+//
+// Written by hand because the measurement IS the status line, and because
+// importing a websocket client here would promote gorilla/websocket from an
+// indirect requirement of this module to a direct one.
+func rawHandshake(t *testing.T, address, origin string, sendOrigin bool) (int, string) {
+	t.Helper()
+
+	conn, err := net.Dial("tcp", address)
+	if err != nil {
+		t.Fatalf("dial %s: %v", address, err)
+	}
+	defer conn.Close()
+	if err := conn.SetDeadline(time.Now().Add(30 * time.Second)); err != nil {
+		t.Fatalf("SetDeadline: %v", err)
+	}
+
+	request := "GET /v1/realtime HTTP/1.1\r\n" +
+		"Host: " + address + "\r\n" +
+		"Upgrade: websocket\r\n" +
+		"Connection: Upgrade\r\n" +
+		"Sec-WebSocket-Version: 13\r\n" +
+		"Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n" +
+		"Cookie: " + internalidentity.DefaultCookieName + "=browser-session-credential\r\n"
+	if sendOrigin {
+		request += "Origin: " + origin + "\r\n"
+	}
+	request += "\r\n"
+	if _, err := io.WriteString(conn, request); err != nil {
+		t.Fatalf("write handshake: %v", err)
+	}
+
+	response, err := http.ReadResponse(bufio.NewReader(conn), nil)
+	if err != nil {
+		t.Fatalf("read handshake response: %v", err)
+	}
+	defer response.Body.Close()
+	body, err := io.ReadAll(response.Body)
+	if err != nil {
+		t.Fatalf("read handshake body: %v", err)
+	}
+	return response.StatusCode, string(body)
 }
