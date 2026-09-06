@@ -6,10 +6,14 @@ github.com/centrifugal/centrifuge v0.38.0 h1:UJTowwc5lSwnpvd3vbrTseODbU7osSggN67
 github.com/centrifugal/centrifuge v0.38.0/go.mod h1:rcZLARnO5GXOeE9qG7iIPMvERxESespqkSX4cGLCAzo=
 github.com/centrifugal/centrifuge-go v0.10.12 h1:CX8zgXJ/WD0psI1bMdLiyz0HmXV+xV+IzDkYgpfN58Q=
 github.com/centrifugal/centrifuge-go v0.10.12/go.mod h1:yONZBopAssVw7mluSRs/6YTYkqKe+llSGIokNVlBDZ4=
+github.com/centrifugal/centrifuge-go v0.12.0 h1:c7gAu4Qdrxt0xGMykgiI0MN4fFVZ4mMQw/rmdHcCKOI=
+github.com/centrifugal/centrifuge-go v0.12.0/go.mod h1:2JOOFZuLxjs5rc4Umyu6EUqwF4BP8qun/XZQ0Nh884E=
 github.com/centrifugal/centrifuge-go v0.12.1 h1:nvk5y6/TYGqa2ysQ0+qkcS5DTVC0jTITkDVk2wKXTqc=
 github.com/centrifugal/centrifuge-go v0.12.1/go.mod h1:YkU4klP3EyPLbSP/5eb2+w9S7Swv2gw73hYnSrcVnB8=
 github.com/centrifugal/protocol v0.17.0 h1:hD0WczyiG7zrVJcgkQsd5/nhfFXt0Y04SJHV2Z7B1rg=
 github.com/centrifugal/protocol v0.17.0/go.mod h1:9MdiYyjw5Bw1+d5Sp4Y0NK+qiuTNyd88nrHJsUUh8k4=
+github.com/centrifugal/protocol v0.19.2 h1:wc1S75EJvX5/KczsqEG74Bt/Jw/XwECDUzWR/vE/E9U=
+github.com/centrifugal/protocol v0.19.2/go.mod h1:zFsp4f1ZRejq1dkyNUbabdPj4dMYOpK8RRXDwHGVpVY=
 github.com/centrifugal/protocol v0.21.0 h1:yagnxWBH7vK2+0+A0bmPAIOCaFqTvaLVWubkklS7Xyo=
 github.com/centrifugal/protocol v0.21.0/go.mod h1:3pinAfcb+bH8Yp8Ewhf9QTRTzsQ9veP/QOrCk5D5SSE=
 github.com/cespare/xxhash/v2 v2.3.0 h1:UL815xU9SqsFlibzuggzjXhog7bL6oX9BbNZnL2UFvs=

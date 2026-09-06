@@ -62,6 +62,11 @@ type serverOptions struct {
 	onDisconnect func(centrifuge.DisconnectEvent)
 	// onSubscribed observes what the server agreed to.
 	onSubscribed func(centrifuge.SubscribeEvent)
+	// compression sets WebsocketConfig.Compression. It exists so that the
+	// handshake case can assert the REFUSAL against a positive control in
+	// which the same probe observes an acceptance; without the control the
+	// refusal would be indistinguishable from a probe that never offered.
+	compression bool
 	// onConnect hands a case the SERVER's side of a connection. It is an
 	// option rather than a second node.OnConnect call because that method is a
 	// setter: registering a second handler would silently discard the first
@@ -73,6 +78,10 @@ type serverOptions struct {
 type spikeServer struct {
 	node *centrifuge.Node
 	url  string
+	// addr is the loopback host:port the handler is mounted on, for the one
+	// case that speaks the WebSocket handshake itself instead of through a
+	// client library.
+	addr string
 }
 
 // newServer starts an embedded node. Every disabled feature is disabled HERE,
@@ -162,10 +171,10 @@ func newServer(t *testing.T, opts serverOptions) *spikeServer {
 	handler := centrifuge.NewWebsocketHandler(node, centrifuge.WebsocketConfig{
 		// Loopback only; the test's own origin is not a deployment decision.
 		CheckOrigin: func(*http.Request) bool { return true },
-		// Compression is OFF. It is a decision: permessage-deflate is a
-		// per-connection memory and CPU cost at the 1,000-5,000 connection
-		// scale this transport is sized for.
-		Compression:    false,
+		// Compression is OFF by default. It is a decision: permessage-deflate
+		// is a per-connection memory and CPU cost at the 1,000-5,000
+		// connection scale this transport is sized for.
+		Compression:    opts.compression,
 		WriteTimeout:   opts.writeTimeout,
 		PingPongConfig: centrifuge.PingPongConfig{PingInterval: opts.pingInterval, PongTimeout: opts.pongTimeout},
 	})
@@ -177,7 +186,11 @@ func newServer(t *testing.T, opts serverOptions) *spikeServer {
 		_ = node.Shutdown(ctx)
 	})
 
-	return &spikeServer{node: node, url: "ws" + strings.TrimPrefix(httpServer.URL, "http")}
+	return &spikeServer{
+		node: node,
+		url:  "ws" + strings.TrimPrefix(httpServer.URL, "http"),
+		addr: strings.TrimPrefix(httpServer.URL, "http://"),
+	}
 }
 
 // events collects what a client observed, so an assertion is made against a

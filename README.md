@@ -177,24 +177,39 @@ rather than leaving it to a caveat.
 
 ## Realtime transport
 
-The realtime transport is pinned exactly, and the pins are held equal to
-`go.mod` by a test in `internal/realtime/transport`:
+The realtime transport is pinned exactly. The pins below, the constants in
+`internal/realtime/transport/doc.go` and `go.mod` are held equal to one another
+by tests in that package -- including this table, which is read from this file,
+so it cannot drift into a fourth unguarded copy of the version triple:
 
 | Role | Module / package | Version |
 | --- | --- | --- |
 | Embedded server, for ClientLink | `github.com/centrifugal/centrifuge` | `v0.38.0` |
-| Go client, for HostLink | `github.com/centrifugal/centrifuge-go` | `v0.10.12` |
-| Wire library both depend on | `github.com/centrifugal/protocol` | `v0.17.0` |
+| Go client, for HostLink | `github.com/centrifugal/centrifuge-go` | `v0.12.0` |
+| Wire library both depend on | `github.com/centrifugal/protocol` | `v0.19.2` |
 | Browser client | npm `centrifuge` | `5.7.2` |
 
 **The Go client is deliberately not the latest, and cannot be.** Factory embeds
 the server for ClientLink and dials with the client for HostLink in one binary,
-so both resolve ONE `centrifugal/protocol` version. `centrifuge-go` v0.11.0 and
-above require `protocol` v0.19.2 or later, and `centrifuge` v0.38.0 does not
-build against it (`undefined: protocol.GetStreamCommandDecoder`). v0.10.12 is
-the newest client that coexists. Moving the client requires moving the server
-first, and moving the server invalidates the compatibility measurement taken
-against the pinned browser client.
+so both resolve ONE `centrifugal/protocol` version. The compatibility test is
+executable, and every version below was built and run rather than inferred from
+a `go.mod` require line -- a require is a floor, not a statement about which
+symbols a package exports:
+
+| `centrifuge-go` | resolved `protocol` | `go build ./...` |
+| --- | --- | --- |
+| `v0.10.12` | `v0.17.0` | exit 0 |
+| `v0.11.0` | `v0.19.2` | exit 0 |
+| `v0.12.0` | `v0.19.2` | exit 0 (**pinned**) |
+| `v0.12.1` | `v0.21.0` | exit 1 -- `undefined: protocol.GetStreamCommandDecoder` |
+
+`protocol` v0.19.2 still exports `GetStreamCommandDecoder` alongside its
+replacement; only v0.21.0 drops it. So the break is at `centrifuge-go` v0.12.1,
+and `v0.12.0` is the newest client that coexists with the pinned server.
+Reaching v0.12.1 means moving the embedded server to a release built against
+`protocol` v0.21.0+, and it is that server move -- not the client move -- that
+invalidates the compatibility measurement taken against the pinned browser
+client and requires the spike be redone.
 
 Everything the transport is trusted to do is measured against a real embedded
 node over a real loopback WebSocket in `internal/realtime/transport`, including
@@ -205,6 +220,16 @@ whole SECONDS, so a sub-second ping interval is silently not negotiated and the
 server then closes healthy connections for a missing pong. The 5,000-connection
 transport-only case is behind the `transportscale` build tag and makes no
 durability or correctness claim.
+
+History, recovery, presence, join/leave, client publication and WebSocket
+compression are each **asserted** off rather than merely left unset. Compression
+is asserted by speaking the RFC 6455 opening handshake directly from the
+standard library and reading `Sec-WebSocket-Extensions` off the 101 response,
+because the Go client surfaces neither the response nor the negotiated
+extension; this deliberately adds no direct `gorilla/websocket` dependency. The
+Redis and NATS brokers and standalone Centrifugo are **absent rather than
+asserted-refused** -- the node keeps its in-process memory broker and no
+external process is started. The suite exercises the JSON protocol only.
 
 ## Status
 
