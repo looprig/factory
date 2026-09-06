@@ -249,7 +249,7 @@ func TestExplicitLimitsReplaceTheDefaults(t *testing.T) {
 	reconcile := DefaultReconcileLimits()
 	reconcile.MaxDuePerSweep = 7
 	client := DefaultClientLinkLimits()
-	client.PerConnectionQueue = 11
+	client.PerConnectionQueueBytes = 4096
 	host := DefaultHostLinkLimits()
 	host.MaxLinks = 13
 

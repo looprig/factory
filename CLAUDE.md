@@ -654,6 +654,92 @@ would let a cross-site page present a POST as a GET: exempted as safe, then
 executed as a write. The note lives beside the allowlist in `guard.go`, where a
 route author will read it.
 
+## The ClientLink
+
+A6.1 built `internal/realtime/clientlink`: the browser-facing duplex connection,
+split into an `Engine` that decides and a Centrifuge adapter that carries. Every
+decision — protocol version, credential, channel, RPC method — is the Engine's,
+so the policy is drivable without a socket and the adapter has nothing to
+choose. `factory.New` does **not** compose it yet; `/v1/realtime` still answers
+501 and now names A9.1 as its owner.
+
+**Two properties of the transport are load-bearing and were measured, not
+assumed.**
+
+`ClientLinkLimits.PingInterval` is **rejected below one second** rather than
+floored. The connect reply carries the cadence as a whole number of seconds
+(`centrifuge@v0.38.0/client.go:2466`), so 500ms arrives as `0`; the Go client
+assigns `c.sendPong = res.Pong` *inside* `if res.Ping > 0`
+(`centrifuge-go@v0.12.0/client.go:1467-1474`), so a client told `0` never pongs
+and the server closes **healthy** connections with `DisconnectNoPong` every pong
+timeout. The deployment reads that as a network fault. Truncation *above* the
+floor is allowed and the constant says why.
+
+`ClientLinkLimits.PerConnectionQueueBytes` is in **bytes**, and the name now
+carries the unit because the field previously said "in messages" with a default
+of 256 — which would have configured a 256-**byte** budget and closed
+essentially every connection on its first event. The only thing that enforces it
+is `centrifuge.Config.ClientQueueMaxSize`, which is bytes
+(`centrifuge@v0.38.0/config.go:58-61`). It is measured by execution, both ways:
+64 publications of 4 KiB kill a stalled consumer at a 4 KiB budget with 3008 and
+do not at 16 MiB.
+
+`MaxChannelsPerConnection` exists because the transport defaults
+`ClientChannelLimit` to **128 silently** (`node.go:135-136`), and one browser
+link multiplexes every session its user is watching. A ceiling nobody chose is a
+ceiling discovered by a user hitting it.
+
+**Close codes are the library's, and no custom code is minted.** A5.1 measured
+the boundary and `centrifuge-go@v0.12.0/transport_websocket.go:29` states it:
+
+```go
+reconnect := code < 3500 || code >= 5000 || (code >= 4000 && code < 4500)
+```
+
+So a reconnect-band close **never reaches `OnDisconnected`** — it arrives at
+`OnConnecting`. That is why the handshake refusals are classified into four
+distinct answers rather than one: an unknown credential is 3500 (terminal,
+back to login), an expired one is 3005 (terminal for that token, refresh and
+reconnect), an unsupported protocol is 3506 (terminal), and a credential
+verifier that could not be reached is 3004 **in the reconnect band**, because an
+outage of the credential service must not sign every live user out. A test that
+watched only `OnDisconnected` would time out on the last one and read as a hang.
+
+**A successful handshake authorizes nothing.** The principal is stored in the
+connection's context by `ConnectReply.Context`, and every subscribe and every
+RPC is still decided by the `Authorizer`. Two tenants are driven against one
+handler at once, because one connection cannot separate "the principal came from
+this handshake" from "the handler holds one principal".
+
+**Client publication is disabled by the absence of an `OnPublish` handler**,
+which is what enables it in this library, so there is no check to skip.
+Protobuf framing is refused by `ServeHTTP` **before** the upgrade — the
+websocket handler selects it from `?format=`, `?cf_protocol=` or the
+`centrifuge-protobuf` subprotocol and offers no way to turn it off — with a
+control asserting the otherwise identical handshake IS upgraded.
+
+**Origin is not decided here.** `WebsocketConfig.CheckOrigin` admits everything
+on purpose: `internal/httpapi`'s guard owns the trusted-origin list, the
+forwarded-header trust option and the rule that a handshake carrying a browser
+credential must send an `Origin`, and it runs before this handler in the
+composed chain. A second answer here is a second place for that rule to be
+stated wrongly.
+
+**`internal/command` is a vocabulary, not a seam.** The five
+`sessionstore.CommandKind` values are shared by `internal/httpapi` and
+`internal/realtime/clientlink` because §8.1 makes the REST controls and the
+ClientLink RPCs two spellings of one admission contract. Two private copies
+would satisfy every test either package could write while letting an RPC be
+admitted under a kind no route serves. The strings are pinned once, as absolute
+literals, in that package's own test — every other reader names the constant, so
+nothing else could notice a value change.
+
+**Per-binding repair is not delegated to the transport, and A6.1 does not
+assume it is.** One `messageWriter` per `Client` and no per-channel queue
+*bound* anywhere in the library means a stalled consumer loses its whole
+connection, by the queue budget (3008) or the write deadline (3009). A7.3 owns
+the repair, above the transport.
+
 ## Not implemented yet
 
 A2.4 implements `/objects/{oid}` and `/objects/{oid}/metadata` in the internal

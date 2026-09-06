@@ -15,6 +15,7 @@ import (
 
 	sessionwire "github.com/looprig/core/sessionwire/v1"
 	"github.com/looprig/factory/identity"
+	"github.com/looprig/factory/internal/command"
 	internalidentity "github.com/looprig/factory/internal/identity"
 	"github.com/looprig/sessionstore"
 )
@@ -624,16 +625,21 @@ const (
 
 // The command kinds the control routes authorize under.
 //
-// A3.1 owns the command envelope and the durable vocabulary; these exist here
-// because AuthorizeControl takes a kind and a route that could not name one
-// would have to skip the decision. sessionstore.CommandKind is deliberately an
-// open string upstream, so these are values rather than an enumeration.
+// A3.1 owns the command envelope; these exist here because AuthorizeControl
+// takes a kind and a route that could not name one would have to skip the
+// decision. sessionstore.CommandKind is deliberately an open string upstream,
+// so Factory's closed set is stated in internal/command.
+//
+// They are aliases of that package's rather than a private copy, and A6.1 is
+// why: the ClientLink RPC vocabulary authorizes under the SAME kinds, and two
+// private copies would satisfy every test either package could write while
+// letting an RPC be admitted under a kind no route serves.
 const (
-	commandCreate       sessionstore.CommandKind = "create"
-	commandInput        sessionstore.CommandKind = "input"
-	commandInterrupt    sessionstore.CommandKind = "interrupt"
-	commandRestore      sessionstore.CommandKind = "restore"
-	commandGateResponse sessionstore.CommandKind = "gate_response"
+	commandCreate       = command.KindCreateSession
+	commandInput        = command.KindInput
+	commandInterrupt    = command.KindInterrupt
+	commandRestore      = command.KindRestore
+	commandGateResponse = command.KindGateResponse
 )
 
 // methodRule is what one METHOD on one route declares.
@@ -778,7 +784,12 @@ func routeTable() []route {
 		{pattern: "/v1/sessions/{sid}/interrupt", rules: control(commandInterrupt, "A3.1"), session: true},
 		{pattern: "/v1/sessions/{sid}/restore", rules: control(commandRestore, "A3.1"), session: true},
 		{pattern: "/v1/sessions/{sid}/gates/{gid}", rules: control(commandGateResponse, "A3.1"), session: true},
-		{pattern: "/v1/realtime", rules: pending(authAuthenticated, "A6.1"), streams: true},
+		// A6.1 built the ClientLink -- internal/realtime/clientlink.Handler is
+		// an http.Handler that authenticates, authorizes and multiplexes. What
+		// is still owed here is COMPOSITION: factory.New must construct one and
+		// pass it in, and Stop must shut it down, which is A9.1's stage-2 work
+		// alongside the admission service and the reconcilers.
+		{pattern: "/v1/realtime", rules: pending(authAuthenticated, "A9.1"), streams: true},
 		{pattern: "/v1/csrf-token", rules: served(authAuthenticated, func(rt *Router) http.Handler { return rt.guard.TokenHandler() })},
 	}
 }

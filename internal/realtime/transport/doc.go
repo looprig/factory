@@ -135,7 +135,11 @@
 // would be a second, weaker answer to the same question, and Centrifuge history
 // is explicitly not Looprig's session cursor.
 //
-// # Two findings A6.1 inherits
+// # Two findings A6.1 inherited
+//
+// Both are discharged, and this section is kept as the MEASUREMENT rather than
+// as a to-do: internal/realtime/clientlink holds the guards, and what makes
+// them right is here.
 //
 // ClientLinkLimits.PingInterval must REJECT a sub-second value at option
 // validation with an OptionError. It must not round it, floor it, or default

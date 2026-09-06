@@ -2,9 +2,12 @@ package factory
 
 import (
 	"errors"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/looprig/factory/internal/realtime/clientlink"
 )
 
 // The three limit tables share one shape, and the shape is the point. Each row
@@ -117,8 +120,9 @@ func TestClientLinkLimitsValidate(t *testing.T) {
 		wantErr string
 	}{
 		{"no connections", func(l *ClientLinkLimits) { l.MaxConnections = 0 }, "MaxConnections"},
-		{"no queue", func(l *ClientLinkLimits) { l.PerConnectionQueue = 0 }, "PerConnectionQueue"},
-		{"negative queue", func(l *ClientLinkLimits) { l.PerConnectionQueue = -1 }, "PerConnectionQueue"},
+		{"no queue budget", func(l *ClientLinkLimits) { l.PerConnectionQueueBytes = 0 }, "PerConnectionQueueBytes"},
+		{"no channel ceiling", func(l *ClientLinkLimits) { l.MaxChannelsPerConnection = 0 }, "MaxChannelsPerConnection"},
+		{"negative queue budget", func(l *ClientLinkLimits) { l.PerConnectionQueueBytes = -1 }, "PerConnectionQueueBytes"},
 		{"zero write timeout", func(l *ClientLinkLimits) { l.WriteTimeout = 0 }, "WriteTimeout"},
 		{"zero ping interval", func(l *ClientLinkLimits) { l.PingInterval = 0 }, "PingInterval"},
 		{"zero pong timeout", func(l *ClientLinkLimits) { l.PongTimeout = 0 }, "PongTimeout"},
@@ -294,5 +298,55 @@ func TestMinClientLinkPingIntervalIsOneSecond(t *testing.T) {
 
 	if MinClientLinkPingInterval != time.Second {
 		t.Errorf("MinClientLinkPingInterval = %v, want 1s", MinClientLinkPingInterval)
+	}
+}
+
+// TestClientLinkLimitsAreCarriedWhole holds the root's ClientLinkLimits and the
+// engine's clientlink.Limits in step.
+//
+// They are two declarations because the engine cannot import this package
+// without a cycle, and A9.1 will convert one into the other. A conversion is
+// exactly where a field is silently dropped, and a dropped field here does not
+// fail to compile -- it configures a zero, which for the queue budget is "no
+// budget" and for the channel ceiling is the transport's silent 128. So the two
+// shapes are compared by NAME and TYPE rather than by count: a count alone
+// would be satisfied by a rename, and a rename is what a conversion misses.
+func TestClientLinkLimitsAreCarriedWhole(t *testing.T) {
+	t.Parallel()
+
+	root := reflect.TypeOf(ClientLinkLimits{})
+	engine := reflect.TypeOf(clientlink.Limits{})
+
+	rootFields := make(map[string]reflect.Type, root.NumField())
+	for i := range root.NumField() {
+		field := root.Field(i)
+		rootFields[field.Name] = field.Type
+	}
+	for i := range engine.NumField() {
+		field := engine.Field(i)
+		want, present := rootFields[field.Name]
+		if !present {
+			t.Errorf("clientlink.Limits has %s, which ClientLinkLimits does not", field.Name)
+			continue
+		}
+		if want != field.Type {
+			t.Errorf("%s is %v in clientlink.Limits and %v in ClientLinkLimits", field.Name, field.Type, want)
+		}
+		delete(rootFields, field.Name)
+	}
+	for name := range rootFields {
+		t.Errorf("ClientLinkLimits has %s, which clientlink.Limits does not", name)
+	}
+}
+
+// TestTheTwoPingFloorsAreOneNumber holds the restatement the engine's constant
+// documents. Two floors that disagreed would let a composition validate here
+// and be refused by the engine, or the reverse.
+func TestTheTwoPingFloorsAreOneNumber(t *testing.T) {
+	t.Parallel()
+
+	if MinClientLinkPingInterval != clientlink.MinPingInterval {
+		t.Errorf("MinClientLinkPingInterval = %v but clientlink.MinPingInterval = %v",
+			MinClientLinkPingInterval, clientlink.MinPingInterval)
 	}
 }

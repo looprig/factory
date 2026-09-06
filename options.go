@@ -341,8 +341,26 @@ func (l ReconcileLimits) Validate() error {
 type ClientLinkLimits struct {
 	// MaxConnections bounds concurrent ClientLinks on this replica.
 	MaxConnections int
-	// PerConnectionQueue bounds one connection's outbound queue in messages.
-	PerConnectionQueue int
+
+	// MaxChannelsPerConnection bounds the session channels one link may hold.
+	//
+	// It is configuration rather than an omission because the transport
+	// defaults it SILENTLY: centrifuge@v0.38.0/node.go:135-136 sets
+	// ClientChannelLimit to 128 when it is zero. One browser link multiplexes
+	// every session its user is watching, so a ceiling nobody chose is a
+	// ceiling that is discovered by a user hitting it.
+	MaxChannelsPerConnection int
+
+	// PerConnectionQueueBytes bounds one connection's outbound queue in BYTES.
+	//
+	// The unit is not a preference. The only thing that enforces it is
+	// centrifuge's ClientQueueMaxSize, which config.go:58-61 defines as "a
+	// maximum size of client's message queue in bytes", and A5.1 measured the
+	// resulting close as DisconnectSlow (3008). This field previously said
+	// "in messages" with a default of 256, which would have configured a
+	// 256-BYTE budget and closed essentially every connection on its first
+	// event. The name now carries the unit so the two cannot drift again.
+	PerConnectionQueueBytes int
 	// WriteTimeout bounds one outbound write.
 	WriteTimeout time.Duration
 	// PingInterval is how often the server pings an idle connection.
@@ -376,11 +394,22 @@ const MinClientLinkPingInterval = time.Second
 // replica is expected to hold.
 func DefaultClientLinkLimits() ClientLinkLimits {
 	return ClientLinkLimits{
-		MaxConnections:     5000,
-		PerConnectionQueue: 256,
-		WriteTimeout:       5 * time.Second,
-		PingInterval:       25 * time.Second,
-		PongTimeout:        10 * time.Second,
+		MaxConnections: 5000,
+		// A browser watching a large workspace holds many session channels on
+		// one link, so the ceiling is set above the transport's silent 128 and
+		// stated here. At the 5,000-connection scale this is a ceiling, not a
+		// reservation: nothing is allocated per unused channel.
+		MaxChannelsPerConnection: 256,
+		// One mebibyte is centrifuge's own default
+		// (centrifuge@v0.38.0/node.go:132-133) and it is adopted rather than
+		// re-derived. What matters at this scale is the product: 5,000
+		// connections each allowed a mebibyte is a 5 GiB worst case, which is
+		// a number a deployer must be able to see and lower, which is why it
+		// is a field.
+		PerConnectionQueueBytes: 1 << 20,
+		WriteTimeout:            5 * time.Second,
+		PingInterval:            25 * time.Second,
+		PongTimeout:             10 * time.Second,
 	}
 }
 
@@ -389,7 +418,10 @@ func (l ClientLinkLimits) Validate() error {
 	if err := atLeastOne("ClientLinkLimits.MaxConnections", l.MaxConnections); err != nil {
 		return err
 	}
-	if err := atLeastOne("ClientLinkLimits.PerConnectionQueue", l.PerConnectionQueue); err != nil {
+	if err := atLeastOne("ClientLinkLimits.MaxChannelsPerConnection", l.MaxChannelsPerConnection); err != nil {
+		return err
+	}
+	if err := atLeastOne("ClientLinkLimits.PerConnectionQueueBytes", l.PerConnectionQueueBytes); err != nil {
 		return err
 	}
 	if err := positive("ClientLinkLimits.WriteTimeout", l.WriteTimeout); err != nil {
