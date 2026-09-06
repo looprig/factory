@@ -30,10 +30,8 @@ package identity
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"log/slog"
 	"net/http"
 	"slices"
 	"strings"
@@ -70,108 +68,44 @@ const (
 	maxTraceparentBytes = 256
 )
 
-// redactedPlaceholder is what a scrubbed credential is replaced by. It is a
-// fixed string rather than a length-preserving mask, because a mask discloses
-// the length of the secret.
-const redactedPlaceholder = "REDACTED"
-
-// Source names where a credential was presented. It is part of a diagnosable
-// message: "the cookie credential was not verified" and "the bearer credential
-// was not verified" are different operational problems.
-type Source string
+// The vocabulary a deployer implements lives in the PUBLIC identity package,
+// and is re-declared here as aliases rather than re-stated.
+//
+// The split is the one this package's doc comment describes: Credential,
+// Claims, Source and Verifier are named in the method signature a deployment
+// writes, so they must be reachable from outside the module. The derivation
+// that consumes them -- which carrier a credential is read from, which one
+// wins, what the operation context records -- stays here and has no external
+// implementer.
+//
+// They are ALIASES, not new named types, so there is exactly one Credential in
+// the program: the redaction methods, the interface satisfaction and every
+// existing reference through internal/identity all reach the same declaration,
+// and a deployer's factoryidentity.Verifier is assignable to Config.Verifier
+// with no adapter.
+type (
+	// Source names where a credential was presented.
+	Source = factoryidentity.Source
+	// Credential is presented authentication material on its way to a Verifier.
+	Credential = factoryidentity.Credential
+	// Claims is what a verified credential asserts.
+	Claims = factoryidentity.Claims
+	// Verifier verifies a presented credential and reports what it asserts.
+	Verifier = factoryidentity.Verifier
+)
 
 const (
 	// SourceBearer is an Authorization: Bearer header.
-	SourceBearer Source = "bearer"
+	SourceBearer = factoryidentity.SourceBearer
 	// SourceCookie is the browser session cookie.
-	SourceCookie Source = "cookie"
+	SourceCookie = factoryidentity.SourceCookie
 	// SourceLink is a ClientLink connect token.
-	SourceLink Source = "link"
+	SourceLink = factoryidentity.SourceLink
 )
-
-// Credential is presented authentication material on its way to a Verifier.
-//
-// Its value is unexported and every rendering a consumer can reach is
-// overridden, because the likeliest way a token reaches a log is that somebody
-// formatted the value they were handed.
-//
-// The four methods are NOT four independent mechanisms, and the difference was
-// measured rather than assumed. Deleting GoString or MarshalJSON changes what
-// %#v and encoding/json produce; deleting LogValue does not change what
-// slog.TextHandler produces, because its KindAny path falls back to fmt and
-// reaches String. LogValue is kept because slog.LogValuer is part of the type's
-// contract -- a handler that reflects over the value rather than formatting it
-// sees the difference -- and it is held by an interface assertion rather than
-// by a rendering, since no rendering reads it.
-//
-// Value is still readable, because a Verifier that cannot read the credential
-// cannot verify it. The claim is that a Credential does not leak by ACCIDENT.
-type Credential struct {
-	source Source
-	value  string
-}
 
 // NewCredential builds a credential presented at source.
 func NewCredential(source Source, value string) Credential {
-	return Credential{source: source, value: value}
-}
-
-// Source reports where the credential was presented.
-func (c Credential) Source() Source { return c.source }
-
-// Value is the material a Verifier verifies.
-func (c Credential) Value() string { return c.value }
-
-// String renders the credential for %v, %s and %q without its value.
-func (c Credential) String() string {
-	return "identity.Credential{source:" + string(c.source) + ", value:" + redactedPlaceholder + "}"
-}
-
-// GoString renders the credential for %#v, which ignores String and would
-// otherwise print every unexported field.
-func (c Credential) GoString() string { return c.String() }
-
-// LogValue renders the credential for log/slog, which would otherwise reflect
-// over the struct rather than consult String.
-func (c Credential) LogValue() slog.Value { return slog.StringValue(c.String()) }
-
-// MarshalJSON renders the credential for a structured encoder. encoding/json
-// would emit {} today, since every field is unexported, but that is a property
-// of the field set rather than a decision, and it says nothing to whoever reads
-// the record.
-func (c Credential) MarshalJSON() ([]byte, error) { return json.Marshal(c.String()) }
-
-// Claims is what a verified credential asserts.
-//
-// Tenant may be empty, and that is the local deployment's case rather than an
-// error: a credential minted by a single-tenant local composition names no
-// tenant and receives the configured default. See tenantFor for why that
-// fallback is confined to an actor.
-type Claims struct {
-	// Tenant is the tenant scope the credential was issued for.
-	Tenant sessionwire.TenantID
-	// Subject identifies the caller within that tenant.
-	Subject string
-	// Kind separates a human actor from a Factory service identity.
-	Kind factoryidentity.Kind
-	// ExpiresAt is when the credential stops being accepted. A credential with
-	// no expiry is rejected: it is one that can never be logged out.
-	ExpiresAt time.Time
-}
-
-// Verifier verifies a presented credential and reports what it asserts.
-//
-// It is the seam through which "stateless or shared durably" is satisfied. This
-// package keeps nothing between calls, so whatever a deployment uses to decide
-// a credential -- a signature over a shared key, a token introspection
-// endpoint, a shared session table -- is reachable from every Factory replica
-// by construction.
-//
-// An implementation reports a rejected credential by returning an error that
-// wraps identity.ErrUnauthenticated. Any other error is treated as the verifier
-// being unable to answer; see ErrVerifierUnavailable.
-type Verifier interface {
-	VerifyCredential(ctx context.Context, credential Credential) (Claims, error)
+	return factoryidentity.NewCredential(source, value)
 }
 
 // Clock is the time seam. It is narrower than Factory's public Clock because
@@ -437,7 +371,7 @@ func redactSecrets(message string, secrets ...string) string {
 		if secret == "" {
 			continue
 		}
-		message = strings.ReplaceAll(message, secret, redactedPlaceholder)
+		message = strings.ReplaceAll(message, secret, factoryidentity.RedactedPlaceholder)
 	}
 	return message
 }

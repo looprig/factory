@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/looprig/factory"
+	"github.com/looprig/factory/identity"
 	"github.com/looprig/factory/internal/admission"
 	"github.com/looprig/factory/internal/httpapi"
 	internalidentity "github.com/looprig/factory/internal/identity"
@@ -16,11 +17,38 @@ import (
 
 func iface[T any]() reflect.Type { return reflect.TypeOf((*T)(nil)).Elem() }
 
+// TestTheComposedAuthenticatorSatisfiesBothConsumers is what replaces the
+// public Authenticator seam. The concrete authenticator Factory composes must
+// satisfy every narrow interface that declares one, or the composition root
+// would need an adapter -- and an adapter is a second answer to "which
+// credential authenticated this request".
+func TestTheComposedAuthenticatorSatisfiesBothConsumers(t *testing.T) {
+	t.Parallel()
+
+	composed := reflect.TypeOf((*internalidentity.Authenticator)(nil))
+	for _, consumer := range []reflect.Type{iface[httpapi.Authenticator](), iface[clientlink.Authenticator]()} {
+		if consumer.NumMethod() == 0 {
+			t.Errorf("%s has no methods, so satisfying it proves nothing", consumer)
+			continue
+		}
+		if !composed.Implements(consumer) {
+			t.Errorf("%s does not satisfy %s", composed, consumer)
+		}
+	}
+}
+
 // publicSeams pairs each seam on Factory's option surface with the narrow
 // interfaces the packages that call it declare for themselves.
+//
+// Authentication is deliberately absent. Factory composes ONE authenticator --
+// internal/identity's, built from the deployer's verifier -- because the origin
+// guard and the router require the single implementation that decides which
+// credential authenticated a request. There is therefore no public
+// Authenticator interface to pair, and
+// TestTheComposedAuthenticatorSatisfiesBothConsumers holds the property this
+// row used to hold.
 func publicSeams() map[reflect.Type][]reflect.Type {
 	return map[reflect.Type][]reflect.Type{
-		iface[factory.Authenticator]():       {iface[httpapi.Authenticator](), iface[clientlink.Authenticator]()},
 		iface[factory.Authorizer]():          {iface[httpapi.Authorizer](), iface[clientlink.Authorizer](), iface[admission.Authorizer]()},
 		iface[factory.SessionReader]():       {iface[httpapi.SessionReader]()},
 		iface[factory.Commands]():            {iface[admission.Commands]()},
@@ -95,7 +123,6 @@ func TestPublicSeamsAreExactlyTheUnionOfTheirConsumers(t *testing.T) {
 // allSeams is every interface this task defines, public and internal.
 func allSeams() []reflect.Type {
 	return []reflect.Type{
-		iface[factory.Authenticator](),
 		iface[factory.Authorizer](),
 		iface[factory.SessionReader](),
 		iface[factory.Commands](),
@@ -116,7 +143,12 @@ func allSeams() []reflect.Type {
 		iface[admission.Clock](),
 		iface[admission.UUIDSource](),
 		iface[internalidentity.Clock](),
-		iface[internalidentity.Verifier](),
+		// The credential verifier is the authentication seam a deployer
+		// implements. It is listed here rather than in publicSeams because it
+		// IS the public type: identity.Verifier and internalidentity.Verifier
+		// are one declaration reached through an alias, so pairing them would
+		// assert a type against itself.
+		iface[identity.Verifier](),
 		iface[hostlink.Dialer](),
 		iface[hostlink.Link](),
 	}

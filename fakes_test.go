@@ -5,6 +5,7 @@ import (
 	"io"
 	"io/fs"
 	"net/http"
+	"slices"
 	"testing/fstest"
 	"time"
 
@@ -18,14 +19,6 @@ import (
 // declared in a test file so it is reachable from this package's external test
 // package without becoming part of Factory's API.
 type FakeSeams struct{}
-
-func (FakeSeams) AuthenticateRequest(context.Context, *http.Request) (identity.Principal, error) {
-	return identity.Principal{}, nil
-}
-
-func (FakeSeams) AuthenticateLink(context.Context, string) (identity.Principal, error) {
-	return identity.Principal{}, nil
-}
 
 func (FakeSeams) AuthorizeSessionList(context.Context, identity.Principal) error { return nil }
 
@@ -106,6 +99,42 @@ func (FakeSeams) ReleasePlacement(context.Context, sessionwire.TenantID, session
 	return nil
 }
 
+// FakeTenant and FakeCredentialValue are what FakeVerifier accepts and asserts.
+// They are exported so the external test package can build a request the
+// composed authenticator really verifies.
+const (
+	FakeTenant  = "tenant-a"
+	FakeSubject = "subject-a"
+
+	// FakeCredentialValue is the ONE credential value FakeVerifier accepts.
+	// Accepting exactly one, rather than everything, is what lets a test tell
+	// "the composition authenticated" apart from "the composition did not
+	// authenticate at all".
+	FakeCredentialValue = "composed-credential"
+)
+
+// FakeVerifier is the credential verifier a composed Server authenticates
+// through. It is a real seam implementation rather than a stub that returns a
+// zero Principal: the authenticator, the operation context and the tenant a
+// bootstrap response carries are all production code driven by these claims.
+type FakeVerifier struct{}
+
+func (FakeVerifier) VerifyCredential(_ context.Context, credential identity.Credential) (identity.Claims, error) {
+	if credential.Value() != FakeCredentialValue {
+		return identity.Claims{}, identity.ErrUnauthenticated
+	}
+	return identity.Claims{
+		Tenant:  FakeTenant,
+		Subject: FakeSubject,
+		Kind:    identity.KindActor,
+		// The composed Server uses the system clock unless a test replaces it,
+		// so the expiry is relative to the wall clock rather than a fixture
+		// instant. An hour is far longer than any test run and does not depend
+		// on how loaded the machine is.
+		ExpiresAt: time.Now().Add(time.Hour),
+	}, nil
+}
+
 // FakeClock is a Clock that never fires, for compositions that only need the
 // seam to be present.
 type FakeClock struct{}
@@ -114,10 +143,13 @@ func (FakeClock) Now() time.Time { return time.Unix(0, 0).UTC() }
 
 func (FakeClock) AfterFunc(time.Duration, func()) func() bool { return func() bool { return false } }
 
+// FakeUUID is the one identifier FakeUUIDs returns.
+const FakeUUID = "00000000-0000-4000-8000-000000000000"
+
 // FakeUUIDs is a UUIDSource returning one fixed identifier.
 type FakeUUIDs struct{}
 
-func (FakeUUIDs) NewUUID() (string, error) { return "00000000-0000-4000-8000-000000000000", nil }
+func (FakeUUIDs) NewUUID() (string, error) { return FakeUUID, nil }
 
 // ValidCSRF is a CSRF configuration that validates.
 func ValidCSRF() identity.CSRFConfig {
@@ -138,7 +170,7 @@ func ValidCSRF() identity.CSRFConfig {
 func RequiredOptions() []Option {
 	seams := FakeSeams{}
 	return []Option{
-		WithAuthenticator(seams),
+		WithCredentialVerifier(FakeVerifier{}),
 		WithAuthorizer(seams),
 		WithSessionReader(seams),
 		WithCommands(seams),
@@ -146,6 +178,31 @@ func RequiredOptions() []Option {
 		WithPlacementController(seams),
 		WithCSRF(ValidCSRF()),
 	}
+}
+
+// RequiredOptionsExcept is RequiredOptions with the named options removed, so a
+// test outside this package can replace one composed seam with a recording or
+// refusing one. Option.name is unexported, which is why this lives here.
+//
+// It fails loudly on a name it did not remove, because a typo would otherwise
+// produce a composition carrying BOTH the fake seam and the test's own, which
+// New rejects as a duplicate -- a confusing failure a long way from its cause.
+func RequiredOptionsExcept(names ...string) []Option {
+	kept := make([]Option, 0, len(RequiredOptions()))
+	removed := map[string]bool{}
+	for _, opt := range RequiredOptions() {
+		if slices.Contains(names, opt.name) {
+			removed[opt.name] = true
+			continue
+		}
+		kept = append(kept, opt)
+	}
+	for _, name := range names {
+		if !removed[name] {
+			panic("RequiredOptionsExcept: " + name + " is not a required option")
+		}
+	}
+	return kept
 }
 
 // stubHandler and stubFS are the two UI shapes, for cases that need a non-nil

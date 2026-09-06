@@ -25,14 +25,14 @@ func TestRequiredOptionsCompose(t *testing.T) {
 		t.Fatal("New() returned a nil Server and no error")
 	}
 	present := map[string]bool{
-		"authenticator": server.cfg.authenticator != nil,
-		"authorizer":    server.cfg.authorizer != nil,
-		"reads":         server.cfg.reads != nil,
-		"commands":      server.cfg.commands != nil,
-		"directory":     server.cfg.directory != nil,
-		"placement":     server.cfg.placement != nil,
-		"clock":         server.cfg.clock != nil,
-		"uuids":         server.cfg.uuids != nil,
+		"verifier":   server.cfg.verifier != nil,
+		"authorizer": server.cfg.authorizer != nil,
+		"reads":      server.cfg.reads != nil,
+		"commands":   server.cfg.commands != nil,
+		"directory":  server.cfg.directory != nil,
+		"placement":  server.cfg.placement != nil,
+		"clock":      server.cfg.clock != nil,
+		"uuids":      server.cfg.uuids != nil,
 	}
 	for name, ok := range present {
 		if !ok {
@@ -134,7 +134,7 @@ func TestNewRejectsANilDependency(t *testing.T) {
 	t.Parallel()
 
 	tests := []Option{
-		WithAuthenticator(nil),
+		WithCredentialVerifier(nil),
 		WithAuthorizer(nil),
 		WithSessionReader(nil),
 		WithCommands(nil),

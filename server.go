@@ -10,6 +10,8 @@ import (
 
 	sessionwire "github.com/looprig/core/sessionwire/v1"
 	"github.com/looprig/factory/identity"
+	"github.com/looprig/factory/internal/httpapi"
+	internalidentity "github.com/looprig/factory/internal/identity"
 	"github.com/looprig/sessionstore"
 )
 
@@ -26,12 +28,11 @@ import (
 // seam widened past its consumers fails
 // TestPublicSeamsAreExactlyTheUnionOfTheirConsumers.
 
-// Authenticator derives an immutable Principal from a request or a ClientLink
-// connect credential.
-type Authenticator interface {
-	AuthenticateRequest(ctx context.Context, r *http.Request) (identity.Principal, error)
-	AuthenticateLink(ctx context.Context, token string) (identity.Principal, error)
-}
+// There is deliberately no public Authenticator seam. Factory composes ONE
+// authenticator, internal/identity's, from the credential verifier a deployer
+// supplies through WithCredentialVerifier; server_test.go holds that the
+// composed authenticator satisfies both consumers that declare one. See
+// identity/credential.go for why the seam is the verifier.
 
 // Authorizer decides every public operation and the one service operation.
 type Authorizer interface {
@@ -86,11 +87,25 @@ type UUIDSource interface {
 	NewUUID() (string, error)
 }
 
-// Server is the composed Factory. At this task it holds the validated
-// composition and nothing else: routing, identity, admission, placement and
-// realtime are later tasks.
+// Server is the composed Factory.
+//
+// What it composes TODAY is the durable public HTTP surface and nothing else:
+// the credential authenticator built from the deployer's verifier, the origin
+// and CSRF guard, internal/httpapi's router -- routed reads, the authenticated
+// bootstrap and the JSON error envelope -- and the optional user interface,
+// mounted as that router's fallback outside the API version segment.
+//
+// What it does NOT compose is stated here rather than left to be discovered.
+// Command admission, target placement, the ClientLink and HostLink engines and
+// the multi-replica reconcilers are separate runbook tasks and are not built
+// yet, so the seams they will use are validated at composition and then held
+// unread. The router is composed with an EMPTY launch Department, a nil object
+// policy and no object-store resolver, each of which fails closed: /v1/agents
+// answers an empty list and an object read answers "unavailable" rather than
+// serving bytes no policy authorized.
 type Server struct {
-	cfg config
+	cfg    config
+	router *httpapi.Router
 }
 
 // New validates a composition and returns it.
@@ -132,7 +147,7 @@ func New(opts ...Option) (*Server, error) {
 		name    string
 		present bool
 	}{
-		{"WithAuthenticator", cfg.authenticator != nil},
+		{"WithCredentialVerifier", cfg.verifier != nil},
 		{"WithAuthorizer", cfg.authorizer != nil},
 		{"WithSessionReader", cfg.reads != nil},
 		{"WithCommands", cfg.commands != nil},
@@ -185,8 +200,84 @@ func New(opts ...Option) (*Server, error) {
 		cfg.ui = http.FileServerFS(cfg.uiFS)
 	}
 
-	return &Server{cfg: cfg}, nil
+	router, err := composeRouter(cfg)
+	if err != nil {
+		return nil, err
+	}
+	return &Server{cfg: cfg, router: router}, nil
 }
+
+// composeRouter builds the authenticator, the guard and the router.
+//
+// It runs at composition rather than at the first request, so a deployment that
+// cannot serve fails where an operator is watching. Every rejection below is
+// attributed to the option that carries the offending value.
+func composeRouter(cfg config) (*httpapi.Router, error) {
+	// The default tenant is validated HERE, ahead of NewAuthenticator, so the
+	// attribution below is exact rather than guessed. NewAuthenticator checks
+	// the verifier, then the cookie name, then the default tenant; the verifier
+	// is already known to be non-nil and the tenant is already known to be
+	// valid, so the only rejection it has left is the cookie name.
+	if cfg.defaultTenant != "" {
+		if err := cfg.defaultTenant.Validate(); err != nil {
+			return nil, &OptionError{Option: "WithDefaultTenant", Err: err}
+		}
+	}
+	credentials, err := internalidentity.NewAuthenticator(internalidentity.Config{
+		Verifier:      cfg.verifier,
+		Clock:         cfg.clock,
+		CookieName:    cfg.cookieName,
+		DefaultTenant: cfg.defaultTenant,
+	})
+	if err != nil {
+		return nil, &OptionError{Option: "WithSessionCookieName", Err: err}
+	}
+
+	guard, err := httpapi.NewGuard(httpapi.GuardConfig{
+		CSRF:        cfg.csrf,
+		Credentials: credentials,
+		Clock:       cfg.clock,
+	})
+	if err != nil {
+		return nil, &OptionError{Option: "WithCSRF", Err: err}
+	}
+
+	// The user interface is handed to the router as its SPA fallback rather
+	// than mounted beside or above it, and that is the whole of the API/SPA
+	// precedence rule. The router splits by path BEFORE authentication --
+	// bundle assets are public and API routes are not -- and answers everything
+	// under the version segment itself, so /v1/unknown is the API's JSON route
+	// failure and never the application shell. A composition that consulted the
+	// UI first would serve index.html with status 200 there.
+	router, err := httpapi.NewRouter(httpapi.RouterConfig{
+		Credentials: credentials,
+		Authorizer:  cfg.authorizer,
+		Reads:       cfg.reads,
+		Directory:   cfg.directory,
+		Guard:       guard,
+		IDs:         cfg.uuids,
+		UI:          cfg.ui,
+	})
+	if err != nil {
+		// Unreachable from a composition New accepted: every value NewRouter
+		// validates has been validated above. It is returned rather than
+		// dropped because "unreachable" is a claim about today's checks.
+		return nil, err
+	}
+	return router, nil
+}
+
+// Handler is Factory's public HTTP surface: the API under /v1, and the injected
+// user interface everywhere else when one was supplied.
+//
+// It is what a LIBRARY embedding uses. Factory does not own the socket in that
+// shape -- the embedder supplies the http.Server, and MaxHeaderBytes with it --
+// so nothing here reads a listener. A deployment that wants Factory to own the
+// server calls Serve instead.
+//
+// The returned handler is the same one on every call and is safe for concurrent
+// use.
+func (s *Server) Handler() http.Handler { return s.router }
 
 // UI reports the optional user interface handler.
 //

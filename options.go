@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	sessionwire "github.com/looprig/core/sessionwire/v1"
 	"github.com/looprig/factory/identity"
 )
 
@@ -75,7 +76,9 @@ type Option struct {
 }
 
 type config struct {
-	authenticator Authenticator
+	verifier      identity.Verifier
+	cookieName    string
+	defaultTenant sessionwire.TenantID
 	authorizer    Authorizer
 	reads         SessionReader
 	commands      Commands
@@ -106,15 +109,44 @@ func nilDependency(name string) error {
 	return &OptionError{Option: name, Err: ErrNilDependency}
 }
 
-// WithAuthenticator supplies the HTTP and ClientLink authenticator.
-func WithAuthenticator(a Authenticator) Option {
-	return option("WithAuthenticator", func(c *config) error {
-		if a == nil {
-			return nilDependency("WithAuthenticator")
+// WithCredentialVerifier supplies the credential verifier.
+//
+// This is the authentication seam, and it is deliberately NOT an authenticator.
+// Which carrier a credential is read from, which one wins when a request
+// presents two, and what the operation context records about the one that
+// authenticated are decided in exactly one place, because a second answer to
+// "which credential authenticated this request" is an origin guard that skips
+// its CSRF rules silently -- internal/httpapi.GuardConfig.Credentials states
+// that at length. What a deployment genuinely owns is what makes a presented
+// credential valid and what it asserts, which is this interface.
+func WithCredentialVerifier(v identity.Verifier) Option {
+	return option("WithCredentialVerifier", func(c *config) error {
+		if v == nil {
+			return nilDependency("WithCredentialVerifier")
 		}
-		c.authenticator = a
+		c.verifier = v
 		return nil
 	})
+}
+
+// WithSessionCookieName replaces the browser session cookie a request is read
+// from when it carries no Authorization header.
+//
+// A name that is not a valid cookie name is refused by New rather than at the
+// first request: net/http DROPS such a cookie when it writes one, so the
+// composition would look configured and never authenticate anybody.
+func WithSessionCookieName(name string) Option {
+	return option("WithSessionCookieName", func(c *config) error { c.cookieName = name; return nil })
+}
+
+// WithDefaultTenant scopes an actor credential that names no tenant.
+//
+// Leaving it unset requires every credential to name its own tenant, which is
+// the cloud deployment's shape; a single-tenant local composition sets it. It
+// applies to an ACTOR only -- a service credential that named no tenant would
+// otherwise acquire one by configuration.
+func WithDefaultTenant(tenant sessionwire.TenantID) Option {
+	return option("WithDefaultTenant", func(c *config) error { c.defaultTenant = tenant; return nil })
 }
 
 // WithAuthorizer supplies the authorizer for every public operation.

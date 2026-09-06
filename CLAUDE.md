@@ -202,17 +202,20 @@ package, and adding one would make widening a dependency invisible at the place
 that acquired it.
 
 One constraint overrides that, and it is the language, not a preference: a
-deployer implements `Authenticator` and `Authorizer` from OUTSIDE this module
+deployer implements `identity.Verifier` and `Authorizer` from OUTSIDE this module
 and must be able to NAME every type in their signatures, so a public seam may
 not mention a type from `internal/`. That is the whole reason `Principal` and
 `CSRFConfig` live in the public `identity` package rather than in
 `internal/identity` as runbook 05's file list anticipated; A1's derivation code
 belongs beside them.
 
-`internal/identity` is where that derivation code went: `Credential`, `Claims`,
-`Verifier`, the `Authenticator` and `OperationContext` have no external
-implementer, so none of them is vocabulary a deployer has to learn. What A1.1
-added to the PUBLIC package is only what an implementer must NAME:
+`internal/identity` is where that derivation code went: the `Authenticator` and
+`OperationContext` have no external implementer, so neither is vocabulary a
+deployer has to learn. `Credential`, `Claims`, `Source` and `Verifier` DO have
+one -- A9.1 found that the router and the guard require the concrete internal
+authenticator, so the seam a deployment implements is the verifier -- and they
+moved to the public `identity` package, with aliases left behind so there is one
+declaration rather than two. What A1.1 added to the PUBLIC package is
 `ErrUnauthenticated` and `ErrCredentialExpired`. The expired sentinel wraps the
 other, so an edge matching one classification still catches both; it is separate
 because it is the one rejection a browser acts on without a human.
@@ -683,10 +686,13 @@ task that fills its body in, and answers 501 until it does;
 `TestTheUnimplementedMethodsAreExactlyTheOnesLaterTasksOwn` holds the two sets
 equal. `httpapi.Directory` has no production implementation yet — **A4.1 owns
 it**, and until then `/v1/agents` reports every pooled target as unadvertised
-under any composition that supplies a directory answering empty pages. Nothing composes a `Router` into `factory.New` yet — server composition
-is A9. Nothing wires the `Authenticator` into `factory.New` yet -- there is
-no default authenticator option, because a deployment supplies the `Verifier`
-and there is no credible default for one. `internal/realtime` now exists and holds the ClientLink
+under any composition that supplies a directory answering empty pages. `factory.New` composes the authenticator, the guard and the `Router`, and
+`Server.Handler` serves them; A9.1 stage 1 did that over the seams that exist.
+What it does NOT compose is ClientLink, HostLink, placement or the reconcilers,
+and the router it builds carries an empty launch `Department`, a nil
+`ObjectPolicy` and no object-store resolver -- each fails closed. There is no
+default verifier option, because a deployment supplies the `Verifier` and there
+is no credible default for one. `internal/realtime` now exists and holds the ClientLink
 and HostLink seams. `cmd/factory` and `internal/placement/kubernetes` do not
 exist; their exemptions grant nothing today and `TestBoundaryScopesAreNotStale`
 will fail if one of those directories appears without a Go file in it. Do not

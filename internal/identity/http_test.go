@@ -24,7 +24,6 @@ import (
 	"time"
 
 	sessionwire "github.com/looprig/core/sessionwire/v1"
-	"github.com/looprig/factory"
 	factoryidentity "github.com/looprig/factory/identity"
 	"github.com/looprig/factory/internal/httpapi"
 	"github.com/looprig/factory/internal/identity"
@@ -165,16 +164,16 @@ func TestNewAuthenticatorValidatesItsConfiguration(t *testing.T) {
 }
 
 // TestAuthenticatorSatisfiesTheSeamsItIsBuiltFor is what makes this type the
-// thing composition can supply. It is asserted against the two narrow consumer
-// interfaces AND the public union, because an implementation satisfying the
-// narrow pair but not the union cannot be passed to WithAuthenticator.
+// thing composition can supply. Factory composes exactly one authenticator and
+// hands it to both consumers, so it is asserted against both narrow consumer
+// interfaces; there is no public union interface for it, because the seam a
+// deployer implements is the Verifier rather than an authenticator.
 func TestAuthenticatorSatisfiesTheSeamsItIsBuiltFor(t *testing.T) {
 	t.Parallel()
 
 	a := newTestAuthenticator(t, identity.Config{Verifier: constantVerifier(validClaims())})
 	var _ httpapi.Authenticator = a
 	var _ clientlink.Authenticator = a
-	var _ factory.Authenticator = a
 }
 
 // ---------------------------------------------------------------------------

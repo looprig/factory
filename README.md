@@ -64,13 +64,34 @@ option is applied at most once -- a repeat is an error, not a last-wins -- and
 an explicit `nil` dependency is an error rather than a request for the default,
 because the seams that have defaults are defaulted by their ABSENCE.
 
-The seams a deployer supplies are `Authenticator`, `Authorizer`,
+The seams a deployer supplies are `identity.Verifier`, `Authorizer`,
 `SessionReader`, `Commands`, `Directory`, `PlacementController`, the CSRF
-configuration, and optionally a `Clock`, a `UUIDSource`, limits and a UI. The
+configuration, and optionally a `Clock`, a `UUIDSource`, a session cookie name,
+a default tenant, limits and a UI. Authentication is supplied as a VERIFIER and
+not as an authenticator: Factory composes exactly one authenticator, because
+which credential authenticated a request must have one answer and a second one
+is an origin guard that skips its CSRF rules silently. The
 UI is optional in both shapes: `WithUIHandler` for a handler and `WithUIFS` for
 a static bundle, mutually exclusive, and **a composition with neither is valid
 and is exercised as such** -- the default binary mounts the Vite bundle, and an
 embedder that mounts its own or none composes the same `Server`.
+
+## Serving
+
+`Server.Handler` is Factory's public HTTP surface: the API under `/v1`, and the
+injected user interface everywhere else. The injected UI is handed to the router
+as its fallback rather than mounted above or beside it, which is what makes
+**API routes take precedence over the SPA**: the router splits by path before
+authentication, so `/v1/unknown` is a JSON `route_not_found`, never
+`index.html`.
+
+What `New` composes today is that surface and nothing else -- the authenticator
+built from the deployer's verifier, the origin and CSRF guard, the router and
+the optional UI. Command admission, placement, the ClientLink and HostLink
+engines and the multi-replica reconcilers are separate tasks; the seams they
+will use are validated at composition and then held unread. The router is built
+with an empty launch `Department`, a nil object policy and no object-store
+resolver, each of which fails closed.
 
 Each public seam is the union of the narrow interfaces the packages that CALL
 it declare for themselves, in `internal/httpapi`, `internal/admission`,

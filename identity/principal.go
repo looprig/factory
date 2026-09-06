@@ -2,11 +2,13 @@
 // seams exchange.
 //
 // It is a public leaf package rather than an internal one for a reason that is
-// a language constraint, not a preference: an Authenticator or Authorizer
-// supplied by a deployer must be able to NAME the type in its own method
-// signatures, and Go forbids a package outside this module from importing
+// a language constraint, not a preference: a Verifier or Authorizer supplied by
+// a deployer must be able to NAME the type in its own method signatures, and Go
+// forbids a package outside this module from importing
 // github.com/looprig/factory/internal/... . Everything else about the seams
-// stays with the package that calls them.
+// stays with the package that calls them; see credential.go for why the
+// authentication seam a deployer implements is the Verifier rather than an
+// authenticator.
 package identity
 
 import (
