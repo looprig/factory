@@ -192,6 +192,81 @@ func TestPerConnectionQueueBytesIsMeasuredInBytes(t *testing.T) {
 	})
 }
 
+// TestTheConnectionLabelIsTheSubjectNotTheTenant is the reader
+// ConnectReply.Credentials.UserID had none of.
+//
+// A6.1's gate mutated `principal.Subject()` to `string(principal.Tenant())` and
+// NOTHING failed: the only two mentions of UserID in the package were the
+// decision's own comment and the assignment it describes. A documented decision
+// with no reader is a comment, and this one does not stay a diagnostic --
+// centrifuge keys UserConnectionLimit and its personal-channel machinery on
+// UserID, so the day A6.3 or A7 uses either, a tenant in this field is a shared
+// label across every user of that tenant.
+//
+// The two values are different absolute literals, so the assertion cannot pass
+// by them happening to agree, and the second check states the mutant directly.
+func TestTheConnectionLabelIsTheSubjectNotTheTenant(t *testing.T) {
+	t.Parallel()
+
+	authenticator, err := internalidentity.NewAuthenticator(internalidentity.Config{Verifier: &nodeVerifier{}})
+	if err != nil {
+		t.Fatalf("NewAuthenticator: %v", err)
+	}
+	handler, err := NewHandler(Config{
+		Authenticator: authenticator,
+		Authorizer:    internalidentity.Authorizer{},
+		Limits:        nodeTestLimits(),
+		Version:       "v-label",
+	})
+	if err != nil {
+		t.Fatalf("NewHandler: %v", err)
+	}
+
+	// The SERVER's view of the connection, which is the only place this field
+	// is observable: the transport hands it to nothing the client can read.
+	labels := make(chan string, 1)
+	handler.node.OnConnect(func(client *centrifuge.Client) {
+		handler.connected(client)
+		select {
+		case labels <- client.UserID():
+		default:
+		}
+	})
+
+	server := httptest.NewServer(handler)
+	t.Cleanup(func() {
+		server.Close()
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		_ = handler.Shutdown(ctx)
+	})
+
+	data, err := json.Marshal(map[string]string{"protocol_version": ProtocolVersion})
+	if err != nil {
+		t.Fatalf("marshal connect data: %v", err)
+	}
+	client := centrifugego.NewJsonClient("ws"+strings.TrimPrefix(server.URL, "http"), centrifugego.Config{
+		Token: nodeTestToken,
+		Data:  data,
+	})
+	t.Cleanup(client.Close)
+	if err := client.Connect(); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+
+	select {
+	case label := <-labels:
+		if label != "user-a" {
+			t.Errorf("the connection label is %q, want the SUBJECT %q", label, "user-a")
+		}
+		if label == "tenant-a" {
+			t.Error("the connection label is the tenant; a diagnostic carrying a tenant reads as a scope, and centrifuge keys per-user limits and personal channels on it")
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("no connected event reached the server")
+	}
+}
+
 // stalledConsumer subscribes a client whose publication callback BLOCKS, then
 // publishes a fixed load and reports whether the server closed the connection,
 // with the hub's connection count as a second, independent witness.

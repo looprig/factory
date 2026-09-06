@@ -424,8 +424,9 @@ func TestEveryHandshakeRefusalIsClassifiedForTheBrowser(t *testing.T) {
 		//
 		// A reconnect-band row asserts only that the close was NOT terminal,
 		// and it has to, because of a limitation measured here rather than
-		// assumed: centrifuge-go@v0.12.0/client.go:753-758 returns early from
-		// moveToConnecting when the client is ALREADY in StateConnecting,
+		// assumed: centrifuge-go@v0.12.0/client.go:511 is moveToConnecting and
+		// its guard at :519-527 returns early when the client is ALREADY in
+		// StateConnecting,
 		// which it is for the whole of an initial connect. So a reconnect-band
 		// close at connect time reaches no client callback carrying its code
 		// at all. The code itself is pinned by
@@ -436,8 +437,6 @@ func TestEveryHandshakeRefusalIsClassifiedForTheBrowser(t *testing.T) {
 	}{
 		// 3500, DisconnectInvalidToken. Terminal: retrying changes nothing.
 		{name: "an unknown credential", token: "not-a-token", protocol: clientlink.ProtocolVersion, wantCode: 3500, wantTerminal: true},
-		// 3005, DisconnectExpired. Terminal for THIS token; the browser
-		// refreshes and reconnects without sending the user back to login.
 		// 3005, DisconnectExpired. It is BELOW 3500 and therefore in the
 		// reconnect band: the browser refreshes its credential and comes back,
 		// rather than sending the user to login. That is exactly the
