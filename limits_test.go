@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/looprig/factory/internal/realtime/clientlink"
+	"github.com/looprig/factory/internal/realtime/hostlink"
 )
 
 // The three limit tables share one shape, and the shape is the point. Each row
@@ -348,5 +349,119 @@ func TestTheTwoPingFloorsAreOneNumber(t *testing.T) {
 	if MinClientLinkPingInterval != clientlink.MinPingInterval {
 		t.Errorf("MinClientLinkPingInterval = %v but clientlink.MinPingInterval = %v",
 			MinClientLinkPingInterval, clientlink.MinPingInterval)
+	}
+}
+
+// TestHostLinkLimitsAreCarriedWhole is TestClientLinkLimitsAreCarriedWhole for
+// the other link, and it exists for the same reason: two declarations, because
+// the engine cannot import this package without a cycle, and A9.1 will convert
+// one into the other. A dropped field does not fail to compile -- it configures
+// a zero, which for MaxLinks is a pool that refuses its first bind and for
+// IdleTimeout is a reaper that closes every link the moment it goes idle.
+//
+// The comparison is by NAME and TYPE. A count alone would be satisfied by a
+// rename, and a rename is exactly what a conversion misses.
+func TestHostLinkLimitsAreCarriedWhole(t *testing.T) {
+	t.Parallel()
+
+	root := reflect.TypeOf(HostLinkLimits{})
+	engine := reflect.TypeOf(hostlink.Limits{})
+
+	rootFields := make(map[string]reflect.Type, root.NumField())
+	for i := range root.NumField() {
+		field := root.Field(i)
+		rootFields[field.Name] = field.Type
+	}
+	for i := range engine.NumField() {
+		field := engine.Field(i)
+		want, present := rootFields[field.Name]
+		if !present {
+			t.Errorf("hostlink.Limits has %s, which HostLinkLimits does not", field.Name)
+			continue
+		}
+		if want != field.Type {
+			t.Errorf("%s is %v in hostlink.Limits and %v in HostLinkLimits", field.Name, field.Type, want)
+		}
+		delete(rootFields, field.Name)
+	}
+	for name := range rootFields {
+		t.Errorf("HostLinkLimits has %s, which hostlink.Limits does not", name)
+	}
+}
+
+// TestTheTwoHostLinkDefaultTablesAgree holds the VALUES equal, not just the
+// shape.
+//
+// hostlink.DefaultLimits exists because the pool fills a zero Limits rather
+// than rejecting it, so an in-module caller gets a usable pool without
+// restating five durations. That is only safe while the two tables are one
+// table: if they drifted, a deployer who named no HostLinkLimits and an
+// in-module caller who named none would get DIFFERENT pools, and the difference
+// would show up as a connection reaped early or a ceiling reached sooner, with
+// nothing in either configuration to read it from.
+func TestTheTwoHostLinkDefaultTablesAgree(t *testing.T) {
+	t.Parallel()
+
+	root := DefaultHostLinkLimits()
+	engine := hostlink.DefaultLimits()
+
+	for name, pair := range map[string][2]any{
+		"MaxLinks":     {root.MaxLinks, engine.MaxLinks},
+		"DialTimeout":  {root.DialTimeout, engine.DialTimeout},
+		"IdleTimeout":  {root.IdleTimeout, engine.IdleTimeout},
+		"ReconnectMin": {root.ReconnectMin, engine.ReconnectMin},
+		"ReconnectMax": {root.ReconnectMax, engine.ReconnectMax},
+	} {
+		if pair[0] != pair[1] {
+			t.Errorf("%s is %v in DefaultHostLinkLimits and %v in hostlink.DefaultLimits", name, pair[0], pair[1])
+		}
+	}
+	// And the absolute values, so "they agree" cannot be satisfied by both
+	// tables moving together to something nobody chose.
+	if root.MaxLinks != 256 {
+		t.Errorf("DefaultHostLinkLimits().MaxLinks = %d, want 256", root.MaxLinks)
+	}
+	if root.IdleTimeout != 60*time.Second {
+		t.Errorf("DefaultHostLinkLimits().IdleTimeout = %v, want 1m0s", root.IdleTimeout)
+	}
+}
+
+// TestBothHostLinkValidatorsRejectTheSameLimits keeps the second check from
+// becoming a WEAKER check. The root validates what a deployer supplied and the
+// engine validates what reached it; a row that only one of them rejects is a
+// composition that validates at the boundary and fails at the connection, or
+// the reverse.
+func TestBothHostLinkValidatorsRejectTheSameLimits(t *testing.T) {
+	t.Parallel()
+
+	rows := map[string]func(*HostLinkLimits){
+		"no links":                    func(l *HostLinkLimits) { l.MaxLinks = 0 },
+		"zero dial timeout":           func(l *HostLinkLimits) { l.DialTimeout = 0 },
+		"zero idle timeout":           func(l *HostLinkLimits) { l.IdleTimeout = 0 },
+		"zero reconnect floor":        func(l *HostLinkLimits) { l.ReconnectMin = 0 },
+		"zero reconnect ceiling":      func(l *HostLinkLimits) { l.ReconnectMax = 0 },
+		"inverted backoff":            func(l *HostLinkLimits) { l.ReconnectMin = l.ReconnectMax + time.Second },
+		"dial beyond the idle window": func(l *HostLinkLimits) { l.DialTimeout = l.IdleTimeout + time.Second },
+	}
+	for name, mutate := range rows {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			root := DefaultHostLinkLimits()
+			mutate(&root)
+			engine := hostlink.Limits{
+				MaxLinks:     root.MaxLinks,
+				DialTimeout:  root.DialTimeout,
+				IdleTimeout:  root.IdleTimeout,
+				ReconnectMin: root.ReconnectMin,
+				ReconnectMax: root.ReconnectMax,
+			}
+			if root.Validate() == nil {
+				t.Errorf("HostLinkLimits.Validate accepted %q", name)
+			}
+			if engine.Validate() == nil {
+				t.Errorf("hostlink.Limits.Validate accepted %q", name)
+			}
+		})
 	}
 }
