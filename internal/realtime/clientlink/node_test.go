@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -166,10 +167,10 @@ func TestPerConnectionQueueBytesIsMeasuredInBytes(t *testing.T) {
 	t.Run("a four kibibyte budget closes a stalled consumer", func(t *testing.T) {
 		t.Parallel()
 
-		event, closed := stalledConsumer(t, 1<<12, publications, payloadBytes)
+		event, closed, connections := stalledConsumer(t, 1<<12, publications, payloadBytes)
 		if !closed {
-			t.Fatalf("a stalled consumer with a 4 KiB budget survived %d publications of %d bytes (%d KiB in total)",
-				publications, payloadBytes, publications*payloadBytes/1024)
+			t.Fatalf("a stalled consumer with a 4 KiB budget survived %d publications of %d bytes (%d KiB in total); the hub still holds %d connection(s)",
+				publications, payloadBytes, publications*payloadBytes/1024, connections)
 		}
 		// 3008 is DisconnectSlow, the queue bound. Asserting the code rather
 		// than "it was closed" is what separates the budget from the write
@@ -183,7 +184,7 @@ func TestPerConnectionQueueBytesIsMeasuredInBytes(t *testing.T) {
 	t.Run("a sixteen mebibyte budget survives the same load", func(t *testing.T) {
 		t.Parallel()
 
-		event, closed := stalledConsumer(t, 1<<24, publications, payloadBytes)
+		event, closed, _ := stalledConsumer(t, 1<<24, publications, payloadBytes)
 		if closed {
 			t.Errorf("a stalled consumer with a 16 MiB budget was closed with code %d (%s) by %d publications of %d bytes",
 				event.Code, event.Reason, publications, payloadBytes)
@@ -192,11 +193,29 @@ func TestPerConnectionQueueBytesIsMeasuredInBytes(t *testing.T) {
 }
 
 // stalledConsumer subscribes a client whose publication callback BLOCKS, then
-// publishes a fixed load and reports whether the server closed the connection.
+// publishes a fixed load and reports whether the server closed the connection,
+// with the hub's connection count as a second, independent witness.
 //
 // The write deadline is set far longer than the case can take, so a close here
 // is attributable to the queue budget and not to the other bound.
-func stalledConsumer(t *testing.T, queueBytes, publications, payloadBytes int) (centrifuge.DisconnectEvent, bool) {
+//
+// THE ORDER OF THE LAST THREE STEPS IS THE WHOLE CORRECTNESS OF THIS HELPER,
+// and the first version had it wrong. The server's close is issued from the
+// publish path, but it cannot UNWIND while the transport's write is blocked on
+// a socket nobody is draining -- the consumer's callback is the thing holding
+// it, and the server's write deadline here is 30s. So a version that decided
+// the verdict first and released the consumer afterwards was waiting for an
+// event that could not arrive until it stopped waiting: it reported "survived"
+// in 8 of 14 clean runs and 4 of 4 in isolation, and in a failing run the hub
+// held ZERO connections -- the close had happened and the harness missed it.
+// The load is published in full, THEN the consumer is released, THEN the
+// verdict is taken. Releasing after the last publication cannot change the
+// outcome, because the overflow decision is made during the loop.
+//
+// The connection count is returned so a "survived" verdict is checkable against
+// something other than the event plumbing that just failed to see the close;
+// the helper refuses to return that verdict when the two disagree.
+func stalledConsumer(t *testing.T, queueBytes, publications, payloadBytes int) (centrifuge.DisconnectEvent, bool, int) {
 	t.Helper()
 
 	limits := nodeTestLimits()
@@ -285,8 +304,18 @@ func stalledConsumer(t *testing.T, queueBytes, publications, payloadBytes int) (
 		default:
 		}
 	})
-	// This callback BLOCKS, which is what a slow consumer IS.
-	sub.OnPublication(func(centrifugego.PublicationEvent) { <-blocked })
+	// This callback BLOCKS, which is what a slow consumer IS. Once released it
+	// counts, so the surviving case has a POSITIVE terminating signal -- every
+	// publication arrived -- rather than only the expiry of a deadline.
+	var received atomic.Int64
+	drained := make(chan struct{})
+	var drainOnce sync.Once
+	sub.OnPublication(func(centrifugego.PublicationEvent) {
+		<-blocked
+		if received.Add(1) >= int64(publications) {
+			drainOnce.Do(func() { close(drained) })
+		}
+	})
 	if err := sub.Subscribe(); err != nil {
 		t.Fatalf("Subscribe: %v", err)
 	}
@@ -301,25 +330,37 @@ func stalledConsumer(t *testing.T, queueBytes, publications, payloadBytes int) (
 		if _, err := handler.node.Publish(channel, payload); err != nil {
 			t.Fatalf("Publish: %v", err)
 		}
-		select {
-		case event := <-disconnects:
-			unblock()
-			return event, true
-		default:
-		}
 	}
-	// The overflow close is issued from the publish path, but in a goroutine,
-	// so a bounded wait is needed after the last publication. It is bounded by
-	// a deadline rather than by a poll count because nothing here asserts that
-	// anything is fast.
+
+	// The whole load is in. Releasing the consumer now lets the transport
+	// unwind, which is the only way a close ALREADY DECIDED can be observed.
+	unblock()
+
 	select {
 	case event := <-disconnects:
-		unblock()
-		return event, true
-	case <-time.After(5 * time.Second):
+		return event, true, handler.Connections()
+	case <-drained:
+		// Every publication reached the client, so the budget did not bite.
+		// The short second look is not a poll for the close: it is there
+		// because "the last publication arrived" and "the server closed"
+		// could in principle race, and the close is the stronger answer.
+		select {
+		case event := <-disconnects:
+			return event, true, handler.Connections()
+		case <-time.After(time.Second):
+		}
+	case <-time.After(30 * time.Second):
 	}
-	unblock()
-	return centrifuge.DisconnectEvent{}, false
+
+	connections := handler.Connections()
+	// A "survived" verdict with an empty hub is the failure this helper was
+	// rewritten to make impossible to report. It is not a system finding and
+	// must not be dressed as one.
+	if connections == 0 {
+		t.Fatalf("no disconnect event was observed but the hub holds 0 connections after %d publications of %d bytes: the harness missed the close",
+			publications, payloadBytes)
+	}
+	return centrifuge.DisconnectEvent{}, false, connections
 }
 
 // TestLimitsValidate is the table for the second validation, the one that
