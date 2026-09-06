@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"slices"
+	"sync"
 	"time"
 
 	sessionwire "github.com/looprig/core/sessionwire/v1"
@@ -106,6 +107,12 @@ type UUIDSource interface {
 type Server struct {
 	cfg    config
 	router *httpapi.Router
+
+	// mu guards the serving lifecycle only. The composition above it is
+	// immutable after New, so nothing else needs it.
+	mu    sync.Mutex
+	state serverState
+	http  *http.Server
 }
 
 // New validates a composition and returns it.
@@ -118,6 +125,7 @@ func New(opts ...Option) (*Server, error) {
 	cfg := config{
 		clock:     SystemClock(),
 		uuids:     CryptoUUIDSource(),
+		http:      DefaultHTTPLimits(),
 		reconcile: DefaultReconcileLimits(),
 		client:    DefaultClientLinkLimits(),
 		host:      DefaultHostLinkLimits(),
@@ -179,6 +187,7 @@ func New(opts ...Option) (*Server, error) {
 		name string
 		err  error
 	}{
+		{"WithHTTPLimits", cfg.http.Validate()},
 		{"WithReconcileLimits", cfg.reconcile.Validate()},
 		{"WithClientLinkLimits", cfg.client.Validate()},
 		{"WithHostLinkLimits", cfg.host.Validate()},

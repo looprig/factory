@@ -85,6 +85,19 @@ as its fallback rather than mounted above or beside it, which is what makes
 authentication, so `/v1/unknown` is a JSON `route_not_found`, never
 `index.html`.
 
+`Serve` and `Stop` are the OPTIONAL half. An embedder that owns its own
+`http.Server` uses `Handler` and never calls them. A deployment that wants
+Factory to own the server passes a listener it opened itself -- which address,
+which network, whether a supervisor passed the descriptor in, whether TLS is
+terminated here -- and gets the wire-level bounds `HTTPLimits` carries:
+`ReadHeaderTimeout`, `IdleTimeout` and `MaxHeaderBytes`. There is deliberately
+no `ReadTimeout` and no `WriteTimeout`; both are absolute per-connection
+deadlines, and this surface streams object bodies and will carry a WebSocket.
+`Stop` is idempotent, does not return until what it stopped has stopped, and
+stops **public admission first** so nothing new is admitted while the background
+components -- when they exist -- are torn down. It never touches a Host runtime:
+a session outlives every Factory replica.
+
 What `New` composes today is that surface and nothing else -- the authenticator
 built from the deployer's verifier, the origin and CSRF guard, the router and
 the optional UI. Command admission, placement, the ClientLink and HostLink

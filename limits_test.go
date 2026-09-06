@@ -17,6 +17,7 @@ func TestDefaultLimitsAreValid(t *testing.T) {
 	t.Parallel()
 
 	for name, err := range map[string]error{
+		"HTTPLimits":       DefaultHTTPLimits().Validate(),
 		"ReconcileLimits":  DefaultReconcileLimits().Validate(),
 		"ClientLinkLimits": DefaultClientLinkLimits().Validate(),
 		"HostLinkLimits":   DefaultHostLinkLimits().Validate(),
@@ -24,6 +25,49 @@ func TestDefaultLimitsAreValid(t *testing.T) {
 		if err != nil {
 			t.Errorf("Default%s() is itself rejected: %v", name, err)
 		}
+	}
+}
+
+func TestHTTPLimitsValidate(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		mutate  func(*HTTPLimits)
+		wantErr string
+	}{
+		{"zero header deadline", func(l *HTTPLimits) { l.ReadHeaderTimeout = 0 }, "ReadHeaderTimeout"},
+		{"negative header deadline", func(l *HTTPLimits) { l.ReadHeaderTimeout = -time.Second }, "ReadHeaderTimeout"},
+		{"zero idle window", func(l *HTTPLimits) { l.IdleTimeout = 0 }, "IdleTimeout"},
+		{"negative idle window", func(l *HTTPLimits) { l.IdleTimeout = -time.Second }, "IdleTimeout"},
+		// A header ceiling below one realistic header block rejects every
+		// request rather than bounding an abusive one, so it is held above a
+		// floor rather than merely above zero.
+		{"no header budget", func(l *HTTPLimits) { l.MaxHeaderBytes = 0 }, "MaxHeaderBytes"},
+		{"negative header budget", func(l *HTTPLimits) { l.MaxHeaderBytes = -1 }, "MaxHeaderBytes"},
+		{"header budget just below the floor", func(l *HTTPLimits) { l.MaxHeaderBytes = minHeaderBytes - 1 }, "MaxHeaderBytes"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			limits := DefaultHTTPLimits()
+			tt.mutate(&limits)
+			assertRejected(t, limits.Validate(), limits, tt.wantErr)
+		})
+	}
+}
+
+// TestHTTPHeaderBudgetFloorIsInclusive holds the boundary the table above only
+// approaches: the floor itself is accepted, so the rule is "at least" rather
+// than "more than".
+func TestHTTPHeaderBudgetFloorIsInclusive(t *testing.T) {
+	t.Parallel()
+
+	limits := DefaultHTTPLimits()
+	limits.MaxHeaderBytes = minHeaderBytes
+	if err := limits.Validate(); err != nil {
+		t.Errorf("MaxHeaderBytes at the floor was rejected: %v", err)
 	}
 }
 

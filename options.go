@@ -90,6 +90,7 @@ type config struct {
 
 	csrf      identity.CSRFConfig
 	csrfSet   bool
+	http      HTTPLimits
 	reconcile ReconcileLimits
 	client    ClientLinkLimits
 	host      HostLinkLimits
@@ -229,6 +230,13 @@ func WithUUIDSource(u UUIDSource) Option {
 // WithCSRF supplies the origin and CSRF configuration. It has no default.
 func WithCSRF(cfg identity.CSRFConfig) Option {
 	return option("WithCSRF", func(c *config) error { c.csrf = cfg; c.csrfSet = true; return nil })
+}
+
+// WithHTTPLimits replaces the connection limits Serve applies. They bound the
+// socket, so they say nothing about a library embedding that uses Handler and
+// supplies its own http.Server.
+func WithHTTPLimits(l HTTPLimits) Option {
+	return option("WithHTTPLimits", func(c *config) error { c.http = l; return nil })
 }
 
 // WithReconcileLimits replaces the reconciliation limits.

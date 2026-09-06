@@ -52,6 +52,9 @@ func TestUIPresenceIsTheOnlyDifference(t *testing.T) {
 		t.Fatalf("New() with a UI = %v", err)
 	}
 
+	if without.HTTPLimits() != with.HTTPLimits() {
+		t.Errorf("HTTP limits differ: %+v vs %+v", without.HTTPLimits(), with.HTTPLimits())
+	}
 	if without.ReconcileLimits() != with.ReconcileLimits() {
 		t.Errorf("reconciliation limits differ: %+v vs %+v", without.ReconcileLimits(), with.ReconcileLimits())
 	}

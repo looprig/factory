@@ -688,6 +688,8 @@ equal. `httpapi.Directory` has no production implementation yet — **A4.1 owns
 it**, and until then `/v1/agents` reports every pooled target as unadvertised
 under any composition that supplies a directory answering empty pages. `factory.New` composes the authenticator, the guard and the `Router`, and
 `Server.Handler` serves them; A9.1 stage 1 did that over the seams that exist.
+`Serve`/`Stop` are optional and own an `http.Server` but not the listener, which
+is where `httpapi.RouteLimits`' deferred socket bounds landed as `HTTPLimits`.
 What it does NOT compose is ClientLink, HostLink, placement or the reconcilers,
 and the router it builds carries an empty launch `Department`, a nil
 `ObjectPolicy` and no object-store resolver -- each fails closed. There is no

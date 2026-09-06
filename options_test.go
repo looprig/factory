@@ -39,6 +39,9 @@ func TestRequiredOptionsCompose(t *testing.T) {
 			t.Errorf("composed Server has no %s", name)
 		}
 	}
+	if got := server.HTTPLimits(); got != DefaultHTTPLimits() {
+		t.Errorf("HTTPLimits() = %+v, want the default %+v", got, DefaultHTTPLimits())
+	}
 	if got := server.ReconcileLimits(); got != DefaultReconcileLimits() {
 		t.Errorf("ReconcileLimits() = %+v, want the default %+v", got, DefaultReconcileLimits())
 	}
@@ -211,6 +214,7 @@ func TestNewRejectsInvalidLimits(t *testing.T) {
 	t.Parallel()
 
 	tests := []Option{
+		WithHTTPLimits(HTTPLimits{}),
 		WithReconcileLimits(ReconcileLimits{}),
 		WithClientLinkLimits(ClientLinkLimits{}),
 		WithHostLinkLimits(HostLinkLimits{}),
@@ -239,6 +243,8 @@ func TestNewRejectsInvalidLimits(t *testing.T) {
 func TestExplicitLimitsReplaceTheDefaults(t *testing.T) {
 	t.Parallel()
 
+	http := DefaultHTTPLimits()
+	http.IdleTimeout = 17 * time.Second
 	reconcile := DefaultReconcileLimits()
 	reconcile.MaxDuePerSweep = 7
 	client := DefaultClientLinkLimits()
@@ -247,12 +253,16 @@ func TestExplicitLimitsReplaceTheDefaults(t *testing.T) {
 	host.MaxLinks = 13
 
 	server, err := New(append(RequiredOptions(),
+		WithHTTPLimits(http),
 		WithReconcileLimits(reconcile),
 		WithClientLinkLimits(client),
 		WithHostLinkLimits(host),
 	)...)
 	if err != nil {
 		t.Fatalf("New() = %v, want no error", err)
+	}
+	if got := server.HTTPLimits(); got != http {
+		t.Errorf("HTTPLimits() = %+v, want %+v", got, http)
 	}
 	if got := server.ReconcileLimits(); got != reconcile {
 		t.Errorf("ReconcileLimits() = %+v, want %+v", got, reconcile)
