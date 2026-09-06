@@ -175,9 +175,42 @@ digest or a re-encoding leaks that derivative, and
 `TestScrubbingCoversOnlyAVerbatimCredential` pins the boundary from both sides
 rather than leaving it to a caveat.
 
+## Realtime transport
+
+The realtime transport is pinned exactly, and the pins are held equal to
+`go.mod` by a test in `internal/realtime/transport`:
+
+| Role | Module / package | Version |
+| --- | --- | --- |
+| Embedded server, for ClientLink | `github.com/centrifugal/centrifuge` | `v0.38.0` |
+| Go client, for HostLink | `github.com/centrifugal/centrifuge-go` | `v0.10.12` |
+| Wire library both depend on | `github.com/centrifugal/protocol` | `v0.17.0` |
+| Browser client | npm `centrifuge` | `5.7.2` |
+
+**The Go client is deliberately not the latest, and cannot be.** Factory embeds
+the server for ClientLink and dials with the client for HostLink in one binary,
+so both resolve ONE `centrifugal/protocol` version. `centrifuge-go` v0.11.0 and
+above require `protocol` v0.19.2 or later, and `centrifuge` v0.38.0 does not
+build against it (`undefined: protocol.GetStreamCommandDecoder`). v0.10.12 is
+the newest client that coexists. Moving the client requires moving the server
+first, and moving the server invalidates the compatibility measurement taken
+against the pinned browser client.
+
+Everything the transport is trusted to do is measured against a real embedded
+node over a real loopback WebSocket in `internal/realtime/transport`, including
+the answers that are inconvenient: a stalled consumer loses its whole
+connection, not one subscription, by either the connection queue bound or the
+connection write deadline; and the connect reply carries the ping interval in
+whole SECONDS, so a sub-second ping interval is silently not negotiated and the
+server then closes healthy connections for a missing pong. The 5,000-connection
+transport-only case is behind the `transportscale` build tag and makes no
+durability or correctness claim.
+
 ## Status
 
 Seams and identity derivation. `contract.go` states the cross-service contract,
 `server.go` / `options.go` state the composition, and `internal/identity`
 derives principals; the HTTP API, admission, routing, placement and the realtime
-engines are the subject of later tasks in runbook 05.
+engines are the subject of later tasks in runbook 05. The realtime transport is
+pinned and measured (A5.1); the ClientLink and HostLink engines that consume it
+are not built.
