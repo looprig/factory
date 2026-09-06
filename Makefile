@@ -18,8 +18,16 @@ GOFILES = GOWORK=off go run ./internal/modfiles/cmd/modfiles -root .
 # recipe added later that pipes needs this too; one that does not, does not.
 PIPEFAIL := set -o pipefail;
 
+# -count=1 is not belt-and-braces either, and it is not a preference about
+# speed. Without it `go test` REPLAYS a cached pass for any package whose
+# inputs are unchanged, and `make check` then reports success on code it did
+# not execute. A6.1's gate measured exactly that: a case failing 8 times in 14
+# clean runs sat behind `ok … (cached)` in a green `make check`. The whole
+# point of this target is to be the run that decides, so it may not be a
+# replay of an earlier one; a flake, a timing-dependent case and a test that
+# depends on the clock or the machine are all invisible to a cache.
 test:
-	GOWORK=off go test -race ./...
+	GOWORK=off go test -count=1 -race ./...
 
 fmt:
 	$(PIPEFAIL) $(GOFILES) | xargs -0 gofmt -w
