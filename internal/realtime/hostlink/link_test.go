@@ -467,7 +467,7 @@ func TestAHostRefusalIsReportedAsTheHostsOwnAnswer(t *testing.T) {
 	pool := newPool(t, dialer, hostlink.Limits{})
 	mustBind(t, pool, target(hostOne, endpoint1), bindRequest(hostOne, "s-1"))
 
-	refusal := &hostlink.HostRefusal{Code: sessionwire.HostLinkErrorNotAdmitting}
+	refusal := &hostlink.HostRefusal{HostLinkError: sessionwire.HostLinkError{Code: sessionwire.HostLinkErrorNotAdmitting}}
 	dialer.link(hostOne).failCommand(refusal)
 
 	err := pool.DeliverCommand(context.Background(), tenant, "s-1", sessionwire.HostLinkCommandDelivery{CommandID: "cmd-abc"})
@@ -694,7 +694,9 @@ func TestAFailedBindOverAFreshLinkKeepsTheLinkButNotTheBinding(t *testing.T) {
 	t.Parallel()
 
 	dialer := newRecordingDialer()
-	dialer.onDial = func(l *fakeLink) { l.failBind(&hostlink.HostRefusal{Code: sessionwire.HostLinkErrorEpochMismatch}) }
+	dialer.onDial = func(l *fakeLink) {
+		l.failBind(&hostlink.HostRefusal{HostLinkError: sessionwire.HostLinkError{Code: sessionwire.HostLinkErrorEpochMismatch, CurrentLeaseEpoch: 11}})
+	}
 	pool := newPool(t, dialer, hostlink.Limits{})
 
 	var refusal *hostlink.HostRefusal
@@ -1169,26 +1171,29 @@ func TestDialerYieldsALinkForTheHostItWasAskedFor(t *testing.T) {
 func TestThisPackageCannotTouchTheInbox(t *testing.T) {
 	t.Parallel()
 
-	set := token.NewFileSet()
-	pkgs, err := parser.ParseDir(set, ".", func(info os.FileInfo) bool {
-		return !strings.HasSuffix(info.Name(), "_test.go")
-	}, parser.ImportsOnly)
+	entries, err := os.ReadDir(".")
 	if err != nil {
-		t.Fatalf("ParseDir: %v", err)
+		t.Fatalf("ReadDir: %v", err)
 	}
 
 	files := 0
-	for _, pkg := range pkgs {
-		for name, file := range pkg.Files {
-			files++
-			for _, spec := range file.Imports {
-				path, err := strconv.Unquote(spec.Path.Value)
-				if err != nil {
-					t.Fatalf("%s: unquote %s: %v", name, spec.Path.Value, err)
-				}
-				if path == "github.com/looprig/sessionstore" || strings.HasPrefix(path, "github.com/looprig/sessionstore/") {
-					t.Errorf("%s imports %s: this package must not be able to write the inbox", name, path)
-				}
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		files++
+		parsed, err := parser.ParseFile(token.NewFileSet(), name, nil, parser.ImportsOnly)
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		for _, spec := range parsed.Imports {
+			path, err := strconv.Unquote(spec.Path.Value)
+			if err != nil {
+				t.Fatalf("%s: unquote %s: %v", name, spec.Path.Value, err)
+			}
+			if path == "github.com/looprig/sessionstore" || strings.HasPrefix(path, "github.com/looprig/sessionstore/") {
+				t.Errorf("%s imports %s: this package must not be able to write the inbox", name, path)
 			}
 		}
 	}

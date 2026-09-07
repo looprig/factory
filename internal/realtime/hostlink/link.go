@@ -43,18 +43,18 @@ var ErrCommandUndelivered = errors.New("hostlink: command was not delivered")
 
 // HostRefusal is a Host's own answer to a control request.
 //
-// It carries Core's typed code rather than a message, because a caller must
+// It carries Core's typed record rather than a message, because a caller must
 // branch on the reason: an epoch mismatch is a stale route to re-resolve and a
 // runtime mismatch is a placement decision to remake, and telling them apart by
 // matching text is how a caller silently starts doing the wrong one.
+//
+// The record is EMBEDDED rather than copied field by field. Core's HostLinkError
+// already states which detail belongs with which code -- an epoch only with a
+// mismatch, a runtime id only with a runtime mismatch -- and a second flat copy
+// of those three fields would be a second authority for that rule, which is the
+// shape of defect this module has had to correct twice.
 type HostRefusal struct {
-	// Code is the Host's typed reason.
-	Code sessionwire.HostLinkErrorCode
-	// CurrentLeaseEpoch is the epoch the Host holds, when it reported one.
-	CurrentLeaseEpoch uint64
-	// RuntimeCompatibilityID is the runtime the Host holds, when it reported
-	// one.
-	RuntimeCompatibilityID string
+	sessionwire.HostLinkError
 }
 
 func (e *HostRefusal) Error() string {
