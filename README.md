@@ -255,7 +255,12 @@ and routes untouched, measured over fakes and over real sockets.
 names and the `{type, data}` push envelope here are Factory's half of a protocol
 whose Host half does not exist in this repository, and the tests run against a
 stand-in node implementing exactly that proposal. It is a declared gap, not an
-agreement.
+agreement. The strings are pinned as absolute literals, because they are what
+Host must mirror. Where they should finally live is unresolved: `internal/` is a
+place Host cannot import, and Core's `sessionwire/v1` is transport-neutral and
+deliberately not the answer — a method name is transport-shaped, and putting one
+in a tier-0 module would make a future transport change a tier-0 breaking
+release.
 
 The pool carries the control plane only. Per-binding queues, backpressure repair
 and the live tail are A7.3; choosing which Host a session belongs to is A7.2.

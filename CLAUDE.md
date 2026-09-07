@@ -845,10 +845,14 @@ Two cases measure it, one over fakes and one over real sockets.
 **Three transport properties were measured and two of them corrected a claim
 written from memory.**
 
-`centrifuge.DisconnectInvalidToken` is **3500**, not 3501 — 3501 is
-`DisconnectBadRequest` (`centrifuge@v0.38.0/disconnect.go:122`). The code is
-carried in a structured `HostDisconnect` field so a caller and a test branch on
-the value rather than matching text.
+`centrifuge.DisconnectInvalidToken` is **3500**, not 3501
+(`centrifuge@v0.38.0/disconnect.go:122`); 3501 is `DisconnectBadRequest`, at its
+own declaration `disconnect.go:127`. Both line numbers are at the **pinned**
+v0.38.0 and are not interchangeable: at the unpinned v0.39.0, `:122` is
+`DisconnectStateInvalidated`. The code is carried in a structured
+`HostDisconnect` field so a caller and a test branch on the value rather than
+matching text, and a terminal-band close on a LIVE link — not only at dial
+time — is what stops the link answering.
 
 **The embedded server validates a push body**, so `Client.Send` refuses invalid
 JSON outright. An "unreadable push" case must therefore send well-formed JSON
@@ -883,6 +887,40 @@ Factory's half of a protocol whose Host half does not exist in this repository.
 The Host writer must implement this mirror, or one of the two must move. Do not
 read the tests here as agreement with Host; the node they run against is a
 stand-in that implements exactly this proposal.
+
+**Where the framing should live is unresolved, and two homes are ruled out.**
+`factory/internal/` is not it — Host cannot import a Factory-internal package,
+so one half of a two-repo contract sits where the other half cannot see it. And
+Core's `sessionwire/v1` is not it either: a method name and a push discriminator
+are transport-*shaped*, they exist because the transport is centrifuge, and
+`sessionwire/v1` is transport-neutral today. Putting `hostlink.bind` into a
+tier-0 module would make a future transport change a tier-0 breaking release.
+The answer is a shared, explicitly transport-scoped home; root books it, and
+nothing in this repository should be read as that decision having been taken.
+
+Because those strings are the artifact Host mirrors, they are pinned as
+**absolute literals** — a test that compared `MethodBind` to itself pinned
+nothing, since a rename moves both sides together.
+
+**One decision in the proposal is contestable and is recorded as such.** Pushing
+a capacity report as an async message rather than publishing it to a channel is
+right for a *registry observation*, which is per-session and per-route, and
+weaker for a *capacity report*, which every Factory replica wants: a channel
+would let the broker fan one publication out instead of the Host calling
+`Client.Send` per connected replica, and two replicas on one Host is a measured
+case. It is not taken now because there is no agreed channel namespace — the
+same gap as the method names — and the `Observer` seam absorbs a later change.
+
+**The route table and a link's binding set are two maps, and only one of them
+was observable.** `Bindings()` counts a link's binding set; `RouteFor()` reports
+the route table, which is the pool's actual routing authority. Both unbind cases
+asserted on the first while claiming the second, so `Unbind`'s `delete` of the
+route survived deletion — and the consequence was not a wrong answer: `ReapIdle`
+would still collect the link, whose binding set really is empty, and the next
+`DeliverCommand` dereferenced nil under `p.mu`, leaking the lock and wedging
+`Close` behind it. Both lookups of `p.links` by a routed Host now fail closed
+with `ErrUnknownBinding`, and `Unbind` drops an orphaned route rather than
+keeping one that would refuse every later bind as a conflict.
 
 The pool carries the **control** plane only. Session event data, per-binding
 queues, backpressure repair and the live tail are A7.3's, and nothing in this

@@ -66,6 +66,25 @@ const ClientName = "factory-hostlink"
 // method names, no push discriminator, no channel vocabulary. That gap is real
 // and is recorded here rather than papered over. The Host writer must implement
 // the mirror of exactly this, or one of the two must move.
+//
+// Where these strings should eventually live is UNRESOLVED, and internal/ is
+// not it: Host cannot import a Factory-internal package, so one half of a
+// two-repo contract currently sits somewhere the other half cannot see. Core's
+// sessionwire/v1 is deliberately NOT the answer either. A method name and a
+// push discriminator are transport-SHAPED -- they exist because the transport
+// is centrifuge, and they would read differently under gRPC or raw WebSocket
+// frames -- while sessionwire/v1 is today transport-neutral: it says what a
+// record is and nothing about how it travels. Putting hostlink.bind into a
+// tier-0 module would leak the transport choice downward and make a future
+// transport change a tier-0 breaking release. What this needs is a shared,
+// explicitly transport-scoped home; booking one is not this package's to
+// decide, and nothing here should be read as that decision having been taken.
+//
+// Because the strings are the artifact Host mirrors, they are pinned as
+// absolute literals by TestTheWireVocabularyIsPinnedToItsLiterals rather than
+// through the constants themselves. A fixture built from the constant under
+// test pins nothing: a rename would move both sides together and the suite
+// would stay green while Factory stopped speaking the protocol Host implements.
 const (
 	// MethodBind establishes one Factory-local route to a Host-owned session.
 	MethodBind = "hostlink.bind"
@@ -82,6 +101,20 @@ const (
 // observations behind the subscription machinery; there is exactly one
 // connection per Host and every observation on it is for this replica, so a
 // discriminated message on that connection is the whole requirement.
+//
+// That reasoning is stronger for a REGISTRY observation than for a CAPACITY
+// report, and the difference is recorded rather than answered. A registry
+// observation is per-session and per-route, so it genuinely concerns only the
+// replica holding the route. A capacity report is a Host-level advertisement
+// every Factory replica wants: published to a channel, the broker would fan one
+// message out to every subscribed replica instead of the Host calling
+// Client.Send once per connected replica, and two replicas on one Host is
+// already a measured case rather than a hypothetical one. A Host writer has a
+// real argument here. It is not taken now because there is no agreed channel
+// namespace to take it with -- that is the same gap as the method names -- and
+// because the Observer seam absorbs the change: moving capacity to a
+// publication changes how a link is wired to the transport and nothing above
+// it.
 const (
 	// PushTypeCapacity carries a HostLinkCapacityReport.
 	PushTypeCapacity = "host.capacity"
