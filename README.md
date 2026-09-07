@@ -266,6 +266,37 @@ The pool carries the control plane only. Per-binding queues, backpressure repair
 and the live tail are A7.3; choosing which Host a session belongs to is A7.2.
 `factory.New` composes neither the pool nor the reaper's cadence; A9.1 owns that.
 
+## Placement
+
+`internal/placement` decides where a session runs. `Decide` is pure — a catalog
+record, an optional registry observation and one capacity page in, one of five
+outcomes out — and the reconciler around it takes the session's short-lived
+reconciliation claim, stores desired state idempotently and hands a dedicated
+session's intent to a `WorkloadController`.
+
+A live owner is preferred before any claim is taken, and a replica that loses
+the claim re-reads the registry rather than answering "busy": the winner may
+have finished placing in between. `ReusableOwner` is the module's one statement
+of "is this the session's own live owner"; `internal/admission` calls it.
+
+Desired state is idempotent twice over. A content comparison keeps a replica
+from rewriting an intent already stored, which is what holds the desired
+generation still, and a key derived from the intent keeps a second replica from
+applying it again — two Factories deriving one intent derive one key, and
+SessionStore checks the key before the revision.
+
+`WorkloadController` names no platform type and has one method. H5 puts the
+Kubernetes adapter inside this module and links it into `cmd/controller` alone,
+so a nil controller is a supported configuration and a dedicated session
+reaching the tenant-facing replica is refused by name.
+
+**Two gaps are declared rather than worked around.** The pinned `core v0.7.0`
+has no request that can ask a Host to take an unowned session —
+`HostLinkBindRequest` refuses a zero lease epoch — so a pooled decision names a
+Host and stops there. And a `tenant_exclusive` pooled advertisement is never
+selected, because Factory cannot see which tenants a Host serves and refusing is
+the only enforcement of specification section 12 available to it.
+
 ## Status
 
 Seams and identity derivation. `contract.go` states the cross-service contract,
@@ -273,4 +304,6 @@ Seams and identity derivation. `contract.go` states the cross-service contract,
 derives principals; the HTTP API, admission, routing and placement are the
 subject of later tasks in runbook 05. The realtime transport is pinned and
 measured (A5.1), the ClientLink engine is built (A6.1) and the HostLink pool and
-dialer are built (A7.1); `factory.New` composes none of the three.
+dialer are built (A7.1); `factory.New` composes none of the three. Target
+discovery (A4.1) and the placement policy and reconciler (A4.2) are built and
+likewise uncomposed.

@@ -929,6 +929,117 @@ belongs to is A7.2's demand-driven binding, which calls `Bind` and `Unbind`.
 `ReapIdle` is a method rather than a goroutine because A9.1 owns the start/stop
 ordering that would give it a lifetime.
 
+## Placement
+
+`internal/placement` is split into a pure half and an I/O half, and the split is
+its main structural claim. `policy.go` is a total function of a catalog record,
+an optional registry observation and one capacity page — no clock of its own, no
+store call, nothing it can create — so every rule a reviewer checks is driven
+directly rather than through a store. `reconciler.go` holds the claim, the
+desired-state write and the controller call, and its only decision is which of
+`Decide`'s answers it acted on.
+
+**An owner is preferred before any claim is taken.** An owned session is the
+common case, and putting a durable compare-and-swap in front of it would
+serialize routing behind a record whose purpose is coordinating *scaling*.
+Losing the claim is neither a failure nor simply a deferral: specification
+section 15 step 4 makes a replica that observes an existing claim re-read
+observed state, so the loser re-reads the registry and reports an owner the
+winner has just produced. The case that holds this needs the owner to appear
+BETWEEN the two reads — written as "put an owner, then reconcile" it passed
+against a reconciler with the re-read deleted, because the first read already
+saw the owner and no claim was ever attempted.
+
+**`ReusableOwner` is the one statement of "is this the session's own live
+owner".** `internal/admission` calls it; its own identical copy was removed. The
+two must not be able to differ, because an owner placement would re-place while
+admission still delivered to it is a command handed to a Host the router is
+about to abandon. Placement is compared along with agent and runtime, which
+reads as strict until you ask what the alternative does: section 14 defers
+migration and never live-migrates a running session, so a mismatch means "not
+reusable", never "move it".
+
+**Desired state is idempotent through two mechanisms guarding different
+things.** The content comparison keeps a replica from rewriting an intent
+already stored, which is what holds the desired *generation* still — and the
+generation is exactly what tells a controller its work is stale, so a reconciler
+that rewrote the same intent would invalidate every controller's completed work
+on every pass. The derived idempotency key keeps a *second* replica from writing
+it a second time: two Factories deriving one intent derive one key, SessionStore
+checks the key before the revision, and the loser's write is absorbed as a
+replay. Both racers are driven. `Result.DesiredWrites` counts calls rather than
+claiming "this replica applied it": with a derived key the two replicas are
+indistinguishable in the record they leave, which is the point.
+
+The key is length-prefixed per field before hashing, and that is driven too:
+concatenated, version `v1` with payload `2x` and version `v12` with payload `x`
+share a key, and SessionStore treats a reused key for a NEW intent as a replay
+that succeeds without applying anything.
+
+### What H5 decided, and where each part of it shows up
+
+The Kubernetes adapter is **internal**, built as **two binaries from the one
+`factory` module**, with **no leader election**.
+
+- `WorkloadController` therefore names no platform type.
+  `sessionstore.PlacementIntent` is the whole currency: Factory-authored desire
+  and nothing else — no lease epoch, no HostID, no residency — carrying the
+  generation a controller records against the workload it created.
+- It has **exactly one method**. Section 13's deletion ordering — request drain,
+  wait for an epoch-fenced checkpoint and an observed `cold` release, then
+  delete — has none of its steps in this module, and a `Delete` declared today
+  would be a seam with no implementation, no caller and no test. D2.2 adds it
+  with the protocol it depends on.
+- A **nil controller is a valid configuration**, because `cmd/factory` holds no
+  workload create/delete RBAC and composes none. A dedicated session reaching
+  that replica is refused by name with `ErrNoWorkloadController`; reporting it as
+  "no capacity" would send a caller into a retry loop waiting for an autoscaler
+  that never runs.
+- Replicas are safe with no leader through the derived key and the content
+  comparison above, not through the claim, which suppresses duplicate scaling
+  only.
+
+`factory.PlacementController`'s `EnsurePlacement(ctx, sessionstore.DesiredWorkload)`
+predates that answer and cannot identify a workload — a `DesiredWorkload` is a
+payload and a version label with no tenant, session or generation — so nothing
+here implements it. Reconciling the public option surface with H5 (most likely
+by deleting the option, since the adapter is internal) is A9.1/D1.1 composition
+work and is deliberately not done here.
+
+### Two gaps, declared rather than papered over
+
+**The pinned wire cannot carry an attachment.** A4.2 step 2 has the selected
+candidate asked to acquire or attach. At the pinned `core v0.7.0` there is no
+request that could: the only per-session control request is
+`HostLinkBindRequest`, and it refuses a zero `LeaseEpoch` — so a bind names an
+ownership tuple that a session with no owner, which is the only kind that
+reaches placement, does not have. Core's own bind decoder fails closed so that
+"unknown members cannot become a future attach/create workflow", which is the
+same gap seen from the other side. `OutcomeAttachPooled` therefore names a Host
+and stops; the caller performs no attachment because none exists to perform.
+`TestThePinnedWireCannotCarryAnAttachment` pins the premise, so a Core that
+grows the request fails this repository rather than leaving a stale citation.
+The same test records that **Core names no `lease_held` refusal**: step 2's
+`LeaseHeld` is spelled `HostLinkErrorEpochMismatch`, whose `CurrentLeaseEpoch`
+is the whole answer.
+
+**Tenant-exclusive pooled capacity is refused, not admitted.** Section 12 makes
+Factory placement the enforcer of tenant exclusivity for a pooled Host without
+the isolating capacity class, and Factory cannot see which tenants a Host is
+serving: SessionStore files targets under an `(AgentID, RuntimeCompatibilityID,
+Placement)` scope with no tenant dimension, so no query answers "is this
+exclusive Host already this tenant's". The only enforcement available is to
+refuse the class, so a `tenant_exclusive` **pooled** advertisement is never
+selected. The cost is stated rather than left to be found: such Hosts give no
+pooled placement at all until the directory carries a tenant dimension, which is
+H8's per-tenant Department and a specification section 7 change that is not this
+repository's to book.
+
+Not built here: the HostBindings of A4.3, the attachment and demand-driven
+binding of A7.2, drain-before-delete of D2.2, and the authorship of a dedicated
+workload's payload — `Desired` is an INPUT, because what a launch template
+should contain is a composition question A9.1 owns.
+
 ## Not implemented yet
 
 A2.4 implements `/objects/{oid}` and `/objects/{oid}/metadata` in the internal

@@ -787,3 +787,46 @@ func TestTwoIntentsNeverShareADesiredKey(t *testing.T) {
 		t.Errorf("the same intent derived two keys, %q and %q", first, repeated)
 	}
 }
+
+// TestThePinnedWireCannotCarryAnAttachment is why OutcomeAttachPooled stops at
+// NAMING a Host instead of asking it to take the session.
+//
+// A4.2 step 2 says the selected candidate is asked to acquire or attach. At the
+// pinned core v0.7.0 there is no request that could carry that: the only
+// per-session control request is HostLinkBindRequest, and it refuses a zero
+// lease epoch -- so a bind names an ownership tuple that a session with no
+// owner, which is the only kind that reaches placement, does not have. Core's
+// own bind decoder says as much, failing closed so that "unknown members cannot
+// become a future attach/create workflow".
+//
+// This asserts a DEPENDENCY's behaviour deliberately and for one reason: it is
+// the premise of a gap this package declares, and a premise nobody rechecks is
+// how a stale citation survives a version bump. When Core grows the request,
+// this test is what fails.
+func TestThePinnedWireCannotCarryAnAttachment(t *testing.T) {
+	t.Parallel()
+
+	bind := sessionwire.HostLinkBindRequest{
+		Version: sessionwire.CurrentWireVersion, TenantID: testTenant, SessionID: testSession,
+		HostID: "host-shared", HostGeneration: 1, LeaseEpoch: 0,
+		RuntimeCompatibilityID: testRuntime, IdempotencyKey: "attach-1",
+	}
+	if err := bind.Validate(); err == nil {
+		t.Fatal("a bind with no lease epoch was accepted; the pinned wire may now carry an attachment")
+	}
+	bind.LeaseEpoch = 1
+	if err := bind.Validate(); err != nil {
+		t.Fatalf("a bind naming a lease epoch was refused (%v), so the case above proves nothing about the epoch", err)
+	}
+
+	// Core's refusal codes carry no lease_held. A4.2 step 2's LeaseHeld is
+	// spelled epoch_mismatch here, and the current epoch is the whole answer.
+	held := sessionwire.HostLinkError{Code: "lease_held"}
+	if err := held.Validate(); err == nil {
+		t.Error("core now names a lease_held refusal; the reuse path should read it")
+	}
+	mismatch := sessionwire.HostLinkError{Code: sessionwire.HostLinkErrorEpochMismatch, CurrentLeaseEpoch: 9}
+	if err := mismatch.Validate(); err != nil {
+		t.Errorf("epoch_mismatch with a current epoch was refused: %v", err)
+	}
+}
