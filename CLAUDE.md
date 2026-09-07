@@ -794,6 +794,103 @@ assume it is.** One `messageWriter` per `Client` and no per-channel queue
 connection, by the queue budget (3008) or the write deadline (3009). A7.3 owns
 the repair, above the transport.
 
+## The HostLink
+
+A7.1 built `internal/realtime/hostlink`: Factory's client side of the
+Factory-Host connection, split the same way the ClientLink is. `Pool` decides
+and `CentrifugeDialer` carries, so the pooling invariant is drivable without a
+socket and the transport has nothing to choose. `factory.New` does **not**
+compose it; A9.1 owns that, along with the reaper's cadence.
+
+The invariant is one sentence: **a session binding never costs a connection, and
+a connection is never shared between Hosts.** The route table is keyed by
+tenant AND session, because a session id is unique only within its tenant. Four
+decisions protect that sentence, and each is a decision rather than an
+implementation detail:
+
+- **A bind record must name the Host its link goes to.** A bind carrying another
+  Host's tuple would be refused by the receiving Host for a reason that reads as
+  a lease problem rather than as a Factory routing bug.
+- **Re-binding elsewhere is refused, not moved.** A silent move leaves the first
+  Host holding a route the pool no longer tracks and can therefore never unbind.
+  Re-binding to the *same* Host resends; that is the lease-epoch refresh.
+- **A failed unbind still releases the local route.** A bind is Factory-local
+  routing state that the Host validates against its own durable lease, so a
+  route kept after a failure is kept forever — there is no retry, and the next
+  bind would be refused as a conflict against a route nobody wants.
+- **A refused bind keeps the connection and drops the binding.** The Host
+  answered, so the socket is good; discarding it turns one lease disagreement
+  into a dial storm.
+
+`MaxLinks` bounds **Hosts**, and the check is reached only for a Host with no
+link. That distinction needs a case where the two counts differ — with a ceiling
+of one, the reuse path never reaches the check, so a pool counting sessions
+passes it. `TestSessionsAlreadyBoundDoNotConsumeTheLinkCeiling` is that case.
+
+**Runbook A7.1 step 3 — a failed command RPC leaves the committed inbox record
+pending — is two claims and both are held.** `ErrCommandUndelivered` is returned
+only for a failure to hand the record over; a Host's own answer arrives as
+`*HostRefusal` carrying Core's typed `HostLinkError` and is deliberately **not**
+wrapped in it, so a caller tells "never seen" from "answered" without reading
+message text. And nothing here could mark the record anything else: a
+parsed-import test holds that no production file in the package imports
+`sessionstore`, and fails as vacuous at zero files. It proves what this package
+cannot do, not what the admission service does.
+
+**Step 2 is a decision, not an omission.** Several Factory replicas each hold
+their own link to one Host; there is no broker and no leader to lose, and
+closing one replica's pool leaves the others' connections and routes untouched.
+Two cases measure it, one over fakes and one over real sockets.
+
+**Three transport properties were measured and two of them corrected a claim
+written from memory.**
+
+`centrifuge.DisconnectInvalidToken` is **3500**, not 3501 — 3501 is
+`DisconnectBadRequest` (`centrifuge@v0.38.0/disconnect.go:122`). The code is
+carried in a structured `HostDisconnect` field so a caller and a test branch on
+the value rather than matching text.
+
+**The embedded server validates a push body**, so `Client.Send` refuses invalid
+JSON outright. An "unreadable push" case must therefore send well-formed JSON
+this build still cannot read, which is also the case that exists in production.
+An unreadable push is **dropped**, not fatal: a capacity report is an
+advertisement and a registry observation is a routing hint, and neither is worth
+the sessions multiplexed over the connection.
+
+**`Config.Token` is left empty and `GetToken` is the only credential path.**
+Setting both looks like belt and braces and is not: the client consults
+`GetToken` only when the token is empty
+(`centrifuge-go@v0.12.0/client.go:1183`), so a populated `Token` means the
+callback is never reached on a first connect. An up-front `ServiceToken` fetch
+written here first **survived** a mutation for exactly that reason — the library
+fell back to the callback and produced the same refusal by a different mechanism
+— so the redundant path is gone. Two other guards went the same way: a `closed`
+fast path in `Pool.Close`, whose idempotence actually comes from emptying the
+link table, and an `idleSince` reset on bind, unreachable because `idleSince` is
+read only when the binding set is empty and only `Unbind` empties it.
+
+The version is verified on **every** connect, not just the first, and reconnection
+itself stays the transport's with the backoff taken from the pool's limits. A
+Host restarted at a version this build does not speak would otherwise be
+reconnected to indefinitely while every control record failed to decode; instead
+the link is marked terminal and stops answering.
+
+**A declared gap, not a seam.** Core v0.7.0 defines the HostLink record *bodies*
+and their strict JSON, and defines **no transport framing** for them: no method
+names, no push discriminator, no channel vocabulary. `MethodBind`,
+`MethodUnbind`, `MethodCommand` and the `{type, data}` push envelope are
+Factory's half of a protocol whose Host half does not exist in this repository.
+The Host writer must implement this mirror, or one of the two must move. Do not
+read the tests here as agreement with Host; the node they run against is a
+stand-in that implements exactly this proposal.
+
+The pool carries the **control** plane only. Session event data, per-binding
+queues, backpressure repair and the live tail are A7.3's, and nothing in this
+package may be read as having solved them. Choosing *which* Host a session
+belongs to is A7.2's demand-driven binding, which calls `Bind` and `Unbind`.
+`ReapIdle` is a method rather than a goroutine because A9.1 owns the start/stop
+ordering that would give it a lifetime.
+
 ## Not implemented yet
 
 A2.4 implements `/objects/{oid}` and `/objects/{oid}/metadata` in the internal
@@ -834,8 +931,9 @@ What it does NOT compose is ClientLink, HostLink, placement or the reconcilers,
 and the router it builds carries an empty launch `Department`, a nil
 `ObjectPolicy` and no object-store resolver -- each fails closed. There is no
 default verifier option, because a deployment supplies the `Verifier` and there
-is no credible default for one. `internal/realtime` now exists and holds the ClientLink
-and HostLink seams. `cmd/factory` and `internal/placement/kubernetes` do not
+is no credible default for one. `internal/realtime` holds the ClientLink engine
+(A6.1), the HostLink pool and dialer (A7.1) and the pinned transport spike
+(A5.1); none of the three is composed by `factory.New`. `cmd/factory` and `internal/placement/kubernetes` do not
 exist; their exemptions grant nothing today and `TestBoundaryScopesAreNotStale`
 will fail if one of those directories appears without a Go file in it. Do not
 add a placeholder Go file to satisfy it: that would permanently satisfy a live

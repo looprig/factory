@@ -231,11 +231,41 @@ Redis and NATS brokers and standalone Centrifugo are **absent rather than
 asserted-refused** -- the node keeps its in-process memory broker and no
 external process is started. The suite exercises the JSON protocol only.
 
+## The HostLink
+
+`internal/realtime/hostlink` is Factory's client side of the Factory-Host
+connection, split like the ClientLink: a `Pool` that decides and a
+`CentrifugeDialer` that carries. The invariant is one sentence — a session
+binding never costs a connection, and a connection is never shared between
+Hosts — and the route table is keyed by tenant AND session, because a session id
+is unique only within its tenant.
+
+A failed command RPC is reported as `ErrCommandUndelivered`, which leaves the
+already committed inbox record pending. A Host's own answer arrives as
+`*HostRefusal` carrying Core's typed `HostLinkError` and is deliberately not in
+that class, so a caller tells "never seen" from "answered" without reading
+message text. The package imports no store and a parsed-import test holds that,
+so it could not record anything about the record either way.
+
+Several Factory replicas may hold their own connection to one Host. There is no
+broker and no leader: closing one replica's pool leaves the others' connections
+and routes untouched, measured over fakes and over real sockets.
+
+**Core defines the record bodies and no transport framing for them.** The method
+names and the `{type, data}` push envelope here are Factory's half of a protocol
+whose Host half does not exist in this repository, and the tests run against a
+stand-in node implementing exactly that proposal. It is a declared gap, not an
+agreement.
+
+The pool carries the control plane only. Per-binding queues, backpressure repair
+and the live tail are A7.3; choosing which Host a session belongs to is A7.2.
+`factory.New` composes neither the pool nor the reaper's cadence; A9.1 owns that.
+
 ## Status
 
 Seams and identity derivation. `contract.go` states the cross-service contract,
 `server.go` / `options.go` state the composition, and `internal/identity`
-derives principals; the HTTP API, admission, routing, placement and the realtime
-engines are the subject of later tasks in runbook 05. The realtime transport is
-pinned and measured (A5.1); the ClientLink and HostLink engines that consume it
-are not built.
+derives principals; the HTTP API, admission, routing and placement are the
+subject of later tasks in runbook 05. The realtime transport is pinned and
+measured (A5.1), the ClientLink engine is built (A6.1) and the HostLink pool and
+dialer are built (A7.1); `factory.New` composes none of the three.
