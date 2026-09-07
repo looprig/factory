@@ -73,7 +73,11 @@ type Claims interface {
 //     against the workload it created. A controller that reconciled generation 7
 //     and is handed 7 again has nothing to do, however many Host heartbeats have
 //     moved the record's revision in between. That is what makes calling this on
-//     every reconciliation cheap rather than wasteful.
+//     every reconciliation cheap rather than wasteful. (Attribution, since it is
+//     easy to over-read: H5's recorded text contains no "records generation"
+//     clause. The requirement is A4.2 step 1's idempotent desired generation and
+//     the field is sessionstore.PlacementIntent.Generation, a member by
+//     construction. H5 decides the adapter's placement, not this.)
 //   - Multiple replicas of either binary run with NO leader election, so this
 //     is called concurrently for one session by design. Deterministic workload
 //     identity is the mechanism that makes that safe -- the claim only
@@ -85,8 +89,10 @@ type Claims interface {
 // epoch-fenced checkpoint and an observed cold release, THEN delete -- and none
 // of those steps exists in this module yet. A Delete declared here today would
 // be a seam with no implementation, no caller and no test, which is the shape
-// of the "guarantee" this lane has twice found inert. D2.2 adds it with the
-// drain protocol it depends on.
+// of the "guarantee" this lane has twice found inert. The operative widener is
+// D1.1 step 1, which specifies ensure, observe, request-drain and delete;
+// D2.2 supplies the drain protocol those last two depend on. A4.2 step 3 asks
+// for a NARROW interface, so one method is what was requested.
 type WorkloadController interface {
 	EnsureWorkload(ctx context.Context, intent sessionstore.PlacementIntent) error
 }
