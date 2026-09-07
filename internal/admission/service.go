@@ -10,6 +10,7 @@ import (
 	sessionwire "github.com/looprig/core/sessionwire/v1"
 	"github.com/looprig/factory/identity"
 	"github.com/looprig/factory/internal/command"
+	"github.com/looprig/factory/internal/placement"
 	"github.com/looprig/sessionstore"
 )
 
@@ -370,8 +371,17 @@ func gateAdmission(gates []sessionwire.GateProjection, request sessionwire.GateR
 	return refusal(sessionwire.ErrorCodeGateResolved, nil)
 }
 
+// freshMatchingOwner reports whether a resident Host may be handed this
+// session's gate response.
+//
+// It is the placement package's rule, called rather than restated. The question
+// -- is this observation this session's own live, admitting owner -- is exactly
+// the one a placement decides before choosing to reuse an owner instead of
+// re-placing, and the two answers must not be able to differ: an owner
+// placement would re-place while admission still delivered to it is a command
+// handed to a Host the router is about to abandon. A5's own copy of the
+// comparison predated internal/placement and was identical to it; keeping both
+// would have been a second authority for one rule.
 func freshMatchingOwner(owner sessionwire.HostLinkRegistryObservation, record sessionstore.CatalogRecord, now time.Time) bool {
-	return owner.TenantID == record.TenantID && owner.SessionID == record.SessionID && owner.AgentID == record.AgentID &&
-		owner.RuntimeCompatibilityID == record.RuntimeCompatibilityID && owner.Placement == record.DesiredPlacement &&
-		owner.Residency == sessionwire.SessionResidencyResident && owner.Accepting && owner.ExpiresAt.After(now)
+	return placement.ReusableOwner(owner, record, now)
 }
