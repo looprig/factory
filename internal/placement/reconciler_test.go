@@ -4,6 +4,14 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"go/ast"
+	"go/parser"
+	"go/token"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -792,17 +800,26 @@ func TestTwoIntentsNeverShareADesiredKey(t *testing.T) {
 // NAMING a Host instead of asking it to take the session.
 //
 // A4.2 step 2 says the selected candidate is asked to acquire or attach. At the
-// pinned core v0.7.0 there is no request that could carry that: the only
-// per-session control request is HostLinkBindRequest, and it refuses a zero
-// lease epoch -- so a bind names an ownership tuple that a session with no
-// owner, which is the only kind that reaches placement, does not have. Core's
-// own bind decoder says as much, failing closed so that "unknown members cannot
-// become a future attach/create workflow".
+// pinned core v0.7.0 there is no request that could carry that. Three requests
+// concern one session -- bind, unbind and drain -- and only a bind could
+// ESTABLISH a route; it refuses a zero lease epoch, so a bind names an
+// ownership tuple that a session with no owner, which is the only kind that
+// reaches placement, does not have. Unbind refuses a zero epoch too, and drain
+// asks a Host to give up a session it already holds. Core's own bind decoder
+// says the same from the other side, failing closed so that "unknown members
+// cannot become a future attach/create workflow".
 //
 // This asserts a DEPENDENCY's behaviour deliberately and for one reason: it is
 // the premise of a gap this package declares, and a premise nobody rechecks is
-// how a stale citation survives a version bump. When Core grows the request,
-// this test is what fails.
+// how a stale citation survives a version bump.
+//
+// Three ways Core could close the gap, and this test fails on each:
+//
+//   - bind stops refusing a zero epoch  -- the first assertion;
+//   - a lease_held refusal appears      -- the second;
+//   - a NEW record type is declared     -- the third, which is derived from
+//     the pinned package rather than naming a type, because a test can only
+//     name what already exists and the new type is precisely what does not.
 func TestThePinnedWireCannotCarryAnAttachment(t *testing.T) {
 	t.Parallel()
 
@@ -828,5 +845,190 @@ func TestThePinnedWireCannotCarryAnAttachment(t *testing.T) {
 	mismatch := sessionwire.HostLinkError{Code: sessionwire.HostLinkErrorEpochMismatch, CurrentLeaseEpoch: 9}
 	if err := mismatch.Validate(); err != nil {
 		t.Errorf("epoch_mismatch with a current epoch was refused: %v", err)
+	}
+
+	// The two assertions above are blind to the likeliest way this gap closes:
+	// Core adding a NEW record type beside an unchanged bind. Neither names a
+	// type Core does not have yet, and no reflect call can enumerate a
+	// package's declarations, so the vocabulary is derived from the pinned
+	// package's SOURCE and compared against an absolute list.
+	got := exportedHostLinkTypes(t, pinnedSessionwireDir(t))
+	if !slices.Equal(got, pinnedHostLinkTypes) {
+		t.Errorf("the pinned HostLink record vocabulary is %q, not %q.\n"+
+			"Core's HostLink surface changed under the pin. Re-read the gap: if a new record can ask a Host to "+
+			"take a session it does not own, OutcomeAttachPooled must stop naming a Host and start asking one.",
+			got, pinnedHostLinkTypes)
+	}
+}
+
+// pinnedHostLinkTypes is every exported HostLink* type declared by the pinned
+// core sessionwire/v1, as ABSOLUTE literals. A set built from the package
+// itself would pin nothing; this list is what a reader compared against.
+//
+// The whole HostLink prefix is pinned rather than only the *Request suffix,
+// and the width is the point. A gap-marker that watched `HostLink*Request`
+// would still miss a `HostLinkAttach` or a `HostLinkAdoption`, and naming is
+// exactly what a future Core is free to choose. The cost is stated so nobody
+// later files it as noise: ANY growth of the HostLink vocabulary fails this
+// test, including growth that has nothing to do with attachment. That is the
+// intended reading -- the failure asks a human to recheck a premise, and the
+// answer may well be "still true, update the list".
+//
+// VersionNegotiation{Request,Response} are deliberately outside it: they
+// negotiate a connection, name no session, and cannot carry placement.
+var pinnedHostLinkTypes = []string{
+	"HostLinkBindRequest",
+	"HostLinkCapacityReport",
+	"HostLinkCommandDelivery",
+	"HostLinkDrainObservation",
+	"HostLinkDrainRequest",
+	"HostLinkDrainState",
+	"HostLinkError",
+	"HostLinkErrorCode",
+	"HostLinkRegistryObservation",
+	"HostLinkUnbindRequest",
+}
+
+// pinnedCoreVersion is the core version this module's go.mod names, as an
+// absolute literal. It exists so the scan below cannot silently read a
+// DIFFERENT copy of core: under the workspace go.work, or after a pin moves,
+// "the sessionwire on disk" and "the sessionwire this build resolves" are not
+// the same directory, and a premise checked against the wrong one is the stale
+// citation this test exists to prevent.
+const pinnedCoreVersion = "v0.7.0"
+
+const pinnedCoreModule = "github.com/looprig/core"
+
+// pinnedSessionwireDir returns the module cache directory of the sessionwire
+// package at exactly the version go.mod requires, failing if go.mod has moved.
+//
+// The cache path is the module path verbatim: escaping only applies to upper
+// case letters and this path has none.
+func pinnedSessionwireDir(t *testing.T) string {
+	t.Helper()
+
+	// internal/placement -> module root. A test's working directory is its own
+	// package directory, which go test guarantees.
+	gomod, err := os.ReadFile(filepath.Join("..", "..", "go.mod"))
+	if err != nil {
+		t.Fatalf("read go.mod: %v", err)
+	}
+	required := requiredVersion(string(gomod), pinnedCoreModule)
+	if required != pinnedCoreVersion {
+		t.Fatalf("go.mod requires %s %q, but this test was written against %q; recheck every citation in this "+
+			"package against the version now pinned before updating the constant", pinnedCoreModule, required, pinnedCoreVersion)
+	}
+
+	out, err := exec.Command("go", "env", "GOMODCACHE").Output()
+	if err != nil {
+		t.Fatalf("go env GOMODCACHE: %v", err)
+	}
+	cache := strings.TrimSpace(string(out))
+	if cache == "" {
+		t.Fatal("go env GOMODCACHE is empty, so the pinned package cannot be located")
+	}
+	dir := filepath.Join(cache, pinnedCoreModule+"@"+required, "sessionwire", "v1")
+	if entries, err := os.ReadDir(dir); err != nil || len(entries) == 0 {
+		t.Fatalf("pinned sessionwire at %s is unreadable or empty (%v); a scan over nothing proves nothing", dir, err)
+	}
+	return dir
+}
+
+// requiredVersion reports the version a go.mod requires for one module path,
+// or "" when it requires none. Both the block and the single-line forms are
+// read, and the module path is matched as a whole field so that a require of
+// github.com/looprig/coreutil could not answer for github.com/looprig/core.
+func requiredVersion(content, module string) string {
+	for _, line := range strings.Split(content, "\n") {
+		if idx := strings.Index(line, "//"); idx >= 0 {
+			line = line[:idx]
+		}
+		fields := strings.Fields(line)
+		if len(fields) > 0 && fields[0] == "require" {
+			fields = fields[1:]
+		}
+		if len(fields) == 2 && fields[0] == module {
+			return fields[1]
+		}
+	}
+	return ""
+}
+
+// exportedHostLinkTypes reports every exported HostLink* type declared by the
+// production files of a sessionwire package, sorted.
+//
+// It parses rather than greps for the reason command_vocabulary_test.go and
+// import_boundary_test.go give: source text cannot tell a declaration from a
+// comment or a string mentioning one, and this scan's whole value is that it
+// notices a declaration nobody told it about. Test files are excluded because
+// a dependency's own test fixtures are not its wire surface. A scan that
+// parsed no file fails rather than reporting an empty vocabulary, which would
+// otherwise pass as "nothing new".
+func exportedHostLinkTypes(t *testing.T, dir string) []string {
+	t.Helper()
+
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("read %s: %v", dir, err)
+	}
+	var names []string
+	scanned := 0
+	fset := token.NewFileSet()
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		parsed, err := parser.ParseFile(fset, filepath.Join(dir, name), nil, parser.SkipObjectResolution)
+		if err != nil {
+			t.Fatalf("parse %s: %v", name, err)
+		}
+		scanned++
+		for _, decl := range parsed.Decls {
+			gen, ok := decl.(*ast.GenDecl)
+			if !ok || gen.Tok != token.TYPE {
+				continue
+			}
+			for _, spec := range gen.Specs {
+				typ, ok := spec.(*ast.TypeSpec)
+				if !ok || !typ.Name.IsExported() || !strings.HasPrefix(typ.Name.Name, "HostLink") {
+					continue
+				}
+				names = append(names, typ.Name.Name)
+			}
+		}
+	}
+	if scanned == 0 {
+		t.Fatalf("no production Go file was parsed under %s; an empty vocabulary would pass as unchanged", dir)
+	}
+	slices.Sort(names)
+	return names
+}
+
+// TestTheHostLinkVocabularyScanSeesANewType is the positive control for the
+// scan itself. The assertion above can only report growth it is capable of
+// seeing, and against the real pinned core it reports the same list every run
+// whether it works or is stuck -- so the detector is driven over a package it
+// is told the answer to, including a type declared inside a grouped
+// declaration, one that only LOOKS like a record, and one in a test file.
+func TestTheHostLinkVocabularyScanSeesANewType(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	write := func(name, body string) {
+		t.Helper()
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o600); err != nil {
+			t.Fatalf("write %s: %v", name, err)
+		}
+	}
+	write("hostlink.go", "package v1\n\ntype HostLinkBindRequest struct{}\n\n"+
+		"type (\n\tHostLinkAttachRequest struct{}\n\thostLinkPrivate struct{}\n)\n\n"+
+		"type HostPlacement string\n\n// type HostLinkCommentOnly struct{}\n\n"+
+		"const notAType = \"type HostLinkStringOnly struct{}\"\n")
+	write("hostlink_test.go", "package v1\n\ntype HostLinkFixture struct{}\n")
+
+	want := []string{"HostLinkAttachRequest", "HostLinkBindRequest"}
+	if got := exportedHostLinkTypes(t, dir); !slices.Equal(got, want) {
+		t.Fatalf("the scan reported %q, want %q", got, want)
 	}
 }

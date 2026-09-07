@@ -1014,18 +1014,34 @@ work and is deliberately not done here.
 
 **The pinned wire cannot carry an attachment.** A4.2 step 2 has the selected
 candidate asked to acquire or attach. At the pinned `core v0.7.0` there is no
-request that could: the only per-session control request is
-`HostLinkBindRequest`, and it refuses a zero `LeaseEpoch` — so a bind names an
-ownership tuple that a session with no owner, which is the only kind that
-reaches placement, does not have. Core's own bind decoder fails closed so that
-"unknown members cannot become a future attach/create workflow", which is the
-same gap seen from the other side. `OutcomeAttachPooled` therefore names a Host
-and stops; the caller performs no attachment because none exists to perform.
-`TestThePinnedWireCannotCarryAnAttachment` pins the premise, so a Core that
-grows the request fails this repository rather than leaving a stale citation.
-The same test records that **Core names no `lease_held` refusal**: step 2's
-`LeaseHeld` is spelled `HostLinkErrorEpochMismatch`, whose `CurrentLeaseEpoch`
-is the whole answer.
+request that could. Three of its records concern one session — bind, unbind and
+drain — and only a **bind** could establish a route; it refuses a zero
+`LeaseEpoch`, so a bind names an ownership tuple that a session with no owner,
+which is the only kind that reaches placement, does not have. Unbind refuses a
+zero epoch too, and drain asks a Host to *give up* a session it already holds.
+Core's own bind decoder fails closed so that "unknown members cannot become a
+future attach/create workflow", which is the same gap seen from the other side.
+`OutcomeAttachPooled` therefore names a Host and stops; the caller performs no
+attachment because none exists to perform. The same premise records that **Core
+names no `lease_held` refusal**: step 2's `LeaseHeld` is spelled
+`HostLinkErrorEpochMismatch`, whose `CurrentLeaseEpoch` is the whole answer.
+
+**The marker is executable, and its third assertion is derived rather than
+named.** `TestThePinnedWireCannotCarryAnAttachment` fails on each of the three
+ways Core could close this: bind relaxing the zero-epoch rule, a `lease_held`
+code appearing, and — the likeliest, and the one the first version was blind to
+— a **new record type** declared beside an unchanged bind. A test cannot name a
+type that does not exist yet and no reflect call can enumerate a package, so the
+HostLink vocabulary is parsed out of the pinned `sessionwire/v1` source and
+compared against an absolute list of the ten names it holds today. The version
+is read from `go.mod` and required to be the pin before anything is parsed, so
+the premise cannot be checked against a different copy of core than the build
+resolves. The whole `HostLink` prefix is watched rather than the `*Request`
+suffix, because naming is exactly what a future Core is free to choose; the
+accepted cost is that any growth of that vocabulary fails the test and asks a
+human to recheck the premise. `TestTheHostLinkVocabularyScanSeesANewType` is the
+scan's own positive control, because against a clean pinned core the assertion
+reports the same list whether the scan works or is stuck.
 
 **Tenant-exclusive pooled capacity is refused, not admitted.** Section 12 makes
 Factory placement the enforcer of tenant exclusivity for a pooled Host without
