@@ -248,6 +248,23 @@ func (p *Pool) Bindings(host sessionwire.HostID) int {
 	return len(pooled.bindings)
 }
 
+// RouteFor reports which Host a tenant-scoped session is bound to.
+//
+// It exists because the route table is the pool's actual routing authority and
+// nothing else can observe it. Bindings counts entries in a DIFFERENT map, held
+// per link, and the two are only kept in step by this file: a route released
+// without its binding, or a binding released without its route, satisfies every
+// count this type otherwise exposes. The second of those is the more expensive
+// one -- an orphaned route names a Host the reaper is then free to collect,
+// because the reaper's own test is the binding set -- so the table is made
+// observable rather than inferred.
+func (p *Pool) RouteFor(tenantID sessionwire.TenantID, sessionID sessionwire.SessionID) (sessionwire.HostID, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	host, ok := p.routes[routeKey{tenant: tenantID, session: sessionID}]
+	return host, ok
+}
+
 // Bind establishes one session route over the pooled link to target.
 //
 // Both the target and the record are validated BEFORE anything is dialled, so a
@@ -326,7 +343,18 @@ func (p *Pool) Unbind(ctx context.Context, req sessionwire.HostLinkUnbindRequest
 	if req.HostID != host {
 		return fmt.Errorf("%w: request names %q, session is bound to %q", ErrTargetMismatch, req.HostID, host)
 	}
-	pooled := p.links[host]
+	// The route and the link table are two maps. They are written and deleted
+	// in the same critical section, so a route always names a live link -- but
+	// nothing in the type system says so, and the cost of being wrong is not a
+	// wrong answer but a nil dereference under this lock, which wedges every
+	// later caller as well as killing this one. It fails closed instead, and
+	// the orphaned route is DROPPED: a route naming nothing that survived its
+	// own refusal would refuse every later bind for that session as a conflict.
+	pooled, ok := p.links[host]
+	if !ok {
+		delete(p.routes, key)
+		return fmt.Errorf("%w: session %q was routed to %q, which has no link", ErrUnknownBinding, req.SessionID, host)
+	}
 	delete(p.routes, key)
 	delete(pooled.bindings, key)
 	if len(pooled.bindings) == 0 {
@@ -360,7 +388,15 @@ func (p *Pool) DeliverCommand(ctx context.Context, tenantID sessionwire.TenantID
 		p.mu.Unlock()
 		return fmt.Errorf("%w: session %q", ErrUnknownBinding, sessionID)
 	}
-	link := p.links[host].link
+	// Fails closed for the reason Unbind does. The route is left in place here
+	// rather than dropped, because a delivery is not the caller that owns the
+	// route's lifetime; Unbind is.
+	pooled, ok := p.links[host]
+	if !ok {
+		p.mu.Unlock()
+		return fmt.Errorf("%w: session %q is routed to %q, which has no link", ErrUnknownBinding, sessionID, host)
+	}
+	link := pooled.link
 	p.mu.Unlock()
 
 	if err := link.DeliverCommand(ctx, delivery); err != nil {

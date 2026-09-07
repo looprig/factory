@@ -265,6 +265,16 @@ func TestUnbindTellsTheHostAndReleasesTheLocalRoute(t *testing.T) {
 	if got := pool.Bindings(hostOne); got != 1 {
 		t.Errorf("Bindings(%s) = %d, want 1", hostOne, got)
 	}
+	// The ROUTE TABLE is asserted on separately, because it is a different map
+	// from the one Bindings reads. A pool that emptied the binding set and left
+	// the route behind satisfies the count above and is broken: the route
+	// outlives the link the reaper is then free to collect.
+	if host, ok := pool.RouteFor(tenant, "s-1"); ok {
+		t.Errorf("RouteFor(s-1) = %q after the unbind, want no route", host)
+	}
+	if host, ok := pool.RouteFor(tenant, "s-2"); !ok || host != hostOne {
+		t.Errorf("RouteFor(s-2) = %q,%v, want %q,true", host, ok, hostOne)
+	}
 	unbinds := dialer.link(hostOne).unbinds()
 	if len(unbinds) != 1 {
 		t.Fatalf("the Host received %d unbind requests, want 1", len(unbinds))
@@ -339,6 +349,91 @@ func TestAFailedUnbindStillReleasesTheLocalRoute(t *testing.T) {
 	}
 	if got := pool.Bindings(hostOne); got != 0 {
 		t.Errorf("Bindings(%s) = %d after a failed unbind, want 0", hostOne, got)
+	}
+	// Same reason as above: the claim in this test's name is about the ROUTE,
+	// and the binding count is a different map that cannot report it.
+	if host, ok := pool.RouteFor(tenant, "s-1"); ok {
+		t.Errorf("RouteFor(s-1) = %q after a failed unbind, want no route", host)
+	}
+}
+
+// TestAnUnboundSessionIsBindableToAnotherHost is the consequence of releasing
+// the route, measured rather than asserted.
+//
+// Unbind's whole purpose is to make the next Bind possible: a route left behind
+// is refused as an ErrBindingConflict against "a route nobody wants", which is
+// the failure Unbind's own doc warns about. Binding elsewhere afterwards is the
+// only caller-visible behaviour that distinguishes a released route from a
+// binding set that merely lost an entry.
+func TestAnUnboundSessionIsBindableToAnotherHost(t *testing.T) {
+	t.Parallel()
+
+	dialer := newRecordingDialer()
+	pool := newPool(t, dialer, hostlink.Limits{})
+
+	mustBind(t, pool, target(hostOne, endpoint1), bindRequest(hostOne, "s-1"))
+	if err := pool.Unbind(context.Background(), unbindRequest(hostOne, "s-1")); err != nil {
+		t.Fatalf("Unbind: %v", err)
+	}
+
+	if err := pool.Bind(context.Background(), target(hostTwo, endpoint2), bindRequest(hostTwo, "s-1")); err != nil {
+		t.Fatalf("Bind to the second host after an unbind: %v", err)
+	}
+	if host, ok := pool.RouteFor(tenant, "s-1"); !ok || host != hostTwo {
+		t.Errorf("RouteFor(s-1) = %q,%v after rebinding elsewhere, want %q,true", host, ok, hostTwo)
+	}
+	// And the command follows the new route, so this is not merely a bind that
+	// returned nil while the table still pointed at the old Host.
+	delivery := sessionwire.HostLinkCommandDelivery{CommandID: "cmd-after-unbind"}
+	if err := pool.DeliverCommand(context.Background(), tenant, "s-1", delivery); err != nil {
+		t.Fatalf("DeliverCommand after rebinding: %v", err)
+	}
+	if got := dialer.link(hostTwo).commands(); len(got) != 1 || got[0].CommandID != "cmd-after-unbind" {
+		t.Errorf("host-2 received %v, want one delivery of cmd-after-unbind", got)
+	}
+	if got := dialer.link(hostOne).commands(); len(got) != 0 {
+		t.Errorf("host-1 received %v after the session moved, want nothing", got)
+	}
+}
+
+// TestACommandForASessionUnboundAndThenReapedIsRefusedRatherThanDelivered is
+// the same missing delete seen from the reaper's side, and it is the path that
+// costs a panic rather than a wrong answer.
+//
+// ReapIdle is ALLOWED to collect a link whose binding set is empty. If Unbind
+// empties the bindings but leaves the route, the route then names a Host with
+// no entry in the link table, and the next delivery looks that entry up. Only
+// the route table can report this; Bindings and Links are both already zero in
+// the correct case as well.
+func TestACommandForASessionUnboundAndThenReapedIsRefusedRatherThanDelivered(t *testing.T) {
+	t.Parallel()
+
+	dialer := newRecordingDialer()
+	limits := defaultLimits()
+	limits.IdleTimeout = 30 * time.Second
+	clock := &fakeClock{now: time.Unix(1_700_000_000, 0)}
+	pool := newPoolWithClock(t, dialer, limits, clock)
+
+	mustBind(t, pool, target(hostOne, endpoint1), bindRequest(hostOne, "s-1"))
+	if err := pool.Unbind(context.Background(), unbindRequest(hostOne, "s-1")); err != nil {
+		t.Fatalf("Unbind: %v", err)
+	}
+	if host, ok := pool.RouteFor(tenant, "s-1"); ok {
+		t.Fatalf("RouteFor(s-1) = %q after the unbind, want no route", host)
+	}
+
+	clock.advance(limits.IdleTimeout)
+	if got := pool.ReapIdle(); got != 1 {
+		t.Fatalf("ReapIdle() reaped %d links, want 1", got)
+	}
+
+	err := pool.DeliverCommand(context.Background(), tenant, "s-1",
+		sessionwire.HostLinkCommandDelivery{CommandID: "cmd-abc"})
+	if !errors.Is(err, hostlink.ErrUnknownBinding) {
+		t.Fatalf("DeliverCommand after unbind and reap = %v, want ErrUnknownBinding", err)
+	}
+	if got := dialer.link(hostOne).commands(); len(got) != 0 {
+		t.Errorf("the reaped Host received %v, want nothing", got)
 	}
 }
 
