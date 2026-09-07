@@ -119,7 +119,8 @@ func TestADialIsRefusedWhenTheHostRejectsTheCredential(t *testing.T) {
 	// 3500 is DisconnectInvalidToken (centrifuge@v0.38.0/disconnect.go:122),
 	// in the terminal band 3500-3999, so the client does not reconnect and
 	// reports it through OnDisconnected. The literal was measured, not
-	// recalled: it was first written as 3501, which is DisconnectBadRequest.
+	// recalled: it was first written as 3501, which is DisconnectBadRequest
+	// (disconnect.go:127 -- its own declaration, not :122).
 	if closed.Code != 3500 {
 		t.Errorf("HostDisconnect.Code = %d, want 3500", closed.Code)
 	}
@@ -176,8 +177,13 @@ func TestEachControlRecordReachesTheHostAsItsOwnMethodAndBody(t *testing.T) {
 	if len(calls) != 3 {
 		t.Fatalf("the Host received %d rpcs, want 3", len(calls))
 	}
+	// The wanted methods are ABSOLUTE LITERALS, not the constants. Comparing
+	// what the Host recorded against hostlink.MethodBind pins nothing: a rename
+	// moves both sides together and this case stays green while Factory stops
+	// speaking the protocol the Host implements. TestTheWireVocabularyIsPinnedToItsLiterals
+	// states the same strings once more, deliberately.
 	if got, want := []string{calls[0].method, calls[1].method, calls[2].method},
-		[]string{hostlink.MethodBind, hostlink.MethodCommand, hostlink.MethodUnbind}; !slices.Equal(got, want) {
+		[]string{"hostlink.bind", "hostlink.command", "hostlink.unbind"}; !slices.Equal(got, want) {
 		t.Fatalf("the Host received methods %v, want %v", got, want)
 	}
 
@@ -729,6 +735,104 @@ func (h *hostServer) pushRaw(t *testing.T, data []byte) {
 			t.Fatal("no connected client to push to")
 		}
 		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// TestTheWireVocabularyIsPinnedToItsLiterals holds Factory's half of an
+// unwritten cross-repo contract to absolute strings.
+//
+// Core v0.7.0 defines the record bodies and no transport framing, so these
+// names are a PROPOSAL the Host writer must mirror exactly. Every other case in
+// this file compares what the stand-in recorded against the constant it was
+// sent with, which pins nothing at all: renaming MethodBind renames both sides
+// and the whole suite stays green. Writing the strings out is what makes a
+// rename a deliberate act rather than a silent one, for the same reason
+// limits_test.go pins the ping boundary as a literal rather than through the
+// constant it guards.
+func TestTheWireVocabularyIsPinnedToItsLiterals(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name string
+		got  string
+		want string
+	}{
+		{"MethodBind", hostlink.MethodBind, "hostlink.bind"},
+		{"MethodUnbind", hostlink.MethodUnbind, "hostlink.unbind"},
+		{"MethodCommand", hostlink.MethodCommand, "hostlink.command"},
+		{"PushTypeCapacity", hostlink.PushTypeCapacity, "host.capacity"},
+		{"PushTypeRegistry", hostlink.PushTypeRegistry, "host.registry"},
+	} {
+		if tc.got != tc.want {
+			t.Errorf("%s = %q, want %q -- this string is Factory's half of a protocol "+
+				"whose Host half mirrors it; changing it is a cross-repo change", tc.name, tc.got, tc.want)
+		}
+	}
+}
+
+// TestATerminalDisconnectOnALiveLinkStopsItAnswering is the other half of the
+// terminal-link decision, which was otherwise pinned only on the version path.
+//
+// centrifuge-go reports 3500-3999 and 4500-4999 through OnDisconnected and does
+// not reconnect from them (centrifuge-go@v0.12.0/client.go:989). A link that
+// kept answering afterwards would report every control record as an undelivered
+// command, which is a retry loop against a Host that has already given its
+// final answer. TestADialIsRefusedWhenTheHostRejectsTheCredential cannot cover
+// this: there the refusal arrives at DIAL time, Dial fails and no link is ever
+// returned, so a LIVE link never carries the terminal state.
+func TestATerminalDisconnectOnALiveLinkStopsItAnswering(t *testing.T) {
+	t.Parallel()
+
+	host := newHostServer(t, hostOptions{})
+	link := mustDial(t, host)
+	// The link must be established and working first, otherwise this is the
+	// dial-time case again under another name.
+	if err := link.Bind(context.Background(), bindRequest(hostOne, "s-1")); err != nil {
+		t.Fatalf("Bind before the disconnect: %v", err)
+	}
+
+	// The library's own constant, so the band is the library's rather than a
+	// number recalled here. DisconnectInvalidToken is 3500
+	// (centrifuge@v0.38.0/disconnect.go:122).
+	host.disconnectEveryone(centrifuge.DisconnectInvalidToken)
+
+	// The wait is written out rather than delegated to waitUntil so that a
+	// failure names a VALUE: a link that answered would be reporting some other
+	// error, and "no HostDisconnect within 20s" alone would read as this box's
+	// load. The last error actually seen is carried into the message.
+	var closed *hostlink.HostDisconnect
+	var last error
+	for deadline := time.Now().Add(waitFor); ; {
+		last = link.Bind(context.Background(), bindRequest(hostOne, "s-2"))
+		if errors.As(last, &closed) {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the link kept answering after a terminal disconnect: last Bind error = %v, want a *HostDisconnect", last)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	// The verdict is taken from values, not from the wait.
+	if closed.Code != 3500 {
+		t.Errorf("HostDisconnect.Code = %d, want 3500", closed.Code)
+	}
+	if closed.Host != hostOne {
+		t.Errorf("HostDisconnect.Host = %q, want %q", closed.Host, hostOne)
+	}
+	// Every method is refused, not just the one that discovered the state.
+	err := link.DeliverCommand(context.Background(), sessionwire.HostLinkCommandDelivery{CommandID: "cmd-abc"})
+	if !errors.As(err, &closed) {
+		t.Errorf("DeliverCommand after a terminal disconnect = %v, want the HostDisconnect", err)
+	}
+	// And nothing reached the Host afterwards: a link that answered would have
+	// tried, which is the retry loop this decision exists to prevent.
+	for index, call := range host.calls() {
+		if call.method != "hostlink.bind" {
+			t.Errorf("rpc %d after the terminal disconnect was %q, want no rpc but the first bind", index, call.method)
+		}
+	}
+	if got := len(host.calls()); got != 1 {
+		t.Errorf("the Host received %d rpcs, want 1 -- only the bind that preceded the disconnect", got)
 	}
 }
 
