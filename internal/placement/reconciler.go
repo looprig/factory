@@ -3,10 +3,10 @@ package placement
 import (
 	"context"
 	"crypto/sha256"
-	"encoding/binary"
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"strconv"
 	"time"
 
 	sessionwire "github.com/looprig/core/sessionwire/v1"
@@ -426,6 +426,13 @@ func storedDesired(record sessionstore.CatalogRecord, desired Desired) bool {
 // of "2x" hashes the same as "v12" with "x" -- and two intents sharing a key is
 // precisely the case SessionStore's contract warns about: a reused key for a
 // NEW intent succeeds without applying anything.
+//
+// The prefix is the DECIMAL length followed by a NUL, rather than a fixed-width
+// integer, and that is not a style choice: a four-byte width has to narrow an
+// int to a uint32 somewhere, which is a silent truncation for a field longer
+// than four gigabytes -- exactly the collision this framing exists to prevent,
+// reintroduced by the mechanism preventing it. A NUL cannot appear among
+// decimal digits, so the boundary is unambiguous and no conversion is needed.
 func desiredKey(req Request, desired Desired) string {
 	digest := sha256.New()
 	for _, field := range [][]byte{
@@ -436,9 +443,8 @@ func desiredKey(req Request, desired Desired) string {
 		[]byte(desired.Workload.PayloadVersion),
 		desired.Workload.Payload,
 	} {
-		var length [4]byte
-		binary.BigEndian.PutUint32(length[:], uint32(len(field)))
-		digest.Write(length[:])
+		digest.Write([]byte(strconv.Itoa(len(field))))
+		digest.Write([]byte{0})
 		digest.Write(field)
 	}
 	return "placement-" + hex.EncodeToString(digest.Sum(nil))
