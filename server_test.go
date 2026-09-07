@@ -11,6 +11,7 @@ import (
 	"github.com/looprig/factory/internal/admission"
 	"github.com/looprig/factory/internal/httpapi"
 	internalidentity "github.com/looprig/factory/internal/identity"
+	"github.com/looprig/factory/internal/placement"
 	"github.com/looprig/factory/internal/realtime/clientlink"
 	"github.com/looprig/factory/internal/realtime/hostlink"
 )
@@ -52,13 +53,13 @@ func publicSeams() map[reflect.Type][]reflect.Type {
 		iface[factory.Authorizer]():          {iface[httpapi.Authorizer](), iface[clientlink.Authorizer](), iface[admission.Authorizer]()},
 		iface[factory.SessionReader]():       {iface[httpapi.SessionReader]()},
 		iface[factory.Commands]():            {iface[admission.Commands]()},
-		iface[factory.Directory]():           {iface[admission.Directory](), iface[httpapi.Directory]()},
+		iface[factory.Directory]():           {iface[admission.Directory](), iface[httpapi.Directory](), iface[placement.Directory]()},
 		iface[factory.PlacementController](): {iface[admission.PlacementController]()},
 		// internal/identity declares a Clock with only Now, because expiry is
 		// the only time it reads. Pairing it here is what keeps the union
 		// assertion honest: a narrower consumer must still be satisfied by the
 		// one object a deployer supplies.
-		iface[factory.Clock]():      {iface[admission.Clock](), iface[internalidentity.Clock]()},
+		iface[factory.Clock]():      {iface[admission.Clock](), iface[internalidentity.Clock](), iface[placement.Clock]()},
 		iface[factory.UUIDSource](): {iface[admission.UUIDSource]()},
 	}
 }
@@ -151,6 +152,16 @@ func allSeams() []reflect.Type {
 		iface[identity.Verifier](),
 		iface[hostlink.Dialer](),
 		iface[hostlink.Link](),
+		// internal/placement's seams are listed here and NOT in publicSeams,
+		// as hostlink's are. Its Catalog declares UpdateCatalogDesiredState,
+		// which no seam on the option surface carries: factory.SessionReader is
+		// the READ plane and widening it to author desired state is a
+		// composition decision A9.1 owns, not one a task adding a consumer may
+		// make by pairing a row here. What this list still buys them is
+		// TestNoSeamNamesAStoragePrimitive.
+		iface[placement.Catalog](),
+		iface[placement.Claims](),
+		iface[placement.WorkloadController](),
 	}
 }
 
