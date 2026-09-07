@@ -305,5 +305,5 @@ derives principals; the HTTP API, admission, routing and placement are the
 subject of later tasks in runbook 05. The realtime transport is pinned and
 measured (A5.1), the ClientLink engine is built (A6.1) and the HostLink pool and
 dialer are built (A7.1); `factory.New` composes none of the three. Target
-discovery (A4.1) and the placement policy and reconciler (A4.2) are built and
-likewise uncomposed.
+discovery (A4.1), the placement policy and reconciler (A4.2) and the local
+HostBindings table (A4.3) are built and likewise uncomposed.

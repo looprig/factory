@@ -1055,10 +1055,94 @@ pooled placement at all until the directory carries a tenant dimension, which is
 H8's per-tenant Department and a specification section 7 change that is not this
 repository's to book.
 
-Not built here: the HostBindings of A4.3, the attachment and demand-driven
-binding of A7.2, drain-before-delete of D2.2, and the authorship of a dedicated
-workload's payload — `Desired` is an INPUT, because what a launch template
-should contain is a composition question A9.1 owns.
+Not built here: the attachment and demand-driven binding of A7.2,
+drain-before-delete of D2.2, and the authorship of a dedicated workload's
+payload — `Desired` is an INPUT, because what a launch template should contain
+is a composition question A9.1 owns.
+
+## The local binding table
+
+A4.3 added `routing.Bindings`: which Host each session this replica is serving
+is bound to, and how many local subscribers want it. It is **local state only**
+— nothing is written durably, nothing is coordinated with another replica, and
+a restart is a new value that knows nothing. There is deliberately no
+reconstruction path to write, because reconstruction is what the ordinary path
+already does: the registry answers who owns the session and a subscriber's
+`Acquire` supplies the demand.
+
+**Identity is the whole ownership tuple, not the session.** `BindingKey` is
+`{TenantID, SessionID, HostID, HostGeneration, LeaseEpoch}`, and each member
+names a way a route becomes wrong without the session changing: a session id is
+unique only within a tenant (the HostLink pool's route table learned this), a
+session that moved is served by a different link, a restarted Host has none of
+the state the route assumed, and a superseded epoch is exactly what the owning
+Host refuses. So "invalidate" and "the key changed" are one fact, and there is
+no second staleness rule that could disagree with the key.
+
+**Reuse costs no registry read, which is what makes invalidation a push.** The
+route is not re-derived on use, so `Observe` is how it learns a tuple is no
+longer current — and the assertion for that is a COUNT of registry reads, since
+a table that re-read every time would return an identical binding and pass any
+comparison of the two. `Observe` **drops** the route rather than rebinding from
+the observation: a push is a hint, the registry is the authority, and what the
+push is trusted for is only "what you hold is stale", which needs no trust at
+all. Demand survives, so the next `Acquire` or `Deliver` rebinds. An older
+epoch is stale and ignored; the same epoch naming a different Host or
+generation is a contradiction and invalidates, because keeping a route the
+registry contradicts is how a command reaches a Host that is not the owner.
+The stated cost: a lease that changes with nobody pushing leaves a stale route
+until the owning Host refuses what it carries. That is a refusal, not a repair;
+repair is A7.3's.
+
+**Demand is the only lifetime rule.** `Deliver` requires demand and does not
+open a route, so a caller delivering to an unwatched session brackets it with
+`Acquire`/`Release` and the pool's idle window absorbs the cost. A delivery
+whose binding was invalidated is rebound and the command is **redelivered** to
+the new owner — the delivery carries only the retry-stable public CommandID,
+and the Host's lease and SessionStore's idempotency are what make repeating it
+safe. A delivery FAILURE changes nothing: this table cannot tell a lost
+connection from a refusal, and dropping the route on either is a rebind storm
+that still has not delivered anything.
+
+**A failed unbind still drops the local route, and `Close` joins rather than
+returns.** The first is the HostLink pool's rule one level up and for its
+reason: nothing above retries, so a route kept after a failure is kept forever
+and the next bind is refused as a conflict against a route nobody wants. The
+second is so one Host's failure cannot strand the routes on the others, which
+are the ones a restarted replica would then conflict with. `Close` has no
+`closed` fast path: a mutant deleting one survived the whole suite, because
+idempotence comes from emptying the table — the same evidence on which the
+HostLink pool removed its own.
+
+**The bind key is derived and framed.** Core wants a retry-stable idempotency
+key; deriving it from the tuple is what makes a repeated bind a repeat without
+coordination, and the unbind carries the same key so a Host's two records of
+one route cannot name two things. The tuple is length-framed before hashing —
+an identifier is arbitrary UTF-8 up to `MaxIDBytes`, so tenant `a` with session
+`bc` and tenant `ab` with session `c` are one string under concatenation. That
+is `internal/placement`'s desired-key lesson, asserted here in its own right
+rather than shared, because the two keys frame different fields; no integer
+conversion appears in either.
+
+**The seam names Core, not the transport.** `Binder` is the HostLink pool's
+control surface stated in Core's vocabulary, with the endpoint passed beside
+the request instead of the pool's `Target` struct. A binding is routing state
+that outlives any particular transport, and naming a `hostlink` type here would
+put centrifuge in this package's graph where the boundary rules deliberately do
+not have it. The cost is one adapter at composition, which is A9.1's.
+
+**`Directory.Owner` did not report every absence, and A4.3's integration case
+is what found it.** Outside the legacy single-tenant layout SessionStore
+verifies a session's collision witnesses before it reads a record, so a session
+that was never created fails with `*KeyspaceError` / `binding_not_found` and
+never reaches the registry — `internal/httpapi` recorded exactly this, and
+`routing` had the same defect: every absent session was reported as a store
+FAILURE, which a caller answers by placing a session that has no record to
+place. The classification table could not have caught it, because a fake
+answers whatever error a case hands it and the cases were written from the
+registry's vocabulary; the case that found it drives the real store, and it
+also pins the store's answer so a later SessionStore that stopped answering
+that way would say so here.
 
 ## Not implemented yet
 
