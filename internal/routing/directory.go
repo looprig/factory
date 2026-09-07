@@ -77,15 +77,22 @@ func NewDirectory(store Store, limits Limits) (*Directory, error) {
 // Absence, expiry and a released tombstone all mean that no owner is routable;
 // their different store codes remain an operational concern, not three kinds
 // of ownership.
+//
+// ABSENCE IS NOT ALWAYS A REGISTRY CODE. Outside the legacy single-tenant
+// layout the store verifies a session's collision witnesses BEFORE it reads a
+// record, so a session that was never created fails with *KeyspaceError
+// binding_not_found and never reaches the registry at all. sessionstore's own
+// noSuchSession names exactly that set, and internal/httpapi found the same
+// thing the hard way: reading only the registry codes made every absent
+// session a store FAILURE, which a caller answers by treating a routable
+// session as unroutable -- or, here, by placing a session that has no record
+// to place. Keyspace codes other than binding_not_found are real deployment
+// faults and are propagated.
 func (d *Directory) Owner(ctx context.Context, tenant sessionwire.TenantID, session sessionwire.SessionID) (sessionwire.HostLinkRegistryObservation, bool, error) {
 	entry, err := d.store.GetHostRegistration(ctx, sessionstore.GetHostRegistrationRequest{TenantID: tenant, SessionID: session})
 	if err != nil {
-		var registryErr *sessionstore.RegistryError
-		if errors.As(err, &registryErr) {
-			switch registryErr.Code {
-			case sessionstore.RegistryErrorNotFound, sessionstore.RegistryErrorExpired, sessionstore.RegistryErrorReleased:
-				return sessionwire.HostLinkRegistryObservation{}, false, nil
-			}
+		if noSuchOwner(err) {
+			return sessionwire.HostLinkRegistryObservation{}, false, nil
 		}
 		return sessionwire.HostLinkRegistryObservation{}, false, err
 	}
@@ -141,4 +148,19 @@ func (d *Directory) Candidates(ctx context.Context, original sessionstore.ListCo
 			dueCursor = result.NextCursor
 		}
 	}
+}
+
+// noSuchOwner reports the store failures that mean "this session has no
+// routable owner" rather than "the store could not answer".
+func noSuchOwner(err error) bool {
+	var registryErr *sessionstore.RegistryError
+	if errors.As(err, &registryErr) {
+		switch registryErr.Code {
+		case sessionstore.RegistryErrorNotFound, sessionstore.RegistryErrorExpired, sessionstore.RegistryErrorReleased:
+			return true
+		}
+		return false
+	}
+	var keyspaceErr *sessionstore.KeyspaceError
+	return errors.As(err, &keyspaceErr) && keyspaceErr.Code == sessionstore.KeyspaceBindingNotFound
 }

@@ -244,6 +244,17 @@ func TestOwnerClassifiesStoreErrors(t *testing.T) {
 		{name: "not found is absence", storeErr: &sessionstore.RegistryError{Code: sessionstore.RegistryErrorNotFound}, absent: true},
 		{name: "expired is absence", storeErr: &sessionstore.RegistryError{Code: sessionstore.RegistryErrorExpired}, absent: true},
 		{name: "released is absence", storeErr: &sessionstore.RegistryError{Code: sessionstore.RegistryErrorReleased}, absent: true},
+		// A session that was never created never reaches the registry at all:
+		// outside the legacy single-tenant layout the store verifies its
+		// collision witnesses first and answers *KeyspaceError
+		// binding_not_found. sessionstore's own noSuchSession names exactly
+		// this set, and internal/httpapi already learned the same lesson --
+		// reading only the registry codes made every absent session a store
+		// FAILURE rather than an absent owner.
+		{name: "an unbound session is absence", storeErr: &sessionstore.KeyspaceError{Code: sessionstore.KeyspaceBindingNotFound}, absent: true},
+		// The control that keeps the arm above from swallowing the keyspace's
+		// real failures: a layout mismatch is a deployment fault, not absence.
+		{name: "another keyspace failure is propagated", storeErr: &sessionstore.KeyspaceError{Code: sessionstore.KeyspaceLayoutMismatch}},
 		{name: "backend failure is propagated", storeErr: backendErr},
 		{name: "non-registry failure is propagated", storeErr: nonRegistryErr},
 	}
@@ -270,6 +281,35 @@ func TestOwnerClassifiesStoreErrors(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestOwnerReportsASessionNobodyRegisteredAsAbsent is the case the table above
+// could not have caught on its own. The fake answers whatever error a case
+// hands it, so a table written from the registry's vocabulary tests the
+// classification against the classifier's own assumptions; this drives the
+// REAL store, which is where the answer for a session nobody registered
+// actually comes from.
+func TestOwnerReportsASessionNobodyRegisteredAsAbsent(t *testing.T) {
+	store, _ := openDirectoryStore(t)
+	directory := mustDirectory(t, store, DefaultLimits())
+
+	owner, ok, err := directory.Owner(context.Background(), "tenant-a", "session-never-created")
+	if err != nil {
+		t.Fatalf("Owner = %v, want an absent owner rather than a failure", err)
+	}
+	if ok || owner != (sessionwire.HostLinkRegistryObservation{}) {
+		t.Fatalf("Owner = %+v, %v; want no routable owner", owner, ok)
+	}
+
+	// And the premise, so a later sessionstore that stopped answering this way
+	// would say so here rather than leaving the arm above covering nothing.
+	_, direct := store.GetHostRegistration(context.Background(), sessionstore.GetHostRegistrationRequest{
+		TenantID: "tenant-a", SessionID: "session-never-created",
+	})
+	var keyspace *sessionstore.KeyspaceError
+	if !errors.As(direct, &keyspace) || keyspace.Code != sessionstore.KeyspaceBindingNotFound {
+		t.Fatalf("the store answered %v for a session nobody created, want a keyspace binding_not_found", direct)
 	}
 }
 
