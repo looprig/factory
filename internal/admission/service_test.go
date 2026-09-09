@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -1087,9 +1088,27 @@ func admissionEntryPoints(t *testing.T) map[string]func(*serviceFixture) error {
 // can be broken. A site nobody drives is either dead code or an untested fold,
 // and both want a human.
 //
-// The call graph is syntactic, and which way it errs is derived in
-// packageCallGraph rather than asserted here -- the two comments disagreed, and
-// the one that claimed the safe direction was the wrong one.
+// # The unit of analysis, stated so the claim cannot be wider than it
+//
+// A node is a function DECLARATION or a function LITERAL, in a non-test .go
+// file directly in this package's directory. That is what the guard keys on and
+// therefore the boundary of what it can see:
+//
+//   - Another PACKAGE cannot host one of these sites: refusal is unexported, so
+//     nothing outside this directory can call it. There are no subdirectories,
+//     and one would be a different package. This is not a file-name prefix rule
+//     -- every non-test .go file here is scanned -- so a site cannot hide by
+//     being in a file somebody did not think to name.
+//   - A literal is its own node with no incoming edge, so a refusal minted
+//     inside a closure is reported unreached rather than inheriting the
+//     reachability of the function that declares it.
+//   - A call this scan cannot attribute is not an edge, so its target looks
+//     unreached and fails. That is the direction the whole construction has to
+//     err in, and packageCallGraph derives it rather than asserting it.
+//
+// What remains: a local variable of func type whose name shadows a package
+// function would produce a spurious identifier edge. That one is stated rather
+// than closed.
 func TestEveryClassifiedRefusalIsReachableFromADrivenEntryPoint(t *testing.T) {
 	t.Parallel()
 
@@ -1194,6 +1213,7 @@ func packageCallGraph(root string) (callers, callees map[string][]string, duplic
 	callers, callees = map[string][]string{}, map[string][]string{}
 	declared := map[string]int{}
 	fset := token.NewFileSet()
+	var record func(string, ast.Node)
 	for _, entry := range entries {
 		name := entry.Name()
 		if entry.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
@@ -1220,32 +1240,52 @@ func packageCallGraph(root string) (callers, callees map[string][]string, duplic
 			if fn.Recv != nil && len(fn.Recv.List) == 1 && len(fn.Recv.List[0].Names) == 1 {
 				receiver = fn.Recv.List[0].Names[0].Name
 			}
-			ast.Inspect(fn.Body, func(n ast.Node) bool {
-				call, ok := n.(*ast.CallExpr)
-				if !ok {
-					return true
-				}
-				var called string
-				switch fun := call.Fun.(type) {
-				case *ast.Ident:
-					called = fun.Name
-				case *ast.SelectorExpr:
-					ident, isIdent := fun.X.(*ast.Ident)
-					if !isIdent || receiver == "" || ident.Name != receiver {
+			record = func(from string, body ast.Node) {
+				ast.Inspect(body, func(n ast.Node) bool {
+					// A function literal is its OWN node, so its calls are not
+					// attributed to the declaration that encloses it. That is
+					// escape (C), reported from the sessionstore lane's audit of
+					// the same construction: a call nested inside an
+					// already-reached function inherits its reachability, and a
+					// closure that is declared but never invoked would inherit
+					// coverage it does not have. A literal has no incoming edge
+					// here at all, so a refusal minted inside one is reported
+					// unreached and has to be argued for. There are none today.
+					if lit, isLit := n.(*ast.FuncLit); isLit && n != body {
+						name := from + "@literal:" + strconv.Itoa(fset.Position(lit.Pos()).Line)
+						if _, seen := callees[name]; !seen {
+							callees[name] = nil
+						}
+						record(name, lit.Body)
+						return false
+					}
+					call, ok := n.(*ast.CallExpr)
+					if !ok {
 						return true
 					}
-					called = fun.Sel.Name
-				default:
+					var called string
+					switch fun := call.Fun.(type) {
+					case *ast.Ident:
+						called = fun.Name
+					case *ast.SelectorExpr:
+						ident, isIdent := fun.X.(*ast.Ident)
+						if !isIdent || receiver == "" || ident.Name != receiver {
+							return true
+						}
+						called = fun.Sel.Name
+					default:
+						return true
+					}
+					if !slices.Contains(callees[from], called) {
+						callees[from] = append(callees[from], called)
+					}
+					if !slices.Contains(callers[called], from) {
+						callers[called] = append(callers[called], from)
+					}
 					return true
-				}
-				if !slices.Contains(callees[fn.Name.Name], called) {
-					callees[fn.Name.Name] = append(callees[fn.Name.Name], called)
-				}
-				if !slices.Contains(callers[called], fn.Name.Name) {
-					callers[called] = append(callers[called], fn.Name.Name)
-				}
-				return true
-			})
+				})
+			}
+			record(fn.Name.Name, fn.Body)
 		}
 	}
 	for name, count := range declared {
