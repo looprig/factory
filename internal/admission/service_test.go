@@ -802,6 +802,15 @@ func TestNoDependencyFaultBecomesAPublicCode(t *testing.T) {
 				exercised[s.dependency+"."+s.method] = true
 				exercisedMu.Unlock()
 
+				// Two assertions, and the second is what keeps the sweep
+				// from passing vacuously. A broken injector -- one that armed
+				// nothing -- would leave every call on its happy path, and
+				// "nothing was classified" is also true of a service that was
+				// never asked anything. A dependency that failed must produce
+				// SOME failure; a swallowed one is its own defect.
+				if err == nil {
+					t.Fatalf("%s.%s failed and %s succeeded anyway", s.dependency, s.method, entryName)
+				}
 				var classified *Error
 				if errors.As(err, &classified) {
 					t.Errorf("%s.%s failed and %s answered with the public code %q; an edge renders that as a decision about the command",
