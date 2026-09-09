@@ -28,15 +28,15 @@ var serviceNow = time.Date(2026, 9, 5, 12, 0, 0, 0, time.UTC)
 // fake that recorded a private enum instead would be a second list to keep in
 // step with the interfaces, which is the thing that test exists not to have.
 type faultInjector struct {
-	// failing is the method name that returns injectedFault when called.
+	// failing is the method name that returns errInjectedFault when called.
 	failing string
 	// called records every method name this fake was asked for.
 	called map[string]bool
 }
 
-// injectedFault is the dependency failure every site is driven with. It is one
+// errInjectedFault is the dependency failure every site is driven with. It is one
 // value so "did this surface" is decidable by errors.Is at any depth.
-var injectedFault = errors.New("the dependency could not be reached")
+var errInjectedFault = errors.New("the dependency could not be reached")
 
 // enter records a call and reports the failure this method must return, if any.
 func (f *faultInjector) enter(method string) error {
@@ -45,7 +45,7 @@ func (f *faultInjector) enter(method string) error {
 	}
 	f.called[method] = true
 	if f.failing == method {
-		return injectedFault
+		return errInjectedFault
 	}
 	return nil
 }
