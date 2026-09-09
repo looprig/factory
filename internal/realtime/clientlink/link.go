@@ -55,6 +55,31 @@ type Limits struct {
 	PingInterval time.Duration
 	// PongTimeout is how long a ping may go unanswered.
 	PongTimeout time.Duration
+
+	// CommandTimeout bounds ONE command admission.
+	//
+	// It is the only bound a durable admission has, and the reason it must
+	// exist here is a property of the pinned transport rather than a
+	// preference. centrifuge@v0.38.0 dispatches an RPC SYNCHRONOUSLY on the
+	// connection's read loop (client.go:1385 -> 2259), and the connection
+	// context is cancelled by the websocket handler's `defer close(ctxCh)`
+	// (handler_websocket.go:218-222) -- when that loop RETURNS. An in-flight
+	// admission is what keeps the loop from returning, so nothing about the
+	// connection can cancel one: not a disconnect, not Handler.Shutdown. It was
+	// documented as "bounded by the link's lifetime" and was bounded by
+	// nothing, which made a wedged store or directory two operational failures
+	// rather than one -- a link hung forever, and, because dispatch is serial,
+	// every other frame on that link blocked behind it, so a replica could not
+	// be drained while one admission was stuck.
+	//
+	// What it promises is exactly what a context promises, and no more. It is a
+	// DEADLINE handed to the Admitter, not a guillotine on the reply: a
+	// dependency that honours its context returns at the deadline, and one that
+	// ignores it is not bounded by anything here. httpapi.RouteLimits states
+	// the same limit for the REST edge's own deadline, and this is that
+	// decision for this edge rather than a second authority for one number --
+	// the two edges bound different work over different transports.
+	CommandTimeout time.Duration
 }
 
 // Validate reports why these limits may not be used.
@@ -82,6 +107,9 @@ func (l Limits) Validate() error {
 	}
 	if l.PongTimeout <= 0 {
 		return fmt.Errorf("%w: PongTimeout is %v, want a positive duration", ErrInvalidConfig, l.PongTimeout)
+	}
+	if l.CommandTimeout <= 0 {
+		return fmt.Errorf("%w: CommandTimeout is %v, want a positive duration", ErrInvalidConfig, l.CommandTimeout)
 	}
 	return nil
 }

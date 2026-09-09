@@ -127,6 +127,8 @@ func TestClientLinkLimitsValidate(t *testing.T) {
 		{"zero write timeout", func(l *ClientLinkLimits) { l.WriteTimeout = 0 }, "WriteTimeout"},
 		{"zero ping interval", func(l *ClientLinkLimits) { l.PingInterval = 0 }, "PingInterval"},
 		{"zero pong timeout", func(l *ClientLinkLimits) { l.PongTimeout = 0 }, "PongTimeout"},
+		{"zero command timeout", func(l *ClientLinkLimits) { l.CommandTimeout = 0 }, "CommandTimeout"},
+		{"negative command timeout", func(l *ClientLinkLimits) { l.CommandTimeout = -time.Second }, "CommandTimeout"},
 		// A pong deadline at or beyond the ping cadence never separates a slow
 		// peer from a dead one: the next ping is sent before the previous one's
 		// deadline has been reached.

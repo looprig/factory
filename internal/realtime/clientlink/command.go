@@ -90,6 +90,26 @@ var commandSpecs = map[Method]commandSpec{
 // calls the type's Validate. So "the bytes decode" and "the request is a valid
 // V1 command" are one answer rather than two, and it is Core's answer, not a
 // grammar this package restates.
+//
+// The duplicate-member refusal covers the REQUEST's own members and stops at
+// the opaque ones. `blocks` and a gate response's `values` entries are
+// json.RawMessage, so a duplicate key INSIDE a block is carried through
+// verbatim into the durable payload; measured, `[{"text":"x","text":"y"}]` is
+// admitted. Two consequences belong to whoever consumes that payload rather
+// than to this edge: the stored bytes are not canonicalised, so a Host applying
+// them and a viewer rendering them may resolve the duplicate differently, and
+// since SessionStore compares payload BYTES on retry, two logically identical
+// commands spelled with different duplicate orderings are command_rejected
+// rather than idempotent. Canonicalising here would mean this package parsing a
+// vocabulary only Harness defines, which is the same reason the journal route
+// forwards stored bodies whole.
+//
+// Note what the refusal is and is not load-bearing for. The session is
+// single-reader BY CONSTRUCTION -- rpcCommand.session and the closure handed to
+// the service close over the same decoded value -- so even a lenient duplicate
+// resolution could not make the authorized session differ from the admitted
+// one. The refusal is defence in depth on top of that, not the thing that
+// closes the hazard.
 
 func decodeCreate(data []byte) (rpcCommand, error) {
 	var req sessionwire.CreateRequest
@@ -215,6 +235,15 @@ func (e *Engine) Admit(ctx context.Context, principal identity.Principal, method
 		// answered with had it got there.
 		return refusalBody(sessionwire.ErrorCodeInvalidRequest)
 	}
+	// The bound is applied here rather than in the transport adapter, for the
+	// reason every other decision on this surface is the Engine's: the deadline
+	// is policy, it is read from the composed Limits, and a test must be able
+	// to drive it without a socket. It covers the authorization decision as
+	// well as the admission, because both are dependency calls a wedged
+	// deployment can stall and neither is work the caller should wait on
+	// forever. See Limits.CommandTimeout for what the bound is worth.
+	ctx, cancel := context.WithTimeout(ctx, e.cfg.Limits.CommandTimeout)
+	defer cancel()
 	if err := e.cfg.Authorizer.AuthorizeControl(ctx, principal, decoded.session, spec.kind); err != nil {
 		return nil, err
 	}
@@ -320,9 +349,15 @@ func replyFor(entry sessionstore.InboxEntry) ([]byte, error) {
 func refusalBody(code sessionwire.ErrorCode) ([]byte, error) {
 	body, err := json.Marshal(sessionwire.ErrorEnvelope{Error: sessionwire.ErrorDetail{Code: code}})
 	if err != nil {
-		// Unreachable while every code is non-empty -- Core refuses to marshal
-		// an ErrorDetail with an empty code and nothing else in the envelope
-		// can fail. It fails closed rather than returning a half-built body.
+		// REACHABLE, and it was described as unreachable until a gate measured
+		// it. Core refuses to marshal an ErrorDetail with an empty code
+		// ("missing_required_field"), and an empty code is a value admission
+		// can produce: (*admission.Error).Error() explicitly contemplates
+		// Code == "", so a zero-valued &admission.Error{} from any present or
+		// future admission path arrives here. Without this arm the browser
+		// would receive an EMPTY successful RPC reply -- the one answer a
+		// client cannot classify at all -- so it fails closed as a fault
+		// instead, and TestARefusalWithNoCodeIsAFaultNotAnEmptyReply drives it.
 		return nil, fmt.Errorf("%w: %v", ErrUnreadableRecord, err)
 	}
 	return body, nil

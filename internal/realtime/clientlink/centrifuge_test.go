@@ -159,6 +159,7 @@ func testLimits() clientlink.Limits {
 		WriteTimeout:             5 * time.Second,
 		PingInterval:             25 * time.Second,
 		PongTimeout:              10 * time.Second,
+		CommandTimeout:           30 * time.Second,
 	}
 }
 

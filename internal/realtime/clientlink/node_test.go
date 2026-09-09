@@ -544,6 +544,8 @@ func TestLimitsValidate(t *testing.T) {
 		// value below the floor and is written as an absolute literal.
 		{"a sub-second ping cadence", func(l *Limits) { l.PingInterval = 999 * time.Millisecond }, "PingInterval"},
 		{"no ping cadence", func(l *Limits) { l.PingInterval = 0 }, "PingInterval"},
+		{"no command bound", func(l *Limits) { l.CommandTimeout = 0 }, "CommandTimeout"},
+		{"a negative command bound", func(l *Limits) { l.CommandTimeout = -time.Second }, "CommandTimeout"},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
@@ -699,6 +701,7 @@ func nodeTestLimits() Limits {
 		WriteTimeout:             5 * time.Second,
 		PingInterval:             25 * time.Second,
 		PongTimeout:              10 * time.Second,
+		CommandTimeout:           30 * time.Second,
 	}
 }
 

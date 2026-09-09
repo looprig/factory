@@ -367,6 +367,19 @@ type ClientLinkLimits struct {
 	PingInterval time.Duration
 	// PongTimeout is how long a ping may go unanswered.
 	PongTimeout time.Duration
+
+	// CommandTimeout bounds ONE command RPC's durable admission.
+	//
+	// It is the only bound such an admission has, and it is configuration
+	// rather than a constant because the deployment owns how long its durable
+	// plane may take. The transport gives the handler no per-RPC context --
+	// centrifuge@v0.38.0's RPCEvent carries a method and a payload and nothing
+	// else -- and it dispatches the RPC synchronously on the connection's read
+	// loop, so an unbounded admission does not merely hang one command: it
+	// holds every other frame on that link and it prevents the replica from
+	// draining. See clientlink.Limits.CommandTimeout for the measurement and
+	// for the limit of what a deadline can promise.
+	CommandTimeout time.Duration
 }
 
 // MinClientLinkPingInterval is the shortest ping cadence the ClientLink wire
@@ -410,6 +423,14 @@ func DefaultClientLinkLimits() ClientLinkLimits {
 		WriteTimeout:            5 * time.Second,
 		PingInterval:            25 * time.Second,
 		PongTimeout:             10 * time.Second,
+		// Thirty seconds, which is httpapi's DefaultRouteLimits.RequestTimeout
+		// deliberately: the two edges bound the same durable work reached over
+		// two transports, so a command admitted over REST and the identical one
+		// admitted over a ClientLink get the same patience by default. It is
+		// unrelated to the ping cadence and is NOT bounded by it -- a liveness
+		// deadline answers "is this peer there", and this answers "how long may
+		// this deployment's durable plane take".
+		CommandTimeout: 30 * time.Second,
 	}
 }
 
@@ -434,6 +455,9 @@ func (l ClientLinkLimits) Validate() error {
 		return err
 	}
 	if err := positive("ClientLinkLimits.PongTimeout", l.PongTimeout); err != nil {
+		return err
+	}
+	if err := positive("ClientLinkLimits.CommandTimeout", l.CommandTimeout); err != nil {
 		return err
 	}
 	// A pong deadline at or beyond the ping cadence never separates a slow peer
