@@ -63,6 +63,34 @@ func IsCode(err error, code sessionwire.ErrorCode) bool {
 
 func refusal(code sessionwire.ErrorCode, cause error) error { return &Error{Code: code, Cause: cause} }
 
+// A dependency FAULT is not a refusal, and the two are returned differently.
+//
+// Every target and directory read this service makes has three outcomes -- yes,
+// no, and "could not ask" -- and the third used to be folded into the second.
+// An *Error is a CLASSIFIED PUBLIC refusal: an edge renders it as a decision
+// about the caller's command, and a decision is what a caller stops retrying.
+// So a transient directory outage arrived at a browser as runtime_unavailable
+// or gate_not_resumable, with A6.2's ClientLink correctly reporting it
+// non-retryable -- correctly, because those codes cannot distinguish their one
+// transient cause from their permanent ones, which is exactly why the transient
+// one must not be spelled with them.
+//
+// A fault is therefore returned as ITSELF, wrapped for an operator's log and
+// carrying no public code, so errors.As finds no *Error and each edge answers
+// from its own fault channel. The ClientLink answers centrifuge's temporary
+// internal error; the REST controls (A3.3) will answer through httpapi's
+// existing storeUnavailable and internalFailure mappings, which already
+// separate a draining store from a fault. No new shared vocabulary is required,
+// which is what makes this correctable here rather than behind the
+// classification authority A9.1 owes.
+//
+// What did NOT change is the negative ANSWER: an unresolvable target is still
+// runtime_unavailable and an absent or stale owner is still gate_not_resumable.
+// The cause is now nil on those paths, because there was no failure to report.
+func resolveTargetFault(err error) error {
+	return fmt.Errorf("admission: resolve the launch target: %w", err)
+}
+
 type Catalog interface {
 	GetCatalogEntry(context.Context, sessionstore.GetCatalogEntryRequest) (sessionstore.CatalogEntry, error)
 	CreateCatalogEntry(context.Context, sessionstore.CreateCatalogEntryRequest) (sessionstore.CatalogEntry, bool, error)
@@ -124,8 +152,11 @@ func (s *Service) AdmitCreate(ctx context.Context, principal identity.Principal,
 		return sessionstore.InboxEntry{}, false, err
 	}
 	target, known, targetErr := s.cfg.Targets.ResolveAgent(ctx, req.AgentID)
-	if targetErr != nil || !known || target.Key.AgentID != req.AgentID {
-		return sessionstore.InboxEntry{}, false, refusal(sessionwire.ErrorCodeRuntimeUnavailable, targetErr)
+	if targetErr != nil {
+		return sessionstore.InboxEntry{}, false, resolveTargetFault(targetErr)
+	}
+	if !known || target.Key.AgentID != req.AgentID {
+		return sessionstore.InboxEntry{}, false, refusal(sessionwire.ErrorCodeRuntimeUnavailable, nil)
 	}
 	return sessionstore.InboxEntry{}, false, refusal(sessionwire.ErrorCodeRuntimeUnavailable, ErrCreateIdentityProtocolUnavailable)
 }
@@ -174,8 +205,11 @@ func (s *Service) AdmitGateResponse(ctx context.Context, principal identity.Prin
 		return sessionstore.InboxEntry{}, false, err
 	}
 	owner, ok, err := s.cfg.Directory.Owner(ctx, principal.Tenant(), req.SessionID)
-	if err != nil || !ok || !freshMatchingOwner(owner, entry.Record, now) {
-		return sessionstore.InboxEntry{}, false, refusal(sessionwire.ErrorCodeGateNotResumable, err)
+	if err != nil {
+		return sessionstore.InboxEntry{}, false, fmt.Errorf("admission: observe the session's owner: %w", err)
+	}
+	if !ok || !freshMatchingOwner(owner, entry.Record, now) {
+		return sessionstore.InboxEntry{}, false, refusal(sessionwire.ErrorCodeGateNotResumable, nil)
 	}
 	return s.admit(ctx, principal.Tenant(), req.SessionID, req.CommandID, CommandGateResponse, payload)
 }
@@ -206,8 +240,11 @@ func (s *Service) existingCompatible(ctx context.Context, tenant sessionwire.Ten
 		return sessionstore.CatalogEntry{}, err
 	}
 	known, err := s.cfg.Targets.IsKnown(ctx, catalogTarget(entry.Record))
-	if err != nil || !known {
-		return sessionstore.CatalogEntry{}, refusal(sessionwire.ErrorCodeRuntimeUnavailable, err)
+	if err != nil {
+		return sessionstore.CatalogEntry{}, fmt.Errorf("admission: read the configured launch targets: %w", err)
+	}
+	if !known {
+		return sessionstore.CatalogEntry{}, refusal(sessionwire.ErrorCodeRuntimeUnavailable, nil)
 	}
 	return entry, nil
 }
@@ -289,8 +326,11 @@ func (s *Service) admitLegacyCreate(ctx context.Context, principal identity.Prin
 		return sessionstore.InboxEntry{}, err
 	}
 	target, known, targetErr := s.cfg.Targets.ResolveAgent(ctx, req.AgentID)
-	if targetErr != nil || !known || target.Key.AgentID != req.AgentID {
-		return sessionstore.InboxEntry{}, refusal(sessionwire.ErrorCodeRuntimeUnavailable, targetErr)
+	if targetErr != nil {
+		return sessionstore.InboxEntry{}, resolveTargetFault(targetErr)
+	}
+	if !known || target.Key.AgentID != req.AgentID {
+		return sessionstore.InboxEntry{}, refusal(sessionwire.ErrorCodeRuntimeUnavailable, nil)
 	}
 	now := s.cfg.Clock.Now().UTC()
 	entry, _, err := s.cfg.Catalog.CreateCatalogEntry(ctx, sessionstore.CreateCatalogEntryRequest{

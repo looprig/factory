@@ -441,3 +441,154 @@ func TestLegacyCreateMintsBothIdentities(t *testing.T) {
 		t.Fatalf("legacy result = %+v", result)
 	}
 }
+
+// TestADependencyFaultIsNotADecisionAboutTheCommand is the fault/refusal split
+// at the layer that has the reader.
+//
+// Every site below asks a dependency a question with three possible outcomes --
+// yes, no, and "could not ask" -- and each one used to fold the third into the
+// second. The consequence is not cosmetic and it reaches a browser: an
+// *admission.Error is a CLASSIFIED public refusal, so a transient directory
+// outage was delivered as runtime_unavailable or gate_not_resumable, which
+// every edge renders as a decision about the caller's command. A6.2's
+// ClientLink additionally fixes retryable at false for every classified
+// refusal, precisely because those codes conflate one transient cause with
+// three permanent ones -- so the client was told a permanent "no" for a
+// condition that was neither a decision nor permanent, and stopped retrying.
+//
+// A fault is therefore returned as ITSELF: not an *admission.Error, carrying no
+// public code, so an edge answers it from its own fault channel (the ClientLink
+// answers centrifuge's temporary internal error; the REST controls A3.3 owns
+// will answer through httpapi's existing storeUnavailable/internalFailure
+// mapping). No new vocabulary is needed anywhere, which is why the fix belongs
+// here rather than behind a shared classification authority.
+//
+// The negative ANSWER is unchanged and is still a refusal. Both halves are
+// driven for every site, because a fix that turned "no" into a fault as well
+// would pass a table that only drove the faults.
+func TestADependencyFaultIsNotADecisionAboutTheCommand(t *testing.T) {
+	boom := errors.New("the directory could not be reached")
+
+	gateRequest := func() sessionwire.GateResponseRequest {
+		return sessionwire.GateResponseRequest{
+			CommandEnvelope: envelope("gate-a"), SessionID: "session-a", GateID: "gate-a",
+			Action: "submit", Values: map[string]json.RawMessage{}, ExpectedOpenEventID: "event-a",
+		}
+	}
+	// residentGate puts the fixture in the state where the gate response's
+	// OWNER read is the next thing that happens: the catalog entry exists, its
+	// target is known, and the gate is open, resident and version-matched.
+	residentGate := func(f *serviceFixture) {
+		f.catalog.getErr = nil
+		f.catalog.entry.Record = sessionstore.CatalogRecord{
+			TenantID: "tenant-a", SessionID: "session-a", AgentID: "agent-a",
+			RuntimeCompatibilityID: "runtime-v1", DesiredPlacement: sessionwire.HostPlacementPooled,
+			OpenGates: []sessionwire.GateProjection{{
+				GateID: "gate-a", OpenedEventID: "event-a", Deadline: serviceNow.Add(time.Hour),
+				Answerability: sessionwire.GateAnswerabilityResident,
+			}},
+		}
+	}
+
+	for _, tt := range []struct {
+		name string
+		// fault configures the dependency to FAIL; answer configures it to say
+		// no. Everything else about the fixture is identical.
+		fault  func(*serviceFixture)
+		answer func(*serviceFixture)
+		call   func(*serviceFixture) error
+		// code is the refusal the negative ANSWER must still produce.
+		code sessionwire.ErrorCode
+	}{
+		{
+			name:   "resolving a create's launch target",
+			fault:  func(f *serviceFixture) { f.targets.err = boom },
+			answer: func(f *serviceFixture) { f.targets.known = false },
+			call: func(f *serviceFixture) error {
+				_, _, err := f.service.AdmitCreate(context.Background(), f.principal,
+					sessionwire.CreateRequest{CommandEnvelope: envelope("create-a"), SessionID: "session-a", AgentID: "agent-a"})
+				return err
+			},
+			code: sessionwire.ErrorCodeRuntimeUnavailable,
+		},
+		{
+			name:   "resolving a legacy create's launch target",
+			fault:  func(f *serviceFixture) { f.targets.err = boom },
+			answer: func(f *serviceFixture) { f.targets.known = false },
+			call: func(f *serviceFixture) error {
+				_, err := f.service.AdmitLegacyCreate(context.Background(), f.principal,
+					LegacyCreateRequest{AgentID: "agent-a", Blocks: []byte(`[{"text":"hello"}]`)})
+				return err
+			},
+			code: sessionwire.ErrorCodeRuntimeUnavailable,
+		},
+		{
+			name: "checking an existing session's pinned runtime",
+			fault: func(f *serviceFixture) {
+				f.catalog.getErr = nil
+				f.targets.err = boom
+			},
+			answer: func(f *serviceFixture) {
+				f.catalog.getErr = nil
+				f.targets.known = false
+			},
+			call: func(f *serviceFixture) error {
+				_, _, err := f.service.AdmitInterrupt(context.Background(), f.principal,
+					sessionwire.InterruptRequest{CommandEnvelope: envelope("interrupt-a"), SessionID: "session-a"})
+				return err
+			},
+			code: sessionwire.ErrorCodeRuntimeUnavailable,
+		},
+		{
+			name: "reading a gate response's owner",
+			fault: func(f *serviceFixture) {
+				residentGate(f)
+				f.directory.err = boom
+			},
+			answer: func(f *serviceFixture) {
+				residentGate(f)
+				f.directory.ok = false
+			},
+			call: func(f *serviceFixture) error {
+				_, _, err := f.service.AdmitGateResponse(context.Background(), f.principal, gateRequest())
+				return err
+			},
+			code: sessionwire.ErrorCodeGateNotResumable,
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Run("a fault is not classified", func(t *testing.T) {
+				f := newServiceFixture(t)
+				tt.fault(f)
+				err := tt.call(f)
+				if err == nil {
+					t.Fatal("a dependency fault was admitted")
+				}
+				if !errors.Is(err, boom) {
+					t.Errorf("error %v does not wrap the dependency's own failure", err)
+				}
+				var classified *Error
+				if errors.As(err, &classified) {
+					t.Errorf("a fault was answered with the public code %q; an edge will render that as a decision about the command",
+						classified.Code)
+				}
+				if f.commands.calls != 0 || f.catalog.createCalls != 0 {
+					t.Errorf("a fault wrote durable state: %d commands, %d catalog entries", f.commands.calls, f.catalog.createCalls)
+				}
+			})
+			// The control. Without it, "a fault is not classified" would also
+			// be the output of a service that had stopped classifying at all.
+			t.Run("a negative answer is still a refusal", func(t *testing.T) {
+				f := newServiceFixture(t)
+				tt.answer(f)
+				err := tt.call(f)
+				if !IsCode(err, tt.code) {
+					t.Errorf("error = %v, want the public code %q", err, tt.code)
+				}
+				if errors.Is(err, boom) {
+					t.Error("the refusal carries a dependency failure that was never configured")
+				}
+			})
+		})
+	}
+}
