@@ -1095,6 +1095,14 @@ func (shapeProbeType) MissingCreated(context.Context, identity.Principal, sessio
 // neutralising `NumOut() != 3` and then driving a two-result probe does not
 // fail, it PANICS on Out(2) -- and a panic is not an assertion kill. Every
 // result position here matches the V1 shape, so only the arity rejects it.
+//
+// The signature therefore has to put error at index 2 with a fourth result
+// after it, which is ST1008 ("error should be returned as the last argument").
+// That is the point of the probe rather than an oversight: it is a shape the
+// rule must REJECT, and a lint that keeps production code from having it is not
+// a reason the rule may go unread.
+//
+//lint:ignore ST1008 this probe exists to be an ill-formed signature the shape rule must reject
 func (shapeProbeType) ExtraResult(context.Context, identity.Principal, sessionwire.InputRequest) (sessionstore.InboxEntry, bool, error, string) {
 	return sessionstore.InboxEntry{}, false, nil, ""
 }
