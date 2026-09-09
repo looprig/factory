@@ -1341,7 +1341,7 @@ pooled placement at all until the directory carries a tenant dimension, which is
 H8's per-tenant Department and a specification section 7 change that is not this
 repository's to book.
 
-Not built here: the attachment and demand-driven binding of A7.2,
+Not built here: the attachment of A4.2 step 2,
 drain-before-delete of D2.2, and the authorship of a dedicated workload's
 payload — `Desired` is an INPUT, because what a launch template should contain
 is a composition question A9.1 owns.
@@ -1429,6 +1429,134 @@ answers whatever error a case hands it and the cases were written from the
 registry's vocabulary; the case that found it drives the real store, and it
 also pins the store's answer so a later SessionStore that stopped answering
 that way would say so here.
+
+## Demand-driven binding
+
+A7.2 added `routing.Demand`: the local subscriber demand that drives `Bindings`,
+and the poll that keeps it current. It is the implementation of the ClientLink's
+`DemandManager` seam, which A6.3 declared and left unimplemented; nothing in
+production composes the two yet, and that adapter is A9.1's along with the rest.
+
+**It sits on `*Bindings` directly and takes the resolver FROM it.** That is the
+single-authority property by construction: the registry read a poll makes to
+decide whether a route is still current is the same reader the table binds
+through, so there is no second ownership authority here that could disagree with
+the routing table about who owns a session. Passing a `Resolver` in beside the
+table would have made that a configuration a composition could get wrong.
+
+**`Acquire` answers a local fact, and a local fact cannot fail.** A session with
+no owner, an owner Core will not carry, a bind the Host refused and a registry
+outage all return nil with the session left UNBOUND and watched. Every one of
+them is a routing outcome the poll retries, and none is a reason to refuse a
+viewer; the only error is a closed plane, where the answer would be a lie. That
+is also why `DemandManager`'s doc specifies an error as a FAULT: an
+implementation answering "no owner" as an error would refuse every viewer of an
+idle session.
+
+**A first subscriber does not restore a cold session, and that is now something
+a test READS.** A6.3's spec gate demonstrated the hazard by adding an
+`AdmitRestore` on every subscribe: the whole suite passed, exit 0. The property
+held by construction of the seams — neither package can express a command — but
+a property of the seams is not a property of the COMPOSITION, which is where the
+restore would go and which does not exist yet.
+`TestNothingOnTheViewingPathAdmitsACommand` closes it structurally and
+module-wide: it derives the viewing path's roots (every method of `Demand`,
+`Engine.Bind`, and every function literal registered for a subscription
+lifecycle event), follows calls through every production file `modfiles`
+enumerates, and reports any admission or placement entry point it can reach. Its
+subject is wider than "restore" on purpose — a subscribe that admitted an input
+is the same defect, and a guard naming only the runbook's instance passes on
+every neighbour.
+
+**Read what makes that graph usable, because the first version was not.** Edges
+are name-keyed with no type information, which is right — every seam in this
+module is called through an interface, so a graph that only followed calls it
+could resolve to a concrete receiver would follow none of them. But treating a
+PACKAGE-qualified call as an edge too (`sessionwire.TenantID(t).Validate()`)
+reached 248 of the module's 362 declarations from these roots, including the
+HTTP router, whose control routes are supposed to admit commands: the ban would
+have had to be deleted the first time a later task implemented the REST restore
+route. Skipping selectors rooted at an imported package brings it to 89, all of
+them plausibly on the path. Two fixtures test the analyzer rather than the
+module: one plants a restore at each root category and two hops away, with two
+controls; the other plants one across an interface seam, which is the case this
+module actually has.
+
+**The poll is refresh, then serve, then arm the next one.** Three sequential
+conditions rather than a branch, which is what makes an owner arriving between
+two polls bind AND stop hinting in the same tick, and an owner disappearing drop
+AND start hinting in the same tick. `Acquire` runs the same `serveLocked` body,
+so a viewer of a cold session gets its first hint immediately rather than an
+interval later.
+
+**A rebind is a release and then an acquire, in that order.**
+`Bindings.Acquire` COUNTS, so rebinding without releasing would leave this
+replica holding two units of demand for one subscriber and the last release
+would never unbind. The staleness rule is not restated: `refreshLocked` pushes
+the observation through `Bindings.Observe` — the single authority for "does this
+contradict what the table holds", including its refusal to act on an older lease
+epoch — and then asks the table what it still holds. A route invalidated by an
+observation a HOST pushed is the same fact and is repaired the same way.
+
+**A registry read that fails keeps a held route and does not refuse a new one.**
+The binding is a routing hint the owning Host fences against its own durable
+lease, so keeping one through an outage risks a refusal, while dropping one
+turns every registry blip into a rebind storm that has delivered nothing.
+
+**`OwnershipPollInterval` is a GAP, not a period.** The next poll is armed at the
+END of the current one, so two polls of one session cannot overlap however slow
+the store is. `PollTimeout` bounds one WHOLE poll rather than each call inside
+it, because a poll runs on the clock's goroutine with no caller and no request
+context to inherit a deadline from. Every case in `demand_test.go` drives
+off-default limits — a bound every call site passes identically is untested by
+construction — and the interval is asserted against an absolute literal, with
+the defaults pinned separately by their own case.
+
+**The `journal_tip` hint is published on EVERY unbound poll**, including when
+the tip has not moved and including when it is zero. That is what repeatable
+means: the hint carries absolute state and no sequence, no nonce and no attempt
+count, so two hints for one tip are the same BYTES and a client that missed one
+loses nothing by taking the next. Publishing only on a change would make it a
+delta in everything but name — a client joining between two changes would wait
+for the next write to learn where the journal already was. The claim is a
+for-all, so a table of tip sequences is not its only reader:
+`FuzzTheJournalTipHintIsAFunctionOfTheTipAlone` derives the space, and its seeds
+discriminate a delta, a suppressed repeat and a numbered hint without `-fuzz`.
+A tip that cannot be READ publishes nothing, which is the fail-closed direction;
+a publish that fails is retried by the next poll, which is the property.
+
+**The tip read asks for the tip and nothing else.** `Tail`, `Limit: 1` and
+`ScanLimit: 1`: the tip is a property of SessionStore's scan PLAN, captured
+before it walks anything, so a tip read wants the smallest page the store will
+build. Without `Tail` the walk starts at sequence one. The request is asserted
+whole, because a read that produced the right hint at the wrong cost would pass
+every assertion about the hint.
+
+**Two guards this file does NOT have, and one assertion it gained, all from the
+same mutation batch.** A generation counter beside the poll's `stop` was written
+first and measured redundant: `teardownLocked` deletes the entry, so comparing
+the entry the timer was armed with against the one the table now holds already
+answers every supersession, and deleting the generation comparison left the
+suite green. `clientlink`'s demand table keeps its generation for a reason that
+does not apply here — `cancelRelease` there leaves the entry in place. A
+`d.closed` beside that comparison went the same way and for `routing.Bindings`'
+own reason at its `Close`: a closed plane has no entries. What did NOT survive
+scrutiny was the missing assertion in the opposite direction — deleting
+`serveLocked`'s first `!entry.held` so that every poll of a bound session called
+`Bindings.Acquire` again survived the whole file, and the consequence is not a
+wasted call but a routing table gaining a unit of demand per poll, whose last
+subscriber's release then never unbinds.
+`TestASteadyPollNeitherRebindsNorAccumulatesDemand` is that reader, and it ends
+by releasing so the count becomes an observable outcome.
+
+**How the scenario set was derived, since the runbook's seven are a floor.**
+Three axes, each enumerated from the code: what the registry can say at a poll
+(seven answers, read off `Directory.Owner` and `Bindings.bindLocked`), what the
+table holds when that answer arrives (unbound, bound, invalidated-by-push), and
+the demand transition (eight, including a release nobody holds, work after
+`Close`, and `Close` with demand outstanding). The unreachable cells are named
+rather than silently skipped, and the three properties that are for-alls rather
+than cells are stated as such.
 
 ## Not implemented yet
 
