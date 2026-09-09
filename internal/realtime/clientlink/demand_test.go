@@ -53,9 +53,11 @@ type recordingDemand struct {
 	// acquireErr and releaseErr, when set, fail every call.
 	acquireErr error
 	releaseErr error
-	// blockAcquire, when non-nil, holds an Acquire until it is closed or the
-	// context is done. It is how a wedged demand plane is driven.
+	// blockAcquire and blockRelease, when non-nil, hold the corresponding call
+	// until they are closed or the context is done. They are how a wedged
+	// demand plane is driven.
 	blockAcquire chan struct{}
+	blockRelease chan struct{}
 	// selfReleased records that the backstop, not the context, ended a call:
 	// a case using blockAcquire must assert it is false, or the backstop
 	// silently stands in for the bound under test.
@@ -91,9 +93,28 @@ func (d *recordingDemand) Acquire(ctx context.Context, tenant sessionwire.Tenant
 
 func (d *recordingDemand) Release(ctx context.Context, tenant sessionwire.TenantID, session sessionwire.SessionID) error {
 	d.mu.Lock()
-	defer d.mu.Unlock()
 	d.releases = append(d.releases, callOf(ctx, tenant, session))
-	return d.releaseErr
+	err, block := d.releaseErr, d.blockRelease
+	d.mu.Unlock()
+	// The record is taken and the lock RELEASED before blocking, so a case can
+	// read what the fake has been asked while a call is still in flight. A fake
+	// that blocked under its own lock would deadlock the assertion instead of
+	// failing it.
+	if block != nil {
+		timer := time.NewTimer(demandBackstop)
+		defer timer.Stop()
+		select {
+		case <-block:
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-timer.C:
+			d.mu.Lock()
+			d.selfReleased = true
+			d.mu.Unlock()
+			return errDemandUnbounded
+		}
+	}
+	return err
 }
 
 var errDemandUnbounded = errors.New("nothing bounded this demand call; the fake released itself")
@@ -871,11 +892,36 @@ func TestReleaseIdleDemandReportsWhatItCouldNotGiveBack(t *testing.T) {
 // stated in both directions over the exported surface of each: for every
 // channel and every tenant, the authorizer accepts exactly when this edge can
 // name a session, and the session it names is the channel's third segment.
+//
+// # The authorizer here is PERMISSIVE, and the first version's was not
+//
+// Driving the engine through the fixture's ordinary authorizer -- which wraps
+// internal/identity's real one -- made the whole target one-directional without
+// saying so: Bind consults the authorizer FIRST and returns before reaching
+// demandKeyOf, so every channel the real grammar refuses read as "this edge
+// cannot route it either" whether that was true or not. A gate measured the
+// consequence: deleting demandKeyOf's fourth-segment check -- a strictly LAXER
+// grammar, and the exact divergence this target exists to catch -- left all
+// eleven seeds passing, including the one written for that case. With
+// allowEverything the two grammars are evaluated independently and compared,
+// which is what "both directions" has to mean.
+//
+// # The seeds are chosen so a laxer grammar fails WITHOUT -fuzz
+//
+// A seed corpus that passes under a broken grammar is a guard that cannot fail
+// in an ordinary `go test` run, and -fuzz is a mode `make check` reaches only
+// through the Makefile's FUZZ_TARGETS. So every clause of demandKeyOf has a
+// seed that dies when it is deleted: a fourth segment, a cross-tenant tenant,
+// an oversized session and an invalid-UTF-8 one.
 func FuzzTheDemandGrammarAgreesWithTheAuthorizers(f *testing.F) {
 	for _, channel := range []string{
 		"session:tenant-a:session-1", "session:tenant-a:", "session::s", "session:tenant-a",
 		"session:tenant-a:a:b", "sessions:tenant-a:s", "", "session:tenant-a:sÿ",
 		"session: :s", "SESSION:tenant-a:s", "session:tenant-a:s ",
+		"session:tenant-a:a:b:c", "session:tenant-a:session-1:",
+		"session:tenant-b:session-1",
+		"session:tenant-a:" + strings.Repeat("s", sessionwire.MaxIDBytes+1),
+		"session:tenant-a:s\xff",
 	} {
 		f.Add(channel, "tenant-a")
 	}
@@ -884,10 +930,10 @@ func FuzzTheDemandGrammarAgreesWithTheAuthorizers(f *testing.F) {
 		if err != nil {
 			t.Skip("no principal can hold this tenant")
 		}
-		fixture := newEngineFixtureForPrincipal(t, principal)
+		engine, demand := permissiveEngine(t, principal)
 		authorized := (internalidentity.Authorizer{}).AuthorizeSubscribe(t.Context(), principal, channel) == nil
 
-		release, err := fixture.engine.Bind(t.Context(), principal, channel)
+		release, err := engine.Bind(t.Context(), principal, channel)
 		routable := err == nil
 		if routable {
 			release()
@@ -899,7 +945,7 @@ func FuzzTheDemandGrammarAgreesWithTheAuthorizers(f *testing.F) {
 		if !routable {
 			return
 		}
-		calls := fixture.demand.acquired()
+		calls := demand.acquired()
 		if len(calls) != 1 {
 			t.Fatalf("channel %q took %d demands, want 1", channel, len(calls))
 		}
@@ -911,30 +957,27 @@ func FuzzTheDemandGrammarAgreesWithTheAuthorizers(f *testing.F) {
 	})
 }
 
-// newEngineFixtureForPrincipal is newEngineFixtureWithLimits for a principal
-// the case chooses, which the fuzz target needs and nothing else does.
-func newEngineFixtureForPrincipal(t *testing.T, principal identity.Principal) *engineFixture {
+// permissiveEngine is an Engine whose authorizer allows every channel, so what
+// Bind answers is demandKeyOf's answer and nothing else.
+//
+// It is what makes the fuzz target compare two grammars rather than consult one
+// of them twice; the fault case below builds the same composition inline for
+// the same reason.
+func permissiveEngine(t *testing.T, principal identity.Principal) (*clientlink.Engine, *recordingDemand) {
 	t.Helper()
 
-	fixture := &engineFixture{
-		authorizer: &recordingAuthorizer{},
-		admitter:   &recordingAdmitter{created: true},
-		demand:     &recordingDemand{},
-		clock:      &manualClock{},
-		principal:  principal,
-	}
+	demand := &recordingDemand{}
 	engine, err := clientlink.NewEngine(clientlink.Config{
 		Authenticator: fixedAuthenticator{principal: principal},
-		Authorizer:    fixture.authorizer,
-		Admitter:      fixture.admitter,
-		Demand:        fixture.demand,
-		Clock:         fixture.clock,
+		Authorizer:    allowEverything{},
+		Admitter:      &recordingAdmitter{created: true},
+		Demand:        demand,
+		Clock:         &manualClock{},
 		Limits:        testLimits(),
 		Version:       buildVersion,
 	})
 	if err != nil {
 		t.Fatalf("NewEngine: %v", err)
 	}
-	fixture.engine = engine
-	return fixture
+	return engine, demand
 }

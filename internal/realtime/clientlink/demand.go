@@ -40,7 +40,9 @@ var ErrUnroutableChannel = errors.New("clientlink: authorized channel names no s
 // return a parse is a change to the authorization contract A2.1 owns. What
 // keeps the two from drifting is the differential fuzz target, which drives
 // both surfaces over one channel string and requires them to agree in both
-// directions.
+// directions -- and which must use a PERMISSIVE authorizer to do it, since Bind
+// returns on a denial before this function is reached. See that target's doc
+// for what a version built on the real authorizer could not see.
 const channelPrefix = "session:"
 
 // demandKey identifies one session's local delivery demand.
@@ -282,22 +284,6 @@ func (e *Engine) releaseDemandLocked(ctx context.Context, key demandKey) error {
 	ctx, cancel := context.WithTimeout(ctx, e.cfg.Limits.DemandTimeout)
 	defer cancel()
 	return e.cfg.Demand.Release(ctx, key.tenant, key.session)
-}
-
-// Demand reports how many local DeliveryBindings this replica holds for a
-// session, and whether its demand is still held.
-//
-// The second result is what a count alone cannot say: a session draining behind
-// the debounce has zero bindings and demand the routing plane still holds.
-func (e *Engine) Demand(tenant sessionwire.TenantID, session sessionwire.SessionID) (bindings int, held bool) {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-
-	entry := e.demand[demandKey{tenant: tenant, session: session}]
-	if entry == nil {
-		return 0, false
-	}
-	return entry.bindings, true
 }
 
 // demandKeyOf derives the session whose delivery demand a channel represents.

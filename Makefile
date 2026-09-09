@@ -57,7 +57,22 @@ vuln:
 # target for a bounded time as part of check; a crasher is written to
 # testdata/fuzz and is committable.
 FUZZTIME ?= 30s
-FUZZ_TARGETS = $(shell GOWORK=off go test -list '^Fuzz' . | grep '^Fuzz')
+# EVERY package, not the root one. This enumerated `.` alone until A6.3 added
+# the module's first out-of-root fuzz target, and the failure mode was silent in
+# the direction that looks safe: the target compiled, ran its seed corpus under
+# `go test`, and was never fuzzed at all -- so `make check` was green over a
+# guard whose only discriminating mode is the one nothing invoked.
+#
+# `go test -list` prints a package's names BEFORE that package's result line, so
+# the names are accumulated and attributed to the `ok`/`FAIL` line that closes
+# them; a package with no fuzz targets contributes nothing. Each token is
+# `importpath|Target`, because the recipe needs both: the package to test, and
+# its source directory to find the artifacts a failure writes.
+# TestEveryFuzzTargetInTheModuleIsFuzzed drives this same command and compares
+# its answer against the targets declared in the sources, so a package this
+# stops reaching is a failure rather than a quieter run.
+FUZZ_TARGET_LIST = GOWORK=off go test -list '^Fuzz' ./... | awk '/^Fuzz/ { names[++n] = $$0; next } /^(ok|FAIL)[ \t]/ { for (i = 1; i <= n; i++) print $$2 "|" names[i]; n = 0 }'
+FUZZ_TARGETS = $(shell $(FUZZ_TARGET_LIST))
 FUZZLOGS ?= .fuzzlogs
 
 # Classifying a fuzz failure: what the ARTIFACT does, and what nobody can know.
@@ -133,18 +148,21 @@ fuzz:
 		exit 1; \
 	fi; \
 	mkdir -p "$(FUZZLOGS)"; \
-	for target in $$targets; do \
+	for token in $$targets; do \
+		pkg="$${token%%|*}"; target="$${token##*|}"; \
+		dir="$$(GOWORK=off go list -f '{{.Dir}}' $$pkg)"; \
+		slug="$$(printf '%s' "$$pkg" | tr '/' '_').$$target"; \
 		attempt=1; \
 		while :; do \
-			log="$(FUZZLOGS)/$$target.log"; \
-			if [ "$$attempt" -gt 1 ]; then log="$(FUZZLOGS)/$$target.retry$$attempt.log"; fi; \
+			log="$(FUZZLOGS)/$$slug.log"; \
+			if [ "$$attempt" -gt 1 ]; then log="$(FUZZLOGS)/$$slug.retry$$attempt.log"; fi; \
 			marker="$$(mktemp)"; \
-			echo "GOWORK=off go test -run ^$$target$$ -fuzz ^$$target$$ -fuzztime $(FUZZTIME) . | tee $$log"; \
-			if GOWORK=off go test -run "^$$target$$" -fuzz "^$$target$$" -fuzztime $(FUZZTIME) . 2>&1 | tee "$$log"; then \
+			echo "GOWORK=off go test -run ^$$target$$ -fuzz ^$$target$$ -fuzztime $(FUZZTIME) $$pkg | tee $$log"; \
+			if GOWORK=off go test -run "^$$target$$" -fuzz "^$$target$$" -fuzztime $(FUZZTIME) "$$pkg" 2>&1 | tee "$$log"; then \
 				rm -f "$$marker"; break; \
 			fi; \
 			artifacts="$$(mktemp)"; \
-			find "testdata/fuzz/$$target" -type f -newer "$$marker" >"$$artifacts" 2>/dev/null || true; \
+			find "$$dir/testdata/fuzz/$$target" -type f -newer "$$marker" >"$$artifacts" 2>/dev/null || true; \
 			rm -f "$$marker"; \
 			echo "--- $$target failed; full output in $$log"; \
 			examined=0; class=finding; \
@@ -152,15 +170,15 @@ fuzz:
 				[ -n "$$artifact" ] || continue; \
 				examined=1; \
 				name="$$(basename "$$artifact")"; \
-				replay="$(FUZZLOGS)/$$target.$$name.replay.log"; \
-				if ! GOWORK=off go test -run "^$$target$$/^$$name$$" -count=5 -timeout 60s -v . >"$$replay" 2>&1 </dev/null; then \
+				replay="$(FUZZLOGS)/$$slug.$$name.replay.log"; \
+				if ! GOWORK=off go test -run "^$$target$$/^$$name$$" -count=5 -timeout 60s -v "$$pkg" >"$$replay" 2>&1 </dev/null; then \
 					echo "--- REPRODUCER: $$artifact REPLAYS AS A FAILURE (replay in $$replay)."; \
 					echo "--- this is a finding whatever the run printed. Commit it and fix the target."; \
 				elif ! grep -q -- "--- PASS: $$target/$$name" "$$replay"; then \
 					echo "--- UNCLASSIFIED: replaying $$artifact matched no subtest, so its exit status"; \
 					echo "--- says nothing about the input. Left in place; read $$replay and $$log."; \
 				else \
-					quarantine="$(FUZZLOGS)/$$target.$$name.unreplayable"; \
+					quarantine="$(FUZZLOGS)/$$slug.$$name.unreplayable"; \
 					mv "$$artifact" "$$quarantine"; \
 					rmdir "$$(dirname "$$artifact")" 2>/dev/null || true; \
 					echo "--- UNREPRODUCIBLE: the run failed and wrote $$name, which does not replay from"; \

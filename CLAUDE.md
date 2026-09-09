@@ -1019,8 +1019,24 @@ the Authorizer is a seam, so an implementation with a different grammar could
 authorize a channel this build cannot name a session in, and answering that
 with 103 would tell a browser entitled to the channel to stop asking forever.
 The two grammars — `internal/identity`'s regular expression and this package's
-`session:` prefix — are held to one answer in both directions by
-`FuzzTheDemandGrammarAgreesWithTheAuthorizers`, over `(channel, tenant)` pairs.
+`session:` prefix — are compared over `(channel, tenant)` pairs by
+`FuzzTheDemandGrammarAgreesWithTheAuthorizers`. **Read what holds that
+property, because the first version's answer was wrong.** The target drives the
+engine through a **permissive** authorizer, and it has to: `Bind` consults the
+authorizer first and returns before reaching `demandKeyOf`, so a target built on
+the real authorizer reports "this edge cannot route it either" for every channel
+that grammar refuses, whether or not it is true — a gate measured deleting the
+fourth-segment check, a strictly laxer grammar, leaving all eleven seeds green,
+including the one written for that case. The seeds now discriminate a laxer
+grammar **without** `-fuzz`, which matters because `-fuzz` is a mode only the
+Makefile's `FUZZ_TARGETS` invokes; that variable enumerated the root package
+alone until A6.3, so the module's first out-of-root target was never fuzzed at
+all. `TestEveryFuzzTargetInTheModuleIsFuzzed` runs the Makefile's own
+enumeration and compares it with the targets `modfiles` finds in the sources.
+The clause-by-clause behaviour — that an authorized channel this edge cannot
+name is a fault and takes no demand — is held by
+`TestAChannelTheAuthorizerAllowedButThisEdgeCannotNameIsAFault`, which builds
+the same permissive composition.
 
 **Both demand calls are bounded, and the release is the half that has nothing
 else.** `DemandTimeout` bounds an acquire for `CommandTimeout`'s reason and
