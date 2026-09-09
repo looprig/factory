@@ -813,9 +813,23 @@ func TestNoDependencyFaultBecomesAPublicCode(t *testing.T) {
 		t.Errorf("no entry point ever called %s with it failing, so the sweep proves nothing about it: "+
 			"either drive it from an entry point or record why it is unreachable", name)
 	}
+	// The record is checked in BOTH directions, and the second one is the method
+	// axis's only pin. Config's FIELDS are compile-pinned -- deleting one stops
+	// service.go compiling -- but an interface's METHOD SET is not: deleting
+	// AuthorizeServiceSweep from Authorizer compiles everywhere and silently
+	// shrank this sweep from 60 pairs to 54, which a gate measured. Nothing in
+	// production reads that method, so nothing else would have said so.
+	derived := map[string]bool{}
+	for _, s := range sites {
+		derived[s.dependency+"."+s.method] = true
+	}
 	for name, reason := range unreachedDependencyMethods() {
 		if exercised[name] {
 			t.Errorf("%s is recorded as unreachable (%q) but the sweep reached it; the record is stale", name, reason)
+		}
+		if !derived[name] {
+			t.Errorf("%s is recorded as unreachable (%q) but is no longer a fallible method of any dependency Config declares; "+
+				"either the interface lost a method and the sweep silently shrank, or the record has outlived its subject", name, reason)
 		}
 	}
 }
@@ -1073,16 +1087,20 @@ func admissionEntryPoints(t *testing.T) map[string]func(*serviceFixture) error {
 // can be broken. A site nobody drives is either dead code or an untested fold,
 // and both want a human.
 //
-// The call graph is deliberately syntactic and edges are restricted to functions
-// this package declares. That under-approximates reachability, which is the safe
-// direction: an unresolvable edge makes a site look UNREACHED and demands
-// attention, where an over-approximation would quietly make everything reachable.
+// The call graph is syntactic, and which way it errs is derived in
+// packageCallGraph rather than asserted here -- the two comments disagreed, and
+// the one that claimed the safe direction was the wrong one.
 func TestEveryClassifiedRefusalIsReachableFromADrivenEntryPoint(t *testing.T) {
 	t.Parallel()
 
-	callers, callees, err := packageCallGraph(".")
+	callers, callees, duplicates, err := packageCallGraph(".")
 	if err != nil {
 		t.Fatalf("parse the admission sources: %v", err)
+	}
+	if len(duplicates) != 0 {
+		t.Fatalf("these names are declared more than once in this package: %v. "+
+			"The call graph is keyed by name, so an edge to one of them reaches both; "+
+			"the guard cannot distinguish them and must not pretend to", duplicates)
 	}
 	if len(callees) == 0 {
 		t.Fatal("vacuous: the scanner found no functions at all")
@@ -1126,15 +1144,55 @@ func TestEveryClassifiedRefusalIsReachableFromADrivenEntryPoint(t *testing.T) {
 // declared function, the names it calls -- and, inverted, the functions that
 // call each name.
 //
-// Names only: it resolves no types, so a call to another package's function of
-// the same name is an edge here too. That direction is safe for both readers
-// above, which use the graph to demand coverage rather than to grant it.
-func packageCallGraph(root string) (callers map[string][]string, callees map[string][]string, err error) {
+// # Which calls become edges, and why the first version was wrong
+//
+// An edge is recorded for exactly two call shapes:
+//
+//	f(...)     a bare identifier
+//	s.f(...)   a selector whose receiver is the ENCLOSING function's own
+//	           receiver identifier
+//
+// and for nothing else. The first version recorded the selector's final
+// identifier for EVERY selector call, which made `req.Validate()` -- a Core
+// method every entry point calls -- an edge to any package function named
+// Validate. Both gates built the same counterexample from that: an orphaned
+// `func Validate(...) error` minting refusal(), called by nobody, was "reached"
+// and passed, while the byte-identical body under a unique name failed. I
+// reproduced the pair before changing anything, one identifier apart, opposite
+// outcomes. So `reached` GRANTED coverage while the test's own comment claimed
+// it demanded it, and the collision surface was every method name in Core and
+// SessionStore: Validate, Error, Unwrap, Tenant.
+//
+// The receiver rule is what attributes a selector call to a function THIS
+// package declares. `s.admit(...)` inside a method with receiver `s` is a call
+// to a method of this package's own type; `req.Validate()` and
+// `s.cfg.Catalog.GetCatalogEntry(...)` are not, and are dropped -- the second
+// because its receiver expression is a selector, not the receiver identifier.
+//
+// # Which way it errs, derived rather than asserted
+//
+// It UNDER-approximates, which is the direction that demands coverage: a call
+// this scan cannot attribute makes its target look unreached and fails, rather
+// than quietly making a site look covered. What it drops is a call to a package
+// function reached through some other value -- a func stored in a field, a
+// method called on a variable of this package's type that is not the receiver.
+// Neither exists here today, and if one appears the guard reports the site it
+// can no longer see instead of passing.
+//
+// One residual over-approximation is unavoidable in a name-keyed graph and is
+// therefore CHECKED rather than argued: two declarations sharing a name would
+// be one node, so an edge to either would reach both. duplicates reports them
+// and the caller fails on a non-empty result. A local variable of func type
+// shadowing a package function's name would also produce a spurious identifier
+// edge; that is the one residual left standing, and it is stated rather than
+// claimed away.
+func packageCallGraph(root string) (callers, callees map[string][]string, duplicates []string, err error) {
 	entries, err := os.ReadDir(root)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	callers, callees = map[string][]string{}, map[string][]string{}
+	declared := map[string]int{}
 	fset := token.NewFileSet()
 	for _, entry := range entries {
 		name := entry.Name()
@@ -1143,15 +1201,24 @@ func packageCallGraph(root string) (callers map[string][]string, callees map[str
 		}
 		file, parseErr := parser.ParseFile(fset, filepath.Join(root, name), nil, 0)
 		if parseErr != nil {
-			return nil, nil, parseErr
+			return nil, nil, nil, parseErr
 		}
 		for _, decl := range file.Decls {
 			fn, ok := decl.(*ast.FuncDecl)
 			if !ok || fn.Body == nil {
 				continue
 			}
+			declared[fn.Name.Name]++
 			if _, seen := callees[fn.Name.Name]; !seen {
 				callees[fn.Name.Name] = nil
+			}
+			// The receiver's identifier, when this declaration has one. A
+			// method declared with no receiver NAME -- func (*Service) f() --
+			// cannot make an attributable selector call, and an empty string
+			// here matches no identifier.
+			receiver := ""
+			if fn.Recv != nil && len(fn.Recv.List) == 1 && len(fn.Recv.List[0].Names) == 1 {
+				receiver = fn.Recv.List[0].Names[0].Name
 			}
 			ast.Inspect(fn.Body, func(n ast.Node) bool {
 				call, ok := n.(*ast.CallExpr)
@@ -1163,6 +1230,10 @@ func packageCallGraph(root string) (callers map[string][]string, callees map[str
 				case *ast.Ident:
 					called = fun.Name
 				case *ast.SelectorExpr:
+					ident, isIdent := fun.X.(*ast.Ident)
+					if !isIdent || receiver == "" || ident.Name != receiver {
+						return true
+					}
 					called = fun.Sel.Name
 				default:
 					return true
@@ -1177,5 +1248,11 @@ func packageCallGraph(root string) (callers map[string][]string, callees map[str
 			})
 		}
 	}
-	return callers, callees, nil
+	for name, count := range declared {
+		if count > 1 {
+			duplicates = append(duplicates, name)
+		}
+	}
+	slices.Sort(duplicates)
+	return callers, callees, duplicates, nil
 }
