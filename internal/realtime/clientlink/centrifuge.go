@@ -291,8 +291,16 @@ func (h *Handler) connected(client *centrifuge.Client) {
 	client.OnSubscribe(func(e centrifuge.SubscribeEvent, cb centrifuge.SubscribeCallback) {
 		principal, ok := principalOf(client)
 		if !ok {
-			// Unreachable: a client exists only after connecting returned a
-			// context carrying one. It fails closed rather than trusting that.
+			// The mechanism, rather than the adjective: a *Client exists only
+			// after connecting returned a ConnectReply, and the library stores
+			// that reply's Context on the client
+			// (centrifuge@v0.38.0/client.go:2379), so every client this handler
+			// can be given carries the context connecting built -- which
+			// carries a principal or the handshake failed. Nothing in this
+			// package can produce a client without one, which is why no test
+			// drives this arm and why deleting it kills nothing. It is kept
+			// because it fails CLOSED against a transport whose construction
+			// order this package does not own.
 			cb(centrifuge.SubscribeReply{}, centrifuge.ErrorUnauthorized)
 			return
 		}
@@ -312,6 +320,8 @@ func (h *Handler) connected(client *centrifuge.Client) {
 	client.OnRPC(func(e centrifuge.RPCEvent, cb centrifuge.RPCCallback) {
 		principal, ok := principalOf(client)
 		if !ok {
+			// See the identical guard on OnSubscribe above for why this arm has
+			// no reader and is kept anyway.
 			cb(centrifuge.RPCReply{}, centrifuge.ErrorUnauthorized)
 			return
 		}

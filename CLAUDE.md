@@ -803,12 +803,29 @@ admission's own `sessionwire.ErrorCode` unchanged, which is what makes the RPC's
 answer and the REST route's answer the same string rather than two vocabularies
 a client must switch on separately; the consumer is already written for it
 (`wui`'s protocol package resolves an RPC whose data has `error` and no
-`command_id` into its Core error hierarchy). A cancelled context, a closing
-store or a provider outage is NOT dressed as one of the nine public codes: a
-client told its command was *rejected* stops retrying, where the truth is that
-nobody knows whether it landed — which is the unknown outcome the durable
-CommandID exists for. `centrifuge.ErrorInternal` is `Temporary`, which is the
-correct advertisement for those.
+`command_id` into its Core error hierarchy). **An error `admission` did not
+itself classify** is never dressed as one of the nine public codes: a client
+told its command was *rejected* stops retrying, where the truth is that nobody
+knows whether it landed — which is the unknown outcome the durable CommandID
+exists for. `centrifuge.ErrorInternal` is `Temporary`, which is the correct
+advertisement for those.
+
+Read that sentence's subject carefully, because the wider version of it — "a
+provider outage is never dressed as a public code" — **was false when it was
+first written here**, and the layer that had the reader was `admission`, not
+this one. `existingCompatible` folded a `Targets.IsKnown` **failure** into
+`runtime_unavailable`, `ResolveAgent`'s failure into the same, and a
+`Directory.Owner` failure into `gate_not_resumable`. Every target and directory
+read has three outcomes — yes, no, and *could not ask* — and the third was
+spelled as the second, so a transient outage reached a browser as a classified,
+non-retryable decision about its command. `internal/admission` now returns a
+dependency fault **as itself**, wrapped for an operator's log and carrying no
+public code; the negative *answer* is unchanged. No new vocabulary was needed to
+do it, which is why it was correctable rather than owed to A9.1's shared
+classification authority: each edge already has a fault channel. None of the
+three fault arms had a test — `TestADependencyFaultIsNotADecisionAboutTheCommand`
+drives all four sites in both directions, because a fix that turned "no" into a
+fault as well would pass a table that only drove the faults.
 
 **The refusal carries no message and `retryable` is false.** Core makes
 `message` optional and `code` the member a client branches on, so a message here
@@ -860,15 +877,53 @@ positive control is a *different* CommandID on the same session: without it
 "nothing moved" would also be the output of a Factory that had stopped admitting
 anything.
 
-**Two limits this task did not close.** A durable admission is bounded by the
-LINK's lifetime rather than the client's patience — centrifuge@v0.38.0's
-`RPCEvent` carries a method and a payload and nothing else, so there is no
-per-RPC context to derive a deadline from, and inventing one here would be a
-second authority for a number the deployment configures (A9.1). And the V1
-`session.create` RPC reaches admission and is refused `runtime_unavailable`,
-because `AdmitCreate` still returns `ErrCreateIdentityProtocolUnavailable`; the
-create path is A3.1's remaining work, and the durable cases here use the legacy
-create to establish a session.
+**`ClientLinkLimits.CommandTimeout` is the ONLY bound a durable admission has,
+and before it there was none.** This was documented as "bounded by the link's
+lifetime", which is false, and the truth is worse than the claim.
+centrifuge@v0.38.0 dispatches an RPC **synchronously on the connection's read
+loop** (`client.go:1385` → `2259`), and the connection context is cancelled by
+the websocket handler's `defer close(ctxCh)` (`handler_websocket.go:218-222`) —
+that is, when the read loop **returns**. An in-flight admission is the very
+thing keeping it from returning, so nothing about the connection can cancel one:
+a blocked admission's context was measured surviving `client.Close()`,
+`node.Shutdown` **and** `server.Close()`. Two operational consequences followed,
+and neither was a slow command: a wedged store or directory **hung one link with
+no bound at all**, and because dispatch is serial it **head-of-line blocked every
+other frame on that link**, so a replica could not be drained while one admission
+was stuck.
+
+The bound is a deadline `Engine.Admit` puts on the context it hands the
+authorizer and the admitter, sized by the deployment and defaulting to
+`httpapi`'s own 30s so a command admitted over REST and the identical one
+admitted over a ClientLink get the same patience. It is worth exactly what a
+context is worth, which is the same limit `httpapi.RouteLimits` states for its
+edge: **a dependency that honours its context returns at the deadline, and one
+that ignores it is bounded by nothing here.** `TestAStuckAdmissionDoesNotWedgeTheLink`
+measures the property that matters over a real socket — not that the stuck
+command fails, but that the link is **still serving** afterwards and that
+`Shutdown` drains — and it is honest about that limit.
+
+Because the connection context can never be cancelled while an RPC is in flight,
+`client.Context()` versus `context.Background()` at the dispatch site is an
+**equivalent mutant**, and both gates probed it: there is no reader because there
+can be no reader. It is still `client.Context()`, for the values it carries and
+because a transport version that dispatched asynchronously would make the parent
+live again.
+
+**One limit this task did not close.** The V1 `session.create` RPC reaches
+admission and is refused `runtime_unavailable`, because `AdmitCreate` still
+returns `ErrCreateIdentityProtocolUnavailable`; the create path is A3.1's
+remaining work, and the durable cases here use the legacy create to establish a
+session.
+
+**A constraint on A3.3, recorded where A3.3 will read it.** `httpapi`'s
+`retryableStatus` returns **true** for 502/503/504, so the obvious
+`runtime_unavailable` → 503 mapping would make the identical refusal
+`retryable:true` over REST and `retryable:false` here. No divergence exists today
+— the control routes answer 501 — but it is the default outcome unless A3.3
+stops it. Whichever way it is settled, the answer must be **one** authority
+consulted by both edges, not two literals; this is the third instance of the
+shape `A9.1-notfound` already names.
 
 **Per-binding repair is not delegated to the transport, and A6.1 does not
 assume it is.** One `messageWriter` per `Client` and no per-channel queue

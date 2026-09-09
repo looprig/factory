@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	sessionwire "github.com/looprig/core/sessionwire/v1"
 	"github.com/looprig/factory/identity"
@@ -85,6 +86,19 @@ type admitCall struct {
 	method    clientlink.Method
 	principal identity.Principal
 	request   any
+	// ctx is the context the edge handed the service. The fake used to discard
+	// it, which made it looser than the real service in exactly the dimension
+	// the command bound lives in -- the gate's class-4 finding. It is kept so
+	// the deadline has a reader.
+	ctx context.Context
+}
+
+// deadline reports the bound the edge imposed on this admission.
+func (c admitCall) deadline() (time.Time, bool) {
+	if c.ctx == nil {
+		return time.Time{}, false
+	}
+	return c.ctx.Deadline()
 }
 
 type recordingAdmitter struct {
@@ -97,17 +111,25 @@ type recordingAdmitter struct {
 	err error
 	// gate, when non-nil, is received from before the admission returns: it is
 	// what makes "the reply follows the commit" measurable rather than timed.
-	gate  chan struct{}
-	calls []admitCall
+	gate chan struct{}
+	// waitForContext makes the fake behave like a dependency that honours the
+	// context it is given: it returns only when that context ends, and reports
+	// the context's own error. Nothing else releases it.
+	waitForContext bool
+	calls          []admitCall
 }
 
-func (a *recordingAdmitter) record(method clientlink.Method, principal identity.Principal, request any) (sessionstore.InboxEntry, bool, error) {
+func (a *recordingAdmitter) record(ctx context.Context, method clientlink.Method, principal identity.Principal, request any) (sessionstore.InboxEntry, bool, error) {
 	a.mu.Lock()
-	a.calls = append(a.calls, admitCall{method: method, principal: principal, request: request})
-	gate, entry, created, err := a.gate, a.entry, a.created, a.err
+	a.calls = append(a.calls, admitCall{method: method, principal: principal, request: request, ctx: ctx})
+	gate, wait, entry, created, err := a.gate, a.waitForContext, a.entry, a.created, a.err
 	a.mu.Unlock()
 	if gate != nil {
 		<-gate
+	}
+	if wait {
+		<-ctx.Done()
+		return sessionstore.InboxEntry{}, false, ctx.Err()
 	}
 	return entry, created, err
 }
@@ -118,24 +140,24 @@ func (a *recordingAdmitter) recorded() []admitCall {
 	return slices.Clone(a.calls)
 }
 
-func (a *recordingAdmitter) AdmitCreate(_ context.Context, p identity.Principal, req sessionwire.CreateRequest) (sessionstore.InboxEntry, bool, error) {
-	return a.record(clientlink.MethodSessionCreate, p, req)
+func (a *recordingAdmitter) AdmitCreate(ctx context.Context, p identity.Principal, req sessionwire.CreateRequest) (sessionstore.InboxEntry, bool, error) {
+	return a.record(ctx, clientlink.MethodSessionCreate, p, req)
 }
 
-func (a *recordingAdmitter) AdmitInput(_ context.Context, p identity.Principal, req sessionwire.InputRequest) (sessionstore.InboxEntry, bool, error) {
-	return a.record(clientlink.MethodSessionInput, p, req)
+func (a *recordingAdmitter) AdmitInput(ctx context.Context, p identity.Principal, req sessionwire.InputRequest) (sessionstore.InboxEntry, bool, error) {
+	return a.record(ctx, clientlink.MethodSessionInput, p, req)
 }
 
-func (a *recordingAdmitter) AdmitInterrupt(_ context.Context, p identity.Principal, req sessionwire.InterruptRequest) (sessionstore.InboxEntry, bool, error) {
-	return a.record(clientlink.MethodSessionInterrupt, p, req)
+func (a *recordingAdmitter) AdmitInterrupt(ctx context.Context, p identity.Principal, req sessionwire.InterruptRequest) (sessionstore.InboxEntry, bool, error) {
+	return a.record(ctx, clientlink.MethodSessionInterrupt, p, req)
 }
 
-func (a *recordingAdmitter) AdmitRestore(_ context.Context, p identity.Principal, req sessionwire.RestoreRequest) (sessionstore.InboxEntry, bool, error) {
-	return a.record(clientlink.MethodSessionRestore, p, req)
+func (a *recordingAdmitter) AdmitRestore(ctx context.Context, p identity.Principal, req sessionwire.RestoreRequest) (sessionstore.InboxEntry, bool, error) {
+	return a.record(ctx, clientlink.MethodSessionRestore, p, req)
 }
 
-func (a *recordingAdmitter) AdmitGateResponse(_ context.Context, p identity.Principal, req sessionwire.GateResponseRequest) (sessionstore.InboxEntry, bool, error) {
-	return a.record(clientlink.MethodGateRespond, p, req)
+func (a *recordingAdmitter) AdmitGateResponse(ctx context.Context, p identity.Principal, req sessionwire.GateResponseRequest) (sessionstore.InboxEntry, bool, error) {
+	return a.record(ctx, clientlink.MethodGateRespond, p, req)
 }
 
 // acceptedEntry is one durable record, with every member an absolute literal
@@ -164,6 +186,12 @@ type engineFixture struct {
 func newEngineFixture(t *testing.T) *engineFixture {
 	t.Helper()
 
+	return newEngineFixtureWithLimits(t, testLimits())
+}
+
+func newEngineFixtureWithLimits(t *testing.T, limits clientlink.Limits) *engineFixture {
+	t.Helper()
+
 	principal, err := identity.NewPrincipal(tenantA, "user-a", identity.KindActor)
 	if err != nil {
 		t.Fatalf("NewPrincipal: %v", err)
@@ -177,7 +205,7 @@ func newEngineFixture(t *testing.T) *engineFixture {
 		Authenticator: fixedAuthenticator{principal: principal},
 		Authorizer:    f.authorizer,
 		Admitter:      f.admitter,
-		Limits:        testLimits(),
+		Limits:        limits,
 		Version:       buildVersion,
 	})
 	if err != nil {
@@ -699,20 +727,47 @@ func TestTheAdmissionServiceIsExactlyTheSeamThisEdgeCalls(t *testing.T) {
 	service := reflect.TypeOf((*admission.Service)(nil))
 	seam := reflect.TypeOf((*clientlink.Admitter)(nil)).Elem()
 
-	// AdmitLegacyCreate is the ONE V1-shaped exclusion, and it is named rather
-	// than filtered by a pattern: it mints identities server-side and keeps the
-	// legacy unknown-outcome limitation, which is the property step 3 requires
-	// a ClientLink command not to have.
+	// The expected set is derived from the SIGNATURE, not from the name, and
+	// that is the gate's finding: a prefix rule cannot require a future V1
+	// command method that happens not to be called Admit*, which is the same
+	// class-6 hole this test closes everywhere else. A V1 admission is exactly
+	// "(context, Principal, <one Core request type>) -> (InboxEntry, bool,
+	// error)", and nothing else on the service has that shape.
+	//
+	// AdmitLegacyCreate is excluded by shape rather than by name -- it takes
+	// admission's own LegacyCreateRequest and returns a LegacyCreateResult, so
+	// it never matches. It is ALSO named below, because the reason it must stay
+	// off this seam is a decision rather than an accident of its signature: it
+	// mints identities server-side and keeps the legacy unknown-outcome
+	// limitation, which is the property step 3 requires a ClientLink command
+	// not to have. If a later change gave it the V1 shape, the named check is
+	// what would still refuse it.
 	const legacy = "AdmitLegacyCreate"
+	ctxType := reflect.TypeOf((*context.Context)(nil)).Elem()
+	principalType := reflect.TypeOf(identity.Principal{})
+	entryType := reflect.TypeOf(sessionstore.InboxEntry{})
+	errorType := reflect.TypeOf((*error)(nil)).Elem()
+	isV1Admission := func(fn reflect.Type) bool {
+		// NumIn counts the receiver on a method obtained from the type.
+		if fn.NumIn() != 4 || fn.NumOut() != 3 {
+			return false
+		}
+		return fn.In(1) == ctxType && fn.In(2) == principalType &&
+			fn.Out(0) == entryType && fn.Out(1) == reflect.TypeOf(false) && fn.Out(2) == errorType
+	}
 	want := map[string]bool{}
 	for i := range service.NumMethod() {
-		name := service.Method(i).Name
-		if strings.HasPrefix(name, "Admit") && name != legacy {
-			want[name] = true
+		method := service.Method(i)
+		if isV1Admission(method.Type) && method.Name != legacy {
+			want[method.Name] = true
 		}
 	}
 	if len(want) == 0 {
-		t.Fatal("the service declares no admission methods, so this comparison is vacuous")
+		t.Fatal("the service declares no V1 admission methods, so this comparison is vacuous")
+	}
+	// The shape rule must not be so loose that it matches the whole service.
+	if want[legacy] {
+		t.Error("the shape rule matched AdmitLegacyCreate, so it is not distinguishing a V1 admission")
 	}
 	got := map[string]bool{}
 	for i := range seam.NumMethod() {
@@ -720,15 +775,163 @@ func TestTheAdmissionServiceIsExactlyTheSeamThisEdgeCalls(t *testing.T) {
 	}
 	for name := range want {
 		if !got[name] {
-			t.Errorf("admission.Service declares %s, which the ClientLink seam does not call: an RPC cannot reach it", name)
+			t.Errorf("admission.Service declares %s with the V1 admission shape, which the ClientLink seam does not call: an RPC cannot reach it", name)
 		}
 	}
 	for name := range got {
 		if !want[name] {
-			t.Errorf("the ClientLink seam declares %s, which admission.Service does not implement", name)
+			t.Errorf("the ClientLink seam declares %s, which admission.Service does not implement with the V1 admission shape", name)
 		}
 	}
 	if got[legacy] {
 		t.Errorf("the ClientLink seam declares %s; a ClientLink command may not mint its own identities", legacy)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// The command bound.
+// ---------------------------------------------------------------------------
+
+// TestAnAdmissionIsBoundedByTheConfiguredCommandTimeout is the reader for the
+// only bound that exists on a durable admission.
+//
+// # Why a bound has to be here, and what it is worth
+//
+// It was documented as "bounded by the LINK's lifetime". Measured on the pinned
+// transport, it was bounded by NOTHING. centrifuge@v0.38.0 dispatches an RPC
+// SYNCHRONOUSLY on the connection's read loop (client.go:1385 -> 2259), and the
+// connection context is cancelled by the websocket handler's
+// `defer close(ctxCh)` (handler_websocket.go:218-222) -- that is, when the read
+// loop RETURNS. An in-flight admission is the very thing keeping the loop from
+// returning, so a disconnect cannot cancel it, and neither can Shutdown.
+//
+// Two consequences made this a hazard rather than a wrong sentence: a wedged
+// store hangs one link with no bound, and because dispatch is serial, it
+// head-of-line blocks every other frame on that link -- so a replica cannot be
+// drained while one admission is stuck.
+//
+// # What the bound can and cannot promise
+//
+// It is a DEADLINE on the context, not a guillotine on the reply, and the limit
+// is the ordinary contract of a context seam -- the same one httpapi.RouteLimits
+// states for its own: an Admitter that honours the context it is given returns
+// at the deadline, and one that ignores it is not bounded by anything here.
+// That is why the case below drives BOTH: a ctx-honouring admitter, which is
+// released, and the deadline's presence on the context itself, which is what a
+// well-behaved dependency reads.
+func TestAnAdmissionIsBoundedByTheConfiguredCommandTimeout(t *testing.T) {
+	t.Parallel()
+
+	t.Run("the context handed to admission carries the deadline", func(t *testing.T) {
+		t.Parallel()
+
+		f := newEngineFixture(t)
+		f.admitter.entry = acceptedEntry("session-1", "cmd-1")
+		before := time.Now()
+		if _, err := f.admit(t, clientlink.MethodSessionInput, commandBody(clientlink.MethodSessionInput, "session-1", "cmd-1")); err != nil {
+			t.Fatalf("Admit = %v", err)
+		}
+		after := time.Now()
+		calls := f.admitter.recorded()
+		if len(calls) != 1 {
+			t.Fatalf("%d admissions, want 1", len(calls))
+		}
+		deadline, ok := calls[0].deadline()
+		if !ok {
+			t.Fatal("the context handed to admission carries no deadline, so nothing bounds a wedged dependency")
+		}
+		// The window is bracketed by two readings of the clock taken around the
+		// call, so neither bound can fail because the machine was slow: the
+		// deadline may not be earlier than a clock read BEFORE the call plus
+		// the window, nor later than one taken AFTER it plus the window. A
+		// bound of some other duration -- twice the window, a hard-coded
+		// minute, no window at all -- falls outside on one side or the other.
+		window := testLimits().CommandTimeout
+		if earliest := before.Add(window); deadline.Before(earliest) {
+			t.Errorf("the deadline is %v, earlier than the configured window allows (%v)", deadline, earliest)
+		}
+		if latest := after.Add(window); deadline.After(latest) {
+			t.Errorf("the deadline is %v, later than the configured window allows (%v)", deadline, latest)
+		}
+	})
+
+	t.Run("an admission that outlives the bound is released as a fault", func(t *testing.T) {
+		t.Parallel()
+
+		limits := testLimits()
+		limits.CommandTimeout = 50 * time.Millisecond
+		f := newEngineFixtureWithLimits(t, limits)
+		// An admitter that waits for its context, which is what a dependency
+		// honouring the seam does. Nothing releases it but the deadline.
+		f.admitter.mu.Lock()
+		f.admitter.waitForContext = true
+		f.admitter.mu.Unlock()
+
+		reply, err := f.admit(t, clientlink.MethodSessionInput, commandBody(clientlink.MethodSessionInput, "session-1", "cmd-1"))
+		if err == nil {
+			t.Fatalf("Admit returned the reply %s, want the deadline as an error", reply)
+		}
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Errorf("Admit error %v does not wrap context.DeadlineExceeded", err)
+		}
+		// It is a FAULT, not a refusal: the command may or may not have landed,
+		// which is the unknown outcome the durable CommandID exists for. A
+		// public code here would tell the client to stop retrying.
+		if reply != nil {
+			t.Errorf("a bounded-out admission was answered with the body %s", reply)
+		}
+	})
+
+	t.Run("the bound does not shorten an admission that answers", func(t *testing.T) {
+		t.Parallel()
+
+		// The control. Without it, every assertion above is also satisfied by
+		// an engine that refuses every command immediately.
+		f := newEngineFixture(t)
+		f.admitter.entry = acceptedEntry("session-1", "cmd-1")
+		reply, err := f.admit(t, clientlink.MethodSessionInput, commandBody(clientlink.MethodSessionInput, "session-1", "cmd-1"))
+		if err != nil {
+			t.Fatalf("Admit = %v, want the accepted record", err)
+		}
+		if statusOf(t, reply).CommandID != "cmd-1" {
+			t.Errorf("the reply names %q", statusOf(t, reply).CommandID)
+		}
+	})
+}
+
+// TestARefusalWithNoCodeIsAFaultNotAnEmptyReply drives refusalBody's
+// marshal-failure arm, which was documented as unreachable and is not.
+//
+// Core refuses to marshal an ErrorDetail with an empty code, and an empty code
+// is a value admission can produce: (*admission.Error).Error() contemplates
+// Code == "" explicitly, so a zero-valued refusal from any admission path lands
+// here. The answer that matters is what a client would otherwise get -- a
+// SUCCESSFUL RPC carrying an empty body, which is neither a status nor an
+// envelope and which no consumer can classify.
+func TestARefusalWithNoCodeIsAFaultNotAnEmptyReply(t *testing.T) {
+	t.Parallel()
+
+	f := newEngineFixture(t)
+	f.admitter.err = &admission.Error{}
+
+	reply, err := f.admit(t, clientlink.MethodSessionInput, commandBody(clientlink.MethodSessionInput, "session-1", "cmd-1"))
+	if !errors.Is(err, clientlink.ErrUnreadableRecord) {
+		t.Fatalf("Admit = (%s, %v), want ErrUnreadableRecord", reply, err)
+	}
+	if reply != nil {
+		t.Errorf("a codeless refusal was answered with the body %q, which a client cannot classify", reply)
+	}
+
+	// The positive control on the same path: a refusal that DOES carry a code
+	// is still answered as an envelope, so the arm above is reached by the
+	// missing code rather than by refusals having stopped working.
+	control := newEngineFixture(t)
+	control.admitter.err = &admission.Error{Code: sessionwire.ErrorCodeCommandRejected}
+	body, err := control.admit(t, clientlink.MethodSessionInput, commandBody(clientlink.MethodSessionInput, "session-1", "cmd-1"))
+	if err != nil {
+		t.Fatalf("a coded refusal = %v, want an envelope", err)
+	}
+	if got := envelopeCode(t, body); got != sessionwire.ErrorCodeCommandRejected {
+		t.Errorf("the control refusal carried %q", got)
 	}
 }

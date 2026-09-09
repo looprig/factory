@@ -139,8 +139,14 @@ func allSeams() []reflect.Type {
 		iface[clientlink.Authorizer](),
 		// The ClientLink's durable command plane. It is here rather than in
 		// publicSeams for hostlink.Dialer's reason: it is satisfied by
-		// internal/admission.Service, which the composition builds, and a
-		// deployer implements nothing of it.
+		// internal/admission.Service, which a deployer implements nothing of.
+		//
+		// Nothing in production builds either one TODAY -- no production file
+		// calls admission.NewService or clientlink.NewHandler, and
+		// httpapi.routeTable still books /v1/realtime to A9.1. The seam is
+		// listed so TestNoSeamNamesAStoragePrimitive covers it, not because the
+		// wiring exists; A9.1 is what will construct the service and hand it to
+		// the handler.
 		iface[clientlink.Admitter](),
 		iface[admission.Authorizer](),
 		iface[admission.Commands](),

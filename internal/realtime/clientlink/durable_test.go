@@ -607,3 +607,150 @@ func TestAFaultIsAnsweredAsATemporaryTransportFailureOverTheWire(t *testing.T) {
 		t.Errorf("a fault carried the body %s", result.Data)
 	}
 }
+
+// TestAStuckAdmissionDoesNotWedgeTheLink is the operational half of the command
+// bound, measured over a real socket rather than argued from the engine.
+//
+// The hazard the bound closes is not "one slow command". centrifuge dispatches
+// an RPC synchronously on the connection's read loop
+// (centrifuge@v0.38.0/client.go:1385 -> 2259), so an admission that never
+// returns holds the loop, and the loop is what would deliver every OTHER frame
+// on that link and what must return before Handler.Shutdown can drain the
+// connection. Before the bound, a single wedged store therefore hung the link
+// forever and defeated graceful shutdown; the gate measured the connection
+// context surviving Close, Shutdown and the server's own Close for 25 seconds.
+//
+// So the assertion is not that the first command fails. It is that the link is
+// STILL SERVING afterwards: a second command, admitted normally, is answered on
+// the same connection. That is the property head-of-line blocking would break
+// and the one an unbounded admission removes.
+//
+// The stated limit, again, is the seam's: this measures a dependency that
+// HONOURS its context. One that ignores it holds the loop regardless, and no
+// deadline at this layer can change that.
+func TestAStuckAdmissionDoesNotWedgeTheLink(t *testing.T) {
+	t.Parallel()
+
+	limits := testLimits()
+	limits.CommandTimeout = 100 * time.Millisecond
+	f := newFixture(t, limits)
+	f.admitter.mu.Lock()
+	f.admitter.waitForContext = true
+	f.admitter.mu.Unlock()
+
+	client, observed := dialSupported(t, f, "token-a")
+	await(t, observed.connected, "connected event")
+	ctx, cancel := context.WithTimeout(context.Background(), waitFor)
+	defer cancel()
+
+	// The wedged command. It is answered as a temporary fault, never as a
+	// public refusal: whether it landed is unknown, which is what the durable
+	// CommandID makes safe to retry.
+	result, err := client.RPC(ctx, string(clientlink.MethodSessionInput),
+		commandBody(clientlink.MethodSessionInput, "session-1", "cmd-stuck"))
+	if err == nil {
+		t.Fatalf("the wedged command was answered with %s, want a transport failure", result.Data)
+	}
+	if got := codeOf(err); got != 100 {
+		t.Errorf("the wedged command failed with code %d (%v), want 100 (internal, temporary)", got, err)
+	}
+
+	// The link is still serving. This is the assertion; the one above is its
+	// precondition.
+	f.admitter.mu.Lock()
+	f.admitter.waitForContext = false
+	f.admitter.entry = acceptedEntry("session-1", "cmd-after")
+	f.admitter.mu.Unlock()
+
+	after, err := client.RPC(ctx, string(clientlink.MethodSessionInput),
+		commandBody(clientlink.MethodSessionInput, "session-1", "cmd-after"))
+	if err != nil {
+		t.Fatalf("the next command on the same link = %v; the wedged one is still holding the read loop", err)
+	}
+	if got := statusOf(t, after.Data).CommandID; got != "cmd-after" {
+		t.Errorf("the next command was answered for %q, want %q", got, "cmd-after")
+	}
+
+	// And the replica can be drained. Shutdown returning is the whole of what
+	// "graceful" means for this handler; a still-blocked read loop would hold
+	// it to its own deadline instead.
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), waitFor)
+	defer shutdownCancel()
+	if err := f.handler.Shutdown(shutdownCtx); err != nil {
+		t.Errorf("Shutdown = %v, want a drained replica", err)
+	}
+}
+
+// TestACrossTenantSessionIsIndistinguishableFromAnAbsentOne is the committed
+// regression guard for the `A9.1-notfound` carry-forward.
+//
+// `internal/admission`'s catalogNotFound handles CatalogErrorNotFound and
+// KeyspaceBindingNotFound and omits CatalogErrorDeleted and
+// CatalogErrorIdentity. A6.2 is the first edge that routes a command into the
+// catalog lookup at all, so the question "does this path make the gap
+// reachable" became live with it; the measured answer is no, because the
+// released store's default multi-tenant layout hashes the tenant into the
+// session's scope and a foreign tenant therefore fails at the BINDING check,
+// which is handled.
+//
+// That answer is a property of a dependency, not of this module, so it is
+// pinned rather than reasoned about: a later SessionStore that classified the
+// same condition as CatalogErrorDeleted or CatalogErrorIdentity would fall
+// through catalogNotFound, arrive here as a bare fault, and be answered
+// centrifuge-internal instead of session_not_found. Nothing else in the suite
+// would say so -- the neighbouring "a session this tenant does not have" case
+// uses a never-created session on the SAME tenant, which takes the
+// CatalogErrorNotFound arm.
+//
+// The positive control is the point of the case. "session_not_found" is a
+// "nothing was found" answer and is also what a Factory that had stopped
+// resolving anything would produce, so the same fixture must admit the same
+// session for its OWN tenant in the same run.
+func TestACrossTenantSessionIsIndistinguishableFromAnAbsentOne(t *testing.T) {
+	t.Parallel()
+
+	store := openStore(t)
+	owner := testPrincipal(t)
+	r := newReplica(t, store, "runtime-tenancy", time.Date(2026, 9, 8, 13, 0, 0, 0, time.UTC))
+	session := existingSession(t, r, owner)
+
+	stranger, err := identity.NewPrincipal(tenantB, "user-b", identity.KindActor)
+	if err != nil {
+		t.Fatalf("NewPrincipal: %v", err)
+	}
+	engine := r.fixture.handler.Engine()
+
+	foreign, err := engine.Admit(t.Context(), stranger, clientlink.MethodSessionInput,
+		commandBody(clientlink.MethodSessionInput, session, "cmd-foreign"))
+	if err != nil {
+		t.Fatalf("a cross-tenant command = %v, want a refusal envelope; a bare fault here means "+
+			"the store now reports this condition with a code catalogNotFound does not handle (A9.1-notfound)", err)
+	}
+	if got := envelopeCode(t, foreign); got != sessionwire.ErrorCodeSessionNotFound {
+		t.Errorf("a cross-tenant command was refused with %q, want %q", got, sessionwire.ErrorCodeSessionNotFound)
+	}
+
+	// A session that never existed, for the same principal: the two must be the
+	// same public fact, or the refusal discloses that the identifier is real
+	// somewhere else.
+	absent, err := engine.Admit(t.Context(), stranger, clientlink.MethodSessionInput,
+		commandBody(clientlink.MethodSessionInput, "session-never-created", "cmd-foreign"))
+	if err != nil {
+		t.Fatalf("an absent session = %v, want a refusal envelope", err)
+	}
+	if string(absent) != string(foreign) {
+		t.Errorf("a cross-tenant session answered %s and an absent one %s; the two must be indistinguishable", foreign, absent)
+	}
+
+	// The positive control: the SAME session, the SAME engine, the owning
+	// tenant. Without it the two refusals above are also what a Factory that
+	// resolves nothing would produce.
+	own, err := engine.Admit(t.Context(), owner, clientlink.MethodSessionInput,
+		commandBody(clientlink.MethodSessionInput, session, "cmd-own"))
+	if err != nil {
+		t.Fatalf("the owning tenant's command = %v, want an acceptance", err)
+	}
+	if status := statusOf(t, own); status.State != sessionwire.CommandStateAccepted {
+		t.Fatalf("the owning tenant's command was answered %q (%s), want accepted", status.State, own)
+	}
+}

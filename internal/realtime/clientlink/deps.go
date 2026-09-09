@@ -25,6 +25,15 @@ type Authorizer interface {
 
 	// AuthorizeControl covers session.input, session.interrupt and
 	// gate.respond. See the note on httpapi.Authorizer.AuthorizeControl.
+	//
+	// A DENIAL must satisfy errors.Is(err, internalidentity.ErrUnauthorized),
+	// and that is a requirement rather than a description of the implementation
+	// that exists. rpcRefusal reads it to answer 103 (permission denied,
+	// terminal for this principal); an implementation returning a
+	// differently-typed refusal is answered 100 instead, which centrifuge marks
+	// TEMPORARY -- a denial dressed as a fault, telling a client to retry an
+	// operation it may never perform. Anything else the authorizer returns is a
+	// fault and is correctly answered as one.
 	AuthorizeControl(ctx context.Context, principal identity.Principal, session sessionwire.SessionID, kind sessionstore.CommandKind) error
 }
 
