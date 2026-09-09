@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"go/ast"
 	"go/parser"
 	"go/token"
@@ -728,10 +729,26 @@ func TestADependencyFaultIsNotADecisionAboutTheCommand(t *testing.T) {
 // so it contributes no fault site.
 //
 // The universe may not be computed from the thing it probes. Config and *Service
-// are the production declarations the service is BUILT from, not values it
-// indexes at run time, so shrinking either is a compile error in service.go
-// rather than a quieter test -- which is the trap sessionstore's own derivation
-// (commit 7f9f598) had to avoid and names explicitly.
+// are production declarations, not values the service indexes at run time, so
+// neither axis can be narrowed by narrowing this file -- which is the trap
+// sessionstore's own derivation (commit 7f9f598) had to avoid and names.
+//
+// What PINS each axis is different, and the sentence that stood here said one
+// thing about both. Measured, on this tree:
+//
+//	a Config FIELD          deleting it stops service.go compiling, because the
+//	                        service dereferences s.cfg.Directory and friends.
+//	                        `go build ./...` fails. Nothing else is needed.
+//	an interface METHOD     deleting it compiles everywhere and shrank this
+//	                        sweep 60 -> 54, green. Pinned only by the
+//	                        bidirectional record check below.
+//	a *Service METHOD       deleting AdmitInterrupt leaves `go build ./...` at
+//	                        EXIT 0 -- I ran it. The only breakage is this test
+//	                        file failing to compile, which is a real failure but
+//	                        is not what "a compile error in service.go" claims,
+//	                        and it is the test file that would have to be edited
+//	                        to make it go away. The set-equality check on the
+//	                        entry points is what makes that edit visible.
 //
 // # Anti-vacuity
 //
@@ -1112,14 +1129,21 @@ func admissionEntryPoints(t *testing.T) map[string]func(*serviceFixture) error {
 func TestEveryClassifiedRefusalIsReachableFromADrivenEntryPoint(t *testing.T) {
 	t.Parallel()
 
-	callers, callees, duplicates, err := packageCallGraph(".")
+	callers, callees, unattributable, err := packageCallGraph(".")
 	if err != nil {
 		t.Fatalf("parse the admission sources: %v", err)
 	}
-	if len(duplicates) != 0 {
-		t.Fatalf("these names are declared more than once in this package: %v. "+
-			"The call graph is keyed by name, so an edge to one of them reaches both; "+
-			"the guard cannot distinguish them and must not pretend to", duplicates)
+	// A call that LOOKS like a receiver call and is not a method this package
+	// declares on that receiver's type is a hard failure rather than a dropped
+	// edge, because the two shapes that produce it are exactly the two escapes
+	// this guard was found not to close: a shadowed receiver identifier, and a
+	// func-typed field. Neither can be told from a method call syntactically,
+	// so the analysis reports that it cannot see rather than guessing.
+	if len(unattributable) != 0 {
+		t.Fatalf("this package makes %d call(s) the reachability analysis cannot attribute:\n\t%s\n"+
+			"Each is either a receiver identifier shadowed by another value or a func-typed field. "+
+			"The graph cannot distinguish either from a method call, so it fails here rather than "+
+			"granting coverage it has not established", len(unattributable), strings.Join(unattributable, "\n\t"))
 	}
 	if len(callees) == 0 {
 		t.Fatal("vacuous: the scanner found no functions at all")
@@ -1129,7 +1153,12 @@ func TestEveryClassifiedRefusalIsReachableFromADrivenEntryPoint(t *testing.T) {
 		t.Fatal("vacuous: no production function calls refusal(), so this proves nothing")
 	}
 
-	driven := admissionEntryPoints(t)
+	// The driven set is qualified the way the graph is: these are methods on
+	// *Service, so their nodes are Service.AdmitX.
+	driven := map[string]bool{}
+	for name := range admissionEntryPoints(t) {
+		driven["Service."+name] = true
+	}
 	reached := map[string]bool{}
 	var walk func(string)
 	walk = func(fn string) {
@@ -1160,60 +1189,60 @@ func TestEveryClassifiedRefusalIsReachableFromADrivenEntryPoint(t *testing.T) {
 }
 
 // packageCallGraph parses root's production files and reports, for every
-// declared function, the names it calls -- and, inverted, the functions that
-// call each name.
+// declared function, the QUALIFIED names it calls -- and, inverted, the
+// functions that call each name -- together with every call it could not
+// attribute.
 //
-// # Which calls become edges, and why the first version was wrong
+// # The unit of analysis
 //
-// An edge is recorded for exactly two call shapes:
+// A node is one of:
 //
-//	f(...)     a bare identifier
-//	s.f(...)   a selector whose receiver is the ENCLOSING function's own
-//	           receiver identifier
+//	funcName            a package-level function
+//	Type.MethodName     a method, keyed by its receiver TYPE, not by the
+//	                    identifier the receiver happens to be spelled with
+//	Node@literal:LINE   a function literal, its own node with no incoming edge
 //
-// and for nothing else. The first version recorded the selector's final
-// identifier for EVERY selector call, which made `req.Validate()` -- a Core
-// method every entry point calls -- an edge to any package function named
-// Validate. Both gates built the same counterexample from that: an orphaned
-// `func Validate(...) error` minting refusal(), called by nobody, was "reached"
-// and passed, while the byte-identical body under a unique name failed. I
-// reproduced the pair before changing anything, one identifier apart, opposite
-// outcomes. So `reached` GRANTED coverage while the test's own comment claimed
-// it demanded it, and the collision surface was every method name in Core and
-// SessionStore: Validate, Error, Unwrap, Tenant.
+// Keying methods by type is what closes two escapes that a name-keyed graph
+// cannot, and both were live here until this round -- each demonstrated by a
+// controlled pair in which the byte-identical orphan survives:
 //
-// The receiver rule is what attributes a selector call to a function THIS
-// package declares. `s.admit(...)` inside a method with receiver `s` is a call
-// to a method of this package's own type; `req.Validate()` and
-// `s.cfg.Catalog.GetCatalogEntry(...)` are not, and are dropped -- the second
-// because its receiver expression is a selector, not the receiver identifier.
+//   - (G) RECEIVER SHADOWING. A block-scoped `s := req; s.Validate()` inside a
+//     method whose receiver is also `s` looked like a receiver call, so it
+//     became an edge to a package function named Validate. `s` is the receiver
+//     of 11 of the 13 methods here, and the old rule compared identifier TEXT
+//     with no scope analysis. I reproduced it before rewriting: `go vet` clean,
+//     package green, orphan unreached and passing.
+//   - (H) A FUNC-TYPED FIELD. `s.hook()`, where hook is a field rather than a
+//     method, is syntactically identical to a method call. The stated residual
+//     said "a local VARIABLE shadowing a package function", and a struct field
+//     is not that.
 //
-// # Which way it errs, derived rather than asserted
+// Both are closed by the same rule: a selector call on the receiver identifier
+// is an edge ONLY when its selector is a method this package declares on that
+// receiver's type. Anything else that looks like a receiver call is
+// UNATTRIBUTABLE and is a hard failure, the way duplicate declarations were --
+// the guard sets that precedent and this follows it. Failing closed is the
+// point: the analysis says what it cannot see instead of guessing.
 //
-// It UNDER-approximates, which is the direction that demands coverage: a call
-// this scan cannot attribute makes its target look unreached and fails, rather
-// than quietly making a site look covered. What it drops is a call to a package
-// function reached through some other value -- a func stored in a field, a
-// method called on a variable of this package's type that is not the receiver.
-// Neither exists here today, and if one appears the guard reports the site it
-// can no longer see instead of passing.
+// # What it therefore cannot see
 //
-// One residual over-approximation is unavoidable in a name-keyed graph and is
-// therefore CHECKED rather than argued: two declarations sharing a name would
-// be one node, so an edge to either would reach both. duplicates reports them
-// and the caller fails on a non-empty result. A local variable of func type
-// shadowing a package function's name would also produce a spurious identifier
-// edge; that is the one residual left standing, and it is stated rather than
-// claimed away.
-func packageCallGraph(root string) (callers, callees map[string][]string, duplicates []string, err error) {
+//   - A call through any other value -- a func in a map, an interface method on
+//     a field -- is not an edge. Its target looks unreached and FAILS, which is
+//     the direction this construction must err in.
+//   - A package-level function called only via a value assigned elsewhere is
+//     unreachable to this scan and fails for the same reason.
+//   - Qualification removes the name-collision hazard by construction rather
+//     than by a check: a free `catalogNotFound` and an `Error.catalogNotFound`
+//     are now two nodes, so neither can inherit the other's callers. The
+//     explicit duplicate check that stood here is gone with it, because a guard
+//     that can no longer fire is not a guard.
+func packageCallGraph(root string) (callers, callees map[string][]string, unattributable []string, err error) {
 	entries, err := os.ReadDir(root)
 	if err != nil {
 		return nil, nil, nil, err
 	}
-	callers, callees = map[string][]string{}, map[string][]string{}
-	declared := map[string]int{}
+	var files []*ast.File
 	fset := token.NewFileSet()
-	var record func(string, ast.Node)
 	for _, entry := range entries {
 		name := entry.Name()
 		if entry.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
@@ -1223,76 +1252,114 @@ func packageCallGraph(root string) (callers, callees map[string][]string, duplic
 		if parseErr != nil {
 			return nil, nil, nil, parseErr
 		}
+		files = append(files, file)
+	}
+
+	// First pass: what this package declares. The method set per receiver type
+	// is what the second pass attributes against.
+	freeFunctions := map[string]bool{}
+	methodsOf := map[string]map[string]bool{}
+	for _, file := range files {
+		for _, decl := range file.Decls {
+			fn, ok := decl.(*ast.FuncDecl)
+			if !ok {
+				continue
+			}
+			typeName, _, isMethod := receiverOf(fn)
+			if !isMethod {
+				freeFunctions[fn.Name.Name] = true
+				continue
+			}
+			if methodsOf[typeName] == nil {
+				methodsOf[typeName] = map[string]bool{}
+			}
+			methodsOf[typeName][fn.Name.Name] = true
+		}
+	}
+
+	callers, callees = map[string][]string{}, map[string][]string{}
+	var record func(from string, body ast.Node, recvType, recvName string)
+	record = func(from string, body ast.Node, recvType, recvName string) {
+		if _, seen := callees[from]; !seen {
+			callees[from] = nil
+		}
+		ast.Inspect(body, func(n ast.Node) bool {
+			if lit, isLit := n.(*ast.FuncLit); isLit && n != body {
+				record(from+"@literal:"+strconv.Itoa(fset.Position(lit.Pos()).Line), lit.Body, recvType, recvName)
+				return false
+			}
+			call, ok := n.(*ast.CallExpr)
+			if !ok {
+				return true
+			}
+			var called string
+			switch fun := call.Fun.(type) {
+			case *ast.Ident:
+				if !freeFunctions[fun.Name] {
+					return true
+				}
+				called = fun.Name
+			case *ast.SelectorExpr:
+				ident, isIdent := fun.X.(*ast.Ident)
+				if !isIdent || recvName == "" || ident.Name != recvName {
+					return true
+				}
+				if !methodsOf[recvType][fun.Sel.Name] {
+					unattributable = append(unattributable, fmt.Sprintf("%s calls %s.%s at %s, which is not a method this package declares on %s",
+						from, ident.Name, fun.Sel.Name, fset.Position(call.Pos()), recvType))
+					return true
+				}
+				called = recvType + "." + fun.Sel.Name
+			default:
+				return true
+			}
+			if !slices.Contains(callees[from], called) {
+				callees[from] = append(callees[from], called)
+			}
+			if !slices.Contains(callers[called], from) {
+				callers[called] = append(callers[called], from)
+			}
+			return true
+		})
+	}
+
+	for _, file := range files {
 		for _, decl := range file.Decls {
 			fn, ok := decl.(*ast.FuncDecl)
 			if !ok || fn.Body == nil {
 				continue
 			}
-			declared[fn.Name.Name]++
-			if _, seen := callees[fn.Name.Name]; !seen {
-				callees[fn.Name.Name] = nil
+			typeName, recvName, isMethod := receiverOf(fn)
+			key := fn.Name.Name
+			if isMethod {
+				key = typeName + "." + fn.Name.Name
 			}
-			// The receiver's identifier, when this declaration has one. A
-			// method declared with no receiver NAME -- func (*Service) f() --
-			// cannot make an attributable selector call, and an empty string
-			// here matches no identifier.
-			receiver := ""
-			if fn.Recv != nil && len(fn.Recv.List) == 1 && len(fn.Recv.List[0].Names) == 1 {
-				receiver = fn.Recv.List[0].Names[0].Name
-			}
-			record = func(from string, body ast.Node) {
-				ast.Inspect(body, func(n ast.Node) bool {
-					// A function literal is its OWN node, so its calls are not
-					// attributed to the declaration that encloses it. That is
-					// escape (C), reported from the sessionstore lane's audit of
-					// the same construction: a call nested inside an
-					// already-reached function inherits its reachability, and a
-					// closure that is declared but never invoked would inherit
-					// coverage it does not have. A literal has no incoming edge
-					// here at all, so a refusal minted inside one is reported
-					// unreached and has to be argued for. There are none today.
-					if lit, isLit := n.(*ast.FuncLit); isLit && n != body {
-						name := from + "@literal:" + strconv.Itoa(fset.Position(lit.Pos()).Line)
-						if _, seen := callees[name]; !seen {
-							callees[name] = nil
-						}
-						record(name, lit.Body)
-						return false
-					}
-					call, ok := n.(*ast.CallExpr)
-					if !ok {
-						return true
-					}
-					var called string
-					switch fun := call.Fun.(type) {
-					case *ast.Ident:
-						called = fun.Name
-					case *ast.SelectorExpr:
-						ident, isIdent := fun.X.(*ast.Ident)
-						if !isIdent || receiver == "" || ident.Name != receiver {
-							return true
-						}
-						called = fun.Sel.Name
-					default:
-						return true
-					}
-					if !slices.Contains(callees[from], called) {
-						callees[from] = append(callees[from], called)
-					}
-					if !slices.Contains(callers[called], from) {
-						callers[called] = append(callers[called], from)
-					}
-					return true
-				})
-			}
-			record(fn.Name.Name, fn.Body)
+			record(key, fn.Body, typeName, recvName)
 		}
 	}
-	for name, count := range declared {
-		if count > 1 {
-			duplicates = append(duplicates, name)
-		}
+	slices.Sort(unattributable)
+	return callers, callees, unattributable, nil
+}
+
+// receiverOf reports a declaration's receiver TYPE and the identifier it is
+// spelled with. A method declared with no receiver name -- func (*Service) f()
+// -- yields an empty name, which matches no identifier, so it can make no
+// attributable selector call.
+func receiverOf(fn *ast.FuncDecl) (typeName, name string, isMethod bool) {
+	if fn.Recv == nil || len(fn.Recv.List) != 1 {
+		return "", "", false
 	}
-	slices.Sort(duplicates)
-	return callers, callees, duplicates, nil
+	field := fn.Recv.List[0]
+	expr := field.Type
+	if star, isStar := expr.(*ast.StarExpr); isStar {
+		expr = star.X
+	}
+	ident, isIdent := expr.(*ast.Ident)
+	if !isIdent {
+		return "", "", false
+	}
+	if len(field.Names) == 1 {
+		name = field.Names[0].Name
+	}
+	return ident.Name, name, true
 }
