@@ -65,6 +65,15 @@ func TestEveryBoundedShutdownPrecedesAnUnboundedClose(t *testing.T) {
 	// already corrected is five; the sixth is in internal/realtime/transport,
 	// which no gate reached. That is the argument for a census rather than a
 	// list, made by the census on its first run.
+	//
+	// It is A COUNT, and saying so is the point rather than an apology. There is
+	// no authority in this module for "how many websocket fixtures there ought
+	// to be", so this cannot be derived the way the admission sweep's axes are.
+	// What a count can see: the scanner breaking, or the fixtures being deleted.
+	// What it cannot: one site added and another removed in the same change, or
+	// a seventh site appearing -- which is why the ORDERING check above is over
+	// every site found rather than over a listed six, and why this floor is the
+	// weaker of the two readers in this file.
 	if len(sites) < 6 {
 		t.Fatalf("the census found %d shutdown/close pairs, want at least the six this module had when it was written; "+
 			"a scan that stopped finding them is indistinguishable from a tree that stopped having them: %v", len(sites), sites)
