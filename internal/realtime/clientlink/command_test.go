@@ -115,6 +115,11 @@ type recordingAdmitter struct {
 	// waitForContext makes the fake behave like a dependency that honours the
 	// context it is given: it returns when that context ends, and reports the
 	// context's own error.
+	//
+	// A case that sets it MUST assert unbounded() is false. Without that the
+	// backstop below silently stands in for the property under test, which is
+	// the masking bug this whole mechanism exists to avoid; both current call
+	// sites assert it, and a gate confirmed the flag is genuinely read.
 	waitForContext bool
 	// selfReleased records that the BACKSTOP released the admission instead of
 	// the context. It is the difference between "the bound worked" and "the
@@ -130,9 +135,11 @@ type recordingAdmitter struct {
 
 // admitterBackstop is the wall-clock ceiling on a context-honouring fake.
 //
-// It is generous by two orders of magnitude against every CommandTimeout any
-// case configures, so on a green tree the context always wins and nothing here
-// depends on the machine being fast. It is reached only when NOTHING bounded
+// It is 50x to 100x every CommandTimeout any case configures -- 5s against
+// 100ms and 50ms -- so on a green tree the context always wins and nothing here
+// depends on the machine being fast. (It said "two orders of magnitude", which
+// is true of one bound and not the other; in a round about narrowing claims,
+// that one is now stated as measured.) It is reached only when NOTHING bounded
 // the admission, which is exactly the condition a case must fail on rather than
 // wait out.
 const admitterBackstop = 5 * time.Second
@@ -802,9 +809,40 @@ func TestTheAdmissionServiceIsExactlyTheSeamThisEdgeCalls(t *testing.T) {
 	if len(want) == 0 {
 		t.Fatal("the service declares no V1 admission methods, so this comparison is vacuous")
 	}
-	// The shape rule must not be so loose that it matches the whole service.
-	if want[legacy] {
-		t.Error("the shape rule matched AdmitLegacyCreate, so it is not distinguishing a V1 admission")
+	// The shape rule needs a positive control over known-answer inputs, and the
+	// first version of this check was not one: it asked whether `want` held
+	// AdmitLegacyCreate, which the loop above had already excluded BY NAME, so
+	// the map could never contain that key and the guard could never fire. A
+	// gate then gutted isV1Admission to two of its six conditions and the suite
+	// passed. That is the same class-6 defect this test exists to close, in the
+	// check written to prove it was closed.
+	//
+	// So the rule is driven against the real method it must reject, looked up
+	// OUTSIDE the name filter, and against a table of near misses that differ
+	// from the V1 shape in exactly one dimension each. Every condition in
+	// isV1Admission has a row that fails without it.
+	legacyMethod, found := service.MethodByName(legacy)
+	if !found {
+		t.Fatalf("%s is not declared on the service, so the exclusion below proves nothing", legacy)
+	}
+	if isV1Admission(legacyMethod.Type) {
+		t.Errorf("the shape rule matches %s, so it is not distinguishing a V1 admission from a legacy one", legacy)
+	}
+	for name, probe := range map[string]any{
+		"the exact V1 shape":       shapeProbeType.AdmitExact,
+		"one argument short":       shapeProbeType.MissingPrincipal,
+		"one argument too many":    shapeProbeType.ExtraArgument,
+		"no context":               shapeProbeType.NoContext,
+		"a principal by pointer":   shapeProbeType.PointerPrincipal,
+		"one result short":         shapeProbeType.MissingCreated,
+		"a catalog entry returned": shapeProbeType.WrongEntry,
+		"a non-boolean second":     shapeProbeType.WrongCreated,
+		"a non-error third":        shapeProbeType.WrongError,
+	} {
+		want := name == "the exact V1 shape"
+		if got := isV1Admission(reflect.TypeOf(probe)); got != want {
+			t.Errorf("isV1Admission(%s) = %t, want %t", name, got, want)
+		}
 	}
 	got := map[string]bool{}
 	for i := range seam.NumMethod() {
@@ -927,6 +965,40 @@ func TestAnAdmissionIsBoundedByTheConfiguredCommandTimeout(t *testing.T) {
 		}
 	})
 
+	// The AUTHORIZER half. The bound is placed above AuthorizeControl rather
+	// than below it, and that placement was a claim with no reader: moving the
+	// deadline below the authorization call was measured surviving the whole
+	// module suite. A wedged authorizer produces the identical hazard to a
+	// wedged store -- it holds the serial read loop and defeats Shutdown -- and
+	// it is at least as plausible a dependency, since it is a seam a deployer
+	// supplies and A9.1 composes.
+	t.Run("a wedged authorizer is bounded too", func(t *testing.T) {
+		t.Parallel()
+
+		limits := testLimits()
+		limits.CommandTimeout = 50 * time.Millisecond
+		f := newEngineFixtureWithLimits(t, limits)
+		f.authorizer.mu.Lock()
+		f.authorizer.waitForContext = true
+		f.authorizer.mu.Unlock()
+
+		reply, err := f.admit(t, clientlink.MethodSessionInput, commandBody(clientlink.MethodSessionInput, "session-1", "cmd-1"))
+		if err == nil {
+			t.Fatalf("Admit returned the reply %s, want the deadline as an error", reply)
+		}
+		if f.authorizer.unbounded() {
+			t.Fatal("the authorization decision was released by the fake's own backstop, so the bound does not cover it")
+		}
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Errorf("Admit error %v does not wrap context.DeadlineExceeded", err)
+		}
+		// It never reached admission, which is the other half of the placement:
+		// a command whose authorization never completed must not be admitted.
+		if calls := f.admitter.recorded(); len(calls) != 0 {
+			t.Errorf("a bounded-out authorization still reached admission %d times", len(calls))
+		}
+	})
+
 	t.Run("the bound does not shorten an admission that answers", func(t *testing.T) {
 		t.Parallel()
 
@@ -979,4 +1051,49 @@ func TestARefusalWithNoCodeIsAFaultNotAnEmptyReply(t *testing.T) {
 	if got := envelopeCode(t, body); got != sessionwire.ErrorCodeCommandRejected {
 		t.Errorf("the control refusal carried %q", got)
 	}
+}
+
+// shapeProbe supplies known-answer inputs for isV1Admission.
+//
+// Each method differs from the V1 admission shape in exactly ONE dimension, so
+// a rule that dropped any single condition fails on one row rather than on all
+// of them. They are reached as METHOD EXPRESSIONS, which produce a func whose
+// first parameter is the receiver -- the same shape reflect.Type.Method yields,
+// which is why isV1Admission counts from index 1.
+type shapeProbeType struct{}
+
+func (shapeProbeType) AdmitExact(context.Context, identity.Principal, sessionwire.InputRequest) (sessionstore.InboxEntry, bool, error) {
+	return sessionstore.InboxEntry{}, false, nil
+}
+
+func (shapeProbeType) MissingPrincipal(context.Context, sessionwire.InputRequest) (sessionstore.InboxEntry, bool, error) {
+	return sessionstore.InboxEntry{}, false, nil
+}
+
+func (shapeProbeType) ExtraArgument(context.Context, identity.Principal, sessionwire.InputRequest, string) (sessionstore.InboxEntry, bool, error) {
+	return sessionstore.InboxEntry{}, false, nil
+}
+
+func (shapeProbeType) NoContext(string, identity.Principal, sessionwire.InputRequest) (sessionstore.InboxEntry, bool, error) {
+	return sessionstore.InboxEntry{}, false, nil
+}
+
+func (shapeProbeType) PointerPrincipal(context.Context, *identity.Principal, sessionwire.InputRequest) (sessionstore.InboxEntry, bool, error) {
+	return sessionstore.InboxEntry{}, false, nil
+}
+
+func (shapeProbeType) MissingCreated(context.Context, identity.Principal, sessionwire.InputRequest) (sessionstore.InboxEntry, error) {
+	return sessionstore.InboxEntry{}, nil
+}
+
+func (shapeProbeType) WrongEntry(context.Context, identity.Principal, sessionwire.InputRequest) (sessionstore.CatalogEntry, bool, error) {
+	return sessionstore.CatalogEntry{}, false, nil
+}
+
+func (shapeProbeType) WrongCreated(context.Context, identity.Principal, sessionwire.InputRequest) (sessionstore.InboxEntry, string, error) {
+	return sessionstore.InboxEntry{}, "", nil
+}
+
+func (shapeProbeType) WrongError(context.Context, identity.Principal, sessionwire.InputRequest) (sessionstore.InboxEntry, bool, string) {
+	return sessionstore.InboxEntry{}, false, ""
 }

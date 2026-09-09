@@ -95,6 +95,17 @@ type recordingAuthorizer struct {
 	control   []controlCall
 	// denyKind, when set, refuses exactly one command kind.
 	denyKind sessionstore.CommandKind
+	// waitForContext makes the authorizer behave like a wedged dependency that
+	// honours its context, exactly as recordingAdmitter's flag does. A stalled
+	// AUTHORIZER produces the identical hazard to a stalled admission -- it
+	// holds the serial read loop and defeats Shutdown -- so the bound has to
+	// cover it, and a claim that it does needs this to have a reader.
+	//
+	// A case that sets it MUST assert selfReleased is false, or the backstop
+	// below silently stands in for the property under test.
+	waitForContext bool
+	// selfReleased records that the backstop, not the context, released it.
+	selfReleased bool
 }
 
 type subscribeCall struct {
@@ -118,12 +129,32 @@ func (a *recordingAuthorizer) AuthorizeSubscribe(ctx context.Context, principal 
 func (a *recordingAuthorizer) AuthorizeControl(ctx context.Context, principal identity.Principal, session sessionwire.SessionID, kind sessionstore.CommandKind) error {
 	a.mu.Lock()
 	a.control = append(a.control, controlCall{tenant: principal.Tenant(), session: session, kind: kind})
-	deny := a.denyKind
+	deny, wait := a.denyKind, a.waitForContext
 	a.mu.Unlock()
 	if deny != "" && kind == deny {
 		return fmt.Errorf("%w: refused for this case", internalidentity.ErrUnauthorized)
 	}
+	if wait {
+		timer := time.NewTimer(admitterBackstop)
+		defer timer.Stop()
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-timer.C:
+			a.mu.Lock()
+			a.selfReleased = true
+			a.mu.Unlock()
+			return errAdmissionUnbounded
+		}
+	}
 	return a.inner.AuthorizeControl(ctx, principal, session, kind)
+}
+
+// unbounded reports that the backstop, not the context, ended the decision.
+func (a *recordingAuthorizer) unbounded() bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.selfReleased
 }
 
 func (a *recordingAuthorizer) subscribeCalls() []subscribeCall {
@@ -196,10 +227,22 @@ func newFixture(t *testing.T, limits clientlink.Limits) *fixture {
 	}
 	server := httptest.NewServer(handler)
 	t.Cleanup(func() {
-		server.Close()
+		// Shutdown BEFORE Close, and the order is the same lesson the fake's
+		// backstop taught one layer in. httptest.Server.Close waits for
+		// outstanding requests with no bound of its own, so a wedged read loop
+		// -- exactly what an unbounded admission produces -- hung the whole
+		// package until Go's ten-minute timeout instead of failing the case
+		// that caused it. A gate measured that: a clean 0.12s assertion failure
+		// followed by a 10-minute timeout in an unrelated case.
+		//
+		// Shutting the node down first closes the client connections, which is
+		// what lets the server's outstanding requests finish, so the bounded
+		// call is the one that does the work and the unbounded one has nothing
+		// left to wait for.
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		_ = handler.Shutdown(ctx)
+		server.Close()
 	})
 	return &fixture{
 		handler:    handler,
