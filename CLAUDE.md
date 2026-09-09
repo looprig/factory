@@ -822,10 +822,29 @@ non-retryable decision about its command. `internal/admission` now returns a
 dependency fault **as itself**, wrapped for an operator's log and carrying no
 public code; the negative *answer* is unchanged. No new vocabulary was needed to
 do it, which is why it was correctable rather than owed to A9.1's shared
-classification authority: each edge already has a fault channel. None of the
-three fault arms had a test — `TestADependencyFaultIsNotADecisionAboutTheCommand`
-drives all four sites in both directions, because a fix that turned "no" into a
-fault as well would pass a table that only drove the faults.
+classification authority: each edge already has a fault channel.
+
+One fold is knowingly left: `admissiblePayload` maps a `canonicalCommand` encode
+failure — a Go-level fault about a request that has already passed `Validate` —
+onto `invalid_request`. It is very nearly unreachable, since the input is a Core
+type that just validated, and it is named here rather than fixed so the narrowed
+claim above stays exactly true rather than nearly true. None of the
+four call sites (three distinct dependency methods, `ResolveAgent` twice) had a
+test.
+
+**And a table of named sites was the wrong reader for it.** The property is
+service-wide, so a fixed list defends it only where somebody thought to look —
+which is how two more folds of the identical shape sat unread in the two
+functions this fix rewrote, one of them telling a *retried* command it had been
+permanently rejected. `TestNoDependencyFaultBecomesAPublicCode` derives its
+subject from the mechanism instead: the METHOD SETS of the dependency interfaces
+the Service declares, read by reflection, each made to fail in turn against every
+entry point, asserting that **if the failing method was called, the answer
+carries no public code**. A method nothing drives fails the sweep rather than
+passing it, so a dependency added later cannot join the set of untested folds.
+`TestADependencyFaultIsNotADecisionAboutTheCommand` remains beside it for the
+half a fault sweep cannot check — that the negative *answer* is still a refusal,
+which is site-specific.
 
 **The refusal carries no message and `retryable` is false.** Core makes
 `message` optional and `code` the member a client branches on, so a message here
@@ -906,9 +925,12 @@ command fails, but that the link is **still serving** afterwards and that
 Because the connection context can never be cancelled while an RPC is in flight,
 `client.Context()` versus `context.Background()` at the dispatch site is an
 **equivalent mutant**, and both gates probed it: there is no reader because there
-can be no reader. It is still `client.Context()`, for the values it carries and
-because a transport version that dispatched asynchronously would make the parent
-live again.
+can be no reader. It is still `client.Context()` because a transport version that
+dispatched asynchronously would make the parent live again — **not** for the
+values it carries, which is a reader that does not exist: the only value on it
+is the operation context, and `principalOf` reads that from the `*Client`
+directly. The same non-reader applies one layer in, to `Engine.Admit`'s own
+parent, and for the same pinned reason.
 
 **One limit this task did not close.** The V1 `session.create` RPC reaches
 admission and is refused `runtime_unavailable`, because `AdmitCreate` still

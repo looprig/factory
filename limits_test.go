@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/looprig/factory/internal/httpapi"
 	"github.com/looprig/factory/internal/realtime/clientlink"
 	"github.com/looprig/factory/internal/realtime/hostlink"
 )
@@ -351,6 +352,36 @@ func TestTheTwoPingFloorsAreOneNumber(t *testing.T) {
 	if MinClientLinkPingInterval != clientlink.MinPingInterval {
 		t.Errorf("MinClientLinkPingInterval = %v but clientlink.MinPingInterval = %v",
 			MinClientLinkPingInterval, clientlink.MinPingInterval)
+	}
+}
+
+// TestTheTwoEdgeCommandBoundsAreOneNumber holds the coupling
+// DefaultClientLinkLimits documents in prose, in the shape
+// TestTheTwoPingFloorsAreOneNumber already established for this repository.
+//
+// The default is not merely "thirty seconds": it is httpapi's own request
+// deadline, so a command admitted over REST and the identical one admitted over
+// a ClientLink get the same patience from a deployment that configures neither.
+// A restatement can move on one side only -- a gate measured this one changing
+// to 1s with nothing failing -- and the failure is silent and asymmetric, which
+// is the coupling failing open.
+//
+// It compares the two DEFAULTS rather than a literal, deliberately: pinning 30s
+// here would freeze a number a deployment is free to tune the meaning of, while
+// this fails exactly when the two stop being one number.
+func TestTheTwoEdgeCommandBoundsAreOneNumber(t *testing.T) {
+	t.Parallel()
+
+	client := DefaultClientLinkLimits().CommandTimeout
+	route := httpapi.DefaultRouteLimits().RequestTimeout
+	if client != route {
+		t.Errorf("DefaultClientLinkLimits().CommandTimeout = %v but httpapi.DefaultRouteLimits().RequestTimeout = %v; "+
+			"the two edges bound the same durable work and their defaults are documented as one number", client, route)
+	}
+	// Anti-vacuity: two zero values would also be equal, and a zero bound is
+	// refused by both validators, so it could only arrive as a mistake here.
+	if client <= 0 {
+		t.Errorf("the shared default is %v, so the comparison above is between two unusable values", client)
 	}
 }
 
