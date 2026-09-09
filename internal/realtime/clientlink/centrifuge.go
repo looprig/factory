@@ -328,13 +328,19 @@ func (h *Handler) connected(client *centrifuge.Client) {
 		// The CONNECTION's context, because this transport version offers no
 		// other: centrifuge@v0.38.0's RPCEvent carries a method and a payload
 		// and nothing else (events.go:279-285), so there is no per-RPC
-		// cancellation to derive one from. The consequence is worth stating
-		// rather than leaving to be discovered -- a durable admission is
-		// bounded by the LINK's lifetime, not by the client's patience, so a
-		// browser that abandons a command does not cancel the write it started.
-		// A bound of this surface's own belongs with the rest of the
-		// composition's deadlines (A9.1); inventing one here would be a second
-		// authority for a number the deployment configures.
+		// cancellation to derive one from.
+		//
+		// It is not what BOUNDS the admission, and nothing about the connection
+		// could be: an RPC is dispatched synchronously on the read loop
+		// (client.go:1385 -> 2259) and this context is cancelled when that loop
+		// RETURNS (handler_websocket.go:218-222), so an in-flight admission is
+		// the very thing keeping it alive -- measured surviving client.Close,
+		// node.Shutdown and the server's own Close. The bound is the Engine's
+		// Limits.CommandTimeout, applied inside Admit; see that field for what
+		// it is worth and for the two failures its absence caused. Passing
+		// context.Background() here instead would be an EQUIVALENT change for
+		// the same reason, and it stays as it is because a transport version
+		// that dispatched asynchronously would make this parent live again.
 		body, err := h.engine.Admit(client.Context(), principal, Method(e.Method), e.Data)
 		if err != nil {
 			cb(centrifuge.RPCReply{}, rpcRefusal(err))
