@@ -347,8 +347,9 @@ func (h *Handler) connected(client *centrifuge.Client) {
 		// context off it (see principalOf, below), and it descends from the
 		// http.Request's, which net/http loads with LocalAddrContextKey
 		// (net/http/server.go:1933) and ServerContextKey
-		// (net/http/server.go:3549, and :3920 for a server built by
-		// Serve). So the equivalence is narrower than "no values", and it rests
+		// (net/http/server.go:3549 in Serve, and :3920 in
+		// ListenAndServeTLS). So the equivalence is narrower than "no values",
+		// and it rests
 		// on two facts about THIS composition: the parent cannot be cancelled
 		// while the RPC is in flight, per the paragraph above; and no consumer
 		// downstream of Admit reads a value from the context it is given --
