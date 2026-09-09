@@ -192,18 +192,37 @@ func censusOfFile(fset *token.FileSet, file *ast.File, relative string) []cleanu
 		node *ast.BlockStmt
 	}
 	var bodies []body
-	enclosing := "file"
+	// The enclosing declaration is found by POSITION rather than by remembering
+	// the last one walked. A package-level `var f = func(){...}` appearing after
+	// a declaration was labelled with that declaration's name -- which a probe
+	// exposed as "Close@8" for a literal inside no function at all. A wrong
+	// label in a failure message is the same class of defect as a wrong line
+	// number in a comment, so it is derived rather than tracked.
+	declarations := map[*ast.FuncDecl]bool{}
+	ast.Inspect(file, func(n ast.Node) bool {
+		if decl, ok := n.(*ast.FuncDecl); ok && decl.Body != nil {
+			declarations[decl] = true
+		}
+		return true
+	})
+	enclosingOf := func(pos token.Pos) string {
+		for decl := range declarations {
+			if decl.Pos() <= pos && pos <= decl.End() {
+				return decl.Name.Name
+			}
+		}
+		return "file"
+	}
 	ast.Inspect(file, func(n ast.Node) bool {
 		switch decl := n.(type) {
 		case *ast.FuncDecl:
 			if decl.Body == nil {
 				return true
 			}
-			enclosing = decl.Name.Name
-			bodies = append(bodies, body{name: enclosing, node: decl.Body})
+			bodies = append(bodies, body{name: decl.Name.Name, node: decl.Body})
 		case *ast.FuncLit:
 			bodies = append(bodies, body{
-				name: enclosing + "@" + strconv.Itoa(fset.Position(decl.Pos()).Line),
+				name: enclosingOf(decl.Pos()) + "@" + strconv.Itoa(fset.Position(decl.Pos()).Line),
 				node: decl.Body,
 			})
 		}
