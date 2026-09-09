@@ -340,16 +340,20 @@ func (h *Handler) connected(client *centrifuge.Client) {
 		// it is worth and for the two failures its absence caused.
 		//
 		// Passing context.Background() here is an EQUIVALENT change today, and
-		// the reason is worth stating exactly, because two earlier attempts at
-		// it were wrong. This context is NOT valueless: principalOf reads the
-		// operation context off it three lines above (centrifuge.go:388), and
-		// it descends from the http.Request's, which net/http loads with
-		// ServerContextKey and LocalAddrContextKey (server.go:1933, 3143). The
-		// equivalence is narrower than "no values" and rests on two facts about
-		// THIS composition: the parent cannot be cancelled while the RPC is in
-		// flight, per the paragraph above; and no consumer downstream of Admit
-		// reads a value from the context it is given -- internal/identity's
-		// Authorizer discards it (authorize.go:50) and admission forwards it to
+		// the reason is worth stating exactly, because three earlier attempts
+		// at it were wrong -- twice in the mechanism, once in the citations.
+		//
+		// This context is NOT valueless. principalOf reads the operation
+		// context off it (see principalOf, below), and it descends from the
+		// http.Request's, which net/http loads with LocalAddrContextKey
+		// (net/http/server.go:1933) and ServerContextKey
+		// (net/http/server.go:3549, and :3920 for a server built by
+		// Serve). So the equivalence is narrower than "no values", and it rests
+		// on two facts about THIS composition: the parent cannot be cancelled
+		// while the RPC is in flight, per the paragraph above; and no consumer
+		// downstream of Admit reads a value from the context it is given --
+		// internal/identity's Authorizer takes it as `_ context.Context`
+		// (internal/identity/authorize.go:50) and admission forwards it to
 		// SessionStore, which knows none of these keys. A consumer that read one
 		// would make this a live difference, which is the other reason to leave
 		// it as it is, alongside a transport version that dispatched

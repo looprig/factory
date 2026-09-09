@@ -813,14 +813,18 @@ func TestTheAdmissionServiceIsExactlyTheSeamThisEdgeCalls(t *testing.T) {
 	// first version of this check was not one: it asked whether `want` held
 	// AdmitLegacyCreate, which the loop above had already excluded BY NAME, so
 	// the map could never contain that key and the guard could never fire. A
-	// gate then gutted isV1Admission to two of its six conditions and the suite
-	// passed. That is the same class-6 defect this test exists to close, in the
-	// check written to prove it was closed.
+	// gate then gutted isV1Admission to two of its SEVEN conditions and the
+	// suite passed. That is the same class-6 defect this test exists to close,
+	// in the check written to prove it was closed.
 	//
 	// So the rule is driven against the real method it must reject, looked up
-	// OUTSIDE the name filter, and against a table of near misses that differ
-	// from the V1 shape in exactly one dimension each. Every condition in
-	// isV1Admission has a row that fails without it.
+	// OUTSIDE the name filter, and against a table of near misses.
+	//
+	// What is claimed for the table is that every condition in isV1Admission has
+	// at least one row that fails without it, established by neutralising each
+	// condition in turn. What is NOT claimed is that each row differs in exactly
+	// one dimension: dropping an argument or a result shifts every position
+	// after it, so MissingPrincipal and MissingCreated each differ in two.
 	legacyMethod, found := service.MethodByName(legacy)
 	if !found {
 		t.Fatalf("%s is not declared on the service, so the exclusion below proves nothing", legacy)
@@ -1091,13 +1095,20 @@ func (shapeProbeType) MissingCreated(context.Context, identity.Principal, sessio
 // absence made "every condition has a row that fails without it" false: the
 // arity-out check was the one condition with no sole reader.
 //
-// It has to be a FOURTH result rather than a second short one, because
-// neutralising `NumOut() != 3` and then driving a two-result probe does not
-// fail, it PANICS on Out(2) -- and a panic is not an assertion kill. Every
-// result position here matches the V1 shape, so only the arity rejects it.
+// It has to be a FOURTH result rather than a second short one, and the reason
+// given here was wrong until a gate ran the experiment and I re-ran it. It does
+// NOT panic: with `NumOut() != 3` removed, a two-result probe reaches
+// `fn.Out(1) == reflect.TypeOf(false)`, which is false for an error, and `&&`
+// short-circuits before Out(2). So MissingCreated is rejected by a TYPE check
+// even with the arity gone, which makes it no reader at all for the arity.
 //
-// The signature therefore has to put error at index 2 with a fourth result
-// after it, which is ST1008 ("error should be returned as the last argument").
+// This probe is. Every result position matches the V1 shape, so nothing but the
+// count can reject it: with the arity check removed it is the one row that
+// fires -- measured, on this tree, `isV1Admission(one result too many) = true,
+// want false`.
+//
+// The signature has to put error at index 2 with a fourth result after it,
+// which is ST1008 ("error should be returned as the last argument").
 // That is the point of the probe rather than an oversight: it is a shape the
 // rule must REJECT, and a lint that keeps production code from having it is not
 // a reason the rule may go unread.

@@ -837,11 +837,30 @@ service-wide, so a fixed list defends it only where somebody thought to look —
 which is how two more folds of the identical shape sat unread in the two
 functions this fix rewrote, one of them telling a *retried* command it had been
 permanently rejected. `TestNoDependencyFaultBecomesAPublicCode` derives its
-subject from the mechanism instead: the METHOD SETS of the dependency interfaces
-the Service declares, read by reflection, each made to fail in turn against every
-entry point, asserting that **if the failing method was called, the answer
-carries no public code**. A method nothing drives fails the sweep rather than
-passing it, so a dependency added later cannot join the set of untested folds.
+subject instead — dependencies from the interface-kind **fields of `Config`**,
+fault sites from the methods of those interfaces whose last result is an
+`error`, entry points from the exported methods of **`*Service`** — and drives
+the cross-product, asserting that **if the failing method was called, the answer
+carries no public code**.
+
+**What each axis is pinned by is not the same, and the difference matters.**
+Deleting a *field* from `Config` is a compile error in `service.go`, so that axis
+cannot shrink quietly. Deleting a *method* from one of those interfaces compiles
+everywhere — a gate did it and the sweep went from 60 pairs to 54, green — so
+the method axis is pinned only by the bidirectional check on
+`unreachedDependencyMethods`: a record naming a method that is no longer derived
+fails, which is what makes the disappearance visible. Do not restate the
+compile-pinning claim over both axes; it is true of one.
+
+Reflection cannot see a *call site*, so a third layer parses the sources and
+requires every function calling `refusal()` — the sole constructor of a
+classified code — to be reachable from a driven entry point. Its first version
+**granted** coverage where it claimed to demand it: an orphan named `Validate`
+was "reached" because `req.Validate()` was recorded as an edge to that name. The
+graph now records only calls it can attribute — a bare identifier, or a selector
+on the enclosing function's own receiver — and a duplicate declared name is a
+hard failure, because a name-keyed graph cannot distinguish two of them.
+
 `TestADependencyFaultIsNotADecisionAboutTheCommand` remains beside it for the
 half a fault sweep cannot check — that the negative *answer* is still a refusal,
 which is site-specific.
@@ -927,14 +946,15 @@ Because the connection context can never be cancelled while an RPC is in flight,
 **equivalent mutant**, and both gates probed it: there is no reader because there
 can be no reader. It is still `client.Context()`, and the reason is narrower than
 either of the two this document gave before. The context is **not** valueless:
-`principalOf` reads the operation context off it (`centrifuge.go:388`), and it
-descends from the `http.Request`'s, which `net/http` loads with
-`ServerContextKey` and `LocalAddrContextKey`. What makes the mutant equivalent
-is the pair of facts above plus one about this composition: **no consumer
-downstream of `Admit` reads a value from the context it is handed** —
-`internal/identity`'s `Authorizer` discards it (`authorize.go:50`) and admission
-forwards it to SessionStore, which knows none of these keys. A consumer that
-read one would make it a live difference. The same applies one layer in, to
+`principalOf` reads the operation context off it, and it descends from the
+`http.Request`'s, which `net/http` loads with `LocalAddrContextKey`
+(`net/http/server.go:1933`) and `ServerContextKey` (`net/http/server.go:3549`).
+What makes the mutant equivalent is the pair of facts above plus one about this
+composition: **no consumer downstream of `Admit` reads a value from the context
+it is handed** — `internal/identity`'s `Authorizer` takes it as
+`_ context.Context` (`internal/identity/authorize.go:50`) and admission forwards
+it to SessionStore, which knows none of these keys. A consumer that read one
+would make it a live difference. The same applies one layer in, to
 `Engine.Admit`'s own parent.
 
 **One limit this task did not close.** The V1 `session.create` RPC reaches
