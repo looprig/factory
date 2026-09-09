@@ -1461,3 +1461,54 @@ func TestTheBrowsersStreamPositionIsNeitherHonouredNorRetained(t *testing.T) {
 		t.Errorf("the demand plane was told %q/%q, want %q/session-1", first.tenant, first.session, tenantA)
 	}
 }
+
+// TestShutdownsDeadlineReachesTheDemandFlush is the bound on the drain, and it
+// is the assertion that makes the flush safe to have added.
+//
+// Shutdown gives back the demand its links were holding, and it does so
+// SERIALLY, under the engine's lock. So a demand plane that has stopped
+// answering turns a drain into one DemandTimeout per session -- for a replica
+// holding a few hundred, that is not a slow shutdown, it is a shutdown that
+// never finishes. What prevents it is that the flush is handed the CALLER's
+// context, so every release inherits the operator's deadline; deriving one from
+// context.Background would look identical on a healthy plane.
+//
+// The fake reports separately whether its own backstop, rather than the
+// deadline, released it -- so a pass cannot be explained by the fake giving up.
+func TestShutdownsDeadlineReachesTheDemandFlush(t *testing.T) {
+	t.Parallel()
+
+	f := newFixture(t, testLimits())
+	f.demand.mu.Lock()
+	f.demand.blockRelease = make(chan struct{})
+	f.demand.mu.Unlock()
+
+	client, observed := dialSupported(t, f, "token-a")
+	await(t, observed.connected, "connected event")
+	for _, session := range []string{"session-1", "session-2", "session-3", "session-4"} {
+		subscribeWith(t, client, sessionChannel(tenantA, session), centrifugego.SubscriptionConfig{})
+	}
+	waitUntil(t, func() bool { return len(f.demand.acquired()) == 4 }, "four acquires")
+
+	// One second, against a DemandTimeout of thirty. Nothing but the caller's
+	// deadline can end these four releases inside it.
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	started := time.Now()
+	_ = f.handler.Shutdown(ctx)
+	elapsed := time.Since(started)
+
+	if f.demand.unbounded() {
+		t.Fatal("the fake's own backstop released a call; the shutdown deadline did not reach the flush")
+	}
+	// demandBackstop is the fake's own limit, so anything at or beyond it means
+	// the deadline was not what ended the drain. The configured DemandTimeout is
+	// 30s and there are four sessions, so an unbounded flush is two orders of
+	// magnitude slower than this.
+	if elapsed >= demandBackstop {
+		t.Errorf("Shutdown with a one-second deadline took %v; the flush is not bounded by the caller's context", elapsed)
+	}
+	if got := len(f.demand.released()); got == 0 {
+		t.Error("the flush attempted no release at all, so this case measured nothing")
+	}
+}

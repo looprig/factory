@@ -130,6 +130,13 @@ func TestClientLinkLimitsValidate(t *testing.T) {
 		{"zero pong timeout", func(l *ClientLinkLimits) { l.PongTimeout = 0 }, "PongTimeout"},
 		{"zero command timeout", func(l *ClientLinkLimits) { l.CommandTimeout = 0 }, "CommandTimeout"},
 		{"negative command timeout", func(l *ClientLinkLimits) { l.CommandTimeout = -time.Second }, "CommandTimeout"},
+		// A negative debounce is not a choice, and time.AfterFunc would fire it
+		// immediately -- a debounce that silently did not exist. Zero IS a
+		// choice and is accepted; TestAZeroDemandReleaseDebounceIsAccepted is
+		// the boundary this row stops one step short of.
+		{"negative demand debounce", func(l *ClientLinkLimits) { l.DemandReleaseDebounce = -time.Nanosecond }, "DemandReleaseDebounce"},
+		{"zero demand timeout", func(l *ClientLinkLimits) { l.DemandTimeout = 0 }, "DemandTimeout"},
+		{"negative demand timeout", func(l *ClientLinkLimits) { l.DemandTimeout = -time.Second }, "DemandTimeout"},
 		// A pong deadline at or beyond the ping cadence never separates a slow
 		// peer from a dead one: the next ping is sent before the previous one's
 		// deadline has been reached.
@@ -147,6 +154,23 @@ func TestClientLinkLimitsValidate(t *testing.T) {
 			tt.mutate(&limits)
 			assertRejected(t, limits.Validate(), limits, tt.wantErr)
 		})
+	}
+}
+
+// TestAZeroDemandReleaseDebounceIsAccepted pins the boundary the negative-debounce
+// row stops one step short of, with an absolute literal.
+//
+// Zero means "give the demand back as soon as the last subscription is gone",
+// which is a coherent deployment choice: the release still goes through the
+// clock, so the ordering of acquire and release is the same at zero as at a
+// minute. Without this case, tightening the check to "positive" would pass.
+func TestAZeroDemandReleaseDebounceIsAccepted(t *testing.T) {
+	t.Parallel()
+
+	limits := DefaultClientLinkLimits()
+	limits.DemandReleaseDebounce = 0
+	if err := limits.Validate(); err != nil {
+		t.Errorf("a zero DemandReleaseDebounce was rejected: %v", err)
 	}
 }
 

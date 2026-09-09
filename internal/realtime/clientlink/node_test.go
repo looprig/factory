@@ -598,6 +598,20 @@ func TestAPingCadenceOfExactlyOneSecondIsAccepted(t *testing.T) {
 	}
 }
 
+// TestAZeroDemandReleaseDebounceIsAccepted pins the boundary the negative row
+// stops one step short of, as the ping-cadence case does for its floor. Zero is
+// a choice -- release as soon as the last binding is gone -- and tightening the
+// check to "positive" would otherwise pass.
+func TestAZeroDemandReleaseDebounceIsAccepted(t *testing.T) {
+	t.Parallel()
+
+	limits := nodeTestLimits()
+	limits.DemandReleaseDebounce = 0
+	if err := limits.Validate(); err != nil {
+		t.Errorf("a zero DemandReleaseDebounce was rejected: %v", err)
+	}
+}
+
 // TestNewEngineRefusesAnIncompleteComposition holds each required seam.
 func TestNewEngineRefusesAnIncompleteComposition(t *testing.T) {
 	t.Parallel()
