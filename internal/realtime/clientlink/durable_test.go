@@ -227,10 +227,11 @@ func newReplica(t *testing.T, store *sessionstore.Store, prefix string, now time
 		}
 		stopped = true
 		// Bounded Shutdown BEFORE the unbounded Close, for the reason
-		// newFixture's cleanup gives. This is the sibling that kept the old
-		// order when that one was fixed -- the fourth time in this task that a
-		// fix landed at the site named and not at its twin, which is why the
-		// two now say so in each other's terms.
+		// newFixture's cleanup gives. Correcting this one and claiming "the two
+		// now say so in each other's terms" was itself the defect: there were
+		// SIX such fixtures, and four were still wrong. The reader is
+		// TestEveryBoundedShutdownPrecedesAnUnboundedClose, which censuses them
+		// rather than trusting anyone to have looked.
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		_ = handler.Shutdown(ctx)

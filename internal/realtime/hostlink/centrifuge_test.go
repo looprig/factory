@@ -649,10 +649,14 @@ func newHostServer(t *testing.T, opts hostOptions) *hostServer {
 	})
 	server := httptest.NewServer(handler)
 	t.Cleanup(func() {
-		server.Close()
+		// Bounded Shutdown first: an unbounded Close waits for the outstanding
+		// request that a wedged read loop is still holding, so this order is
+		// the difference between a failing case and a ten-minute package
+		// timeout. TestEveryBoundedShutdownPrecedesAnUnboundedClose censuses it.
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		_ = node.Shutdown(ctx)
+		server.Close()
 	})
 	host.url = "ws" + strings.TrimPrefix(server.URL, "http")
 	return host

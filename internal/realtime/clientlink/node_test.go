@@ -236,10 +236,14 @@ func TestTheConnectionLabelIsTheSubjectNotTheTenant(t *testing.T) {
 
 	server := httptest.NewServer(handler)
 	t.Cleanup(func() {
-		server.Close()
+		// Bounded Shutdown first: an unbounded Close waits for the outstanding
+		// request that a wedged read loop is still holding, so this order is
+		// the difference between a failing case and a ten-minute package
+		// timeout. TestEveryBoundedShutdownPrecedesAnUnboundedClose censuses it.
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		_ = handler.Shutdown(ctx)
+		server.Close()
 	})
 
 	data, err := json.Marshal(map[string]string{"protocol_version": ProtocolVersion})
@@ -343,10 +347,14 @@ func stalledConsumer(t *testing.T, queueBytes, publications, payloadBytes int) (
 
 	server := httptest.NewServer(handler)
 	t.Cleanup(func() {
-		server.Close()
+		// Bounded Shutdown first: an unbounded Close waits for the outstanding
+		// request that a wedged read loop is still holding, so this order is
+		// the difference between a failing case and a ten-minute package
+		// timeout. TestEveryBoundedShutdownPrecedesAnUnboundedClose censuses it.
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		_ = handler.Shutdown(ctx)
+		server.Close()
 	})
 
 	data, err := json.Marshal(map[string]string{"protocol_version": ProtocolVersion})
