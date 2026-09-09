@@ -70,22 +70,23 @@ func TestEveryBoundedShutdownPrecedesAnUnboundedClose(t *testing.T) {
 	// Anti-vacuity. A scan that found nothing would pass on a clean tree and on
 	// a broken detector alike.
 	//
-	// The floor is SIX, which is what the census measured -- not the five the
-	// round was told to expect. The three sites a gate named plus the two
-	// already corrected is five; the sixth is in internal/realtime/transport,
-	// which no gate reached. That is the argument for a census rather than a
-	// list, made by the census on its first run.
+	// The floor is NINE, measured on this tree at the moment it was written --
+	// six from rule one and three from rule two. It was SIX, which was the
+	// rule-one population before rule two existed, and leaving it there left
+	// three sites of slack: the scanner could stop seeing a third of the census
+	// and still pass. Re-measured rather than reasoned: the census prints its
+	// own population and this is what it printed.
 	//
 	// It is A COUNT, and saying so is the point rather than an apology. There is
 	// no authority in this module for "how many websocket fixtures there ought
 	// to be", so this cannot be derived the way the admission sweep's axes are.
-	// What a count can see: the scanner breaking, or the fixtures being deleted.
-	// What it cannot: one site added and another removed in the same change, or
-	// a seventh site appearing -- which is why the ORDERING check above is over
-	// every site found rather than over a listed six, and why this floor is the
-	// weaker of the two readers in this file.
-	if len(sites) < 6 {
-		t.Fatalf("the census found %d shutdown/close pairs, want at least the six this module had when it was written; "+
+	// What a count can see: the scanner breaking, or the fixtures being
+	// deleted. What it cannot: one site added and another removed in the same
+	// change. That is why the ORDERING check above runs over every site FOUND
+	// rather than over a listed nine, and why this floor is the weaker of the
+	// two readers in this file.
+	if len(sites) < 9 {
+		t.Fatalf("the census found %d shutdown/close pairs, want at least the nine this module had when it was written; "+
 			"a scan that stopped finding them is indistinguishable from a tree that stopped having them: %v", len(sites), sites)
 	}
 	for _, site := range sites {
@@ -113,8 +114,11 @@ func TestEveryBoundedShutdownPrecedesAnUnboundedClose(t *testing.T) {
 }
 
 // sanctionedCleanupOrder names sites where Close before Shutdown is correct,
-// with the reason. It is empty: every site in this module today is a websocket
-// fixture whose Close waits on the read loop its Shutdown releases.
+// with the reason.
+//
+// It holds two, both of them rule two's, and both close the CLIENT rather than
+// the listener. The key names the SUBJECT of the Close, so neither sanction can
+// also cover a listener's Close appearing in the same function later.
 func sanctionedCleanupOrder() map[string]string {
 	const clientClose = "this closes the CLIENT, not the listener. Running it first is what releases " +
 		"the connection the node then shuts down, and it is not the unbounded wait the rule exists for: " +
