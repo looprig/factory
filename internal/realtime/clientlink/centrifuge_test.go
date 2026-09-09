@@ -176,6 +176,8 @@ type fixture struct {
 	verifier   *verifier
 	authorizer *recordingAuthorizer
 	admitter   *recordingAdmitter
+	demand     *recordingDemand
+	clock      *manualClock
 }
 
 // testLimits is the ClientLink configuration a case starts from. It is written
@@ -191,6 +193,8 @@ func testLimits() clientlink.Limits {
 		PingInterval:             25 * time.Second,
 		PongTimeout:              10 * time.Second,
 		CommandTimeout:           30 * time.Second,
+		DemandReleaseDebounce:    15 * time.Second,
+		DemandTimeout:            30 * time.Second,
 	}
 }
 
@@ -215,10 +219,14 @@ func newFixture(t *testing.T, limits clientlink.Limits) *fixture {
 	}
 	authorizer := &recordingAuthorizer{}
 	admitter := &recordingAdmitter{created: true}
+	demand := &recordingDemand{}
+	clock := &manualClock{}
 	handler, err := clientlink.NewHandler(clientlink.Config{
 		Authenticator: authenticator,
 		Authorizer:    authorizer,
 		Admitter:      admitter,
+		Demand:        demand,
+		Clock:         clock,
 		Limits:        limits,
 		Version:       buildVersion,
 	})
@@ -250,6 +258,8 @@ func newFixture(t *testing.T, limits clientlink.Limits) *fixture {
 		verifier:   v,
 		authorizer: authorizer,
 		admitter:   admitter,
+		demand:     demand,
+		clock:      clock,
 	}
 }
 
@@ -1078,5 +1088,376 @@ func TestABrowserReconnectsToAnotherReplicaWithTheSameToken(t *testing.T) {
 	}
 	if calls := second.authorizer.subscribeCalls(); len(calls) != 1 || calls[0].channel != channel {
 		t.Errorf("the second replica's authorizer saw %+v, want one call for %q", calls, channel)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// A6.3 -- authorized subscriptions, tracked as delivery demand, over a real
+// socket. Everything below is a TRANSITION of a real subscription's lifecycle;
+// the engine-level cases in demand_test.go drive the table, and these drive
+// what the transport does to it.
+// ---------------------------------------------------------------------------
+
+// subscribeWith subscribes with an explicit configuration and returns the
+// subscription and the event the server's reply produced.
+//
+// It exists because the recovery members a browser can ASK for are members of
+// SubscriptionConfig, and the answer is in SubscribedEvent; the plain subscribe
+// helper discards both.
+func subscribeWith(t *testing.T, client *centrifugego.Client, channel string, config centrifugego.SubscriptionConfig) (*centrifugego.Subscription, centrifugego.SubscribedEvent) {
+	t.Helper()
+
+	sub, err := client.NewSubscription(channel, config)
+	if err != nil {
+		t.Fatalf("NewSubscription(%q): %v", channel, err)
+	}
+	subscribed := make(chan centrifugego.SubscribedEvent, 1)
+	failed := make(chan error, 4)
+	sub.OnSubscribed(func(e centrifugego.SubscribedEvent) { send(subscribed, e) })
+	sub.OnError(func(e centrifugego.SubscriptionErrorEvent) { send(failed, e.Error) })
+	if err := sub.Subscribe(); err != nil {
+		t.Fatalf("Subscribe(%q): %v", channel, err)
+	}
+	select {
+	case event := <-subscribed:
+		return sub, event
+	case err := <-failed:
+		t.Fatalf("subscribing to %q was refused: %v", channel, err)
+	case <-time.After(waitFor):
+		t.Fatalf("subscribing to %q neither succeeded nor failed within %v", channel, waitFor)
+	}
+	return nil, centrifugego.SubscribedEvent{}
+}
+
+// unsubscribe drops a subscription and waits for the server to have seen it.
+func unsubscribe(t *testing.T, sub *centrifugego.Subscription) {
+	t.Helper()
+
+	done := make(chan struct{}, 1)
+	sub.OnUnsubscribed(func(centrifugego.UnsubscribedEvent) { send(done, struct{}{}) })
+	if err := sub.Unsubscribe(); err != nil {
+		t.Fatalf("Unsubscribe(%q): %v", sub.Channel, err)
+	}
+	select {
+	case <-done:
+	case <-time.After(waitFor):
+		t.Fatalf("unsubscribing from %q was never acknowledged within %v", sub.Channel, waitFor)
+	}
+}
+
+// TestOneSubscriptionIsOneDeliveryBindingForItsWholeLife is step 2's two edges
+// driven end to end over a socket: the subscribe notifies, the unsubscribe
+// schedules, and the debounce elapsing releases.
+//
+// Nothing here waits for a duration. The debounce is the fixture's clock, so
+// "the release has not happened yet" is asserted at a moment the test chose
+// rather than at a moment a timer happened not to have reached.
+func TestOneSubscriptionIsOneDeliveryBindingForItsWholeLife(t *testing.T) {
+	t.Parallel()
+
+	f := newFixture(t, testLimits())
+	client, observed := dialSupported(t, f, "token-a")
+	await(t, observed.connected, "connected event")
+
+	sub, _ := subscribeWith(t, client, sessionChannel(tenantA, "session-1"), centrifugego.SubscriptionConfig{})
+	waitUntil(t, func() bool { return len(f.demand.acquired()) == 1 }, "the subscription's demand to be acquired")
+	if got := f.demand.acquired()[0]; got.tenant != tenantA || got.session != "session-1" {
+		t.Errorf("the demand plane was told %q/%q, want %q/session-1", got.tenant, got.session, tenantA)
+	}
+	if calls := f.demand.released(); len(calls) != 0 {
+		t.Fatalf("a live subscription released demand: %v", sessionsOf(calls))
+	}
+
+	unsubscribe(t, sub)
+	waitUntil(t, func() bool { return len(f.clock.pending()) == 1 }, "the release to be scheduled")
+	if calls := f.demand.released(); len(calls) != 0 {
+		t.Fatalf("the demand was released before the debounce elapsed: %v", sessionsOf(calls))
+	}
+	if fired := f.clock.fire(); fired != 1 {
+		t.Fatalf("fired %d timers, want 1", fired)
+	}
+	if got := sessionsOf(f.demand.released()); len(got) != 1 || got[0] != "session-1" {
+		t.Fatalf("releases after the debounce: %v, want [session-1]", got)
+	}
+}
+
+// TestASubscriptionTakenAgainInsideTheDebounceCostsNothing is the resubscribe
+// case, over a socket, on ONE link -- the shape a browser produces when a
+// component remounts.
+func TestASubscriptionTakenAgainInsideTheDebounceCostsNothing(t *testing.T) {
+	t.Parallel()
+
+	f := newFixture(t, testLimits())
+	client, observed := dialSupported(t, f, "token-a")
+	await(t, observed.connected, "connected event")
+
+	channel := sessionChannel(tenantA, "session-1")
+	sub, _ := subscribeWith(t, client, channel, centrifugego.SubscriptionConfig{})
+	waitUntil(t, func() bool { return len(f.demand.acquired()) == 1 }, "the first acquire")
+	unsubscribe(t, sub)
+	waitUntil(t, func() bool { return len(f.clock.pending()) == 1 }, "the release to be scheduled")
+
+	// The client's own registry holds one Subscription per channel
+	// (centrifuge-go@v0.12.0/client.go:279-292), so taking the channel again
+	// means removing the unsubscribed one first. That is the browser's
+	// behaviour, not a workaround: the SUBSCRIBE frame that reaches the server
+	// is the same one a fresh page would send.
+	if err := client.RemoveSubscription(sub); err != nil {
+		t.Fatalf("RemoveSubscription: %v", err)
+	}
+	again, _ := subscribeWith(t, client, channel, centrifugego.SubscriptionConfig{})
+	if fired := f.clock.fireEvenStopped(); fired != 1 {
+		t.Fatalf("fired %d timers, want the superseded one", fired)
+	}
+	if calls := f.demand.released(); len(calls) != 0 {
+		t.Fatalf("a resubscribe inside the debounce released demand: %v", sessionsOf(calls))
+	}
+	if calls := f.demand.acquired(); len(calls) != 1 {
+		t.Fatalf("a resubscribe inside the debounce acquired demand %d times, want 1", len(calls))
+	}
+
+	// The control: the retained demand is still real, so dropping it releases.
+	unsubscribe(t, again)
+	waitUntil(t, func() bool { return len(f.clock.pending()) == 1 }, "the second release to be scheduled")
+	f.clock.fire()
+	if got := sessionsOf(f.demand.released()); len(got) != 1 || got[0] != "session-1" {
+		t.Fatalf("releases: %v, want [session-1]", got)
+	}
+}
+
+// TestManyClientsWatchingOneSessionAreOneDemand is the multiple-clients case,
+// and it is the one that distinguishes a count of BINDINGS from a count of
+// subscriptions or of connections.
+//
+// Three links subscribe to one session. The demand plane hears once. Two links
+// go away and it still hears nothing, because the session is still being
+// watched; the third is the last removal.
+func TestManyClientsWatchingOneSessionAreOneDemand(t *testing.T) {
+	t.Parallel()
+
+	f := newFixture(t, testLimits())
+	channel := sessionChannel(tenantA, "shared-session")
+	subs := make([]*centrifugego.Subscription, 0, 3)
+	for range 3 {
+		client, observed := dialSupported(t, f, "token-a")
+		await(t, observed.connected, "connected event")
+		sub, _ := subscribeWith(t, client, channel, centrifugego.SubscriptionConfig{})
+		subs = append(subs, sub)
+	}
+	if calls := f.demand.acquired(); len(calls) != 1 {
+		t.Fatalf("three links watching one session acquired demand %d times, want 1", len(calls))
+	}
+
+	unsubscribe(t, subs[0])
+	unsubscribe(t, subs[1])
+	if pending := f.clock.pending(); len(pending) != 0 {
+		t.Fatalf("a release was scheduled while a third link was still watching: %v", pending)
+	}
+	if calls := f.demand.released(); len(calls) != 0 {
+		t.Fatalf("demand was released while a third link was still watching: %v", sessionsOf(calls))
+	}
+
+	unsubscribe(t, subs[2])
+	waitUntil(t, func() bool { return len(f.clock.pending()) == 1 }, "the release to be scheduled")
+	f.clock.fire()
+	if got := sessionsOf(f.demand.released()); len(got) != 1 || got[0] != "shared-session" {
+		t.Fatalf("releases: %v, want [shared-session]", got)
+	}
+}
+
+// TestALinkGoingAwayReleasesEveryBindingItHeld is the disconnect case.
+//
+// It is not the same case as unsubscribing three times: a disconnect never
+// sends an UNSUBSCRIBE frame, and the bindings are given back only because
+// centrifuge's own close unsubscribes every channel on the way out
+// (centrifuge@v0.38.0/client.go:1075-1081). A link is closed with no warning by
+// a laptop lid, so this is the ordinary path rather than the exceptional one.
+func TestALinkGoingAwayReleasesEveryBindingItHeld(t *testing.T) {
+	t.Parallel()
+
+	f := newFixture(t, testLimits())
+	client, observed := dialSupported(t, f, "token-a")
+	await(t, observed.connected, "connected event")
+	for _, session := range []string{"session-1", "session-2", "session-3"} {
+		subscribeWith(t, client, sessionChannel(tenantA, session), centrifugego.SubscriptionConfig{})
+	}
+	waitUntil(t, func() bool { return len(f.demand.acquired()) == 3 }, "three acquires")
+
+	client.Close()
+	waitUntil(t, func() bool { return len(f.clock.pending()) == 3 }, "three releases to be scheduled")
+	if calls := f.demand.released(); len(calls) != 0 {
+		t.Fatalf("a disconnect released demand before the debounce elapsed: %v", sessionsOf(calls))
+	}
+	if fired := f.clock.fire(); fired != 3 {
+		t.Fatalf("fired %d timers, want 3", fired)
+	}
+	released := map[sessionwire.SessionID]bool{}
+	for _, session := range sessionsOf(f.demand.released()) {
+		released[session] = true
+	}
+	for _, session := range []sessionwire.SessionID{"session-1", "session-2", "session-3"} {
+		if !released[session] {
+			t.Errorf("the binding for %q was never given back", session)
+		}
+	}
+	if len(released) != 3 {
+		t.Errorf("released %v, want exactly the three sessions the link held", released)
+	}
+}
+
+// TestARefusedSubscriptionTakesNoDemandOverTheWire is step 1's refusal shapes,
+// at the layer that actually serves them, with the acceptance as its control.
+//
+// The demand assertion is the addition A6.3 makes to A6.1's identical outcomes:
+// a handler that refused the channel and notified the demand plane anyway would
+// pass every A6.1 case.
+func TestARefusedSubscriptionTakesNoDemandOverTheWire(t *testing.T) {
+	t.Parallel()
+
+	f := newFixture(t, testLimits())
+	client, observed := dialSupported(t, f, "token-a")
+	await(t, observed.connected, "connected event")
+
+	for _, channel := range []string{
+		sessionChannel(tenantB, "session-1"),
+		"arbitrary",
+		"session::session-1",
+		"session:tenant-a:",
+		"session:tenant-a:session-1:extra",
+		"sessions:tenant-a:session-1",
+	} {
+		err := subscribe(t, client, channel)
+		if err == nil {
+			t.Fatalf("subscribing to %q succeeded, want a refusal", channel)
+		}
+		// 103 is ErrorPermissionDenied: every one of these is a decision about
+		// the channel, and none is a fault.
+		if got := codeOf(err); got != 103 {
+			t.Errorf("subscribing to %q failed with code %d (%v), want 103", channel, got, err)
+		}
+	}
+	if calls := f.demand.acquired(); len(calls) != 0 {
+		t.Fatalf("refused subscriptions took demand for %v", sessionsOf(calls))
+	}
+
+	// The control: the same link, its own session, and demand IS taken -- so
+	// the zero above is a fact about the refusals rather than about the link.
+	if err := subscribe(t, client, sessionChannel(tenantA, "session-1")); err != nil {
+		t.Fatalf("subscribing to this principal's own session failed: %v", err)
+	}
+	waitUntil(t, func() bool { return len(f.demand.acquired()) == 1 }, "the accepted subscription's demand")
+}
+
+// TestADemandPlaneFaultRefusesTheSubscriptionOverTheWire holds the
+// classification a browser acts on: a fault is TEMPORARY, so the client may
+// retry, where a denial is terminal.
+func TestADemandPlaneFaultRefusesTheSubscriptionOverTheWire(t *testing.T) {
+	t.Parallel()
+
+	f := newFixture(t, testLimits())
+	f.demand.mu.Lock()
+	f.demand.acquireErr = errors.New("the demand plane is unreachable")
+	f.demand.mu.Unlock()
+
+	client, observed := dialSupported(t, f, "token-a")
+	await(t, observed.connected, "connected event")
+	err := subscribe(t, client, sessionChannel(tenantA, "session-1"))
+	if err == nil {
+		t.Fatal("a subscription was established with no demand behind it")
+	}
+	// 100 is ErrorInternal, which centrifuge marks Temporary
+	// (centrifuge@v0.38.0/errors.go:38-42). 103 would tell the browser it may
+	// never watch this session again.
+	if got := codeOf(err); got != 100 {
+		t.Errorf("the refusal carried code %d (%v), want 100 (internal, temporary)", got, err)
+	}
+}
+
+// TestShutdownGivesBackTheDemandItsLinksHeld is the drain, over real links.
+//
+// The clock is deliberately NOT fired: what is being measured is that the
+// demand comes back at shutdown rather than at the debounce, because a replica
+// being drained does not stay alive for the debounce.
+func TestShutdownGivesBackTheDemandItsLinksHeld(t *testing.T) {
+	t.Parallel()
+
+	f := newFixture(t, testLimits())
+	client, observed := dialSupported(t, f, "token-a")
+	await(t, observed.connected, "connected event")
+	subscribeWith(t, client, sessionChannel(tenantA, "session-1"), centrifugego.SubscriptionConfig{})
+	subscribeWith(t, client, sessionChannel(tenantA, "session-2"), centrifugego.SubscriptionConfig{})
+	waitUntil(t, func() bool { return len(f.demand.acquired()) == 2 }, "two acquires")
+
+	ctx, cancel := context.WithTimeout(context.Background(), waitFor)
+	defer cancel()
+	if err := f.handler.Shutdown(ctx); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+	released := sessionsOf(f.demand.released())
+	if len(released) != 2 {
+		t.Fatalf("shutdown gave back %v, want both sessions", released)
+	}
+}
+
+// TestTheBrowsersStreamPositionIsNeitherHonouredNorRetained is step 3 at the
+// transport, and it is stated as what a client can OBSERVE.
+//
+// A browser asks for a positioned, recoverable subscription -- the only way
+// this protocol can express "resume me from where I was". The reply must say
+// no to both, because those two members are the only thing that makes
+// centrifuge keep a stream position for this connection at all
+// (centrifuge@v0.38.0/client.go:3224, 3248-3249), and because the durable
+// journal cursor is SessionStore's and the browser's, never a Factory
+// replica's: a cursor held here would be a second, weaker answer that a
+// reconnect to another replica could not honour.
+func TestTheBrowsersStreamPositionIsNeitherHonouredNorRetained(t *testing.T) {
+	t.Parallel()
+
+	f := newFixture(t, testLimits())
+	client, observed := dialSupported(t, f, "token-a")
+	await(t, observed.connected, "connected event")
+
+	channel := sessionChannel(tenantA, "session-1")
+	sub, event := subscribeWith(t, client, channel, centrifugego.SubscriptionConfig{
+		Positioned:  true,
+		Recoverable: true,
+		// Data is the one other member a client controls, and this surface
+		// never reads it. A cursor smuggled here must not reach anything.
+		Data: []byte(`{"cursor":"opaque-durable-cursor","from_seq":4242}`),
+	})
+	if event.Positioned {
+		t.Error("the subscription was made positioned at the client's request")
+	}
+	if event.Recoverable {
+		t.Error("the subscription was made recoverable at the client's request")
+	}
+	if event.WasRecovering || event.Recovered {
+		t.Errorf("the server attempted recovery: WasRecovering=%v Recovered=%v", event.WasRecovering, event.Recovered)
+	}
+	if event.StreamPosition != nil {
+		t.Errorf("the reply carried a stream position: %+v", *event.StreamPosition)
+	}
+	if len(event.Data) != 0 {
+		t.Errorf("the reply carried subscription data %q; this surface answers with none", event.Data)
+	}
+
+	// And nothing about the request reached the demand plane: the call carries
+	// the session identity and nothing else could be smuggled through it.
+	waitUntil(t, func() bool { return len(f.demand.acquired()) == 1 }, "the acquire")
+	first := f.demand.acquired()[0]
+
+	// The for-all half. A second subscription to the same channel from another
+	// link, asking for NO recovery and carrying different data, must reach the
+	// demand plane as the identical call.
+	other, otherObserved := dialSupported(t, f, "token-a")
+	await(t, otherObserved.connected, "connected event for the second link")
+	subscribeWith(t, other, channel, centrifugego.SubscriptionConfig{Data: []byte(`{"cursor":"another"}`)})
+	unsubscribe(t, sub)
+	// One binding remains, so nothing is released and the demand is unchanged.
+	if calls := f.demand.acquired(); len(calls) != 1 {
+		t.Fatalf("the second link acquired demand again: %d acquires", len(calls))
+	}
+	if first.tenant != tenantA || first.session != "session-1" {
+		t.Errorf("the demand plane was told %q/%q, want %q/session-1", first.tenant, first.session, tenantA)
 	}
 }

@@ -380,6 +380,28 @@ type ClientLinkLimits struct {
 	// draining. See clientlink.Limits.CommandTimeout for the measurement and
 	// for the limit of what a deadline can promise.
 	CommandTimeout time.Duration
+
+	// DemandReleaseDebounce is how long a session's last local subscription
+	// must have been gone before this replica gives its delivery demand back.
+	//
+	// It is configuration rather than a constant because what it trades is a
+	// deployment's: a longer window keeps a HostLink open for a session nobody
+	// is watching, and a shorter one makes an ordinary browser reconnect cost a
+	// registry read and a rebind. Neither is a correctness failure -- demand is
+	// local routing state and never authority. Zero is permitted and means
+	// "release as soon as the last subscription is gone".
+	DemandReleaseDebounce time.Duration
+
+	// DemandTimeout bounds ONE call into the demand plane, in both directions.
+	//
+	// The acquire is bounded for the reason CommandTimeout is and against the
+	// same mechanism: a subscribe is dispatched on the connection's read loop
+	// and the connection context is cancelled when that loop returns, so an
+	// in-flight acquire is the very thing keeping it alive. The RELEASE is
+	// bounded because it has nothing else: it runs on a timer, after the
+	// connection that caused it is typically gone, so there is no request
+	// context in existence to inherit a deadline from.
+	DemandTimeout time.Duration
 }
 
 // MinClientLinkPingInterval is the shortest ping cadence the ClientLink wire
@@ -441,6 +463,19 @@ func DefaultClientLinkLimits() ClientLinkLimits {
 		// liveness deadline answers "is this peer there", and this answers "how
 		// long may this deployment's durable plane take".
 		CommandTimeout: 30 * time.Second,
+		// Long enough to cover one full reconnect backoff of the client this
+		// surface serves: centrifuge-go@v0.12.0's MaxReconnectDelay defaults to
+		// 20 seconds (config.go:58-60), so a browser that loses its link and
+		// takes the longest retry it will ever take still finds its demand
+		// held. A window below that turns every unlucky reconnect into a
+		// release, a re-acquire and a rebind.
+		DemandReleaseDebounce: 30 * time.Second,
+		// The same patience the durable plane gets, because an acquire reaches
+		// the same durable plane: it reads the session registry and binds a
+		// HostLink. It is a separate field rather than a reuse of
+		// CommandTimeout because the two bound different work, and nothing here
+		// has measured a reason for the two numbers to differ.
+		DemandTimeout: 30 * time.Second,
 	}
 }
 
@@ -468,6 +503,16 @@ func (l ClientLinkLimits) Validate() error {
 		return err
 	}
 	if err := positive("ClientLinkLimits.CommandTimeout", l.CommandTimeout); err != nil {
+		return err
+	}
+	// NON-NEGATIVE, where the durations above must be positive: zero is the
+	// coherent choice "give the demand back as soon as the last subscription
+	// is gone", and a negative one is not a choice at all.
+	if l.DemandReleaseDebounce < 0 {
+		return fmt.Errorf("%w: ClientLinkLimits.DemandReleaseDebounce (%v) must not be negative",
+			ErrInvalidLimits, l.DemandReleaseDebounce)
+	}
+	if err := positive("ClientLinkLimits.DemandTimeout", l.DemandTimeout); err != nil {
 		return err
 	}
 	// A pong deadline at or beyond the ping cadence never separates a slow peer

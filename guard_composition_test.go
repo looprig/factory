@@ -363,6 +363,12 @@ func TestTheGuardDecidesOriginBeforeTheClientLinkUpgrade(t *testing.T) {
 		// gets as far as a command; an admitter that answered would let a case
 		// pass on a fabricated acceptance.
 		Admitter: refusingAdmitter{},
+		// The demand plane fails closed for the reason the admitter does: no
+		// handshake this case drives reaches a subscription, and a demand
+		// manager that answered would let a case pass on a binding nothing
+		// took.
+		Demand: refusingDemand{},
+		Clock:  unusedClock{},
 		Limits: clientlink.Limits{
 			MaxConnections:           16,
 			MaxChannelsPerConnection: 32,
@@ -371,6 +377,8 @@ func TestTheGuardDecidesOriginBeforeTheClientLinkUpgrade(t *testing.T) {
 			PingInterval:             25 * time.Second,
 			PongTimeout:              10 * time.Second,
 			CommandTimeout:           30 * time.Second,
+			DemandReleaseDebounce:    30 * time.Second,
+			DemandTimeout:            30 * time.Second,
 		},
 		Version: "v-composed",
 	})
@@ -505,6 +513,29 @@ func rawHandshake(t *testing.T, address, origin string, sendOrigin bool) (int, s
 		t.Fatalf("read handshake body: %v", err)
 	}
 	return response.StatusCode, string(body)
+}
+
+// unusedClock is the debounce clock for a composition that never establishes a
+// subscription. It schedules nothing, so a release this case somehow reached
+// would never run and the demand fake's own refusal would be reported instead.
+type unusedClock struct{}
+
+func (unusedClock) AfterFunc(time.Duration, func()) func() bool {
+	return func() bool { return false }
+}
+
+// refusingDemand is the delivery-demand plane for a composition case that
+// tracks nothing.
+type refusingDemand struct{}
+
+var errNoDemandHere = errors.New("this composition tracks no delivery demand")
+
+func (refusingDemand) Acquire(context.Context, sessionwire.TenantID, sessionwire.SessionID) error {
+	return errNoDemandHere
+}
+
+func (refusingDemand) Release(context.Context, sessionwire.TenantID, sessionwire.SessionID) error {
+	return errNoDemandHere
 }
 
 // refusingAdmitter is the durable command plane for a composition case that

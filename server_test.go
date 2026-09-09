@@ -59,7 +59,11 @@ func publicSeams() map[reflect.Type][]reflect.Type {
 		// the only time it reads. Pairing it here is what keeps the union
 		// assertion honest: a narrower consumer must still be satisfied by the
 		// one object a deployer supplies.
-		iface[factory.Clock]():      {iface[admission.Clock](), iface[internalidentity.Clock](), iface[placement.Clock]()},
+		// clientlink declares a Clock with only AfterFunc, because scheduling
+		// the debounced demand release is the only time it reads. It is paired
+		// here for internal/identity's reason: a narrower consumer must still
+		// be satisfied by the one object a deployer supplies.
+		iface[factory.Clock]():      {iface[admission.Clock](), iface[internalidentity.Clock](), iface[placement.Clock](), iface[clientlink.Clock]()},
 		iface[factory.UUIDSource](): {iface[admission.UUIDSource]()},
 	}
 }
@@ -148,6 +152,12 @@ func allSeams() []reflect.Type {
 		// wiring exists; A9.1 is what will construct the service and hand it to
 		// the handler.
 		iface[clientlink.Admitter](),
+		// The ClientLink's local delivery-demand plane. It is here rather than
+		// in publicSeams for the same reason: A7.2's internal/routing supplies
+		// the implementation, and a deployer implements nothing of it. Nothing
+		// in production builds either side today.
+		iface[clientlink.DemandManager](),
+		iface[clientlink.Clock](),
 		iface[admission.Authorizer](),
 		iface[admission.Commands](),
 		iface[admission.Directory](),

@@ -972,6 +972,92 @@ stops it. Whichever way it is settled, the answer must be **one** authority
 consulted by both edges, not two literals; this is the third instance of the
 shape `A9.1-notfound` already names.
 
+### Subscriptions are tracked as delivery demand (A6.3)
+
+A6.3 gave the subscribe path its routing half. `Engine.Bind` authorizes one
+channel, derives the session it names, records a **DeliveryBinding**, and
+returns that binding's release. There is no `AuthorizeSubscribe` on the Engine
+any more: authorization and demand are one entry point, so the channel that was
+authorized and the session whose demand was taken cannot come from two
+decisions that disagree — the same defect A6.2 removed from the RPC path, where
+the authorized session and the admitted session came from two decoders.
+
+**A DeliveryBinding is a (connection, channel) pair, not a channel.** Three
+browsers watching one session are three bindings and **one** demand, which is
+what makes both edges edge-triggered: the demand plane is notified on the FIRST
+binding and released after the LAST one has been gone for the configured
+debounce. Neither is a state check — a count of bindings that happens to be one
+is not the same event as a count that just became one.
+
+**A binding arriving inside the debounce retains the demand; it does not
+re-acquire it.** That is what the debounce is for: a page navigation, a
+component remount and a reconnect after a lost link each drop a subscription and
+take it again within a moment, and a replica that released on the first of those
+pays a registry read and a rebind on the second. Cancellation does not rest on
+the timer's `stop` having won its race — `time.Timer.Stop` explicitly may lose
+one — so the entry carries a **generation** the callback compares, and
+`fireEvenStopped` drives the losing side deliberately.
+
+**`Bind`'s answer is the release, and there is no key.** A caller cannot release
+a binding it did not take, release one twice, or release someone else's. The
+transport needs exactly that, because it learns a subscription has ended in
+**three** places and all three must give back one binding once: an unsubscribe,
+a disconnect (`Client.close` unsubscribes every channel before reporting the
+disconnect, `client.go:1075-1081`), and a subscribe the library refused AFTER
+the callback returned — `onSubscribeError` deletes the channel and fires no
+unsubscribe event at all (`client.go:1721-1733`, `1773-1789`, `3672-3681`), so the handler
+consults `IsSubscribed` once the callback returns. The `OnDisconnect` arm is a
+backstop with a mechanism rather than a worry: `unsubscribe` returns early when
+`node.removeSubscription` fails (`client.go:3667-3670`), before the handler is
+reached.
+
+**The tenant is the principal's; only the session is parsed.** A tenant read out
+of a string the client sent is a tenant the client chose. A channel whose tenant
+segment is not the principal's, or whose segments Core will not carry, is a
+**fault** (`ErrUnroutableChannel`, answered 100/temporary) and not a denial:
+the Authorizer is a seam, so an implementation with a different grammar could
+authorize a channel this build cannot name a session in, and answering that
+with 103 would tell a browser entitled to the channel to stop asking forever.
+The two grammars — `internal/identity`'s regular expression and this package's
+`session:` prefix — are held to one answer in both directions by
+`FuzzTheDemandGrammarAgreesWithTheAuthorizers`, over `(channel, tenant)` pairs.
+
+**Both demand calls are bounded, and the release is the half that has nothing
+else.** `DemandTimeout` bounds an acquire for `CommandTimeout`'s reason and
+against the same mechanism; it bounds the debounced release because that release
+runs on a timer after the connection is gone, so there is no request context in
+existence to inherit a deadline from and `context.Background` alone would be
+bounded by nothing. The fake records whether the context it received carried a
+deadline **and** whether it was already cancelled, because a release handed a
+dead context does nothing and looks exactly like one that worked.
+
+**`Handler.Shutdown` gives the demand back.** `Node.Shutdown` closes every link,
+so every binding is gone and every session is sitting behind its debounce; a
+replica that stopped there would leave the routing plane holding demand for
+sessions no connection remains to serve. `ReleaseIdleDemand` fires those
+releases now and joins their failures. A session whose bindings are still held
+is left alone — a live binding means a connection the node did not close.
+
+**Host session ownership is not touched, and cannot be.** Nothing on this path
+names a lease, an epoch or a Host: the demand seam takes a tenant and a session
+and returns an error. Whether a session has an owner, and whether demand causes
+one to be found, is A7.2's, and its own step says a first subscriber must not
+restore a cold session merely for viewing — which is why an error from the
+demand plane is specified as a FAULT and never as "no owner".
+
+**Factory does not retain the browser's durable journal cursor (step 3), and
+that is true at three layers.** The transport never hands one to this package:
+`SubscribeEvent` carries a channel, a token, opaque data and three booleans
+(`centrifuge@v0.38.0/events.go:168-183`) and no offset or epoch. The reply is
+the zero `SubscribeOptions`, so `EnableRecovery` and `EnablePositioning` are
+false, and those two are the only members that make centrifuge keep a stream
+position for the connection at all (`client.go:3224`, `3248-3249`) — a
+browser asking for a positioned recoverable subscription is told **no** to both,
+with no stream position in the reply. And the demand seam carries the session
+identity and nothing else, asserted as a for-all: two subscriptions differing in
+recovery flags and subscription data reach it as indistinguishable calls, with a
+different SESSION as the positive control.
+
 **Per-binding repair is not delegated to the transport, and A6.1 does not
 assume it is.** One `messageWriter` per `Client` and no per-channel queue
 *bound* anywhere in the library means a stalled consumer loses its whole

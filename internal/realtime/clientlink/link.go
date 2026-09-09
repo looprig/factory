@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/looprig/factory/identity"
@@ -80,6 +81,38 @@ type Limits struct {
 	// decision for this edge rather than a second authority for one number --
 	// the two edges bound different work over different transports.
 	CommandTimeout time.Duration
+
+	// DemandReleaseDebounce is how long a session's last local DeliveryBinding
+	// must have been gone before this replica gives its delivery demand back.
+	//
+	// It exists because a browser's subscription set is not stable: a page
+	// navigation, a reconnect after a lost link and a re-render each drop a
+	// subscription and take it again within a moment, and a replica that
+	// released demand on the first of those pays for a registry read and a
+	// bind on the second. What the debounce buys is that the *round trip* does
+	// not happen, not that the release is cheap.
+	//
+	// It bounds nothing and it is not a deadline: it is a delay before a call
+	// that DemandTimeout then bounds. Setting it to a large value keeps a
+	// HostLink open for a session nobody is watching; setting it very small
+	// makes an ordinary reconnect cost a rebind. Neither is a correctness
+	// failure -- demand is local routing state and never authority.
+	DemandReleaseDebounce time.Duration
+
+	// DemandTimeout bounds ONE call into the DemandManager.
+	//
+	// It exists for the reason CommandTimeout does, and against the same
+	// mechanism: a subscribe is dispatched synchronously on the connection's
+	// read loop, and the connection context is cancelled when that loop
+	// RETURNS, so an in-flight Acquire is the very thing keeping it alive.
+	// See CommandTimeout for the measurement.
+	//
+	// It bounds the debounced RELEASE too, and there the reason is stronger
+	// rather than weaker: a release runs on a timer, after the connection that
+	// caused it is typically gone, so there is no request context in existence
+	// to inherit a deadline from. A release derived from context.Background
+	// with no timeout would be bounded by nothing at all.
+	DemandTimeout time.Duration
 }
 
 // Validate reports why these limits may not be used.
@@ -111,6 +144,19 @@ func (l Limits) Validate() error {
 	if l.CommandTimeout <= 0 {
 		return fmt.Errorf("%w: CommandTimeout is %v, want a positive duration", ErrInvalidConfig, l.CommandTimeout)
 	}
+	// A NON-NEGATIVE debounce, deliberately, where every other duration here
+	// must be positive. Zero means "release as soon as the last binding is
+	// gone", which is a coherent deployment choice and not a misconfiguration:
+	// it still schedules the release through the clock, so the ordering of
+	// acquire and release is the same at zero as at a minute. A negative value
+	// is not a choice, and time.AfterFunc would fire it immediately, which
+	// would read as a debounce that silently did not exist.
+	if l.DemandReleaseDebounce < 0 {
+		return fmt.Errorf("%w: DemandReleaseDebounce is %v, want a non-negative duration", ErrInvalidConfig, l.DemandReleaseDebounce)
+	}
+	if l.DemandTimeout <= 0 {
+		return fmt.Errorf("%w: DemandTimeout is %v, want a positive duration", ErrInvalidConfig, l.DemandTimeout)
+	}
 	return nil
 }
 
@@ -130,6 +176,16 @@ type Config struct {
 	// rather than letting a link accept commands it can only refuse.
 	Admitter Admitter
 
+	// Demand is the local delivery-demand plane an authorized subscription
+	// notifies. It is required: a link that accepted subscriptions without
+	// recording demand would be a replica serving channels it has asked
+	// nothing to route to it, and the failure would appear as an empty session
+	// rather than as a refusal.
+	Demand DemandManager
+
+	// Clock schedules the debounced demand release.
+	Clock Clock
+
 	// Limits bounds this replica's connections.
 	Limits Limits
 
@@ -144,6 +200,17 @@ type Config struct {
 // be driven directly by a test and the transport adapter has nothing to decide.
 type Engine struct {
 	cfg Config
+
+	// mu guards the demand table, and it is held ACROSS the DemandManager
+	// call. Holding it across the I/O is what makes "the first binding
+	// notifies, and the last removal releases" an ordering rather than a race:
+	// two subscriptions to one session arriving at once cost one Acquire, and
+	// an Acquire can never interleave with the Release of the demand it is
+	// re-taking. The cost is stated rather than hidden -- a slow demand plane
+	// delays a subscribe to an unrelated session -- and it is the same trade
+	// routing.Bindings documents across its own registry read.
+	mu     sync.Mutex
+	demand map[demandKey]*demandEntry
 }
 
 // NewEngine validates a composition and returns it.
@@ -157,13 +224,19 @@ func NewEngine(cfg Config) (*Engine, error) {
 	if cfg.Admitter == nil {
 		return nil, fmt.Errorf("%w: Admitter is nil", ErrInvalidConfig)
 	}
+	if cfg.Demand == nil {
+		return nil, fmt.Errorf("%w: Demand is nil", ErrInvalidConfig)
+	}
+	if cfg.Clock == nil {
+		return nil, fmt.Errorf("%w: Clock is nil", ErrInvalidConfig)
+	}
 	if cfg.Version == "" {
 		return nil, fmt.Errorf("%w: Version is empty", ErrInvalidConfig)
 	}
 	if err := cfg.Limits.Validate(); err != nil {
 		return nil, err
 	}
-	return &Engine{cfg: cfg}, nil
+	return &Engine{cfg: cfg, demand: map[demandKey]*demandEntry{}}, nil
 }
 
 // Limits returns the composed limits.
@@ -196,14 +269,4 @@ func (e *Engine) Authenticate(ctx context.Context, req ConnectRequest) (identity
 			ErrUnsupportedProtocol, req.ProtocolVersion, ProtocolVersion)
 	}
 	return e.cfg.Authenticator.AuthenticateLink(ctx, req.Token)
-}
-
-// AuthorizeSubscribe decides one channel for one principal.
-//
-// A successful handshake grants no channel. The authorizer parses
-// session:{tenant}:{session} and compares the tenant segment to the principal's
-// own; parsing a channel name is not a grant, which is why the decision is not
-// made here from the parse.
-func (e *Engine) AuthorizeSubscribe(ctx context.Context, principal identity.Principal, channel string) error {
-	return e.cfg.Authorizer.AuthorizeSubscribe(ctx, principal, channel)
 }

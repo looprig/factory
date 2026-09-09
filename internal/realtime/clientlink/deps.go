@@ -5,6 +5,7 @@ package clientlink
 
 import (
 	"context"
+	"time"
 
 	sessionwire "github.com/looprig/core/sessionwire/v1"
 	"github.com/looprig/factory/identity"
@@ -62,4 +63,48 @@ type Admitter interface {
 	AdmitInterrupt(ctx context.Context, principal identity.Principal, req sessionwire.InterruptRequest) (sessionstore.InboxEntry, bool, error)
 	AdmitRestore(ctx context.Context, principal identity.Principal, req sessionwire.RestoreRequest) (sessionstore.InboxEntry, bool, error)
 	AdmitGateResponse(ctx context.Context, principal identity.Principal, req sessionwire.GateResponseRequest) (sessionstore.InboxEntry, bool, error)
+}
+
+// DemandManager is Factory's local delivery-demand plane: which sessions this
+// replica is currently serving to a browser, and therefore which sessions it
+// needs a route to.
+//
+// It is stated in Core's vocabulary and names no routing, transport or binding
+// type. The implementation A7.2 supplies (`internal/routing`) answers an
+// Acquire with the local route it bound, and that value is not this edge's
+// business: a ClientLink knows that a session has a local subscriber, and
+// nothing about which Host serves it. Composing the two is one adapter, and it
+// is A9.1's, exactly as `routing.Binder`'s doc says of the HostLink pool.
+//
+// # What an error from either method MEANS
+//
+// A FAULT, and nothing else. A session with no live owner is not a failure of
+// demand -- A7.2 step 1 says a first subscriber must not restore a cold session
+// merely for viewing -- so an implementation that answered "no owner" as an
+// error would make every viewer of an idle session receive a refused
+// subscription. This edge classifies an Acquire failure as an internal,
+// TEMPORARY transport error, which is the correct advertisement for a
+// dependency that could not be reached and the wrong one for a decision about
+// the caller.
+type DemandManager interface {
+	// Acquire records that this replica has a local subscriber for a session.
+	Acquire(ctx context.Context, tenant sessionwire.TenantID, session sessionwire.SessionID) error
+
+	// Release gives that demand back. It is called once per session, after the
+	// last local DeliveryBinding has been gone for the configured debounce.
+	Release(ctx context.Context, tenant sessionwire.TenantID, session sessionwire.SessionID) error
+}
+
+// Clock is the time seam, and this package reads exactly one thing from it:
+// when to run the debounced release.
+//
+// It declares AfterFunc and NOT Now, because nothing here reads a wall clock. A
+// Now this package never called would be a method every composition supplies
+// identically and no test could distinguish. factory.Clock carries both and is
+// assignable to this without an adapter, which is the property
+// server_test.go's seam pairing holds.
+type Clock interface {
+	// AfterFunc runs f after d and returns a stop function reporting whether
+	// it prevented the call.
+	AfterFunc(d time.Duration, f func()) (stop func() bool)
 }

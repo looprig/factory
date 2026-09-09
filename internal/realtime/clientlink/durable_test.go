@@ -209,10 +209,14 @@ func newReplica(t *testing.T, store *sessionstore.Store, prefix string, now time
 	if err != nil {
 		t.Fatalf("NewAuthenticator: %v", err)
 	}
+	demand := &recordingDemand{}
+	clock := &manualClock{}
 	handler, err := clientlink.NewHandler(clientlink.Config{
 		Authenticator: authenticator,
 		Authorizer:    replicaAuthorizer{},
 		Admitter:      service,
+		Demand:        demand,
+		Clock:         clock,
 		Limits:        testLimits(),
 		Version:       buildVersion,
 	})
@@ -239,7 +243,7 @@ func newReplica(t *testing.T, store *sessionstore.Store, prefix string, now time
 	}
 	t.Cleanup(stop)
 	return &replica{
-		fixture:  &fixture{handler: handler, url: "ws" + strings.TrimPrefix(server.URL, "http"), verifier: v},
+		fixture:  &fixture{handler: handler, url: "ws" + strings.TrimPrefix(server.URL, "http"), verifier: v, demand: demand, clock: clock},
 		service:  service,
 		clock:    replicaClock{now},
 		shutdown: stop,

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"sync"
 
 	centrifuge "github.com/centrifugal/centrifuge"
 	"github.com/looprig/factory/identity"
@@ -157,8 +158,24 @@ func (h *Handler) Engine() *Engine { return h.engine }
 // Connections reports the ClientLinks this replica currently holds.
 func (h *Handler) Connections() int { return h.node.Hub().NumClients() }
 
-// Shutdown closes every ClientLink and stops the node.
-func (h *Handler) Shutdown(ctx context.Context) error { return h.node.Shutdown(ctx) }
+// Shutdown closes every ClientLink and stops the node, then gives back the
+// delivery demand those links were holding.
+//
+// The order is what makes the second half meaningful rather than decorative:
+// Node.Shutdown closes every client and waits for the hub
+// (centrifuge@v0.38.0/node.go:334-338), and closing a client unsubscribes its
+// channels, so by the time it returns every DeliveryBinding is gone and every
+// session's release is merely SCHEDULED behind the debounce. A replica that
+// stopped there would leave the routing table holding demand for sessions no
+// connection remains to serve -- for a drain, that is a HostLink kept open for
+// nobody until the process exits.
+//
+// Both failures are joined rather than the first returned: a node that failed
+// to stop must not hide demand this replica did not give back.
+func (h *Handler) Shutdown(ctx context.Context) error {
+	stopped := h.node.Shutdown(ctx)
+	return errors.Join(stopped, h.engine.ReleaseIdleDemand(ctx))
+}
 
 // ServeHTTP refuses what this surface does not serve, then upgrades.
 //
@@ -288,6 +305,14 @@ func connectRefusal(err error) error {
 // a check somewhere that could be skipped, and A5.1 measured the resulting
 // error on a real connection.
 func (h *Handler) connected(client *centrifuge.Client) {
+	// One holder per CONNECTION. A DeliveryBinding is a (connection, channel)
+	// pair, not a channel: two browsers watching one session are two bindings
+	// and one demand, which is the distinction the whole task turns on. The
+	// holder is captured by this connection's three closures and by nothing
+	// else, so it needs no key and cannot be reached after the connection is
+	// gone.
+	held := &heldBindings{releases: map[string]func(){}}
+
 	client.OnSubscribe(func(e centrifuge.SubscribeEvent, cb centrifuge.SubscribeCallback) {
 		principal, ok := principalOf(client)
 		if !ok {
@@ -304,18 +329,60 @@ func (h *Handler) connected(client *centrifuge.Client) {
 			cb(centrifuge.SubscribeReply{}, centrifuge.ErrorUnauthorized)
 			return
 		}
-		if err := h.engine.AuthorizeSubscribe(client.Context(), principal, e.Channel); err != nil {
-			cb(centrifuge.SubscribeReply{}, centrifuge.ErrorPermissionDenied)
+		// The connection's context, for the reason and with the limits
+		// Engine.Admit's call site states: this transport version gives a
+		// subscribe handler no per-operation context, and the connection's own
+		// cannot be cancelled while the handler is running, so what BOUNDS the
+		// demand call is Limits.DemandTimeout applied inside Bind.
+		release, err := h.engine.Bind(client.Context(), principal, e.Channel)
+		if err != nil {
+			cb(centrifuge.SubscribeReply{}, subscribeRefusal(err))
 			return
 		}
+		// Recorded BEFORE the callback, because the callback is what makes the
+		// subscription live: centrifuge sets flagSubscribed inside it
+		// (centrifuge@v0.38.0/client.go:3217) and only then can an unsubscribe
+		// -- including the one a concurrent close drives
+		// (client.go:1075-1081) -- reach the handler below. A binding recorded
+		// afterwards could be released by a close that already ran.
+		held.hold(e.Channel, release)
 		// The zero SubscribeOptions is the configuration this surface wants:
 		// no EmitPresence, no EmitJoinLeave, no PushJoinLeave, no
 		// EnablePositioning and no EnableRecovery. Naming the zero value is the
 		// point -- sessions are durable in SessionStore, and a transport that
 		// also remembered them would be a second, weaker answer to the same
-		// question.
+		// question. It is also what makes A6.3 step 3 true at the transport:
+		// EnableRecovery and EnablePositioning are the only members that would
+		// make centrifuge retain this connection's stream position at all
+		// (client.go:3224, 3248-3249).
 		cb(centrifuge.SubscribeReply{Options: centrifuge.SubscribeOptions{}}, nil)
+		// The callback runs the whole of subscribeCmd SYNCHRONOUSLY on this
+		// goroutine, and it can still refuse afterwards -- a reply that fails
+		// to encode or to write ends at onSubscribeError (client.go:1773-1789),
+		// which deletes the channel and therefore fires NO unsubscribe event
+		// (client.go:1721-1733, 3672-3681). A binding held for a subscription
+		// that does not exist would hold demand for the life of the link, so
+		// the transport's own answer is consulted once the callback returns.
+		// This cannot double-release: the holder hands each release out once.
+		if !client.IsSubscribed(e.Channel) {
+			held.drop(e.Channel)
+		}
 	})
+
+	// The ordinary end of a binding, and the one a disconnect uses too:
+	// Client.close unsubscribes every channel before it reports the disconnect
+	// (centrifuge@v0.38.0/client.go:1075-1081).
+	client.OnUnsubscribe(func(e centrifuge.UnsubscribeEvent) { held.drop(e.Channel) })
+
+	// The backstop, and it has a mechanism rather than a worry. unsubscribe
+	// returns EARLY when node.removeSubscription fails (client.go:3667-3670),
+	// before the unsubscribe handler is reached, so a broker error on the way
+	// out would strand this connection's demand forever. Nothing in this
+	// composition makes that broker fail -- the node keeps its in-process
+	// memory broker -- so no test drives this arm, and it is kept for the
+	// reason principalOf's is: it fails closed against a component this package
+	// does not own.
+	client.OnDisconnect(func(centrifuge.DisconnectEvent) { held.dropAll() })
 
 	client.OnRPC(func(e centrifuge.RPCEvent, cb centrifuge.RPCCallback) {
 		principal, ok := principalOf(client)
@@ -369,6 +436,74 @@ func (h *Handler) connected(client *centrifuge.Client) {
 		// travels as a Core envelope rather than as a numeric transport code.
 		cb(centrifuge.RPCReply{Data: body}, nil)
 	})
+}
+
+// heldBindings is one connection's DeliveryBindings: the channels it is
+// subscribed to, and the release each one owes.
+//
+// It exists because the transport reports a subscription's end in three
+// different places -- an unsubscribe, a disconnect, and a subscribe that failed
+// after the callback -- and every one of them must give back exactly the
+// binding that was taken, exactly once. Handing the release OUT on removal, and
+// removing under the lock, is what makes "exactly once" a property of the map
+// rather than of the caller: whichever of the three arrives first is the one
+// that releases, and the others find nothing.
+type heldBindings struct {
+	mu       sync.Mutex
+	releases map[string]func()
+}
+
+func (h *heldBindings) hold(channel string, release func()) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.releases[channel] = release
+}
+
+// drop releases the binding for one channel, if this connection still holds it.
+func (h *heldBindings) drop(channel string) {
+	h.mu.Lock()
+	release, held := h.releases[channel]
+	delete(h.releases, channel)
+	h.mu.Unlock()
+	if held {
+		release()
+	}
+}
+
+// dropAll releases everything left. The lock is not held across the releases
+// for the reason drop does not: a release reaches the Engine's own table, and
+// the two locks must always be taken in this order or not at all.
+func (h *heldBindings) dropAll() {
+	h.mu.Lock()
+	releases := make([]func(), 0, len(h.releases))
+	for channel, release := range h.releases {
+		delete(h.releases, channel)
+		releases = append(releases, release)
+	}
+	h.mu.Unlock()
+	for _, release := range releases {
+		release()
+	}
+}
+
+// subscribeRefusal classifies the two conditions Bind can report.
+//
+// A DENIAL is permission denied (103, terminal for this principal), and it
+// discloses nothing: the same answer whether the session exists, belongs to
+// another tenant, or never did.
+//
+// Everything else is a FAULT -- an authorized channel this build cannot name a
+// session in, or a demand plane that could not be reached -- and it is answered
+// with centrifuge's ErrorInternal, which the library marks TEMPORARY
+// (centrifuge@v0.38.0/errors.go:38-42). That is the correct advertisement:
+// resubscribing after a demand-plane outage is exactly what a browser should
+// do, and telling it "permission denied" would stop it forever on a condition
+// that has nothing to do with its permissions.
+func subscribeRefusal(err error) error {
+	if errors.Is(err, internalidentity.ErrUnauthorized) {
+		return centrifuge.ErrorPermissionDenied
+	}
+	return centrifuge.ErrorInternal
 }
 
 // rpcRefusal classifies the conditions Admit could make no admission decision

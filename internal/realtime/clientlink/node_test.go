@@ -216,6 +216,8 @@ func TestTheConnectionLabelIsTheSubjectNotTheTenant(t *testing.T) {
 		Authenticator: authenticator,
 		Authorizer:    internalidentity.Authorizer{},
 		Admitter:      stubAdmitter{},
+		Demand:        stubDemand{},
+		Clock:         stubClock{},
 		Limits:        nodeTestLimits(),
 		Version:       "v-label",
 	})
@@ -321,8 +323,13 @@ func stalledConsumer(t *testing.T, queueBytes, publications, payloadBytes int) (
 		Authenticator: authenticator,
 		Authorizer:    internalidentity.Authorizer{},
 		Admitter:      stubAdmitter{},
-		Limits:        limits,
-		Version:       "v-stall",
+		// This case SUBSCRIBES, so its demand plane must answer. It records
+		// nothing: what is under measurement is the queue budget, and an
+		// assertion about demand here would be an assertion about a fake.
+		Demand:  openDemand{},
+		Clock:   stubClock{},
+		Limits:  limits,
+		Version: "v-stall",
 	})
 	if err != nil {
 		t.Fatalf("NewHandler: %v", err)
@@ -554,6 +561,9 @@ func TestLimitsValidate(t *testing.T) {
 		{"no ping cadence", func(l *Limits) { l.PingInterval = 0 }, "PingInterval"},
 		{"no command bound", func(l *Limits) { l.CommandTimeout = 0 }, "CommandTimeout"},
 		{"a negative command bound", func(l *Limits) { l.CommandTimeout = -time.Second }, "CommandTimeout"},
+		{"a negative debounce", func(l *Limits) { l.DemandReleaseDebounce = -time.Nanosecond }, "DemandReleaseDebounce"},
+		{"no demand bound", func(l *Limits) { l.DemandTimeout = 0 }, "DemandTimeout"},
+		{"a negative demand bound", func(l *Limits) { l.DemandTimeout = -time.Second }, "DemandTimeout"},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
@@ -596,6 +606,8 @@ func TestNewEngineRefusesAnIncompleteComposition(t *testing.T) {
 		Authenticator: stubAuthenticator{},
 		Authorizer:    internalidentity.Authorizer{},
 		Admitter:      stubAdmitter{},
+		Demand:        stubDemand{},
+		Clock:         stubClock{},
 		Limits:        nodeTestLimits(),
 		Version:       "v",
 	}
@@ -610,6 +622,8 @@ func TestNewEngineRefusesAnIncompleteComposition(t *testing.T) {
 		{"no authenticator", func(c *Config) { c.Authenticator = nil }, "Authenticator"},
 		{"no authorizer", func(c *Config) { c.Authorizer = nil }, "Authorizer"},
 		{"no admitter", func(c *Config) { c.Admitter = nil }, "Admitter"},
+		{"no demand manager", func(c *Config) { c.Demand = nil }, "Demand"},
+		{"no clock", func(c *Config) { c.Clock = nil }, "Clock"},
 		{"no version", func(c *Config) { c.Version = "" }, "Version"},
 		{"unusable limits", func(c *Config) { c.Limits = Limits{} }, "MaxConnections"},
 	} {
@@ -710,6 +724,8 @@ func nodeTestLimits() Limits {
 		PingInterval:             25 * time.Second,
 		PongTimeout:              10 * time.Second,
 		CommandTimeout:           30 * time.Second,
+		DemandReleaseDebounce:    15 * time.Second,
+		DemandTimeout:            30 * time.Second,
 	}
 }
 
@@ -754,6 +770,39 @@ func (stubAdmitter) AdmitRestore(context.Context, identity.Principal, sessionwir
 func (stubAdmitter) AdmitGateResponse(context.Context, identity.Principal, sessionwire.GateResponseRequest) (sessionstore.InboxEntry, bool, error) {
 	return sessionstore.InboxEntry{}, false, errStubAdmitter
 }
+
+// stubDemand is the demand plane for the cases that are about the TRANSPORT.
+// Both methods fail closed, so a case that reached one by accident would say so
+// rather than passing on a demand nothing recorded.
+type stubDemand struct{}
+
+var errStubDemand = errors.New("stub demand manager: this case tracks nothing")
+
+func (stubDemand) Acquire(context.Context, sessionwire.TenantID, sessionwire.SessionID) error {
+	return errStubDemand
+}
+
+func (stubDemand) Release(context.Context, sessionwire.TenantID, sessionwire.SessionID) error {
+	return errStubDemand
+}
+
+// openDemand accepts every demand call and records none. It is for the
+// transport cases that must establish a real subscription and assert something
+// else entirely.
+type openDemand struct{}
+
+func (openDemand) Acquire(context.Context, sessionwire.TenantID, sessionwire.SessionID) error {
+	return nil
+}
+
+func (openDemand) Release(context.Context, sessionwire.TenantID, sessionwire.SessionID) error {
+	return nil
+}
+
+// stubClock schedules nothing and reports that it stopped nothing.
+type stubClock struct{}
+
+func (stubClock) AfterFunc(time.Duration, func()) func() bool { return func() bool { return false } }
 
 type stubAuthenticator struct{}
 

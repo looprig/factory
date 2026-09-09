@@ -224,6 +224,8 @@ type engineFixture struct {
 	engine     *clientlink.Engine
 	authorizer *recordingAuthorizer
 	admitter   *recordingAdmitter
+	demand     *recordingDemand
+	clock      *manualClock
 	principal  identity.Principal
 }
 
@@ -243,12 +245,16 @@ func newEngineFixtureWithLimits(t *testing.T, limits clientlink.Limits) *engineF
 	f := &engineFixture{
 		authorizer: &recordingAuthorizer{},
 		admitter:   &recordingAdmitter{created: true},
+		demand:     &recordingDemand{},
+		clock:      &manualClock{},
 		principal:  principal,
 	}
 	engine, err := clientlink.NewEngine(clientlink.Config{
 		Authenticator: fixedAuthenticator{principal: principal},
 		Authorizer:    f.authorizer,
 		Admitter:      f.admitter,
+		Demand:        f.demand,
+		Clock:         f.clock,
 		Limits:        limits,
 		Version:       buildVersion,
 	})
