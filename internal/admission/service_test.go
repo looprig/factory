@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"go/ast"
+	"go/build"
 	"go/parser"
 	"go/token"
 	"os"
@@ -1095,7 +1096,7 @@ func admissionEntryPoints(t *testing.T) map[string]func(*serviceFixture) error {
 // 7f9f598.
 //
 // So this parses the package's production sources, builds the intra-package call
-// graph by name, and requires:
+// graph over the files the toolchain builds, and requires:
 //
 //	every function that calls refusal() is reachable from a driven entry point
 //	every driven entry point exists as a production function
@@ -1129,9 +1130,13 @@ func admissionEntryPoints(t *testing.T) map[string]func(*serviceFixture) error {
 func TestEveryClassifiedRefusalIsReachableFromADrivenEntryPoint(t *testing.T) {
 	t.Parallel()
 
-	callers, callees, unattributable, err := packageCallGraph(".")
+	callers, callees, unattributable, duplicates, err := packageCallGraph(".")
 	if err != nil {
 		t.Fatalf("parse the admission sources: %v", err)
+	}
+	if len(duplicates) != 0 {
+		t.Fatalf("these QUALIFIED names are declared more than once in the files the toolchain builds: %v. "+
+			"Two declarations of one node merge their callers, so an edge to either reaches both", duplicates)
 	}
 	// A call that LOOKS like a receiver call and is not a method this package
 	// declares on that receiver's type is a hard failure rather than a dropped
@@ -1140,10 +1145,12 @@ func TestEveryClassifiedRefusalIsReachableFromADrivenEntryPoint(t *testing.T) {
 	// func-typed field. Neither can be told from a method call syntactically,
 	// so the analysis reports that it cannot see rather than guessing.
 	if len(unattributable) != 0 {
-		t.Fatalf("this package makes %d call(s) the reachability analysis cannot attribute:\n\t%s\n"+
-			"Each is either a receiver identifier shadowed by another value or a func-typed field. "+
-			"The graph cannot distinguish either from a method call, so it fails here rather than "+
-			"granting coverage it has not established", len(unattributable), strings.Join(unattributable, "\n\t"))
+		t.Fatalf("this package makes %d declaration(s) or call(s) the reachability analysis cannot attribute:\n\t%s\n"+
+			"The producers are: a receiver identifier re-declared in its own body; a func-typed FIELD called "+
+			"through the receiver; a method PROMOTED from an embedded type, which this package does not declare; "+
+			"and a receiver whose type cannot be named, such as a generic one. None is distinguishable from an "+
+			"ordinary method call without types, so the analysis fails here rather than granting coverage it has "+
+			"not established", len(unattributable), strings.Join(unattributable, "\n\t"))
 	}
 	if len(callees) == 0 {
 		t.Fatal("vacuous: the scanner found no functions at all")
@@ -1193,89 +1200,153 @@ func TestEveryClassifiedRefusalIsReachableFromADrivenEntryPoint(t *testing.T) {
 // functions that call each name -- together with every call it could not
 // attribute.
 //
-// # The unit of analysis
+// # The unit of analysis, as tested rather than as intended
 //
-// A node is one of:
+// The subject is the set of files build.Context.MatchFile selects for THIS
+// GOOS/GOARCH -- the same decision the compiler makes -- minus _test.go. A node
+// within them is one of:
 //
 //	funcName            a package-level function
-//	Type.MethodName     a method, keyed by its receiver TYPE, not by the
-//	                    identifier the receiver happens to be spelled with
+//	Type.MethodName     a method, keyed by its receiver TYPE
 //	Node@literal:LINE   a function literal, its own node with no incoming edge
 //
-// Keying methods by type is what closes two escapes that a name-keyed graph
-// cannot, and both were live here until this round -- each demonstrated by a
-// controlled pair in which the byte-identical orphan survives:
+// An edge is a bare identifier call to a function this package declares, or a
+// selector call on the enclosing declaration's receiver identifier whose
+// selector is a method this package declares on that receiver's type. Every
+// other call shape produces NO edge, so its target looks unreached and fails.
 //
-//   - (G) RECEIVER SHADOWING. A block-scoped `s := req; s.Validate()` inside a
-//     method whose receiver is also `s` looked like a receiver call, so it
-//     became an edge to a package function named Validate. `s` is the receiver
-//     of 11 of the 13 methods here, and the old rule compared identifier TEXT
-//     with no scope analysis. I reproduced it before rewriting: `go vet` clean,
-//     package green, orphan unreached and passing.
-//   - (H) A FUNC-TYPED FIELD. `s.hook()`, where hook is a field rather than a
-//     method, is syntactically identical to a method call. The stated residual
-//     said "a local VARIABLE shadowing a package function", and a struct field
-//     is not that.
+// Four constructions defeat qualification, and each is a HARD FAILURE naming
+// itself rather than a silent drop, because none is distinguishable from an
+// ordinary method call without type information:
 //
-// Both are closed by the same rule: a selector call on the receiver identifier
-// is an edge ONLY when its selector is a method this package declares on that
-// receiver's type. Anything else that looks like a receiver call is
-// UNATTRIBUTABLE and is a hard failure, the way duplicate declarations were --
-// the guard sets that precedent and this follows it. Failing closed is the
-// point: the analysis says what it cannot see instead of guessing.
+//	a re-declared receiver identifier   `s := &Error{}; s.orphanShadow()`
+//	a func-typed field on the receiver  `s.hook()`
+//	a promoted method                   declared on an embedded type
+//	a receiver that cannot be named     a generic `Box[T]`
 //
-// # What it therefore cannot see
+// The first and last were found by a gate AFTER the previous round claimed the
+// boundary was closed, and both were reproduced here before being fixed.
 //
+// # What it does not cover, measured
+//
+//   - Code the toolchain does not build for this platform is OUTSIDE the graph.
+//     A constrained file's refusal site is not audited by this run, and a run on
+//     another GOOS would audit a different set. What IS checked across all
+//     files, built or not, is duplicate qualified declarations: a
+//     service_windows.go redeclaring a *Service method cannot exist inside one
+//     build, so the only axis it can appear on is between files the build
+//     selects between -- and merging those was how a dead orphan was made
+//     reachable.
 //   - A call through any other value -- a func in a map, an interface method on
-//     a field -- is not an edge. Its target looks unreached and FAILS, which is
-//     the direction this construction must err in.
-//   - A package-level function called only via a value assigned elsewhere is
-//     unreachable to this scan and fails for the same reason.
-//   - Qualification removes the name-collision hazard by construction rather
-//     than by a check: a free `catalogNotFound` and an `Error.catalogNotFound`
-//     are now two nodes, so neither can inherit the other's callers. The
-//     explicit duplicate check that stood here is gone with it, because a guard
-//     that can no longer fire is not a guard.
-func packageCallGraph(root string) (callers, callees map[string][]string, unattributable []string, err error) {
+//     a field -- is not an edge, and fails rather than passing.
+//   - Another package cannot host a site: refusal is unexported and this
+//     directory has no subdirectories.
+func packageCallGraph(root string) (callers, callees map[string][]string, unattributable, duplicates []string, err error) {
 	entries, err := os.ReadDir(root)
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, nil, nil, nil, err
 	}
-	var files []*ast.File
+	var files, allFiles []*ast.File
 	fset := token.NewFileSet()
 	for _, entry := range entries {
 		name := entry.Name()
 		if entry.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
 			continue
 		}
+		// The toolchain's own file selection, not just the .go suffix.
+		// go/parser applies NO build constraints and no GOOS/GOARCH filename
+		// rule, so service_windows.go was parsed on darwin and its
+		// declarations merged with the real ones -- measured: a *Service
+		// method there sharing a qualified name with a reached method made a
+		// DEAD orphan reachable, with `go build ./...` green because the file
+		// is not compiled at all. build.Context.MatchFile is the same decision
+		// the compiler makes, so the graph now describes the program that is
+		// actually built.
+		matched, matchErr := build.Default.MatchFile(root, name)
+		if matchErr != nil {
+			return nil, nil, nil, nil, matchErr
+		}
 		file, parseErr := parser.ParseFile(fset, filepath.Join(root, name), nil, 0)
 		if parseErr != nil {
-			return nil, nil, nil, parseErr
+			return nil, nil, nil, nil, parseErr
 		}
-		files = append(files, file)
+		// Two sets, deliberately. The GRAPH is the program the toolchain
+		// builds. The DUPLICATE census is every file, because a duplicate
+		// qualified name cannot exist within one build -- Go rejects it -- so
+		// the only axis on which one can appear is across files the build
+		// selects between. That is exactly the shape a gate found: a
+		// service_windows.go declaring a *Service method that already exists,
+		// merged into the graph by a parser that applies no constraints.
+		// Reporting it is worth doing in its own right: two platforms with
+		// different bodies for one method means coverage established on this
+		// one says nothing about the other.
+		if matched {
+			files = append(files, file)
+		}
+		allFiles = append(allFiles, file)
 	}
 
 	// First pass: what this package declares. The method set per receiver type
 	// is what the second pass attributes against.
 	freeFunctions := map[string]bool{}
 	methodsOf := map[string]map[string]bool{}
+	declaredAt := map[string]int{}
+	for _, file := range allFiles {
+		for _, decl := range file.Decls {
+			fn, ok := decl.(*ast.FuncDecl)
+			if !ok {
+				continue
+			}
+			typeName, _, kind := receiverOf(fn)
+			if kind == receiverNamed {
+				declaredAt[typeName+"."+fn.Name.Name]++
+			} else if kind == receiverNone {
+				declaredAt[fn.Name.Name]++
+			}
+		}
+	}
 	for _, file := range files {
 		for _, decl := range file.Decls {
 			fn, ok := decl.(*ast.FuncDecl)
 			if !ok {
 				continue
 			}
-			typeName, _, isMethod := receiverOf(fn)
-			if !isMethod {
+			typeName, _, kind := receiverOf(fn)
+			switch kind {
+			case receiverNone:
 				freeFunctions[fn.Name.Name] = true
-				continue
+			case receiverNamed:
+				if methodsOf[typeName] == nil {
+					methodsOf[typeName] = map[string]bool{}
+				}
+				methodsOf[typeName][fn.Name.Name] = true
+			case receiverUnqualifiable:
+				// A GENERIC receiver -- Box[T] is an IndexExpr, not an Ident.
+				// The previous version reported isMethod false, so the method
+				// landed among the free functions under its BARE name and
+				// became one node with any free function of that name: a dead
+				// (*probeBox[T]).orphanProbe was "reached" through a live
+				// orphanProbe(). Failing hard is the cheaper of the two fixes
+				// and matches the unattributable precedent -- the analysis says
+				// it cannot key this rather than keying it wrongly.
+				unattributable = append(unattributable, fmt.Sprintf(
+					"%s at %s has a receiver this scan cannot qualify by type, so its node would collide with any function of the same bare name",
+					fn.Name.Name, fset.Position(fn.Pos())))
 			}
-			if methodsOf[typeName] == nil {
-				methodsOf[typeName] = map[string]bool{}
-			}
-			methodsOf[typeName][fn.Name.Name] = true
 		}
 	}
+	// Restored on the QUALIFIED key. It was deleted last round on the premise
+	// that qualification made it unable to fire; the premise was false and a
+	// gate fired it twice. Qualification removes the free-function/method
+	// collision, and it does NOT remove two declarations of the same qualified
+	// name -- which is what a file the toolchain skips, or an unqualifiable
+	// receiver, produces.
+	for name, count := range declaredAt {
+		if count > 1 {
+			duplicates = append(duplicates, name)
+		}
+	}
+	slices.Sort(duplicates)
 
 	callers, callees = map[string][]string{}, map[string][]string{}
 	var record func(from string, body ast.Node, recvType, recvName string)
@@ -1329,37 +1400,111 @@ func packageCallGraph(root string) (callers, callees map[string][]string, unattr
 			if !ok || fn.Body == nil {
 				continue
 			}
-			typeName, recvName, isMethod := receiverOf(fn)
+			typeName, recvName, kind := receiverOf(fn)
 			key := fn.Name.Name
-			if isMethod {
+			if kind == receiverNamed {
 				key = typeName + "." + fn.Name.Name
+			}
+			// A receiver identifier re-declared anywhere in the body makes
+			// every selector call on that identifier ambiguous to a scan with
+			// no types. The type rule alone narrowed this rather than closing
+			// it: a shadow whose selector the ENCLOSING receiver's type also
+			// declares -- `s := &Error{}; s.orphanShadow()` inside a *Service
+			// method, where both types declare orphanShadow -- booked an edge
+			// to the dead Service.orphanShadow. Measured, and green.
+			if recvName != "" && redeclares(fn.Body, recvName) {
+				unattributable = append(unattributable, fmt.Sprintf(
+					"%s at %s re-declares its receiver identifier %q, so no selector call on it can be attributed",
+					key, fset.Position(fn.Pos()), recvName))
+				recvName = ""
 			}
 			record(key, fn.Body, typeName, recvName)
 		}
 	}
 	slices.Sort(unattributable)
-	return callers, callees, unattributable, nil
+	return callers, callees, unattributable, duplicates, nil
 }
+
+// receiverKind is what receiverOf could establish about a declaration.
+type receiverKind int
+
+const (
+	// receiverNone is a package-level function.
+	receiverNone receiverKind = iota
+	// receiverNamed is a method whose receiver type this scan can name.
+	receiverNamed
+	// receiverUnqualifiable is a method whose receiver type it cannot -- a
+	// generic receiver, today. It is NOT folded into receiverNone: doing that
+	// is what put a generic method among the free functions under its bare
+	// name and merged it with an unrelated node.
+	receiverUnqualifiable
+)
 
 // receiverOf reports a declaration's receiver TYPE and the identifier it is
 // spelled with. A method declared with no receiver name -- func (*Service) f()
 // -- yields an empty name, which matches no identifier, so it can make no
 // attributable selector call.
-func receiverOf(fn *ast.FuncDecl) (typeName, name string, isMethod bool) {
+func receiverOf(fn *ast.FuncDecl) (typeName, name string, kind receiverKind) {
 	if fn.Recv == nil || len(fn.Recv.List) != 1 {
-		return "", "", false
+		return "", "", receiverNone
 	}
 	field := fn.Recv.List[0]
+	if len(field.Names) == 1 {
+		name = field.Names[0].Name
+	}
 	expr := field.Type
 	if star, isStar := expr.(*ast.StarExpr); isStar {
 		expr = star.X
 	}
 	ident, isIdent := expr.(*ast.Ident)
 	if !isIdent {
-		return "", "", false
+		return "", name, receiverUnqualifiable
 	}
-	if len(field.Names) == 1 {
-		name = field.Names[0].Name
-	}
-	return ident.Name, name, true
+	return ident.Name, name, receiverNamed
+}
+
+// redeclares reports whether body introduces a new binding for name, in any
+// scope. It is deliberately scope-blind: a scan with no types cannot tell which
+// binding a later selector call refers to, so ANY re-declaration makes every
+// such call unattributable in that declaration.
+func redeclares(body *ast.BlockStmt, name string) bool {
+	found := false
+	ast.Inspect(body, func(n ast.Node) bool {
+		switch decl := n.(type) {
+		case *ast.AssignStmt:
+			if decl.Tok != token.DEFINE {
+				return true
+			}
+			for _, lhs := range decl.Lhs {
+				if ident, ok := lhs.(*ast.Ident); ok && ident.Name == name {
+					found = true
+				}
+			}
+		case *ast.ValueSpec:
+			for _, ident := range decl.Names {
+				if ident.Name == name {
+					found = true
+				}
+			}
+		case *ast.RangeStmt:
+			for _, expr := range []ast.Expr{decl.Key, decl.Value} {
+				if ident, ok := expr.(*ast.Ident); ok && ident.Name == name {
+					found = true
+				}
+			}
+		case *ast.FuncLit:
+			if decl.Type.Params == nil {
+				return true
+			}
+			for _, param := range decl.Type.Params.List {
+				for _, ident := range param.Names {
+					if ident.Name == name {
+						found = true
+					}
+				}
+			}
+		}
+		return !found
+	})
+	return found
 }
