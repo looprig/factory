@@ -5,6 +5,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"go/ast"
+	"go/parser"
+	"go/token"
+	"os"
+	"path/filepath"
 	"reflect"
 	"slices"
 	"strings"
@@ -700,87 +705,46 @@ func TestADependencyFaultIsNotADecisionAboutTheCommand(t *testing.T) {
 // assertion is over the ANSWER's classification, not over the cause's survival,
 // so a site that classified and discarded the failure is caught too.
 //
+// # Both axes are derived, and neither from the thing they probe
+//
+// The first version derived METHODS from interfaces and took the INTERFACES
+// from a hand-written map of six. That is one axis short, and it was measured:
+// deleting a dependency from the map shrank the sweep and the module stayed
+// green, and a seventh dependency or a seventh entry point joined the service
+// without joining the sweep. The claim "a dependency added later cannot join the
+// set of untested folds" was therefore false of everything except a method on an
+// interface somebody had already listed.
+//
+// Both axes now come from production types:
+//
+//	dependencies   the INTERFACE-KIND FIELDS of admission.Config
+//	fault sites    the methods of those interfaces whose last result is an error
+//	entry points   the exported methods of *Service
+//
+// and both are held by SET EQUALITY, so a seventh of either fails until it is
+// driven or recorded with a reason. Clock drops out of the sweep by the
+// MECHANISM rather than by a note: neither of its methods can return an error,
+// so it contributes no fault site.
+//
+// The universe may not be computed from the thing it probes. Config and *Service
+// are the production declarations the service is BUILT from, not values it
+// indexes at run time, so shrinking either is a compile error in service.go
+// rather than a quieter test -- which is the trap sessionstore's own derivation
+// (commit 7f9f598) had to avoid and names explicitly.
+//
 // # Anti-vacuity
 //
 // A sweep whose faults never reach anything is green and worthless. Every
 // derived method must be exercised by at least one entry point, except those
-// named in unreachedDependencyMethods with a reason -- so a dependency method
-// added later that nothing drives fails HERE and demands a decision, rather
-// than joining the set of untested folds this test exists to end.
+// named in unreachedDependencyMethods with a reason; and every fault must
+// produce SOME failure, or an injector that armed nothing would leave every
+// call on its happy path with "nothing was classified" trivially true.
 func TestNoDependencyFaultBecomesAPublicCode(t *testing.T) {
-	// The dependency surface, derived from the interfaces the Service declares
-	// rather than from a list. A method added to any of them joins the sweep.
-	dependencies := map[string]reflect.Type{
-		"Authorizer": reflect.TypeOf((*Authorizer)(nil)).Elem(),
-		"Targets":    reflect.TypeOf((*TargetResolver)(nil)).Elem(),
-		"Catalog":    reflect.TypeOf((*Catalog)(nil)).Elem(),
-		"Commands":   reflect.TypeOf((*CommandStore)(nil)).Elem(),
-		"Directory":  reflect.TypeOf((*OwnerDirectory)(nil)).Elem(),
-		"IDs":        reflect.TypeOf((*UUIDSource)(nil)).Elem(),
-	}
-	// Clock is deliberately absent: neither of its methods can fail, so there
-	// is no fault to inject. That is a property of the interface -- if a Clock
-	// method ever returns an error, this comment is wrong and the map above is
-	// where it is corrected.
-	type site struct{ dependency, method string }
-	var sites []site
-	for name, typ := range dependencies {
-		if typ.NumMethod() == 0 {
-			t.Fatalf("%s declares no methods, so sweeping it proves nothing", name)
-		}
-		for i := range typ.NumMethod() {
-			sites = append(sites, site{dependency: name, method: typ.Method(i).Name})
-		}
-	}
-	slices.SortFunc(sites, func(a, b site) int {
-		if a.dependency != b.dependency {
-			return strings.Compare(a.dependency, b.dependency)
-		}
-		return strings.Compare(a.method, b.method)
-	})
+	sites := faultSites(t)
 	if len(sites) < 2 {
-		t.Fatalf("the derived dependency surface has %d methods; the sweep is vacuous", len(sites))
+		t.Fatalf("the derived dependency surface has %d fallible methods; the sweep is vacuous", len(sites))
 	}
-
-	// The entry points. Each is configured to reach as deep as the fixture
-	// allows, so a dependency read late in the chain is exercised rather than
-	// short-circuited by an earlier refusal.
-	entries := map[string]func(*serviceFixture) error{
-		"AdmitCreate": func(f *serviceFixture) error {
-			_, _, err := f.service.AdmitCreate(context.Background(), f.principal,
-				sessionwire.CreateRequest{CommandEnvelope: envelope("create-a"), SessionID: "session-a", AgentID: "agent-a"})
-			return err
-		},
-		"AdmitLegacyCreate": func(f *serviceFixture) error {
-			_, err := f.service.AdmitLegacyCreate(context.Background(), f.principal,
-				LegacyCreateRequest{AgentID: "agent-a", Blocks: []byte(`[{"text":"hello"}]`)})
-			return err
-		},
-		"AdmitInput": func(f *serviceFixture) error {
-			_, _, err := f.service.AdmitInput(context.Background(), f.principal,
-				sessionwire.InputRequest{CommandEnvelope: envelope("input-a"), SessionID: "session-a", Blocks: []byte(`[{"text":"hello"}]`)})
-			return err
-		},
-		"AdmitInterrupt": func(f *serviceFixture) error {
-			_, _, err := f.service.AdmitInterrupt(context.Background(), f.principal,
-				sessionwire.InterruptRequest{CommandEnvelope: envelope("interrupt-a"), SessionID: "session-a"})
-			return err
-		},
-		"AdmitRestore": func(f *serviceFixture) error {
-			_, _, err := f.service.AdmitRestore(context.Background(), f.principal,
-				sessionwire.RestoreRequest{CommandEnvelope: envelope("restore-a"), SessionID: "session-a"})
-			return err
-		},
-		"AdmitGateResponse": func(f *serviceFixture) error {
-			_, _, err := f.service.AdmitGateResponse(context.Background(), f.principal,
-				sessionwire.GateResponseRequest{
-					CommandEnvelope: envelope("gate-a"), SessionID: "session-a", GateID: "gate-a",
-					Action: "submit", Values: map[string]json.RawMessage{"answer": json.RawMessage(`"yes"`)},
-					ExpectedOpenEventID: "event-a",
-				})
-			return err
-		},
-	}
+	entries := admissionEntryPoints(t)
 
 	exercised := map[string]bool{}
 	for _, s := range sites {
@@ -788,11 +752,14 @@ func TestNoDependencyFaultBecomesAPublicCode(t *testing.T) {
 			t.Run(s.dependency+"."+s.method+"/"+entryName, func(t *testing.T) {
 				f := newServiceFixture(t)
 				resolvableSession(f)
-				injectFault(f, s.dependency, s.method)
+				injector, armable := armFault(f, s.dependency, s.method)
+				if !armable {
+					t.Fatalf("no fake can arm %s", s.dependency)
+				}
 
 				err := call(f)
 
-				if !dependencyWasCalled(f, s.dependency, s.method) {
+				if !injector.called[s.method] {
 					// This entry point does not reach that dependency method.
 					// Nothing to assert; the coverage floor below is what makes
 					// sure SOME entry point does.
@@ -810,6 +777,22 @@ func TestNoDependencyFaultBecomesAPublicCode(t *testing.T) {
 				// SOME failure; a swallowed one is its own defect.
 				if err == nil {
 					t.Fatalf("%s.%s failed and %s succeeded anyway", s.dependency, s.method, entryName)
+				}
+				// The failure must be THIS failure. "Something went wrong" is a
+				// much weaker claim than "the injected fault surfaced", and the
+				// gap between them is where a service that answered its own
+				// unrelated refusal would hide -- the sweep would then be
+				// asserting that some other error is unclassified while the
+				// dependency's own was folded and discarded.
+				//
+				// The one shape that legitimately does not wrap it is a fold
+				// that DROPS the cause, which is precisely what the
+				// classification assertion below catches, so the two are
+				// reported apart rather than as one condition.
+				var classifiedCause *Error
+				if !errors.Is(err, errInjectedFault) && !errors.As(err, &classifiedCause) {
+					t.Errorf("%s.%s failed and %s answered %v, which neither wraps the injected fault nor classifies it; "+
+						"the dependency's failure was replaced by something else", s.dependency, s.method, entryName, err)
 				}
 				var classified *Error
 				if errors.As(err, &classified) {
@@ -872,42 +855,327 @@ func resolvableSession(f *serviceFixture) {
 	}
 }
 
-// injectFault arms one dependency method to fail.
-func injectFault(f *serviceFixture, dependency, method string) {
+// armFault arms one dependency method to fail and returns that fake's injector,
+// so the caller can ask afterwards whether the method was reached.
+//
+// The boolean is "this fixture has a fake for that dependency", and it is a
+// RESULT rather than a panic because faultSites consults it while deriving:
+// a dependency added to Config that the fixture cannot arm must be a named test
+// failure, not a crash in a helper.
+//
+// It is deliberately the same lookup for both questions. Arming and asking are
+// two views of one fake, so an injector that armed one dependency and reported
+// another's calls is not expressible.
+func armFault(f *serviceFixture, dependency, method string) (*faultInjector, bool) {
+	var injector *faultInjector
 	switch dependency {
 	case "Authorizer":
-		f.auth.failing = method
+		injector = &f.auth.faultInjector
 	case "Targets":
-		f.targets.failing = method
+		injector = &f.targets.faultInjector
 	case "Catalog":
-		f.catalog.failing = method
+		injector = &f.catalog.faultInjector
 	case "Commands":
-		f.commands.failing = method
+		injector = &f.commands.faultInjector
 	case "Directory":
-		f.directory.failing = method
+		injector = &f.directory.faultInjector
 	case "IDs":
-		f.ids.failing = method
+		injector = &f.ids.faultInjector
 	default:
-		panic("no fake for dependency " + dependency)
+		return nil, false
+	}
+	injector.failing = method
+	return injector, true
+}
+
+// ---------------------------------------------------------------------------
+// The derivation. Both axes, and the reader that stops the ratchet.
+// ---------------------------------------------------------------------------
+
+// faultSite is one place a dependency error can enter the service: a fallible
+// method on one of the interfaces Config declares.
+type faultSite struct{ dependency, method string }
+
+// admissionDependencies derives the dependency surface from Config's own
+// INTERFACE-KIND FIELDS.
+//
+// Config is the authority because it is what the service is constructed from
+// and what service.go dereferences field by field; a dependency removed from it
+// does not shrink this sweep quietly, it stops the production file compiling.
+// A test whose universe came from the same map its fixture indexes could be
+// narrowed by narrowing that map, which is the failure mode this replaces.
+func admissionDependencies(t *testing.T) map[string]reflect.Type {
+	t.Helper()
+
+	cfg := reflect.TypeOf(Config{})
+	out := map[string]reflect.Type{}
+	for i := range cfg.NumField() {
+		field := cfg.Field(i)
+		if field.Type.Kind() == reflect.Interface {
+			out[field.Name] = field.Type
+		}
+	}
+	if len(out) == 0 {
+		t.Fatal("Config declares no interface dependencies; the derivation is broken")
+	}
+	return out
+}
+
+// faultSites is the cross-product's first axis: every fallible method of every
+// dependency.
+//
+// "Fallible" is read off the SIGNATURE -- a method whose last result is an error
+// -- so a dependency that cannot fail contributes nothing and needs no note
+// exempting it. It also means a method that GAINS an error result joins the
+// sweep on the same day it becomes able to fail.
+func faultSites(t *testing.T) []faultSite {
+	t.Helper()
+
+	errorType := reflect.TypeOf((*error)(nil)).Elem()
+	// A real fixture, because "can this be armed" is a question about the
+	// fakes, and asking it of a zero value would answer about nil pointers.
+	probe := newServiceFixture(t)
+	var sites []faultSite
+	for name, typ := range admissionDependencies(t) {
+		if typ.NumMethod() == 0 {
+			t.Errorf("%s declares no methods, so sweeping it proves nothing", name)
+		}
+		fallible := 0
+		for i := range typ.NumMethod() {
+			method := typ.Method(i)
+			out := method.Type.NumOut()
+			if out == 0 || method.Type.Out(out-1) != errorType {
+				continue
+			}
+			fallible++
+			sites = append(sites, faultSite{dependency: name, method: method.Name})
+		}
+		if fallible == 0 {
+			// A dependency that cannot fail contributes no site and needs no
+			// fake. Clock is the one, and it leaves the sweep by this arm
+			// rather than by a note somebody has to keep true.
+			continue
+		}
+		// The fixture must be able to arm every dependency that CAN fail. A
+		// seventh interface on Config fails HERE, naming itself, rather than
+		// silently sitting outside the sweep.
+		if _, armable := armFault(probe, name, ""); !armable {
+			t.Errorf("Config declares the fallible dependency %s, which this fixture cannot arm; "+
+				"a fault in it would be outside the sweep", name)
+		}
+	}
+	slices.SortFunc(sites, func(a, b faultSite) int {
+		if a.dependency != b.dependency {
+			return strings.Compare(a.dependency, b.dependency)
+		}
+		return strings.Compare(a.method, b.method)
+	})
+	return sites
+}
+
+// nonEntryPointServiceMethods names exported Service methods that are not
+// command entry points, with the reason. An entry is a claim: the check below
+// fails if one of these is ever driven, so a stale record cannot survive.
+func nonEntryPointServiceMethods() map[string]string {
+	return map[string]string{}
+}
+
+// admissionEntryPoints is the cross-product's second axis, held to *Service's
+// exported method set by SET EQUALITY in both directions.
+//
+// Containment would not do. A seventh entry point added to the service is
+// exactly the case the first version of this sweep missed: it joined the public
+// surface without joining the sweep, and nothing said so.
+func admissionEntryPoints(t *testing.T) map[string]func(*serviceFixture) error {
+	t.Helper()
+
+	entries := map[string]func(*serviceFixture) error{
+		"AdmitCreate": func(f *serviceFixture) error {
+			_, _, err := f.service.AdmitCreate(context.Background(), f.principal,
+				sessionwire.CreateRequest{CommandEnvelope: envelope("create-a"), SessionID: "session-a", AgentID: "agent-a"})
+			return err
+		},
+		"AdmitLegacyCreate": func(f *serviceFixture) error {
+			_, err := f.service.AdmitLegacyCreate(context.Background(), f.principal,
+				LegacyCreateRequest{AgentID: "agent-a", Blocks: []byte(`[{"text":"hello"}]`)})
+			return err
+		},
+		"AdmitInput": func(f *serviceFixture) error {
+			_, _, err := f.service.AdmitInput(context.Background(), f.principal,
+				sessionwire.InputRequest{CommandEnvelope: envelope("input-a"), SessionID: "session-a", Blocks: []byte(`[{"text":"hello"}]`)})
+			return err
+		},
+		"AdmitInterrupt": func(f *serviceFixture) error {
+			_, _, err := f.service.AdmitInterrupt(context.Background(), f.principal,
+				sessionwire.InterruptRequest{CommandEnvelope: envelope("interrupt-a"), SessionID: "session-a"})
+			return err
+		},
+		"AdmitRestore": func(f *serviceFixture) error {
+			_, _, err := f.service.AdmitRestore(context.Background(), f.principal,
+				sessionwire.RestoreRequest{CommandEnvelope: envelope("restore-a"), SessionID: "session-a"})
+			return err
+		},
+		"AdmitGateResponse": func(f *serviceFixture) error {
+			_, _, err := f.service.AdmitGateResponse(context.Background(), f.principal,
+				sessionwire.GateResponseRequest{
+					CommandEnvelope: envelope("gate-a"), SessionID: "session-a", GateID: "gate-a",
+					Action: "submit", Values: map[string]json.RawMessage{"answer": json.RawMessage(`"yes"`)},
+					ExpectedOpenEventID: "event-a",
+				})
+			return err
+		},
+	}
+
+	service := reflect.TypeOf(&Service{})
+	declared := map[string]bool{}
+	for i := range service.NumMethod() {
+		declared[service.Method(i).Name] = true
+	}
+	if len(declared) == 0 {
+		t.Fatal("*Service declares no exported methods; the derivation is broken")
+	}
+	excluded := nonEntryPointServiceMethods()
+	for name := range declared {
+		if entries[name] == nil && excluded[name] == "" {
+			t.Errorf("*Service declares %s, which no entry point in this sweep drives: "+
+				"drive it, or record why it is not a command entry point", name)
+		}
+	}
+	for name := range entries {
+		if !declared[name] {
+			t.Errorf("this sweep drives %s, which *Service no longer declares; the driver has outlived its site", name)
+		}
+		if reason := excluded[name]; reason != "" {
+			t.Errorf("%s is recorded as a non-entry-point (%q) and is driven anyway; the record is stale", name, reason)
+		}
+	}
+	return entries
+}
+
+// TestEveryClassifiedRefusalIsReachableFromADrivenEntryPoint is the third layer,
+// and it is the one that stops the ratchet.
+//
+// The two reflective axes above defend today's surface: a dependency or an entry
+// point added to a production TYPE fails until it is driven. Neither can see a
+// classified refusal minted inside a function that no driven entry point
+// reaches, because a call site is not reflectable -- which is the same wall
+// sessionstore hit on InboxState.terminal() and closed with go/parser at commit
+// 7f9f598.
+//
+// So this parses the package's production sources, builds the intra-package call
+// graph by name, and requires:
+//
+//	every function that calls refusal() is reachable from a driven entry point
+//	every driven entry point exists as a production function
+//
+// refusal() is the ONE constructor of a classified public code -- an *Error is
+// minted nowhere else -- so its call sites are exactly the places the property
+// can be broken. A site nobody drives is either dead code or an untested fold,
+// and both want a human.
+//
+// The call graph is deliberately syntactic and edges are restricted to functions
+// this package declares. That under-approximates reachability, which is the safe
+// direction: an unresolvable edge makes a site look UNREACHED and demands
+// attention, where an over-approximation would quietly make everything reachable.
+func TestEveryClassifiedRefusalIsReachableFromADrivenEntryPoint(t *testing.T) {
+	t.Parallel()
+
+	callers, callees, err := packageCallGraph(".")
+	if err != nil {
+		t.Fatalf("parse the admission sources: %v", err)
+	}
+	if len(callees) == 0 {
+		t.Fatal("vacuous: the scanner found no functions at all")
+	}
+	minting := callers["refusal"]
+	if len(minting) == 0 {
+		t.Fatal("vacuous: no production function calls refusal(), so this proves nothing")
+	}
+
+	driven := admissionEntryPoints(t)
+	reached := map[string]bool{}
+	var walk func(string)
+	walk = func(fn string) {
+		if reached[fn] {
+			return
+		}
+		reached[fn] = true
+		for _, callee := range callees[fn] {
+			if _, declared := callees[callee]; declared {
+				walk(callee)
+			}
+		}
+	}
+	for name := range driven {
+		if _, declared := callees[name]; !declared {
+			t.Errorf("this sweep drives %s, which is not a function in these sources", name)
+			continue
+		}
+		walk(name)
+	}
+
+	for _, fn := range minting {
+		if !reached[fn] {
+			t.Errorf("%s mints a classified public code and is not reachable from any entry point the fault sweep drives; "+
+				"either drive the path that reaches it or establish that it is dead", fn)
+		}
 	}
 }
 
-// dependencyWasCalled reports whether the armed method was reached.
-func dependencyWasCalled(f *serviceFixture, dependency, method string) bool {
-	switch dependency {
-	case "Authorizer":
-		return f.auth.called[method]
-	case "Targets":
-		return f.targets.called[method]
-	case "Catalog":
-		return f.catalog.called[method]
-	case "Commands":
-		return f.commands.called[method]
-	case "Directory":
-		return f.directory.called[method]
-	case "IDs":
-		return f.ids.called[method]
-	default:
-		panic("no fake for dependency " + dependency)
+// packageCallGraph parses root's production files and reports, for every
+// declared function, the names it calls -- and, inverted, the functions that
+// call each name.
+//
+// Names only: it resolves no types, so a call to another package's function of
+// the same name is an edge here too. That direction is safe for both readers
+// above, which use the graph to demand coverage rather than to grant it.
+func packageCallGraph(root string) (callers map[string][]string, callees map[string][]string, err error) {
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return nil, nil, err
 	}
+	callers, callees = map[string][]string{}, map[string][]string{}
+	fset := token.NewFileSet()
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		file, parseErr := parser.ParseFile(fset, filepath.Join(root, name), nil, 0)
+		if parseErr != nil {
+			return nil, nil, parseErr
+		}
+		for _, decl := range file.Decls {
+			fn, ok := decl.(*ast.FuncDecl)
+			if !ok || fn.Body == nil {
+				continue
+			}
+			if _, seen := callees[fn.Name.Name]; !seen {
+				callees[fn.Name.Name] = nil
+			}
+			ast.Inspect(fn.Body, func(n ast.Node) bool {
+				call, ok := n.(*ast.CallExpr)
+				if !ok {
+					return true
+				}
+				var called string
+				switch fun := call.Fun.(type) {
+				case *ast.Ident:
+					called = fun.Name
+				case *ast.SelectorExpr:
+					called = fun.Sel.Name
+				default:
+					return true
+				}
+				if !slices.Contains(callees[fn.Name.Name], called) {
+					callees[fn.Name.Name] = append(callees[fn.Name.Name], called)
+				}
+				if !slices.Contains(callers[called], fn.Name.Name) {
+					callers[called] = append(callers[called], fn.Name.Name)
+				}
+				return true
+			})
+		}
+	}
+	return callers, callees, nil
 }
