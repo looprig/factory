@@ -423,13 +423,23 @@ func DefaultClientLinkLimits() ClientLinkLimits {
 		WriteTimeout:            5 * time.Second,
 		PingInterval:            25 * time.Second,
 		PongTimeout:             10 * time.Second,
-		// Thirty seconds, which is httpapi's DefaultRouteLimits.RequestTimeout
-		// deliberately: the two edges bound the same durable work reached over
-		// two transports, so a command admitted over REST and the identical one
-		// admitted over a ClientLink get the same patience by default. It is
-		// unrelated to the ping cadence and is NOT bounded by it -- a liveness
-		// deadline answers "is this peer there", and this answers "how long may
-		// this deployment's durable plane take".
+		// The same window httpapi's DefaultRouteLimits gives a REST request,
+		// because the two edges bound the same durable work reached over two
+		// transports: a command admitted over REST and the identical one
+		// admitted over a ClientLink should get the same patience from a
+		// deployment that configures neither.
+		//
+		// The NUMBER is deliberately not written in this comment. It was, and a
+		// gate moved the literal with the prose left behind saying "thirty
+		// seconds" -- the restatement nothing reads. What holds the two
+		// together is TestTheTwoEdgeCommandBoundsAreOneNumber, which compares
+		// the two defaults themselves; taking this value from httpapi directly
+		// would remove the drift and the test's ability to fail with it, and a
+		// tautology is worth less than a reader.
+		//
+		// It is unrelated to the ping cadence and is NOT bounded by it: a
+		// liveness deadline answers "is this peer there", and this answers "how
+		// long may this deployment's durable plane take".
 		CommandTimeout: 30 * time.Second,
 	}
 }

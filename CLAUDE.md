@@ -925,12 +925,17 @@ command fails, but that the link is **still serving** afterwards and that
 Because the connection context can never be cancelled while an RPC is in flight,
 `client.Context()` versus `context.Background()` at the dispatch site is an
 **equivalent mutant**, and both gates probed it: there is no reader because there
-can be no reader. It is still `client.Context()` because a transport version that
-dispatched asynchronously would make the parent live again — **not** for the
-values it carries, which is a reader that does not exist: the only value on it
-is the operation context, and `principalOf` reads that from the `*Client`
-directly. The same non-reader applies one layer in, to `Engine.Admit`'s own
-parent, and for the same pinned reason.
+can be no reader. It is still `client.Context()`, and the reason is narrower than
+either of the two this document gave before. The context is **not** valueless:
+`principalOf` reads the operation context off it (`centrifuge.go:388`), and it
+descends from the `http.Request`'s, which `net/http` loads with
+`ServerContextKey` and `LocalAddrContextKey`. What makes the mutant equivalent
+is the pair of facts above plus one about this composition: **no consumer
+downstream of `Admit` reads a value from the context it is handed** —
+`internal/identity`'s `Authorizer` discards it (`authorize.go:50`) and admission
+forwards it to SessionStore, which knows none of these keys. A consumer that
+read one would make it a live difference. The same applies one layer in, to
+`Engine.Admit`'s own parent.
 
 **One limit this task did not close.** The V1 `session.create` RPC reaches
 admission and is refused `runtime_unavailable`, because `AdmitCreate` still

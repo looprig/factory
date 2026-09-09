@@ -226,10 +226,15 @@ func newReplica(t *testing.T, store *sessionstore.Store, prefix string, now time
 			return
 		}
 		stopped = true
-		server.Close()
+		// Bounded Shutdown BEFORE the unbounded Close, for the reason
+		// newFixture's cleanup gives. This is the sibling that kept the old
+		// order when that one was fixed -- the fourth time in this task that a
+		// fix landed at the site named and not at its twin, which is why the
+		// two now say so in each other's terms.
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		_ = handler.Shutdown(ctx)
+		server.Close()
 	}
 	t.Cleanup(stop)
 	return &replica{

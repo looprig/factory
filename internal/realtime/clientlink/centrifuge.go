@@ -337,10 +337,23 @@ func (h *Handler) connected(client *centrifuge.Client) {
 		// the very thing keeping it alive -- measured surviving client.Close,
 		// node.Shutdown and the server's own Close. The bound is the Engine's
 		// Limits.CommandTimeout, applied inside Admit; see that field for what
-		// it is worth and for the two failures its absence caused. Passing
-		// context.Background() here instead would be an EQUIVALENT change for
-		// the same reason, and it stays as it is because a transport version
-		// that dispatched asynchronously would make this parent live again.
+		// it is worth and for the two failures its absence caused.
+		//
+		// Passing context.Background() here is an EQUIVALENT change today, and
+		// the reason is worth stating exactly, because two earlier attempts at
+		// it were wrong. This context is NOT valueless: principalOf reads the
+		// operation context off it three lines above (centrifuge.go:388), and
+		// it descends from the http.Request's, which net/http loads with
+		// ServerContextKey and LocalAddrContextKey (server.go:1933, 3143). The
+		// equivalence is narrower than "no values" and rests on two facts about
+		// THIS composition: the parent cannot be cancelled while the RPC is in
+		// flight, per the paragraph above; and no consumer downstream of Admit
+		// reads a value from the context it is given -- internal/identity's
+		// Authorizer discards it (authorize.go:50) and admission forwards it to
+		// SessionStore, which knows none of these keys. A consumer that read one
+		// would make this a live difference, which is the other reason to leave
+		// it as it is, alongside a transport version that dispatched
+		// asynchronously and would make the parent cancellable again.
 		body, err := h.engine.Admit(client.Context(), principal, Method(e.Method), e.Data)
 		if err != nil {
 			cb(centrifuge.RPCReply{}, rpcRefusal(err))

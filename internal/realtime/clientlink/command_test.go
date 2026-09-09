@@ -835,6 +835,7 @@ func TestTheAdmissionServiceIsExactlyTheSeamThisEdgeCalls(t *testing.T) {
 		"no context":               shapeProbeType.NoContext,
 		"a principal by pointer":   shapeProbeType.PointerPrincipal,
 		"one result short":         shapeProbeType.MissingCreated,
+		"one result too many":      shapeProbeType.ExtraResult,
 		"a catalog entry returned": shapeProbeType.WrongEntry,
 		"a non-boolean second":     shapeProbeType.WrongCreated,
 		"a non-error third":        shapeProbeType.WrongError,
@@ -1084,6 +1085,18 @@ func (shapeProbeType) PointerPrincipal(context.Context, *identity.Principal, ses
 
 func (shapeProbeType) MissingCreated(context.Context, identity.Principal, sessionwire.InputRequest) (sessionstore.InboxEntry, error) {
 	return sessionstore.InboxEntry{}, nil
+}
+
+// ExtraResult is the row the first version of this table did not have, and its
+// absence made "every condition has a row that fails without it" false: the
+// arity-out check was the one condition with no sole reader.
+//
+// It has to be a FOURTH result rather than a second short one, because
+// neutralising `NumOut() != 3` and then driving a two-result probe does not
+// fail, it PANICS on Out(2) -- and a panic is not an assertion kill. Every
+// result position here matches the V1 shape, so only the arity rejects it.
+func (shapeProbeType) ExtraResult(context.Context, identity.Principal, sessionwire.InputRequest) (sessionstore.InboxEntry, bool, error, string) {
+	return sessionstore.InboxEntry{}, false, nil, ""
 }
 
 func (shapeProbeType) WrongEntry(context.Context, identity.Principal, sessionwire.InputRequest) (sessionstore.CatalogEntry, bool, error) {
