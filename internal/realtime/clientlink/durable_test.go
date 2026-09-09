@@ -654,6 +654,12 @@ func TestAStuckAdmissionDoesNotWedgeTheLink(t *testing.T) {
 	if got := codeOf(err); got != 100 {
 		t.Errorf("the wedged command failed with code %d (%v), want 100 (internal, temporary)", got, err)
 	}
+	// The engine's bound must be what released it, not the fake's backstop:
+	// otherwise every assertion below is satisfied by a link that recovers
+	// because the dependency eventually gave up on its own.
+	if f.admitter.unbounded() {
+		t.Fatal("the wedged admission was released by the fake's backstop, so nothing in the engine bounded it")
+	}
 
 	// The link is still serving. This is the assertion; the one above is its
 	// precondition.

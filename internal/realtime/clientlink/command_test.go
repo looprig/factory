@@ -113,11 +113,29 @@ type recordingAdmitter struct {
 	// what makes "the reply follows the commit" measurable rather than timed.
 	gate chan struct{}
 	// waitForContext makes the fake behave like a dependency that honours the
-	// context it is given: it returns only when that context ends, and reports
-	// the context's own error. Nothing else releases it.
+	// context it is given: it returns when that context ends, and reports the
+	// context's own error.
 	waitForContext bool
-	calls          []admitCall
+	// selfReleased records that the BACKSTOP released the admission instead of
+	// the context. It is the difference between "the bound worked" and "the
+	// fake gave up", and it exists because the first version of this fake had
+	// no backstop at all: a mutation removing the bound then hung the whole
+	// package until Go's ten-minute timeout, which is a kill by hang and is not
+	// an assertion kill. A backstop converts that into a clean assertion, and
+	// the flag is what a case reads so the backstop cannot silently stand in
+	// for the property under test.
+	selfReleased bool
+	calls        []admitCall
 }
+
+// admitterBackstop is the wall-clock ceiling on a context-honouring fake.
+//
+// It is generous by two orders of magnitude against every CommandTimeout any
+// case configures, so on a green tree the context always wins and nothing here
+// depends on the machine being fast. It is reached only when NOTHING bounded
+// the admission, which is exactly the condition a case must fail on rather than
+// wait out.
+const admitterBackstop = 5 * time.Second
 
 func (a *recordingAdmitter) record(ctx context.Context, method clientlink.Method, principal identity.Principal, request any) (sessionstore.InboxEntry, bool, error) {
 	a.mu.Lock()
@@ -128,10 +146,29 @@ func (a *recordingAdmitter) record(ctx context.Context, method clientlink.Method
 		<-gate
 	}
 	if wait {
-		<-ctx.Done()
-		return sessionstore.InboxEntry{}, false, ctx.Err()
+		timer := time.NewTimer(admitterBackstop)
+		defer timer.Stop()
+		select {
+		case <-ctx.Done():
+			return sessionstore.InboxEntry{}, false, ctx.Err()
+		case <-timer.C:
+			a.mu.Lock()
+			a.selfReleased = true
+			a.mu.Unlock()
+			return sessionstore.InboxEntry{}, false, errAdmissionUnbounded
+		}
 	}
 	return entry, created, err
+}
+
+// errAdmissionUnbounded is what the fake returns when it had to release itself.
+var errAdmissionUnbounded = errors.New("nothing bounded this admission; the fake released itself")
+
+// unbounded reports that the backstop, not the context, ended an admission.
+func (a *recordingAdmitter) unbounded() bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.selfReleased
 }
 
 func (a *recordingAdmitter) recorded() []admitCall {
@@ -870,6 +907,14 @@ func TestAnAdmissionIsBoundedByTheConfiguredCommandTimeout(t *testing.T) {
 		reply, err := f.admit(t, clientlink.MethodSessionInput, commandBody(clientlink.MethodSessionInput, "session-1", "cmd-1"))
 		if err == nil {
 			t.Fatalf("Admit returned the reply %s, want the deadline as an error", reply)
+		}
+		// Which side released it is the assertion. The fake carries a backstop
+		// so that an engine imposing NO bound fails here in seconds instead of
+		// hanging the package until Go's ten-minute timeout -- a hang is not an
+		// assertion kill, and a probe removing the bound produced exactly one
+		// before this backstop existed.
+		if f.admitter.unbounded() {
+			t.Fatal("the admission was released by the fake's own backstop, so nothing in the engine bounded it")
 		}
 		if !errors.Is(err, context.DeadlineExceeded) {
 			t.Errorf("Admit error %v does not wrap context.DeadlineExceeded", err)
