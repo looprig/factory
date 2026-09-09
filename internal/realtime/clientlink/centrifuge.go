@@ -9,7 +9,6 @@ import (
 	"strings"
 
 	centrifuge "github.com/centrifugal/centrifuge"
-	sessionwire "github.com/looprig/core/sessionwire/v1"
 	"github.com/looprig/factory/identity"
 	internalidentity "github.com/looprig/factory/internal/identity"
 )
@@ -32,15 +31,6 @@ type connectData struct {
 type connectReplyData struct {
 	ProtocolVersion string `json:"protocol_version"`
 	FactoryVersion  string `json:"factory_version"`
-}
-
-// rpcRequest is the envelope every command RPC carries.
-//
-// A6.1 reads only the session, because that is the whole of what an
-// authorization decision needs. A6.2 owns the rest of the envelope and its
-// REST parity; adding members here before then would be guessing at it.
-type rpcRequest struct {
-	SessionID sessionwire.SessionID `json:"session_id"`
 }
 
 // Handler is the ClientLink: an embedded Centrifuge node behind an
@@ -325,28 +315,53 @@ func (h *Handler) connected(client *centrifuge.Client) {
 			cb(centrifuge.RPCReply{}, centrifuge.ErrorUnauthorized)
 			return
 		}
-		var req rpcRequest
-		if len(e.Data) > 0 {
-			if err := json.Unmarshal(e.Data, &req); err != nil {
-				cb(centrifuge.RPCReply{}, centrifuge.ErrorBadRequest)
-				return
-			}
+		// The CONNECTION's context, because this transport version offers no
+		// other: centrifuge@v0.38.0's RPCEvent carries a method and a payload
+		// and nothing else (events.go:279-285), so there is no per-RPC
+		// cancellation to derive one from. The consequence is worth stating
+		// rather than leaving to be discovered -- a durable admission is
+		// bounded by the LINK's lifetime, not by the client's patience, so a
+		// browser that abandons a command does not cancel the write it started.
+		// A bound of this surface's own belongs with the rest of the
+		// composition's deadlines (A9.1); inventing one here would be a second
+		// authority for a number the deployment configures.
+		body, err := h.engine.Admit(client.Context(), principal, Method(e.Method), e.Data)
+		if err != nil {
+			cb(centrifuge.RPCReply{}, rpcRefusal(err))
+			return
 		}
-		err := h.engine.AuthorizeRPC(client.Context(), principal, Method(e.Method), req.SessionID)
-		switch {
-		case errors.Is(err, ErrUnknownMethod):
-			cb(centrifuge.RPCReply{}, centrifuge.ErrorMethodNotFound)
-		case err != nil:
-			cb(centrifuge.RPCReply{}, centrifuge.ErrorPermissionDenied)
-		default:
-			// A6.2 routes an authorized command into the admission service and
-			// replies after the SessionInbox commit. Until then an authorized
-			// RPC is refused as unavailable rather than answered with a
-			// fabricated acceptance: a reply carrying no CommandID would be a
-			// client believing a command was admitted when nothing was written.
-			cb(centrifuge.RPCReply{}, centrifuge.ErrorNotAvailable)
-		}
+		// A body is returned for an acceptance and for a refusal alike, and
+		// both are transport SUCCESSES: see Engine.Admit for why a refusal
+		// travels as a Core envelope rather than as a numeric transport code.
+		cb(centrifuge.RPCReply{Data: body}, nil)
 	})
+}
+
+// rpcRefusal classifies the conditions Admit could make no admission decision
+// about.
+//
+// There are exactly three, and each says something different about what the
+// client should do. An unknown method is a client speaking a vocabulary this
+// build does not have. A refused authorization is terminal for this principal
+// and discloses nothing about the session -- the same answer whether it exists,
+// belongs to another tenant, or never did, which is the property
+// internal/identity's ErrUnauthorized carries and this must not undo by
+// classifying a denial more precisely than a fault.
+//
+// Everything else is internal, and centrifuge's own ErrorInternal is marked
+// TEMPORARY (centrifuge@v0.38.0/errors.go:38-42), which is the correct
+// advertisement for the conditions that reach it: a cancelled context, a
+// closing store, a provider outage. Retrying the same CommandID after one of
+// those is exactly what the durable command identity exists to make safe.
+func rpcRefusal(err error) error {
+	switch {
+	case errors.Is(err, ErrUnknownMethod):
+		return centrifuge.ErrorMethodNotFound
+	case errors.Is(err, internalidentity.ErrUnauthorized):
+		return centrifuge.ErrorPermissionDenied
+	default:
+		return centrifuge.ErrorInternal
+	}
 }
 
 // principalOf reads back the principal the handshake stored.

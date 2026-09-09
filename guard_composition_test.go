@@ -358,6 +358,11 @@ func TestTheGuardDecidesOriginBeforeTheClientLinkUpgrade(t *testing.T) {
 		// credential and a bearer credential the same material.
 		Authenticator: authenticator,
 		Authorizer:    internalidentity.Authorizer{},
+		// The durable plane fails closed. This case is about the ORDER the
+		// origin guard and the link decide in, and no handshake it drives ever
+		// gets as far as a command; an admitter that answered would let a case
+		// pass on a fabricated acceptance.
+		Admitter: refusingAdmitter{},
 		Limits: clientlink.Limits{
 			MaxConnections:           16,
 			MaxChannelsPerConnection: 32,
@@ -499,4 +504,30 @@ func rawHandshake(t *testing.T, address, origin string, sendOrigin bool) (int, s
 		t.Fatalf("read handshake body: %v", err)
 	}
 	return response.StatusCode, string(body)
+}
+
+// refusingAdmitter is the durable command plane for a composition case that
+// admits nothing.
+type refusingAdmitter struct{}
+
+var errNoAdmissionHere = errors.New("this composition admits no command")
+
+func (refusingAdmitter) AdmitCreate(context.Context, factoryidentity.Principal, sessionwire.CreateRequest) (sessionstore.InboxEntry, bool, error) {
+	return sessionstore.InboxEntry{}, false, errNoAdmissionHere
+}
+
+func (refusingAdmitter) AdmitInput(context.Context, factoryidentity.Principal, sessionwire.InputRequest) (sessionstore.InboxEntry, bool, error) {
+	return sessionstore.InboxEntry{}, false, errNoAdmissionHere
+}
+
+func (refusingAdmitter) AdmitInterrupt(context.Context, factoryidentity.Principal, sessionwire.InterruptRequest) (sessionstore.InboxEntry, bool, error) {
+	return sessionstore.InboxEntry{}, false, errNoAdmissionHere
+}
+
+func (refusingAdmitter) AdmitRestore(context.Context, factoryidentity.Principal, sessionwire.RestoreRequest) (sessionstore.InboxEntry, bool, error) {
+	return sessionstore.InboxEntry{}, false, errNoAdmissionHere
+}
+
+func (refusingAdmitter) AdmitGateResponse(context.Context, factoryidentity.Principal, sessionwire.GateResponseRequest) (sessionstore.InboxEntry, bool, error) {
+	return sessionstore.InboxEntry{}, false, errNoAdmissionHere
 }

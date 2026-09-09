@@ -137,6 +137,11 @@ func allSeams() []reflect.Type {
 		iface[httpapi.Directory](),
 		iface[clientlink.Authenticator](),
 		iface[clientlink.Authorizer](),
+		// The ClientLink's durable command plane. It is here rather than in
+		// publicSeams for hostlink.Dialer's reason: it is satisfied by
+		// internal/admission.Service, which the composition builds, and a
+		// deployer implements nothing of it.
+		iface[clientlink.Admitter](),
 		iface[admission.Authorizer](),
 		iface[admission.Commands](),
 		iface[admission.Directory](),

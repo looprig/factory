@@ -788,6 +788,88 @@ both shapes and two controls, because on a clean tree it passes whether it works
 or not. Test files are outside its subject on purpose — `kind_test.go` must
 state all five absolutely, since nothing else could notice a value changing.
 
+### Commands are routed into the admission service (A6.2)
+
+A6.2 gave the RPC path its durable half. An authorized RPC decodes into Core's
+own request type, goes to `internal/admission`, and is answered from the
+authoritative SessionInbox record. `Engine.Admit` is the whole of it; the
+transport adapter still decides nothing.
+
+**A refusal is a reply BODY, not a transport error, and a fault is the
+opposite.** `Admit` returns bytes for every outcome admission classified and an
+error only where no admission decision exists — an unknown method, a denied
+authorization, a fault. The refusal body is a Core `ErrorEnvelope` carrying
+admission's own `sessionwire.ErrorCode` unchanged, which is what makes the RPC's
+answer and the REST route's answer the same string rather than two vocabularies
+a client must switch on separately; the consumer is already written for it
+(`wui`'s protocol package resolves an RPC whose data has `error` and no
+`command_id` into its Core error hierarchy). A cancelled context, a closing
+store or a provider outage is NOT dressed as one of the nine public codes: a
+client told its command was *rejected* stops retrying, where the truth is that
+nobody knows whether it landed — which is the unknown outcome the durable
+CommandID exists for. `centrifuge.ErrorInternal` is `Temporary`, which is the
+correct advertisement for those.
+
+**The refusal carries no message and `retryable` is false.** Core makes
+`message` optional and `code` the member a client branches on, so a message here
+would be a second prose vocabulary A3.3 would have to reproduce word for word.
+No refusal admission mints today is repeatable without changing the request:
+`runtime_unavailable` is minted for an unresolvable target, an oversized
+payload, the missing V1 create reservation **and** a directory read failure, so
+the code cannot distinguish its one transient cause from three permanent ones,
+and advertising it retryable would tell a client to hammer a misconfiguration.
+
+**Decoding precedes authorization, because the session must have one reader.**
+There is no path segment to read a session from, so the session an
+authorization decision is made about is the one the decoded request names. A6.1
+read `session_id` through a private envelope struct — correct while there was
+nothing else to do with the data, and a hazard the moment there is: a body whose
+strict decode and a lenient one disagree (a duplicate member, which Core refuses
+and `encoding/json` resolves to the last occurrence) would be authorized under
+one session and admitted under another. A body Core's decoder refuses is
+therefore refused as `invalid_request` before any authorization decision, which
+discloses nothing: the answer is derived from the caller's own bytes.
+
+**The reply describes the RECORD, never the call.** Admission's "this call
+accepted it" boolean is deliberately unread, so an original acceptance and a
+retry that found the stored record are the same bytes — if they differed a
+client could learn whether its earlier attempt landed. SessionStore's five inbox
+states map onto Core's four: pending, claimed and applying are all `accepted`
+(Core defines it as "the inbox commit succeeded", not "a Host applied it"),
+applied is `applied`, rejected is `rejected` and carries the record's own
+`ErrorDetail`. Core's `pending` is never minted — no durable record means it —
+and a state this build does not recognise is a **fault**, not an optimistic
+acceptance.
+
+**The seam is derived from the service, not listed.** `clientlink.Admitter` is
+audited against `*admission.Service` in both directions by reflection, so an
+admission task adding a sixth V1 command fails here instead of silently leaving
+the ClientLink unable to serve it. `AdmitLegacyCreate` is excluded BY NAME: it
+mints identities server-side and keeps the legacy unknown-outcome limitation,
+which is exactly what a ClientLink command may not have.
+
+**The retry contract is measured against the released store, not a fake.** Two
+admission services and two ClientLink handlers over one `sessionstore.Open` —
+different clocks, different proposed runtime identities — with the accepting
+replica shut down before the retries are sent. The identical retry returns the
+original bytes; the same identity carrying different input, and the same
+identity under a different kind, are `command_rejected`; an uncreated session is
+`session_not_found`; a racing pair of replicas are told one order and one
+mapping. The apply deadline is written once and a retry does not extend it. The
+positive control is a *different* CommandID on the same session: without it
+"nothing moved" would also be the output of a Factory that had stopped admitting
+anything.
+
+**Two limits this task did not close.** A durable admission is bounded by the
+LINK's lifetime rather than the client's patience — centrifuge@v0.38.0's
+`RPCEvent` carries a method and a payload and nothing else, so there is no
+per-RPC context to derive a deadline from, and inventing one here would be a
+second authority for a number the deployment configures (A9.1). And the V1
+`session.create` RPC reaches admission and is refused `runtime_unavailable`,
+because `AdmitCreate` still returns `ErrCreateIdentityProtocolUnavailable`; the
+create path is A3.1's remaining work, and the durable cases here use the legacy
+create to establish a session.
+
 **Per-binding repair is not delegated to the transport, and A6.1 does not
 assume it is.** One `messageWriter` per `Client` and no per-channel queue
 *bound* anywhere in the library means a stalled consumer loses its whole

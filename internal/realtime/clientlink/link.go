@@ -6,10 +6,7 @@ import (
 	"fmt"
 	"time"
 
-	sessionwire "github.com/looprig/core/sessionwire/v1"
 	"github.com/looprig/factory/identity"
-	"github.com/looprig/factory/internal/command"
-	"github.com/looprig/sessionstore"
 )
 
 // ErrInvalidConfig is the class of every NewHandler rejection.
@@ -18,9 +15,6 @@ var ErrInvalidConfig = errors.New("clientlink: invalid configuration")
 // ErrUnsupportedProtocol reports a client speaking a ClientLink application
 // protocol this Factory does not implement.
 var ErrUnsupportedProtocol = errors.New("clientlink: unsupported protocol version")
-
-// ErrUnknownMethod reports an RPC method that is not in the command vocabulary.
-var ErrUnknownMethod = errors.New("clientlink: unknown rpc method")
 
 // ProtocolVersion is the ClientLink APPLICATION protocol this build speaks.
 //
@@ -92,61 +86,6 @@ func (l Limits) Validate() error {
 	return nil
 }
 
-// Method is a typed ClientLink command RPC.
-//
-// Commands are RPCs and events are server publications, and the split is not
-// symmetry for its own sake: a command needs a correlated reply carrying the
-// admitted CommandID, and an event needs fan-out to every subscriber of a
-// channel. Client PUBLICATION is disabled outright, so this vocabulary is the
-// only way a browser can ask for anything.
-type Method string
-
-// The command vocabulary. Each name is the REST path it is the alternative to,
-// because specification section 8.1 makes the two alternatives obeying one
-// admission contract rather than two surfaces with two spellings.
-const (
-	MethodSessionCreate    Method = "session.create"
-	MethodSessionInput     Method = "session.input"
-	MethodSessionInterrupt Method = "session.interrupt"
-	MethodSessionRestore   Method = "session.restore"
-	MethodGateRespond      Method = "gate.respond"
-)
-
-// commandKinds maps each method to the durable command kind it admits.
-//
-// The values are SessionStore's own, so the authorization decision a ClientLink
-// RPC asks for is the identical decision the REST route asks for and one
-// Authorizer implementation answers both.
-var commandKinds = map[Method]sessionstore.CommandKind{
-	MethodSessionCreate:    command.KindCreateSession,
-	MethodSessionInput:     command.KindInput,
-	MethodSessionInterrupt: command.KindInterrupt,
-	MethodSessionRestore:   command.KindRestore,
-	MethodGateRespond:      command.KindGateResponse,
-}
-
-// CommandKindFor reports the command kind a method admits.
-//
-// The boolean is false for every method not in the vocabulary, and a caller
-// must treat that as a refusal rather than defaulting to some kind: an unknown
-// method that fell through to a real command kind would let a client name an
-// operation the vocabulary does not contain.
-func CommandKindFor(method Method) (sessionstore.CommandKind, bool) {
-	kind, ok := commandKinds[method]
-	return kind, ok
-}
-
-// Methods returns the command vocabulary in a stable order.
-func Methods() []Method {
-	return []Method{
-		MethodSessionCreate,
-		MethodSessionInput,
-		MethodSessionInterrupt,
-		MethodSessionRestore,
-		MethodGateRespond,
-	}
-}
-
 // Config composes the ClientLink engine.
 type Config struct {
 	// Authenticator verifies the connect credential. A ClientLink token is the
@@ -157,6 +96,11 @@ type Config struct {
 	// Authorizer decides every subscribe and every RPC. A successful handshake
 	// authorizes nothing beyond itself.
 	Authorizer Authorizer
+
+	// Admitter is the durable command plane every authorized RPC is routed
+	// into. It is required, and NewEngine refuses a composition without one
+	// rather than letting a link accept commands it can only refuse.
+	Admitter Admitter
 
 	// Limits bounds this replica's connections.
 	Limits Limits
@@ -181,6 +125,9 @@ func NewEngine(cfg Config) (*Engine, error) {
 	}
 	if cfg.Authorizer == nil {
 		return nil, fmt.Errorf("%w: Authorizer is nil", ErrInvalidConfig)
+	}
+	if cfg.Admitter == nil {
+		return nil, fmt.Errorf("%w: Admitter is nil", ErrInvalidConfig)
 	}
 	if cfg.Version == "" {
 		return nil, fmt.Errorf("%w: Version is empty", ErrInvalidConfig)
@@ -231,18 +178,4 @@ func (e *Engine) Authenticate(ctx context.Context, req ConnectRequest) (identity
 // made here from the parse.
 func (e *Engine) AuthorizeSubscribe(ctx context.Context, principal identity.Principal, channel string) error {
 	return e.cfg.Authorizer.AuthorizeSubscribe(ctx, principal, channel)
-}
-
-// AuthorizeRPC decides one command RPC for one principal.
-//
-// An unknown method is refused BEFORE the authorizer is consulted, because
-// there is no command kind to ask about: consulting it with a zero kind would
-// ask a question whose answer means nothing and would make an unknown method's
-// refusal depend on the implementation's treatment of an empty value.
-func (e *Engine) AuthorizeRPC(ctx context.Context, principal identity.Principal, method Method, session sessionwire.SessionID) error {
-	kind, known := CommandKindFor(method)
-	if !known {
-		return fmt.Errorf("%w: %q", ErrUnknownMethod, method)
-	}
-	return e.cfg.Authorizer.AuthorizeControl(ctx, principal, session, kind)
 }

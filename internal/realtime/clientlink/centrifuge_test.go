@@ -144,6 +144,7 @@ type fixture struct {
 	url        string
 	verifier   *verifier
 	authorizer *recordingAuthorizer
+	admitter   *recordingAdmitter
 }
 
 // testLimits is the ClientLink configuration a case starts from. It is written
@@ -181,9 +182,11 @@ func newFixture(t *testing.T, limits clientlink.Limits) *fixture {
 		t.Fatalf("NewAuthenticator: %v", err)
 	}
 	authorizer := &recordingAuthorizer{}
+	admitter := &recordingAdmitter{created: true}
 	handler, err := clientlink.NewHandler(clientlink.Config{
 		Authenticator: authenticator,
 		Authorizer:    authorizer,
+		Admitter:      admitter,
 		Limits:        limits,
 		Version:       buildVersion,
 	})
@@ -202,6 +205,7 @@ func newFixture(t *testing.T, limits clientlink.Limits) *fixture {
 		url:        "ws" + strings.TrimPrefix(server.URL, "http"),
 		verifier:   v,
 		authorizer: authorizer,
+		admitter:   admitter,
 	}
 }
 
@@ -781,20 +785,16 @@ func TestEveryCommandRPCIsAuthorizedUnderItsOwnKind(t *testing.T) {
 		{clientlink.MethodGateRespond, "gate_response"},
 	} {
 		session := sessionwire.SessionID("session-" + string(tt.kind))
-		data, err := json.Marshal(map[string]string{"session_id": string(session)})
+		id := sessionwire.CommandID("cmd-" + string(tt.kind))
+		f.admitter.mu.Lock()
+		f.admitter.entry = acceptedEntry(session, id)
+		f.admitter.mu.Unlock()
+		result, err := client.RPC(ctx, string(tt.method), commandBody(tt.method, session, id))
 		if err != nil {
-			t.Fatalf("marshal rpc data: %v", err)
+			t.Fatalf("%s = %v, want the admitted record", tt.method, err)
 		}
-		_, err = client.RPC(ctx, string(tt.method), data)
-		if err == nil {
-			t.Fatalf("%s was answered, but A6.2 owns admission and nothing was committed", tt.method)
-		}
-		// 108 is ErrorNotAvailable. An AUTHORIZED command is refused as
-		// unavailable rather than answered, because a reply carrying no
-		// CommandID would be a client believing a command was admitted when
-		// nothing was written.
-		if got := codeOf(err); got != 108 {
-			t.Errorf("%s failed with code %d (%v), want 108 (not available)", tt.method, got, err)
+		if got := statusOf(t, result.Data).CommandID; got != id {
+			t.Errorf("%s was answered for command %q, want %q", tt.method, got, id)
 		}
 
 		var seen *controlCall
@@ -832,17 +832,27 @@ func TestARefusedCommandRPCIsDenied(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), waitFor)
 	defer cancel()
 
-	data := []byte(`{"session_id":"session-1"}`)
-	_, err := client.RPC(ctx, string(clientlink.MethodSessionInterrupt), data)
+	f.admitter.mu.Lock()
+	f.admitter.entry = acceptedEntry("session-1", "cmd-1")
+	f.admitter.mu.Unlock()
+
+	_, err := client.RPC(ctx, string(clientlink.MethodSessionInterrupt),
+		commandBody(clientlink.MethodSessionInterrupt, "session-1", "cmd-1"))
 	if got := codeOf(err); got != 103 {
 		t.Errorf("a denied interrupt failed with code %d (%v), want 103 (permission denied)", got, err)
 	}
-	// The sibling method, denied by nothing, must still reach the A6.2
-	// placeholder: otherwise "denied" would be indistinguishable from "every
-	// RPC is refused".
-	_, err = client.RPC(ctx, string(clientlink.MethodSessionInput), data)
-	if got := codeOf(err); got != 108 {
-		t.Errorf("an allowed input failed with code %d (%v), want 108 (not available)", got, err)
+	if calls := f.admitter.recorded(); len(calls) != 0 {
+		t.Errorf("a denied interrupt reached admission %d times", len(calls))
+	}
+	// The sibling method, denied by nothing, must still be admitted: otherwise
+	// "denied" would be indistinguishable from "every RPC is refused".
+	result, err := client.RPC(ctx, string(clientlink.MethodSessionInput),
+		commandBody(clientlink.MethodSessionInput, "session-1", "cmd-1"))
+	if err != nil {
+		t.Fatalf("an allowed input failed with %v, want the admitted record", err)
+	}
+	if got := statusOf(t, result.Data).CommandID; got != "cmd-1" {
+		t.Errorf("the reply named command %q, want %q", got, "cmd-1")
 	}
 }
 

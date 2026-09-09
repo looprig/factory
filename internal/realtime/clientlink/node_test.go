@@ -215,6 +215,7 @@ func TestTheConnectionLabelIsTheSubjectNotTheTenant(t *testing.T) {
 	handler, err := NewHandler(Config{
 		Authenticator: authenticator,
 		Authorizer:    internalidentity.Authorizer{},
+		Admitter:      stubAdmitter{},
 		Limits:        nodeTestLimits(),
 		Version:       "v-label",
 	})
@@ -315,6 +316,7 @@ func stalledConsumer(t *testing.T, queueBytes, publications, payloadBytes int) (
 	handler, err := NewHandler(Config{
 		Authenticator: authenticator,
 		Authorizer:    internalidentity.Authorizer{},
+		Admitter:      stubAdmitter{},
 		Limits:        limits,
 		Version:       "v-stall",
 	})
@@ -583,6 +585,7 @@ func TestNewEngineRefusesAnIncompleteComposition(t *testing.T) {
 	complete := Config{
 		Authenticator: stubAuthenticator{},
 		Authorizer:    internalidentity.Authorizer{},
+		Admitter:      stubAdmitter{},
 		Limits:        nodeTestLimits(),
 		Version:       "v",
 	}
@@ -596,6 +599,7 @@ func TestNewEngineRefusesAnIncompleteComposition(t *testing.T) {
 	}{
 		{"no authenticator", func(c *Config) { c.Authenticator = nil }, "Authenticator"},
 		{"no authorizer", func(c *Config) { c.Authorizer = nil }, "Authorizer"},
+		{"no admitter", func(c *Config) { c.Admitter = nil }, "Admitter"},
 		{"no version", func(c *Config) { c.Version = "" }, "Version"},
 		{"unusable limits", func(c *Config) { c.Limits = Limits{} }, "MaxConnections"},
 	} {
@@ -710,6 +714,34 @@ func (nodeVerifier) VerifyCredential(_ context.Context, credential identity.Cred
 		Kind:      identity.KindActor,
 		ExpiresAt: time.Now().Add(time.Hour),
 	}, nil
+}
+
+// stubAdmitter is the durable plane for the cases that are about the
+// TRANSPORT rather than about a command: it is never called, and every method
+// fails closed so a case that reached one by accident would say so rather than
+// reporting a fabricated acceptance.
+type stubAdmitter struct{}
+
+var errStubAdmitter = errors.New("stub admitter: this case admits nothing")
+
+func (stubAdmitter) AdmitCreate(context.Context, identity.Principal, sessionwire.CreateRequest) (sessionstore.InboxEntry, bool, error) {
+	return sessionstore.InboxEntry{}, false, errStubAdmitter
+}
+
+func (stubAdmitter) AdmitInput(context.Context, identity.Principal, sessionwire.InputRequest) (sessionstore.InboxEntry, bool, error) {
+	return sessionstore.InboxEntry{}, false, errStubAdmitter
+}
+
+func (stubAdmitter) AdmitInterrupt(context.Context, identity.Principal, sessionwire.InterruptRequest) (sessionstore.InboxEntry, bool, error) {
+	return sessionstore.InboxEntry{}, false, errStubAdmitter
+}
+
+func (stubAdmitter) AdmitRestore(context.Context, identity.Principal, sessionwire.RestoreRequest) (sessionstore.InboxEntry, bool, error) {
+	return sessionstore.InboxEntry{}, false, errStubAdmitter
+}
+
+func (stubAdmitter) AdmitGateResponse(context.Context, identity.Principal, sessionwire.GateResponseRequest) (sessionstore.InboxEntry, bool, error) {
+	return sessionstore.InboxEntry{}, false, errStubAdmitter
 }
 
 type stubAuthenticator struct{}
