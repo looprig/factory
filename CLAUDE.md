@@ -1468,19 +1468,42 @@ subject is wider than "restore" on purpose — a subscribe that admitted an inpu
 is the same defect, and a guard naming only the runbook's instance passes on
 every neighbour.
 
-**Read what makes that graph usable, because the first version was not.** Edges
-are name-keyed with no type information, which is right — every seam in this
-module is called through an interface, so a graph that only followed calls it
-could resolve to a concrete receiver would follow none of them. But treating a
-PACKAGE-qualified call as an edge too (`sessionwire.TenantID(t).Validate()`)
-reached 248 of the module's 362 declarations from these roots, including the
-HTTP router, whose control routes are supposed to admit commands: the ban would
-have had to be deleted the first time a later task implemented the REST restore
-route. Skipping selectors rooted at an imported package brings it to 89, all of
-them plausibly on the path. Two fixtures test the analyzer rather than the
-module: one plants a restore at each root category and two hops away, with two
-controls; the other plants one across an interface seam, which is the case this
-module actually has.
+**The unit of analysis is the module's own declarations**, reached through bare
+calls, through method and field calls on values — every seam here is dispatched
+through an interface, so a graph following only calls it could resolve to a
+concrete receiver would follow none of them — and through calls qualified by a
+package **of this module**. A call qualified by a package of a FOREIGN module is
+the one shape skipped, and the skip is keyed on the import PATH being outside
+`github.com/looprig/factory`, never on the identifier being an import name.
+
+**Both halves of that were measured, and the first version had the key wrong.**
+Following foreign package-qualified calls as edges to every same-named
+declaration (a dozen `Validate`s, one `Error`) reached **248 of the module's
+362** declarations, including `internal/httpapi`'s router, whose control routes
+are *supposed* to admit commands — the ban would have had to be deleted the
+first time a later task implemented the REST restore route. But keying the skip
+on "is an import name" dropped **22 real intra-module edges**, including
+`admission -> placement.ReusableOwner`, `server.go -> httpapi.NewRouter` and
+`principalOf -> internalidentity.OperationContextFrom`, which is *on the reached
+set*. It was defeatable with no shadowing at all: an identical helper called
+bare from `internal/routing` was a finding, and the same helper moved to
+`internal/placement` and called as `placement.ReachRestore()` was green — the
+shape production already uses 22 times and the shape A9.1's composition will
+have. Keyed on the module path the reach is **91**.
+
+**What it still cannot see is stated at the function**: a call through a func
+value in a struct field, map or slice; a foreign module calling back into
+Factory through a callback (which is not hypothetical — it is how centrifuge
+invokes the subscribe handler, and it is why the roots include the lifecycle
+literals rather than relying on an edge into them); and which of several
+same-named declarations a call really reaches, since it reports all of them.
+It DOES walk files no build configuration compiles, which is conservative for a
+ban. Three fixtures test the analyzer rather than the module: one plants a
+restore at each root category and two hops away with two controls; one plants
+one across an interface seam; one drives a module-qualified call and a
+foreign-qualified one in the same graph, with the foreign target carrying an
+admission entry point so a skip that stopped working reports rather than
+silently widening.
 
 **The poll is refresh, then serve, then arm the next one.** Three sequential
 conditions rather than a branch, which is what makes an owner arriving between
@@ -1503,14 +1526,31 @@ The binding is a routing hint the owning Host fences against its own durable
 lease, so keeping one through an outage risks a refusal, while dropping one
 turns every registry blip into a rebind storm that has delivered nothing.
 
-**`OwnershipPollInterval` is a GAP, not a period.** The next poll is armed at the
-END of the current one, so two polls of one session cannot overlap however slow
-the store is. `PollTimeout` bounds one WHOLE poll rather than each call inside
-it, because a poll runs on the clock's goroutine with no caller and no request
-context to inherit a deadline from. Every case in `demand_test.go` drives
-off-default limits — a bound every call site passes identically is untested by
-construction — and the interval is asserted against an absolute literal, with
-the defaults pinned separately by their own case.
+**`OwnershipPollInterval` is a GAP, not a period — and non-overlap is a
+different claim with a different mechanism.** This document credited both to the
+arming order and only one of them is its. **`d.mu` is what makes two polls of
+one session unable to run at once**: `poll` holds the mutex for its whole body,
+so a successor armed at the START would simply block on it.
+`TestOnePollOfASessionExcludesEveryOther` asks the lock directly with `TryLock`
+from inside a seam call, rather than timing a goroutine — "another goroutine did
+not finish within 50ms" is a timing non-event that passes for a plane holding no
+lock at all. **The arming order is what makes the interval a gap**: measured from
+the previous poll FINISHING, so a store slower than the interval delays the next
+poll instead of queueing one behind the mutex.
+`TestThePollIntervalIsAGapAndNotAPeriod` asks the clock, from inside the tip
+read, whether a successor is already armed — the only place the question can be
+asked, since the two arming orders are indistinguishable once the poll returns.
+
+`PollTimeout` bounds one WHOLE poll rather than each call inside it, because a
+poll runs on the clock's goroutine with no caller and no request context to
+inherit a deadline from. **`Acquire` is the opposite half**: it derives its
+bound from the CALLER's context, so a subscriber's shorter deadline and a
+subscriber's cancellation both still apply, and
+`TestAcquireInheritsTheSubscribersOwnBound` drives both — without the second,
+`context.WithoutCancel` there is indistinguishable. Every case in
+`demand_test.go` drives off-default limits — a bound every call site passes
+identically is untested by construction — and the interval is asserted against
+an absolute literal, with the defaults pinned separately by their own case.
 
 **The `journal_tip` hint is published on EVERY unbound poll**, including when
 the tip has not moved and including when it is zero. That is what repeatable
@@ -1547,7 +1587,11 @@ scrutiny was the missing assertion in the opposite direction — deleting
 wasted call but a routing table gaining a unit of demand per poll, whose last
 subscriber's release then never unbinds.
 `TestASteadyPollNeitherRebindsNorAccumulatesDemand` is that reader, and it ends
-by releasing so the count becomes an observable outcome.
+by releasing so the count becomes an observable outcome. A third member of the
+same family was found later and removed: `teardownLocked`'s `entry.held = false`
+is a dead store, since the entry has just left the table and the only reference
+left is a stale poll's closure, which returns on the identity comparison before
+touching a field.
 
 **How the scenario set was derived, since the runbook's seven are a floor.**
 Three axes, each enumerated from the code: what the registry can say at a poll

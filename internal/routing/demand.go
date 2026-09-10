@@ -235,9 +235,14 @@ func (d *Demand) Acquire(ctx context.Context, tenant sessionwire.TenantID, sessi
 	entry := &demandSession{subscribers: 1}
 	d.sessions[key] = entry
 
-	// Bounded from the CALLER's context here, and from nothing at all in poll.
-	// A subscriber that went away should not leave a registry read running, and
-	// a poll has no caller to inherit from.
+	// Bounded from the CALLER's context here, and from context.Background in
+	// poll. A subscriber that went away should not leave a registry read
+	// running, and a poll has no caller to inherit from.
+	//
+	// WithTimeout DERIVES rather than replaces, which is the whole claim: a
+	// caller's cancellation and a caller's shorter deadline both still apply.
+	// TestAcquireInheritsTheSubscribersOwnBound is what says so -- without it
+	// context.WithoutCancel here, or context.Background, is indistinguishable.
 	pollCtx, cancel := context.WithTimeout(ctx, d.limits.PollTimeout)
 	defer cancel()
 	d.serveLocked(pollCtx, key, entry)
@@ -317,7 +322,13 @@ func (d *Demand) teardownLocked(ctx context.Context, key sessionKey, entry *dema
 	if !entry.held {
 		return nil
 	}
-	entry.held = false
+	// There is deliberately no `entry.held = false` here. The entry has just
+	// been removed from the table and nothing reads it again -- the only
+	// reference left is a stale poll's closure, which returns on the identity
+	// comparison before touching a field. It is the third instance of the
+	// family this file already removed twice, for the reason routing.Bindings
+	// gives at its own Close: a second mechanism for one job survives every
+	// mutation, because what does the work is emptying the table.
 	return d.bindings.Release(ctx, key.tenant, key.session)
 }
 
@@ -381,9 +392,22 @@ func (d *Demand) serveLocked(ctx context.Context, key sessionKey, entry *demandS
 	}
 }
 
-// scheduleLocked arms the next poll. It is called at the END of a poll rather
-// than at its start, so two polls of one session cannot overlap however slow
-// the store is; the interval is a gap, and DemandLimits says so.
+// scheduleLocked arms the next poll.
+//
+// TWO CLAIMS, TWO DIFFERENT MECHANISMS, because an earlier version of this
+// comment credited both to the arming order and only one of them is its.
+//
+// NON-OVERLAP is d.mu's. Two polls of one session cannot run at the same time
+// whatever the arming order is, because poll holds the mutex for its whole
+// body; a successor armed at the START of a poll would simply block on it.
+// TestOnePollOfASessionExcludesEveryOther drives that directly.
+//
+// THE GAP is this call site's. Arming the successor at the END is what makes
+// OwnershipPollInterval a delay measured from the previous poll FINISHING
+// rather than from its starting, so a store slower than the interval delays the
+// next poll instead of queueing one behind the mutex.
+// TestThePollIntervalIsAGapAndNotAPeriod asks the clock, from inside a seam
+// call, whether a successor is already armed.
 func (d *Demand) scheduleLocked(key sessionKey, entry *demandSession) {
 	entry.stop = d.clock.AfterFunc(d.limits.OwnershipPollInterval, func() {
 		d.poll(key, entry)

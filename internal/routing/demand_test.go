@@ -214,6 +214,32 @@ func (w *deadlineWitness) require(t *testing.T, what string, floor, ceiling time
 	}
 }
 
+// cancelled reports how many recorded calls arrived with a context that was
+// already done.
+func (w *deadlineWitness) cancelled() int {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.dead
+}
+
+// longest is the largest remaining budget any recorded call was handed.
+func (w *deadlineWitness) longest(t *testing.T) time.Duration {
+	t.Helper()
+
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if len(w.remaining) == 0 && w.dead == 0 {
+		t.Fatal("no seam call was recorded, so this assertion is vacuous")
+	}
+	longest := time.Duration(0)
+	for _, remaining := range w.remaining {
+		if remaining > longest {
+			longest = remaining
+		}
+	}
+	return longest
+}
+
 // deadlineResolver is the registry read with its bound observed.
 type deadlineResolver struct {
 	*recordingResolver
@@ -229,8 +255,13 @@ func (r *deadlineResolver) Owner(ctx context.Context, tenant sessionwire.TenantI
 // WHOLE request, because "the tip read is bounded" is a claim about the request
 // this package builds and not about the answer it gets back.
 type scriptedTips struct {
-	mu       sync.Mutex
-	witness  *deadlineWitness
+	mu      sync.Mutex
+	witness *deadlineWitness
+	// during runs INSIDE the read, which is inside the poll and inside the
+	// demand plane's lock. It is the only place a case can observe a poll
+	// mid-flight, and two of them need to: one asks the clock whether a
+	// successor is already armed, the other asks the mutex whether it is held.
+	during   func()
 	requests []sessionstore.ReadPublicJournalRequest
 	// tips is consumed one per call; the last value repeats forever, so a case
 	// that cares about one tip writes one.
@@ -242,6 +273,9 @@ type scriptedTips struct {
 func (s *scriptedTips) ReadPublicJournal(ctx context.Context, req sessionstore.ReadPublicJournalRequest) (sessionwire.JournalPage, error) {
 	if s.witness != nil {
 		s.witness.record(ctx)
+	}
+	if s.during != nil {
+		s.during()
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -851,6 +885,128 @@ func TestThePollIsArmedAtTheConfiguredInterval(t *testing.T) {
 	if got := DefaultDemandLimits().OwnershipPollInterval; got == limits.OwnershipPollInterval {
 		t.Errorf("the case drives the default interval (%v), so it could not see a default being used instead", got)
 	}
+}
+
+// TestAcquireInheritsTheSubscribersOwnBound is the reader for a claim the
+// production comment made and nothing checked: Acquire bounds its work from the
+// CALLER's context, not from a fresh one.
+//
+// Both halves are driven because they fail to different mutations. A caller
+// deadline shorter than PollTimeout must win, which kills
+// context.Background(); and a caller who has already gone away must not have a
+// registry read started on its behalf, which kills context.WithoutCancel --
+// a mutation that keeps the deadline and drops the cancellation, and that the
+// first half alone cannot see.
+func TestAcquireInheritsTheSubscribersOwnBound(t *testing.T) {
+	t.Parallel()
+
+	t.Run("a caller deadline shorter than the poll timeout wins", func(t *testing.T) {
+		t.Parallel()
+
+		f := newDemandFixture(t, testDemandLimits)
+		ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
+		defer cancel()
+		if err := f.demand.Acquire(ctx, bindTenant, bindSession); err != nil {
+			t.Fatalf("Acquire: %v", err)
+		}
+		// PollTimeout is 4321ms, so anything at or above a quarter second of
+		// slack came from this package rather than from the caller.
+		if got := f.witness.longest(t); got > 250*time.Millisecond {
+			t.Errorf("a seam call was handed %v of budget, want no more than the caller's 250ms", got)
+		}
+	})
+
+	t.Run("a caller who has already gone is not outlived", func(t *testing.T) {
+		t.Parallel()
+
+		f := newDemandFixture(t, testDemandLimits)
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		if err := f.demand.Acquire(ctx, bindTenant, bindSession); err != nil {
+			t.Fatalf("Acquire: %v", err)
+		}
+		if got := f.witness.cancelled(); got == 0 {
+			t.Error("the seams were handed a live context although the subscriber's own was already cancelled")
+		}
+	})
+}
+
+// TestThePollIntervalIsAGapAndNotAPeriod is the reader for the OTHER claim the
+// production comment made and nothing checked.
+//
+// The question is asked from INSIDE the poll, which is the only place it can
+// be: a successor armed at the START of a poll and one armed at its END are
+// indistinguishable once the poll has returned.
+func TestThePollIntervalIsAGapAndNotAPeriod(t *testing.T) {
+	t.Parallel()
+
+	f := newDemandFixture(t, testDemandLimits)
+	var armedDuringTheRead []int
+	f.tips.during = func() { armedDuringTheRead = append(armedDuringTheRead, len(f.clock.due())) }
+	// Acquire AND two polls, because they arm their successors at two
+	// different call sites and a case observing only the first cannot see the
+	// other move. The first version of this observed Acquire alone, and a
+	// mutation hoisting scheduleLocked to the top of poll survived it.
+	f.acquire(t, bindSession)
+	f.clock.tick(t)
+	f.clock.tick(t)
+
+	if len(armedDuringTheRead) != 3 {
+		t.Fatalf("the read ran %d times, want 3 (one subscribe and two polls)", len(armedDuringTheRead))
+	}
+	for i, armed := range armedDuringTheRead {
+		if armed != 0 {
+			t.Errorf("%d polls were already armed while poll %d was still working; the interval is then measured "+
+				"from a poll STARTING, so a store slower than the interval queues its successor instead of delaying it",
+				armed, i)
+		}
+	}
+	// The positive control: one is armed by the time each returns, so a plane
+	// that armed nothing at all would not pass the assertion above.
+	if got := len(f.clock.due()); got != 1 {
+		t.Errorf("%d polls armed once the last returned, want exactly 1", got)
+	}
+}
+
+// TestOnePollOfASessionExcludesEveryOther is the reader for what actually
+// delivers non-overlap, which is the mutex and not the arming order.
+//
+// It asks the lock directly rather than timing a goroutine: a TryLock that
+// succeeds while a poll is mid-flight is a definite answer, where "another
+// goroutine did not finish within 50ms" is a timing non-event that would pass
+// for a plane holding no lock at all on a slow machine.
+func TestOnePollOfASessionExcludesEveryOther(t *testing.T) {
+	t.Parallel()
+
+	f := newDemandFixture(t, testDemandLimits)
+	var heldDuringTheRead []bool
+	f.tips.during = func() {
+		if f.demand.mu.TryLock() {
+			f.demand.mu.Unlock()
+			heldDuringTheRead = append(heldDuringTheRead, false)
+			return
+		}
+		heldDuringTheRead = append(heldDuringTheRead, true)
+	}
+	// The subscribe path and the poll path take the lock at two different call
+	// sites, so both are observed. A case watching only the subscribe survived
+	// a mutation that released the lock before poll did its work.
+	f.acquire(t, bindSession)
+	f.clock.tick(t)
+
+	if len(heldDuringTheRead) != 2 {
+		t.Fatalf("the read ran %d times, want 2 (one subscribe and one poll)", len(heldDuringTheRead))
+	}
+	for i, held := range heldDuringTheRead {
+		if !held {
+			t.Errorf("the demand plane's lock was free while call %d was mid-flight, so two polls of one session may run at once", i)
+		}
+	}
+	// The control: it is not simply always locked.
+	if !f.demand.mu.TryLock() {
+		t.Fatal("the lock is still held after Acquire returned, so the assertion above says nothing")
+	}
+	f.demand.mu.Unlock()
 }
 
 // TestEveryBackgroundCallIsBoundedByTheConfiguredTimeout covers the half a poll

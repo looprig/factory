@@ -142,7 +142,7 @@ func buildViewingPathGraph(t *testing.T, root string) *callGraph {
 		}
 		relative = filepath.ToSlash(relative)
 		graph.files++
-		imports := fileImportNames(parsed)
+		imports := foreignImportNames(parsed)
 
 		for _, decl := range parsed.Decls {
 			function, ok := decl.(*ast.FuncDecl)
@@ -247,27 +247,58 @@ func collectMentions(body ast.Node, into map[string]struct{}) {
 	})
 }
 
-// collectCalls records the calls a body makes that can be attributed to a VALUE
-// this module might own, and skips the ones that cannot.
+// collectCalls records the calls a body makes that could reach a declaration
+// THIS MODULE owns, and skips only the ones that provably could not.
 //
-// Two shapes are recorded:
+// THE UNIT OF ANALYSIS, stated as what it now is. Three shapes are recorded:
 //
 //   - a bare call, f(x), which names a declaration in the same package;
-//   - a method call on a value, d.bindings.Acquire(x) or admitter.Admit(x),
-//     whose receiver is dispatched at run time and may be any implementation.
+//   - a method or field call on a value, d.bindings.Acquire(x) or
+//     admitter.Admit(x), whose receiver is dispatched at run time and may be
+//     any implementation;
+//   - a call qualified by a package OF THIS MODULE, placement.ReusableOwner(x)
+//     or httpapi.NewRouter(cfg), because a declaration of this module is
+//     exactly what such a call reaches.
 //
-// One shape is skipped: a call rooted at an IMPORTED PACKAGE, such as
-// sessionwire.TenantID(t).Validate() or strings.Cut(s, ":"). That is what keeps
-// the graph from collapsing: the module declares a dozen methods named Validate
-// and one named Error, so treating a package-qualified Validate as an edge to
-// all of them reached 248 of the module's 362 declarations from these roots --
-// including the HTTP router, whose control routes are supposed to admit
-// commands. A ban that reported the whole module would have to be deleted the
-// first time a later task implemented the REST restore route.
+// One shape is skipped: a call qualified by a package of a FOREIGN module,
+// sessionwire.TenantID(t).Validate() or strings.Cut(s, ":"). The skip is keyed
+// on the import PATH being outside github.com/looprig/factory, never on the
+// identifier being an import name.
 //
-// The cost of the skip is stated rather than hidden: a call into another
-// LOOPRIG module that itself called back into Factory would not be followed.
-// Nothing does, and nothing can -- core and sessionstore name no Factory type.
+// **That distinction is the whole correction, and it was measured.** Keying on
+// "is an import name" dropped 22 real intra-module edges -- including
+// admission -> placement.ReusableOwner, server.go -> httpapi.NewRouter and, on
+// the reached set itself, principalOf -> internalidentity.OperationContextFrom.
+// Worse, it was defeatable without any shadowing: an identical helper called
+// bare from internal/routing FAILED the guard, and the same helper moved to
+// internal/placement and called as placement.ReachRestore(nil) PASSED with the
+// whole suite green -- which is the shape production already uses 22 times and
+// the shape A9.1's composition will have.
+//
+// The skip that remains is what keeps the graph from collapsing, and that was
+// measured too: following a FOREIGN package-qualified call as an edge to every
+// same-named declaration (the module declares a dozen methods named Validate
+// and one named Error) reached 248 of the module's 362 declarations from these
+// roots, including internal/httpapi's router, whose control routes are SUPPOSED
+// to admit commands -- so the ban would have had to be deleted the first time a
+// later task implemented the REST restore route. Keyed on the module path it is
+// 91, up from the wrong version's 89.
+//
+// WHAT IT STILL CANNOT SEE, stated rather than left to be found:
+//
+//   - a call made through a func VALUE held in a struct field, a map or a
+//     slice. A restore reached that way is outside its reach entirely.
+//   - a foreign module that calls BACK into Factory through a callback it was
+//     handed. That is not hypothetical -- it is how centrifuge invokes the
+//     subscribe handler -- and it is why the roots include the function
+//     literals registered for the subscription lifecycle events rather than
+//     relying on an edge into them.
+//   - which of several same-named declarations a call actually reaches. It
+//     reports all of them, which is the safe direction for a ban.
+//
+// It DOES walk files no build configuration compiles, because modfiles ignores
+// build constraints deliberately. For a ban that is conservative: it can report
+// a path that is never built, and cannot miss one that is.
 func collectCalls(body ast.Node, imports map[string]struct{}, into map[string]struct{}) {
 	ast.Inspect(body, func(node ast.Node) bool {
 		call, ok := node.(*ast.CallExpr)
@@ -278,7 +309,7 @@ func collectCalls(body ast.Node, imports map[string]struct{}, into map[string]st
 		case *ast.Ident:
 			into[fun.Name] = struct{}{}
 		case *ast.SelectorExpr:
-			if _, qualified := imports[rootIdentifier(fun.X)]; !qualified {
+			if _, foreign := imports[rootIdentifier(fun.X)]; !foreign {
 				into[fun.Sel.Name] = struct{}{}
 			}
 		}
@@ -311,25 +342,43 @@ func rootIdentifier(expr ast.Expr) string {
 	}
 }
 
-// fileImportNames returns the names a file's imports are bound to, which is
-// what collectCalls skips a selector rooted at.
-func fileImportNames(parsed *ast.File) map[string]struct{} {
+// modulePath is this module, and it is the property the skip is keyed on.
+const modulePath = "github.com/looprig/factory"
+
+// foreignImportNames returns the names a file binds to packages of OTHER
+// modules -- the ones collectCalls skips a selector rooted at.
+//
+// A package of THIS module is deliberately absent from the result, whatever it
+// is named and however it is aliased, because a call qualified by one reaches a
+// declaration the graph holds. Containment compares whole SEGMENTS, for
+// import_boundary_test.go's reason: a module named github.com/looprig/factoryx
+// is not this one.
+func foreignImportNames(parsed *ast.File) map[string]struct{} {
 	names := map[string]struct{}{}
 	for _, spec := range parsed.Imports {
+		path, err := strconv.Unquote(spec.Path.Value)
+		if err != nil {
+			continue
+		}
+		if pathIsInThisModule(path) {
+			continue
+		}
 		if spec.Name != nil {
 			if spec.Name.Name != "_" && spec.Name.Name != "." {
 				names[spec.Name.Name] = struct{}{}
 			}
 			continue
 		}
-		path, err := strconv.Unquote(spec.Path.Value)
-		if err != nil {
-			continue
-		}
 		segments := strings.Split(path, "/")
 		names[segments[len(segments)-1]] = struct{}{}
 	}
 	return names
+}
+
+// pathIsInThisModule reports whether an import path names this module or a
+// package inside it, comparing whole path segments.
+func pathIsInThisModule(path string) bool {
+	return path == modulePath || strings.HasPrefix(path, modulePath+"/")
 }
 
 // reach returns every declaration reachable from the roots, and the shortest
@@ -490,6 +539,101 @@ func admitNothing(session string) {}
 	if !slices.Equal(got, want) {
 		t.Errorf("the scan reported %v over the fixture, want %v\nfindings:\n%s",
 			got, want, strings.Join(violations, "\n"))
+	}
+}
+
+// TestTheViewingPathScanFollowsACallIntoThisModulesOwnPackages is the
+// analyzer's self-test for the property the first version got wrong.
+//
+// The failing version keyed its skip on the identifier being an IMPORT NAME
+// rather than on the import being a FOREIGN module, and Factory imports its own
+// packages by path -- twenty-two intra-module edges were silently dropped, and
+// an identical helper moved from internal/routing to internal/placement and
+// called as placement.ReachRestore() turned a finding into a green suite with
+// no shadowing trickery at all. That is the shape A9.1's composition will have.
+//
+// The fixture drives both directions in one graph: a call qualified by a
+// package of THIS module must be followed, and a call qualified by a package of
+// a foreign module must not be -- with the foreign target carrying an admission
+// entry point, so a skip that stopped working would be a finding rather than a
+// silence.
+func TestTheViewingPathScanFollowsACallIntoThisModulesOwnPackages(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	write := func(name, content string) {
+		t.Helper()
+		if dir := filepath.Dir(name); dir != "." {
+			if err := os.MkdirAll(filepath.Join(root, dir), 0o750); err != nil {
+				t.Fatalf("mkdir %s: %v", dir, err)
+			}
+		}
+		if err := os.WriteFile(filepath.Join(root, name), []byte(content), 0o600); err != nil {
+			t.Fatalf("write %s: %v", name, err)
+		}
+	}
+	// The fixture module is named as this one, because that path is the
+	// property the skip is keyed on.
+	write("go.mod", "module "+modulePath+"\n\ngo 1.24\n")
+	write("demand.go", `package fixture
+
+import (
+	"strings"
+
+	"`+modulePath+`/internal/placement"
+	neighbour "`+modulePath+`extra/thing"
+)
+
+type Demand struct{}
+
+func (d *Demand) Acquire(session string) {
+	placement.ReachRestore(nil)
+	strings.Cut(session, ":")
+	neighbour.Reach(nil)
+}
+`)
+	// A module whose path merely STARTS with this one's is a different module.
+	// Without this arm, comparing bytes instead of whole path segments is an
+	// equivalent mutation, because nothing in the real tree imports such a
+	// path -- and "no driver exists today" is exactly how a containment bug
+	// gets in later.
+	write("neighbour.go", `package fixture
+
+func Reach(a Admitter) { a.AdmitCreate() }
+`)
+	write("internal/placement/place.go", `package placement
+
+// ReachRestore is reached through a package qualifier of THIS module.
+func ReachRestore(a Admitter) { a.AdmitRestore() }
+`)
+	// The control: a declaration named for the FOREIGN call the root makes. An
+	// edge to it would be a false one, and it is loaded so that a skip which
+	// stopped working reports rather than merely widening.
+	write("cut.go", `package fixture
+
+type Admitter interface {
+	AdmitRestore()
+	AdmitInput()
+	AdmitCreate()
+}
+
+func Cut(a Admitter, s, sep string) { a.AdmitInput() }
+`)
+
+	graph := buildViewingPathGraph(t, root)
+	_, violations := graph.reach()
+	if len(violations) != 1 {
+		t.Fatalf("the scan reported %d findings, want exactly 1 (the module-qualified call, not the foreign one):\n%s",
+			len(violations), strings.Join(violations, "\n"))
+	}
+	if !strings.Contains(violations[0], "AdmitRestore") {
+		t.Errorf("the finding was %q, want the module-qualified AdmitRestore", violations[0])
+	}
+	if strings.Contains(violations[0], "AdmitInput") {
+		t.Errorf("the finding was %q, so a call qualified by a FOREIGN package was followed", violations[0])
+	}
+	if strings.Contains(violations[0], "AdmitCreate") {
+		t.Errorf("the finding was %q, so a module whose path merely starts with this one's was treated as this one", violations[0])
 	}
 }
 
