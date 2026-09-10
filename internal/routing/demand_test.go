@@ -892,11 +892,15 @@ func TestThePollIsArmedAtTheConfiguredInterval(t *testing.T) {
 // CALLER's context, not from a fresh one.
 //
 // Both halves are driven because they fail to different mutations. A caller
-// deadline shorter than PollTimeout must win, which kills
-// context.Background(); and a caller who has already gone away must not have a
-// registry read started on its behalf, which kills context.WithoutCancel --
-// a mutation that keeps the deadline and drops the cancellation, and that the
-// first half alone cannot see.
+// deadline shorter than PollTimeout must win, which kills context.Background();
+// and a caller who has already gone away must not have a registry read started
+// on its behalf, which kills a derivation that keeps the caller's DEADLINE and
+// drops its CANCELLATION -- a class the first half cannot see, because a
+// cancelled caller's deadline is inherited either way.
+//
+// context.WithoutCancel is NOT an example of that class and was named as one
+// here by mistake: it strips the deadline too, so it dies to both halves. The
+// class is real and this half is what covers it; the illustration was wrong.
 func TestAcquireInheritsTheSubscribersOwnBound(t *testing.T) {
 	t.Parallel()
 

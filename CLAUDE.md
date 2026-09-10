@@ -1478,10 +1478,14 @@ the one shape skipped, and the skip is keyed on the import PATH being outside
 
 **Both halves of that were measured, and the first version had the key wrong.**
 Following foreign package-qualified calls as edges to every same-named
-declaration (a dozen `Validate`s, one `Error`) reached **248 of the module's
+declaration (a dozen `Validate`s, one `Error`) reaches **229 of the module's
 362** declarations, including `internal/httpapi`'s router, whose control routes
 are *supposed* to admit commands — the ban would have had to be deleted the
-first time a later task implemented the REST restore route. But keying the skip
+first time a later task implemented the REST restore route. (**229, not the 248
+this document first said.** That figure was real but measured a different graph:
+an even earlier version treating every identifier a body *mentions* as an edge,
+not only the ones it calls. Re-measured at this head: 91 with the skip, 229
+without, 248 with mentions-as-edges.) But keying the skip
 on "is an import name" dropped **22 real intra-module edges**, including
 `admission -> placement.ReusableOwner`, `server.go -> httpapi.NewRouter` and
 `principalOf -> internalidentity.OperationContextFrom`, which is *on the reached
@@ -1491,12 +1495,25 @@ bare from `internal/routing` was a finding, and the same helper moved to
 shape production already uses 22 times and the shape A9.1's composition will
 have. Keyed on the module path the reach is **91**.
 
-**What it still cannot see is stated at the function**: a call through a func
-value in a struct field, map or slice; a foreign module calling back into
-Factory through a callback (which is not hypothetical — it is how centrifuge
-invokes the subscribe handler, and it is why the roots include the lifecycle
-literals rather than relying on an edge into them); and which of several
-same-named declarations a call really reaches, since it reports all of them.
+**What it still cannot see is stated at the function, and that list is meant to
+be complete**: a call through a func value in a struct field, map or slice; a
+foreign module calling back into Factory through a callback (which is not
+hypothetical — it is how centrifuge invokes the subscribe handler, and it is why
+the roots include the lifecycle literals rather than relying on an edge into
+them); which of several same-named declarations a call really reaches, since it
+reports all of them; a **local identifier shadowing a foreign import's name**,
+since the skip set is per file rather than per scope; and a **generic call with
+explicit type arguments**, whose callee is an `*ast.IndexExpr` and matches
+neither arm of the type switch. The last two are false NEGATIVES rather than
+conservatisms, and neither has an instance in the module today.
+
+**The skip's key is `module_pin_test.go`'s `factoryModulePath`, aliased rather
+than copied.** That constant is checked against the real `go.mod`. A second
+unanchored literal was a guard naming its own subject on the exact key this
+guard has now been corrected for twice, and it was unkillable: the analyzer's
+fixture writes its own `go.mod` from the same constant, so pointing the pair at
+another module path moved both sides together and reverted the reach to 89 in
+silence.
 It DOES walk files no build configuration compiles, which is conservative for a
 ban. Three fixtures test the analyzer rather than the module: one plants a
 restore at each root category and two hops away with two controls; one plants

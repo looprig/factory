@@ -278,11 +278,18 @@ func collectMentions(body ast.Node, into map[string]struct{}) {
 // The skip that remains is what keeps the graph from collapsing, and that was
 // measured too: following a FOREIGN package-qualified call as an edge to every
 // same-named declaration (the module declares a dozen methods named Validate
-// and one named Error) reached 248 of the module's 362 declarations from these
-// roots, including internal/httpapi's router, whose control routes are SUPPOSED
-// to admit commands -- so the ban would have had to be deleted the first time a
-// later task implemented the REST restore route. Keyed on the module path it is
-// 91, up from the wrong version's 89.
+// and one named Error) reaches 229 of the module's 362 declarations from these
+// roots, including internal/httpapi's router -- whose control routes are
+// SUPPOSED to admit commands, so the ban would have had to be deleted the first
+// time a later task implemented the REST restore route. Keyed on the module
+// path it is 91, up from the wrong version's 89.
+//
+// 229 is the figure and 248 was the wrong one, and the difference is a
+// MECHANISM rather than a miscount: 248 is what an even earlier version reached
+// by treating every identifier a body MENTIONS as an edge, not only the ones it
+// calls. Both numbers are real and they measure different graphs; only 229
+// belongs to the claim above. Re-measured at this head: 91 with the skip, 229
+// without, 248 with mentions-as-edges.
 //
 // WHAT IT STILL CANNOT SEE, stated rather than left to be found:
 //
@@ -295,6 +302,22 @@ func collectMentions(body ast.Node, into map[string]struct{}) {
 //     relying on an edge into them.
 //   - which of several same-named declarations a call actually reaches. It
 //     reports all of them, which is the safe direction for a ban.
+//   - a LOCAL identifier that shadows a foreign import's name. The skip set is
+//     per FILE, not per scope, so `sessionwire := somethingOfOurs()` followed
+//     by `sessionwire.Reach()` is skipped in a file importing sessionwire. This
+//     one is a false NEGATIVE, unlike the rest of this list; the module has no
+//     instance today and a shadow of an import name would be reported by review
+//     long before this guard, but it is a hole rather than a conservatism.
+//   - a GENERIC call written with explicit type arguments, `f[T](x)` or
+//     `p.f[T](x)`. The callee is then an *ast.IndexExpr or *ast.IndexListExpr
+//     and matches neither arm of the type switch below, so no edge is recorded
+//     at all. Also a false negative, also with no instance in the module today.
+//
+// Both of those are stated because the point of this list is that it is
+// COMPLETE. Neither is fixed here: each is a change to the analyzer's matching,
+// this file has already been corrected twice on real evidence, and a fix round
+// that widens a mechanism nobody has an instance of is how the next round's
+// blocker gets in.
 //
 // It DOES walk files no build configuration compiles, because modfiles ignores
 // build constraints deliberately. For a ban that is conservative: it can report
@@ -343,7 +366,17 @@ func rootIdentifier(expr ast.Expr) string {
 }
 
 // modulePath is this module, and it is the property the skip is keyed on.
-const modulePath = "github.com/looprig/factory"
+//
+// It is an ALIAS of module_pin_test.go's factoryModulePath rather than a second
+// literal, and that is the whole point: that constant is checked against the
+// real go.mod, so this one cannot drift from what the toolchain resolves. A
+// second unanchored copy was a guard naming its own subject, on the exact key
+// whose mis-derivation this file has now been corrected for twice -- and it was
+// unkillable, because the fixture below writes its own go.mod from the same
+// constant, so pointing the pair at github.com/looprig/factoryzz moved both
+// sides together, silently reverted the reach to the pre-fix 89, and passed the
+// whole suite.
+const modulePath = factoryModulePath
 
 // foreignImportNames returns the names a file binds to packages of OTHER
 // modules -- the ones collectCalls skips a selector rooted at.
@@ -419,6 +452,44 @@ func (g *callGraph) reach() (map[*declaration][]string, []string) {
 	}
 	sort.Strings(violations)
 	return paths, violations
+}
+
+// TestTheViewingPathScanIsKeyedOnTheModuleTheToolchainResolves is what makes
+// the skip's key checkable rather than merely aliased.
+//
+// The alias to module_pin_test.go's factoryModulePath is a good thing and not
+// this test's subject: a mutation does not respect an alias, it REPLACES the
+// line, so pointing the constant at github.com/looprig/factoryzz survived the
+// whole suite even after the alias landed -- the analyzer's fixture writes its
+// own go.mod from the same constant, so both sides moved together, the reach
+// reverted to the pre-fix 89, and nothing said so.
+//
+// So the key is compared against the module the TOOLCHAIN resolves, read from
+// the real go.mod through module_pin_test.go's own live parser. Nothing here
+// restates that parser: a second implementation of "what does go.mod declare"
+// is the defect CLAUDE.md describes at length, and go.mod's grammar permits
+// quoted tokens that a simpler reader would miss.
+func TestTheViewingPathScanIsKeyedOnTheModuleTheToolchainResolves(t *testing.T) {
+	t.Parallel()
+
+	content, err := os.ReadFile("go.mod")
+	if err != nil {
+		t.Fatalf("read go.mod: %v", err)
+	}
+	declared := ""
+	for _, directive := range parseGoModDirectives(string(content)) {
+		if directive.verb == "module" && len(directive.args) == 1 {
+			declared = directive.args[0]
+		}
+	}
+	if declared == "" {
+		t.Fatal("go.mod declares no module, so this comparison has nothing to make")
+	}
+	if modulePath != declared {
+		t.Errorf("the viewing-path scan skips imports outside %q, but this module is %q; "+
+			"every call qualified by a package of the real module is then treated as foreign and dropped",
+			modulePath, declared)
+	}
 }
 
 // TestNothingOnTheViewingPathAdmitsACommand is the production assertion.
