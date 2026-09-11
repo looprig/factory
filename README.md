@@ -262,8 +262,11 @@ deliberately not the answer — a method name is transport-shaped, and putting o
 in a tier-0 module would make a future transport change a tier-0 breaking
 release.
 
-The pool carries the control plane only. Per-binding queues, backpressure repair
-and the live tail are A7.3; choosing which Host a session belongs to is A7.2.
+The pool carries the control plane only. A7.3 moved the per-binding queues and
+the backpressure repair *above* it, into `internal/realtime/delivery` and
+`routing.Relay`; the live tail itself is still absent, because Core defines the
+session-channel record bodies but no HostLink framing to carry them. Choosing
+which Host a session belongs to is A7.2.
 `factory.New` composes neither the pool nor the reaper's cadence; A9.1 owns that.
 
 ## Placement

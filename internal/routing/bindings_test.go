@@ -443,7 +443,10 @@ func TestAnInvalidatedSessionRedeliversOverTheNewBinding(t *testing.T) {
 // TestADeliveryWithoutDemandIsRefused holds the lifetime rule to one thing.
 // A delivery does not open a route, so the demand count is the only reason a
 // binding exists and the only reason it survives; a caller delivering to an
-// unwatched session brackets it with Acquire and Release.
+// unwatched session takes demand first -- through Demand, never through this
+// table directly. This doc used to end "brackets it with Acquire and Release",
+// which is the instruction A7.2-sole-demand-holder settled against: see
+// Demand.Rebind, and Deliver's own corrected paragraph.
 func TestADeliveryWithoutDemandIsRefused(t *testing.T) {
 	t.Parallel()
 

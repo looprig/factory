@@ -277,6 +277,60 @@ func (d *Demand) Release(ctx context.Context, tenant sessionwire.TenantID, sessi
 	return d.teardownLocked(ctx, key, entry)
 }
 
+// Rebind gives a watched session's route back and takes a fresh one
+// IMMEDIATELY, without changing how many subscribers this replica holds.
+//
+// It exists for internal/routing's repair plane, which learns from below that a
+// route is unusable -- a physical HostLink closed, a route queue overflowed --
+// and may not wait an ownership poll to find out. It is deliberately the SAME
+// two statements a poll runs, so a repair and a poll cannot repair differently.
+//
+// # THE INVARIANT THIS METHOD IS THE POINT OF: one demand holder per session
+//
+// Bindings.Release only unbinds on the LAST release, because it COUNTS. This
+// method is a release followed by an acquire, so it is fresh only while this
+// type is the sole holder of the routing table's demand for a session: with a
+// second holder the release would merely decrement, route.bound would stay
+// true, and Bindings.routeLocked would hand the acquire back THE SAME STALE
+// ROUTE without reading the registry at all -- which is precisely the state a
+// repair exists to leave.
+//
+// So the answer to "should Release become owner-aware" is no, and the reason is
+// that owner-awareness would not fix it. Two holders means the route
+// legitimately outlives one holder's release, so the stale-adoption window is a
+// property of there being two, not of the counting. The repair plane therefore
+// takes NO demand and asks here instead.
+// TestASecondHolderOfTheRoutingTablesDemandMakesARebindStale is the reader for
+// the hazard, and TestTheRoutingTablesDemandIsHeldOnlyByTheDemandPlane is the
+// structural guard that keeps a second holder from appearing.
+func (d *Demand) Rebind(ctx context.Context, tenant sessionwire.TenantID, session sessionwire.SessionID) error {
+	key := sessionKey{tenant: tenant, session: session}
+
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.closed {
+		return ErrDemandClosed
+	}
+	entry := d.sessions[key]
+	if entry == nil {
+		// Nothing watches this session, so there is no route to repair and
+		// taking one would open a HostLink for nobody -- the failure
+		// Bindings.Deliver refuses for the same reason.
+		return ErrNoDemand
+	}
+	if entry.held {
+		// The failure is reported for Demand.Release's reason: it says a Host
+		// may still hold a route this replica has forgotten. It does not stop
+		// the rebind, because the local route is gone either way.
+		err := d.bindings.Release(ctx, key.tenant, key.session)
+		entry.held = false
+		d.serveLocked(ctx, key, entry)
+		return err
+	}
+	d.serveLocked(ctx, key, entry)
+	return nil
+}
+
 // Close stops every poll, gives every route back and refuses later work.
 //
 // Every session is attempted and every failure joined rather than returning at

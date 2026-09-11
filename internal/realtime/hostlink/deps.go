@@ -12,9 +12,13 @@
 // Pool holds at most one physical connection per Host and multiplexes every
 // session binding to that Host over it. It owns the CONTROL plane: bind,
 // unbind, command delivery, and the capacity and registry observations a Host
-// pushes. It does NOT carry session event data; per-binding queues, backpressure
-// repair and the live tail are A7.3's, and nothing here may be read as having
-// solved them. It also does not decide WHICH Host a session belongs to; that is
+// pushes. It does NOT carry session event data. The per-binding queues and the
+// backpressure repair now live ABOVE this package, in
+// internal/realtime/delivery and internal/routing's Relay; what is still absent
+// here is the LIVE TAIL itself, because Core v0.7.0 defines the session-channel
+// record bodies but no HostLink transport framing to carry them -- the same gap
+// centrifuge.go records about the method names. Nothing here may be read as
+// having solved any of the three. It also does not decide WHICH Host a session belongs to; that is
 // A7.2's demand-driven binding, which calls Bind and Unbind.
 package hostlink
 

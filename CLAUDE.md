@@ -1077,8 +1077,8 @@ different SESSION as the positive control.
 **Per-binding repair is not delegated to the transport, and A6.1 does not
 assume it is.** One `messageWriter` per `Client` and no per-channel queue
 *bound* anywhere in the library means a stalled consumer loses its whole
-connection, by the queue budget (3008) or the write deadline (3009). A7.3 owns
-the repair, above the transport.
+connection, by the queue budget (3008) or the write deadline (3009). A7.3 built
+the repair above the transport: see "Bounded delivery and backpressure repair".
 
 ## The HostLink
 
@@ -1208,9 +1208,11 @@ would still collect the link, whose binding set really is empty, and the next
 with `ErrUnknownBinding`, and `Unbind` drops an orphaned route rather than
 keeping one that would refuse every later bind as a conflict.
 
-The pool carries the **control** plane only. Session event data, per-binding
-queues, backpressure repair and the live tail are A7.3's, and nothing in this
-package may be read as having solved them. Choosing *which* Host a session
+The pool carries the **control** plane only. Session event data and the live
+tail are still absent — Core v0.7.0 defines no session-event push, so there is
+no framing here to carry one — and the per-binding queues and backpressure
+repair now sit *above* this package, in `internal/realtime/delivery` and
+`routing.Relay`. Nothing here may be read as having solved any of the three. Choosing *which* Host a session
 belongs to is A7.2's demand-driven binding, which calls `Bind` and `Unbind`.
 `ReapIdle` is a method rather than a goroutine because A9.1 owns the start/stop
 ordering that would give it a lifetime.
@@ -1378,11 +1380,16 @@ generation is a contradiction and invalidates, because keeping a route the
 registry contradicts is how a command reaches a Host that is not the owner.
 The stated cost: a lease that changes with nobody pushing leaves a stale route
 until the owning Host refuses what it carries. That is a refusal, not a repair;
-repair is A7.3's.
+the repair is `routing.Relay`'s, which learns from below that a route is
+unusable and asks `Demand.Rebind` rather than waiting for an ownership poll.
 
 **Demand is the only lifetime rule.** `Deliver` requires demand and does not
-open a route, so a caller delivering to an unwatched session brackets it with
-`Acquire`/`Release` and the pool's idle window absorbs the cost. A delivery
+open a route, so a caller delivering to an unwatched session must take demand
+first — **through `Demand`, never through `Bindings` directly**, which is the
+`A7.2-sole-demand-holder` decision below; this paragraph used to say "brackets it
+with `Acquire`/`Release`", which is an instruction to become a second holder of
+this table's demand and is the hazard that decision settled. The pool's idle
+window absorbs the cost either way. A delivery
 whose binding was invalidated is rebound and the command is **redelivered** to
 the new owner — the delivery carries only the retry-stable public CommandID,
 and the Host's lease and SessionStore's idempotency are what make repeating it
@@ -1619,6 +1626,243 @@ the demand transition (eight, including a release nobody holds, work after
 rather than silently skipped, and the three properties that are for-alls rather
 than cells are stated as such.
 
+## Bounded delivery and backpressure repair
+
+A7.3 added `internal/realtime/delivery` (the bounded queue, above the transport)
+and `routing.Relay` (the repair that an overflow owes). Nothing composes them
+yet; the HostLink edge that feeds a `Relay` and the ClientLink edge that
+implements its `Publisher` are A9.1's, with the rest.
+
+**The invariant is one sentence: an enduring record is never discarded
+silently.** Every bound either evicts a record carrying no durable content, or
+reports an overflow that is repaired by telling the affected consumer — and only
+the affected consumer — where to read from. That is `wui`'s U2.2 inversion
+ported to Factory's side of the same stream: dropping the oldest enduring frame
+and reporting it is silent durable loss *with a receipt attached*, because
+nothing redelivers the frame and the reconnect cursor walks past it as soon as a
+later one is applied.
+
+**`Enqueue` has three outcomes, not two.** `nil`; `ErrDropped`, an arriving
+*ephemeral* record a full durable queue had no room for, which lost nothing and
+owes no repair; and `ErrOverflow`, which leaves the queue **unchanged** and owes
+one. Collapsing the first two failure classes would make every busy token stream
+repair a queue that is intact.
+
+**The eviction policy is `wui`'s `selectFrameToDrop`, including its ordering.**
+The busiest declared coalesce key loses its oldest member; with no keyed
+ephemeral present, the oldest ephemeral goes; otherwise there is **no victim**.
+Ties between two equally busy keys are broken by the age of their oldest member,
+so the answer is a function of the buffer and not of map iteration order. The
+coalesce key is **Factory-local and never on the wire**: Core gives an ephemeral
+publication no identity at all, so coalescing without a declared key would be
+guessing that two opaque bodies are interchangeable.
+
+**The two queue bounds are two numbers and must stay two.** A HostBinding's
+route queue holds one session's inbound tail; a DeliveryBinding's queue holds one
+client's outbound copy, and a session with thirty subscribers holds thirty of the
+second and one of the first. `TestEachBoundIsAppliedAtItsOwnSite` drives 5 and 3
+to two absolute answers, so a relay that passed one constant to both sites fails
+— the defect `internal/httpapi` measured on its two page ceilings.
+
+**The bytes are forwarded, never re-encoded.** `ParseEnduring` reads the routing
+and sequence envelope through Core's own decoder, which keeps the body as opaque
+`RawMessage`, and the record queued is the caller's own slice. Both byte
+assertions use a fixture written in a member order Core's marshaller does not
+produce, so a re-encoding path fails where a canonically ordered fixture would
+pass either way.
+
+**The watermark is a bounds PAIR against two different quantities.** *Below its
+own event sequence* is **Core's** rule — `EnduringPublication.Validate` requires
+`covered_through` to equal `journal_seq`, because a live publication covers
+exactly what it committed — and this package classifies that refusal rather than
+restating the comparison, keying on the typed error's `Field` so it cannot be
+confused with an unrelated decode failure (`ErrMalformed` is the control).
+*Above the Host's committed append sequence* is this package's, and
+`Frame.CommittedAppendSeq` is an **input**: a record cannot vouch for itself.
+Both bounds are driven at their exact values in both directions.
+
+**`CommittedAppendSeq` is a declared gap, and the gap is narrower than it first
+reads.** Core v0.7.0 **does** define the session-channel record bodies —
+`enduring_publication`, `ephemeral_publication`, `journal_tip`, `session.reset` —
+and `Relay.classify` dispatches on exactly that discriminator. What is missing is
+two things: any **HostLink transport framing** to carry them, which is the gap
+`internal/realtime/hostlink` already records about the method names, and any
+**member on any record** from which a Host's committed append sequence could be
+read. It is the second that makes the upper watermark bound unimplementable from
+the wire. The field is the seam the Host half will fill; until it exists the
+honest reading is "what the producer declares", and the relay fences against it.
+**For the same reason there is no ephemeral producer in this module**, so the
+ephemeral policy is driven at `Receive` and at the queue's own contract rather
+than through a stream that carries nothing. The dispatch is on Core's own
+discriminator, so a caller cannot mislabel an unsequenced delta as durable data,
+and a repair **control arriving from a Host is refused**: a `session.reset` names
+what *this replica* forwarded in order, which a Host is in no position to know.
+
+**A `session.reset` names what was DELIVERED, not what was queued.** Everything a
+repair discards was never applied, so a reset built from the queue would tell a
+client it holds records it never saw — a hole with a cursor asserting the hole is
+covered. "Contiguous" is enforced rather than assumed: a gap **sticks**, because
+a client told it has everything through a sequence it does not have will never
+read the hole. Zero is the honest answer for a binding that has vouched for
+nothing, which Core allows and which is required here because **Factory does not
+retain the browser's own durable cursor** (A6.3 step 3).
+
+**Repeatability is a property of the encoding, not of a function.** The record
+carries two absolute sequences and no nonce, attempt count or sequence of its
+own, so two resets for one `(last, tip)` are the same bytes;
+`FuzzTheSessionResetIsAFunctionOfItsSequencePairAlone` derives that space rather
+than sampling it, and a second `Repair` supersedes a pending control rather than
+queueing beside it — which falls out of clearing the buffer rather than being a
+second rule.
+
+**A HostBinding repair captures ONE tip for every binding.** Two reads could
+capture two tips, so two clients of one session would be told two different
+places the journal had reached. Each binding's reset still differs, because
+`LastContiguous` is that binding's own. The order is stop, capture, reset each
+binding, rebind, resume after the tip, and it is **asserted as an order**: a
+resume before the rebind restarts a tail on a route being replaced.
+
+**Fail closed, four ways, each closing only what it must.** A tip that cannot be
+read **during a HostBinding repair** closes every affected ClientLink and leaves
+the tail stopped, because a reset naming no tip is not a repair instruction. A
+tip that cannot be read **during a DeliveryBinding overflow** closes that one
+link, for the same reason one level down. A reset Core refuses as incoherent
+closes that one link. A publish failure — as distinct from `ErrWouldBlock`,
+which leaves the record queued — closes that one link. Every step of a host
+repair is attempted and every failure joined, so a tail that would not stop does
+not leave the clients unreset.
+
+**The second of those four was the last unread one, and it is the one that
+mattered most.** Three mutations of `fanOutLocked`'s tip-read branch survived the
+whole module — close every binding, close none, and *return nil and keep
+streaming*. The third does exactly what the branch's own comment forbids: a
+binding that overflowed and cannot be repaired goes on being published to, and
+the client's cursor walks past the hole. It is the sibling of the step-4 arm one
+call site up, which was read and had just been strengthened; the sweep that
+strengthened it covered "only that one" claims and did not descend to the
+fail-closed tip read beneath them. All three die at the error assertion and the
+closed set; the case's final stream arm is a **hedge** against a future edit that
+swallows the failure *and* closes something, and it says so — an earlier version
+of this paragraph claimed the mutations died on that arm, and stripping the arm
+was measured leaving all three still dying.
+
+### The checklist that would have caught all five at once
+
+Five findings across this task were one class: **a claim about what a
+state-destroying action did not touch, sampled before anything pumped the
+observable.** Asking two questions of every `Close`/`Clear`/`Repair`/reset call
+site is cheaper than the rounds it took to find them one at a time:
+
+1. **Is it sampled at all — PER STATEMENT?** `fanOutLocked`'s fail-closed arm
+   failed this outright: nothing asserted about it in any direction. And
+   `Queue.Close` failed it *at a leaf*: it has two statements, `q.closed = true`
+   and `q.buf = nil`, and every refusal a test drove was answered by the first
+   alone, so deleting the second survived the whole module. **Sign off a
+   function, not a statement, and you have signed off half of it.**
+2. **What is the positive observable that would differ if the action touched
+   something it should not have?** A peer's *queue* is not one unless the peer's
+   queue is non-empty at that instant — a fixture that pumps after every record
+   makes every peer's queue empty, so only the *reset* half is testable.
+3. **Is anything between the action and the observable NOT SYNCHRONOUS with the
+   call?** A reset is **queued, not published**; a "no reset for the peer" check
+   read before that peer's own next pump cannot be non-zero whatever the relay
+   did.
+
+**Question 3 is keyed on asynchrony, not on object identity, and the difference
+is a correction.** An earlier version of this note said a "leaf" action — one
+whose observable is the object acted on — needs no pump question. That is sound
+in the positive direction and unsound in the negative: it is true here only
+because every leaf in this package is a mutex-guarded synchronous buffer, and it
+will get the first asynchronous leaf wrong. Worse in practice, the *label*
+waived question 1 as well, which is how `Queue.Close`'s second statement went
+unread. **A leaf earns a shorter answer to question 3 and no relief at all from
+question 1.**
+
+**Every "only that one" claim is asserted against an observable**, not against an
+absence: a wrongly repaired peer has a `session.reset` in its stream, a wrongly
+repaired session has a tail stop and a rebind naming it. Each case carries the
+positive half in the same function, so the repair is visible as a difference
+rather than as nothing having happened.
+
+**Three things about HOW those cases are built, each of which was a surviving
+mutant first.** A peer's queue must be **non-empty at the instant the victim
+overflows**, or the "clear only that queue" half is untested — a fixture that
+pumps after every record leaves every peer's queue empty and can only see the
+*reset* half. A reset is **queued, not published**, so a "no reset for the peer"
+check must be sampled **after that peer's own next pump**; read before it, the
+observable cannot be non-zero whatever the relay did. And a reader for
+`host.queue.Clear()` needs **exactly one** backlog record: with three, the
+uncleared backlog re-overflows the delivery queue and a second repair masks the
+defect behind a plausible-looking reset.
+
+**A sequence is not a count, and a fixture must make them different numbers.**
+Every contiguity assertion here uses sequences well above the number of records
+delivered (11 vs 2, 14/13/12 vs 4/3/2, 65 vs 5), because a mutant naming
+`forwarded` instead of `lastContiguous` is invisible in any fixture where the two
+coincide. Four readers had that collision and all four were changed.
+
+**`Unsubscribe` is the third "only that one" claim** and it is read in its own
+right: a mutant closing every binding of the session passed the whole module
+while the only case calling it held a single binding.
+
+### `A7.2-sole-demand-holder`: one demand holder per session, and it is `Demand`
+
+`Bindings.Release` only unbinds on the **last** release, because it counts. A
+second holder therefore makes a release decrement without unbinding,
+`route.bound` stays true, and `routeLocked` hands the next caller a route nobody
+re-read from the registry — precisely the state a repair exists to leave behind.
+
+The decision is that the invariant is **one holder**, not that `Release` becomes
+owner-aware, and the reason is that owner-awareness **would not fix it**: two
+holders means the route legitimately outlives one holder's release, so the
+stale-adoption window is a property of there being two, not of the counting.
+Owner-awareness would also require `Bindings` to carry a second identity concept
+beside `BindingKey` and to take an owner token on a seam A4.3 deliberately kept
+in Core's vocabulary.
+
+So the repair plane takes **no** demand. `Demand.Rebind` is the seam instead: a
+release then an acquire, the same two statements a poll runs, leaving the
+subscriber count unchanged. `Bindings.Deliver`'s doc, which used to instruct a
+caller to bracket a delivery with `Acquire`/`Release`, is **corrected** in place
+— that instruction is the hazard.
+
+Two readers. `TestASecondHolderOfTheRoutingTablesDemandMakesARebindStale`
+records the hazard by asserting the defective outcome, with a message telling a
+later reader to re-read the argument before deleting it.
+`TestTheRoutingTablesDemandIsHeldOnlyByTheDemandPlane` is the structural half,
+and its subject is the **module**, in two arms: inside `internal/routing` every
+demand-taking reference must sit in a method on `*Demand`, and any *other*
+production file that imports the package may not name `Acquire` or `Release` at
+all.
+
+**The second arm exists because the first version's scope claim was false**, and
+a gate proved it. `internal/` bars other *modules*, not other packages of this
+one, and `Bindings`, `NewBindings`, `Acquire` and `Release` are all **exported**
+— so a second holder one package over compiled and passed everything, and that
+is precisely the shape A9.1's composition has, since the composition root is what
+hands a `*Bindings` to anything. The second arm is deliberately wider than the
+hazard; wider is the safe direction for a ban, and if A9.1 legitimately needs one
+of those names it fails loudly and a human re-reads the argument.
+
+**The unit is the SELECTOR, not the call.** `take := b.Acquire` is a method
+*value* with no call expression to match, and it was the cheapest spelling of the
+hazard and escaped a call-keyed scan. Matching every `.Acquire`/`.Release`
+selector covers calls, method values and method expressions in one rule. The
+import path is **derived end to end and then checked against the compiler**: the
+module half from `go.mod`, the package half from `filepath.Rel`, and the result
+against `reflect.TypeOf(Demand{}).PkgPath()`. Deriving alone was not enough, and
+the difference is worth keeping: the module arm reaches zero files today, so a
+*wrong* import path is invisible in its result — "0 elsewhere importing it" is
+the expected value either way — and the arm's own fixture control is built from
+the same function, so both sides move together. `PkgPath` is the import path the
+linked binary was built with, so requiring the two derivations to agree turns a
+corruption of either into a present-tense failure instead of a silently vacuous
+arm. **This is the third correction of that class in this repository.** Three
+anti-vacuity arms, a seven-case fixture control and an import-detection control;
+the module arm reaches zero files today and the test **logs** that too. What it still cannot see is a call
+through a func value reached from a field, map or slice, and a wrapper spelled
+some other name.
+
 ## Not implemented yet
 
 A2.4 implements `/objects/{oid}` and `/objects/{oid}/metadata` in the internal
@@ -1660,8 +1904,9 @@ and the router it builds carries an empty launch `Department`, a nil
 `ObjectPolicy` and no object-store resolver -- each fails closed. There is no
 default verifier option, because a deployment supplies the `Verifier` and there
 is no credible default for one. `internal/realtime` holds the ClientLink engine
-(A6.1), the HostLink pool and dialer (A7.1) and the pinned transport spike
-(A5.1); none of the three is composed by `factory.New`. `cmd/factory` and `internal/placement/kubernetes` do not
+(A6.1), the HostLink pool and dialer (A7.1), the bounded delivery queue (A7.3)
+and the pinned transport spike (A5.1); none of the four is composed by
+`factory.New`, and neither is `routing.Relay`. `cmd/factory` and `internal/placement/kubernetes` do not
 exist; their exemptions grant nothing today and `TestBoundaryScopesAreNotStale`
 will fail if one of those directories appears without a Go file in it. Do not
 add a placeholder Go file to satisfy it: that would permanently satisfy a live

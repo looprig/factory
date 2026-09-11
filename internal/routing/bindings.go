@@ -108,7 +108,9 @@ type Binding struct {
 // an observation arriving at Observe. A lease that changed with nobody pushing
 // an observation leaves a stale route in place until the owning Host refuses
 // what it carries. That is the same fail-closed shape as everything else here
-// — the Host refuses — but it is a refusal, not a repair. Repair is A7.3's.
+// — the Host refuses — but it is a refusal, not a repair. The repair is
+// Relay's, in repair.go: it learns from BELOW that a route is unusable and asks
+// Demand.Rebind for a fresh one rather than waiting for an ownership poll.
 type Bindings struct {
 	resolver Resolver
 	binder   Binder
@@ -215,9 +217,19 @@ func (b *Bindings) Release(ctx context.Context, tenant sessionwire.TenantID, ses
 //
 // It requires demand and does not open a route (ErrNoBinding otherwise), which
 // keeps the demand count the ONLY rule about a binding's lifetime. A caller
-// delivering to a session nobody is watching brackets the delivery with
-// Acquire and Release; the pool's idle window is what keeps that from costing
-// a dial per command.
+// delivering to a session nobody is watching must take demand FIRST -- and it
+// must take it through Demand, not here.
+//
+// THAT IS A CORRECTION, and the earlier wording is the hazard A7.3 settled.
+// This paragraph used to say "brackets the delivery with Acquire and Release",
+// which instructs a caller to become a SECOND holder of this table's demand.
+// Release only unbinds on the last release, so while a second holder exists a
+// release decrements without unbinding, route.bound stays true, and
+// routeLocked hands the next caller a route nobody re-read from the registry.
+// The invariant is one holder per session and it is Demand; see Demand.Rebind
+// for the whole argument and TestTheRoutingTablesDemandIsHeldOnlyByTheDemandPlane
+// for the guard. The pool's idle window is still what keeps a bracketed
+// delivery from costing a dial per command.
 //
 // A session whose binding was invalidated is rebound here first, so the
 // command is REDELIVERED to the new owner (A4.3 step 2) rather than dropped
@@ -228,7 +240,7 @@ func (b *Bindings) Release(ctx context.Context, tenant sessionwire.TenantID, ses
 // A delivery FAILURE is reported unchanged and changes nothing. This table
 // cannot tell a lost connection from a Host's refusal, and dropping the route
 // on either would turn one failure into a rebind storm without having
-// delivered anything. Per-binding repair is A7.3's, above the transport.
+// delivered anything. Per-binding repair is Relay's, above the transport.
 func (b *Bindings) Deliver(ctx context.Context, tenant sessionwire.TenantID, session sessionwire.SessionID, delivery sessionwire.HostLinkCommandDelivery) error {
 	key := sessionKey{tenant: tenant, session: session}
 
