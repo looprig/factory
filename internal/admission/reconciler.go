@@ -364,14 +364,24 @@ func (r *Reconciler) page(ctx context.Context, shard int, result *SweepResult, h
 
 // settle decides one due row and, if it may, settles it.
 //
-// THE "ONLY" IN STEP 3 IS THE PREDICATE'S, AND IT IS CHECKED TWICE. settleable
-// refuses a row this reconciler has no licence for BEFORE any claim or write,
-// so an unsafe row costs the page it arrived on and nothing else -- and
-// SessionStore then refuses the same row again on its own terms, because the
-// claim rule and the evidence rule are properties of the record that a
-// reconciler restating them could get wrong. The two are not redundant: the
-// apply-deadline half has only ONE authority, since RejectCommand deliberately
-// does not check a deadline, while the claim and evidence halves have two.
+// THE "ONLY" IN STEP 3 IS THE PREDICATE'S. settleable refuses a row this
+// reconciler has no licence for BEFORE any claim or write, so an unsafe row
+// costs the page it arrived on and nothing else.
+//
+// EACH HALF OF THE RULE HAS A DIFFERENT NUMBER OF AUTHORITIES, and the count is
+// worth stating exactly rather than as "checked twice":
+//
+//   - the APPLY DEADLINE has exactly one, this predicate. RejectCommand
+//     deliberately checks no deadline -- only the claiming transitions do -- so
+//     nothing downstream would catch a mistake here.
+//   - the CLAIM has two. This predicate refuses a live claim, and RejectCommand
+//     refuses it again on the record's own terms (InboxErrorClaimHeld), which
+//     is what makes a restatement here safe to get wrong.
+//   - the APPLICATION EVIDENCE has exactly one, and it is NOT this package.
+//     Nothing here reads a journal. The check is not removed, it is left inside
+//     RejectCommand, where it runs against the record in the same operation
+//     that writes it rather than being read here and then going stale between
+//     the read and the write.
 func (r *Reconciler) settle(
 	ctx context.Context,
 	entry sessionstore.InboxEntry,
@@ -533,10 +543,17 @@ func (r *Reconciler) release(ctx context.Context, held map[sessionKey]bool, resu
 // is safe: every arm below DispositionSettleable refuses, so no reordering can
 // admit a row. It is written state-first because the state is the coarsest
 // question and an applying record is the one whose settlement belongs to
-// somebody else entirely, and the claim is asked before the deadline because
-// "a Host is working on it now" is the more specific fact about a row for
-// which both are true. That last choice is the one an ordering mutation can
-// reach, so the predicate table pins it with the case that distinguishes it.
+// somebody else entirely.
+//
+// The claim is asked before the deadline, and that choice is BEHAVIOUR-NEUTRAL
+// rather than an improvement: the only row the two orders disagree about is one
+// whose claim is live AND whose deadline is still open, and such a row cannot
+// reach this predicate in production, because inboxDue files it at
+// min(ApplyDeadline, Claim.ExpiresAt) and so it is not due at either bound.
+// Both orders refuse it, and only the reported REASON differs. It is pinned by
+// the predicate table anyway -- a unit-level pin on an unreachable case -- so
+// the order is not a degree of freedom nothing reads; it is not a claim that
+// the other order would have been wrong.
 //
 // The claim's liveness is spelled as SessionStore's claimHeldAt spells it --
 // half-open, live up to but not including the expiry -- and the zero-claim

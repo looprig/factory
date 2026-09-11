@@ -67,7 +67,7 @@ import (
 //   - F is decided before any of the others and short-circuits the call, so it
 //     is one axis crossed with "everything else", not with each of them.
 //
-// What that leaves is 13 reachable predicate points (TestTheSafetyPredicate...),
+// What that leaves is 14 reachable predicate points (TestTheSafetyPredicate...),
 // the two evidence outcomes over the real journal, three reconciliation-claim
 // states and two callers. The eight named scenarios are noted against the tests
 // that drive them in each test's own comment.
@@ -122,6 +122,15 @@ type countingStore struct {
 
 	store *sessionstore.Store
 
+	// pageBudget, when positive, fails every ListDueCommands after the first
+	// pageBudget of them.
+	//
+	// faultInjector cannot express this: it fails a method from the FIRST call,
+	// which is why the whole suite had no case where a sweep failed while
+	// holding a claim -- the one state the release-on-every-path decision is
+	// about. A budget is the smallest thing that reaches it.
+	pageBudget int
+
 	mu    sync.Mutex
 	calls map[string]int
 }
@@ -172,6 +181,9 @@ func (c *countingStore) ListDueCommands(ctx context.Context, req sessionstore.Li
 	c.note("ListDueCommands")
 	if err := c.enter("ListDueCommands"); err != nil {
 		return sessionstore.DueCommandPage{}, err
+	}
+	if c.pageBudget > 0 && c.count("ListDueCommands") > c.pageBudget {
+		return sessionstore.DueCommandPage{}, errInjectedFault
 	}
 	return c.store.ListDueCommands(ctx, req)
 }
@@ -249,8 +261,16 @@ type sweepFixture struct {
 // can be compared against.
 func newSweepFixture(t *testing.T, shards int) *sweepFixture {
 	t.Helper()
+	return newSweepFixtureWith(t, shards, nil)
+}
+
+// newSweepFixtureWith is newSweepFixture with the replica's configuration
+// adjusted. It exists for the cases that need a page SMALLER than the due work,
+// which is the only way to reach a second page read over a real store.
+func newSweepFixtureWith(t *testing.T, shards int, tune func(*ReconcilerConfig)) *sweepFixture {
+	t.Helper()
 	store, clock := openSweepStore(t, shards)
-	return newSweepReplica(t, store, clock, "replica-a")
+	return newSweepReplicaWith(t, store, clock, "replica-a", tune)
 }
 
 // openSweepStore opens a real store on memstore and returns it WITH the clock
@@ -283,12 +303,27 @@ func (c sweepStoreClock) Now() time.Time { return c.clock.Now() }
 
 func newSweepReplica(t *testing.T, store *sessionstore.Store, clock *sweepClock, holder string) *sweepFixture {
 	t.Helper()
+	return newSweepReplicaWith(t, store, clock, holder, nil)
+}
+
+func newSweepReplicaWith(
+	t *testing.T,
+	store *sessionstore.Store,
+	clock *sweepClock,
+	holder string,
+	tune func(*ReconcilerConfig),
+) *sweepFixture {
+	t.Helper()
 	seam := newCountingStore(store)
 	auth := &sweepAuthorizer{}
-	rec, err := NewReconciler(ReconcilerConfig{
+	config := ReconcilerConfig{
 		Authorizer: auth, Due: seam, Settlement: seam, Claims: seam, Clock: clock,
 		HolderID: holder, ClaimTTL: time.Minute, PageLimit: 32, MaxPages: 4,
-	})
+	}
+	if tune != nil {
+		tune(&config)
+	}
+	rec, err := NewReconciler(config)
 	if err != nil {
 		t.Fatalf("NewReconciler: %v", err)
 	}
@@ -1503,6 +1538,269 @@ func TestSweepCostFollowsFixedShardsAndDueWorkNotTenantsOrTerminalHistory(t *tes
 	}
 }
 
+// TestTheQueryCounterMatchesTheSeamOnAPassThatExercisesEverySite closes the
+// hole a gate found in the instrument itself, and the hole is worth naming
+// because it is the shape a cost claim fails in.
+//
+// SweepResult.Queries is incremented at FOUR sites -- the due page, the claim
+// acquisition, the settlement and the release -- and step 4's whole for-all is
+// read through it. The cross-check that made it trustworthy ran only on a
+// QUIET pass, where exactly one of the four executes, so deleting any of the
+// other three left the suite green and the counter silently short. A cost
+// observable with three unread increments is an assertion, not a measurement.
+//
+// So this pass is required to have RUN every site before the totals are
+// compared: each of the four seam methods must have a nonzero count, which is
+// what stops the cross-check from quietly narrowing again if a later change
+// stops one of them happening.
+func TestTheQueryCounterMatchesTheSeamOnAPassThatExercisesEverySite(t *testing.T) {
+	f := newSweepFixture(t, 4)
+	const sessions = 12
+	for i := range sessions {
+		// Three tenants, so the pass crosses the shard boundary the same way a
+		// real deployment does rather than piling one tenant into one shard.
+		tenant := sessionwire.TenantID(fmt.Sprintf("tenant-%d", i%3))
+		f.admit(tenant, fmt.Sprintf("session-%02d", i), fmt.Sprintf("command-%02d", i), sweepBase.Add(time.Minute))
+	}
+	f.clock.Set(sweepBase.Add(time.Hour))
+
+	results := f.pass()
+	if got := totalRejected(results); got != sessions {
+		t.Fatalf("the busy pass settled %d of %d rows, so it is not the pass this measures", got, sessions)
+	}
+	// Anti-vacuity, per site. Without this the comparison below is satisfied by
+	// a pass that never reached three of the four counters -- which is exactly
+	// the state that shipped.
+	for _, method := range []string{
+		"ListDueCommands", "AcquireReconciliationClaim", "RejectCommand", "ReleaseReconciliationClaim",
+	} {
+		if f.seam.count(method) == 0 {
+			t.Fatalf("this pass never called %s, so it cannot cross-check that counter site", method)
+		}
+	}
+	if got, want := totalQueries(results), f.seam.providerQueries(); got != want {
+		t.Fatalf("the result reports %d queries and the seam counted %d; the counter has drifted "+
+			"(per method: pages %d, acquisitions %d, settlements %d, releases %d)",
+			got, want,
+			f.seam.count("ListDueCommands"), f.seam.count("AcquireReconciliationClaim"),
+			f.seam.count("RejectCommand"), f.seam.count("ReleaseReconciliationClaim"))
+	}
+	// The same identity stated from the other side, so a pair of compensating
+	// errors -- one site over-counting and another under-counting -- cannot
+	// satisfy the totals comparison. Each site is named.
+	composed := f.seam.count("ListDueCommands") + f.seam.count("AcquireReconciliationClaim") +
+		f.seam.count("RejectCommand") + f.seam.count("ReleaseReconciliationClaim")
+	if totalQueries(results) != composed {
+		t.Fatalf("the counter totals %d and its four named sites total %d", totalQueries(results), composed)
+	}
+}
+
+// TestAFailedSweepStillReleasesTheClaimsItTook reads the decision the release
+// site's comment states and the three-question table answered Q3 with: the
+// release runs on EVERY path, including the failing one.
+//
+// Nothing read it. Every failing case in the suite failed the FIRST page read,
+// so no claim was ever held when a sweep errored -- the claim was vacuous
+// exactly where the decision applies. Returning early on a page error survived,
+// stranding claims for the whole TTL, which is the harm the production comment
+// names.
+//
+// Reaching it needs a page SMALLER than the shard's due work and a failure on
+// the SECOND read, so the first page has already taken a claim.
+func TestAFailedSweepStillReleasesTheClaimsItTook(t *testing.T) {
+	f := newSweepFixtureWith(t, 1, func(c *ReconcilerConfig) {
+		c.PageLimit = 1
+		c.MaxPages = 8
+	})
+	for i := range 3 {
+		f.admit(sweepTenant, fmt.Sprintf("session-%02d", i), fmt.Sprintf("command-%02d", i), sweepBase.Add(time.Minute))
+	}
+	f.clock.Set(sweepBase.Add(time.Hour))
+	f.seam.pageBudget = 1
+
+	result, err := f.rec.Sweep(context.Background(), f.service)
+	if err == nil {
+		t.Fatal("the second page read was configured to fail and the sweep succeeded")
+	}
+	// Anti-vacuity: without a claim in hand at the moment of the failure this
+	// case says nothing, and that is precisely how the shipped suite missed it.
+	if result.Claimed == 0 {
+		t.Fatal("the sweep failed before taking any claim, so the release path is untested here")
+	}
+	if result.Released != result.Claimed {
+		t.Fatalf("a failing sweep took %d claims and released %d; the rest are stranded for the whole TTL",
+			result.Claimed, result.Released)
+	}
+	// The positive observable in the store, not only on the result: the claim
+	// this replica took is no longer live, so another replica may take the work
+	// immediately rather than waiting out a horizon.
+	for i := range 3 {
+		session := sessionwire.SessionID(fmt.Sprintf("session-%02d", i))
+		entry, err := f.store.GetReconciliationClaim(context.Background(), sessionstore.GetReconciliationClaimRequest{
+			TenantID: sweepTenant, SessionID: session,
+		})
+		if err == nil && entry.Claim.HolderID == "replica-a" {
+			t.Errorf("%s is still claimed by the replica whose sweep failed, until %v", session, entry.Claim.ExpiresAt)
+		}
+	}
+}
+
+// TestADeferredSessionsRowsCostOneAcquisition reads the DEFERRAL half of the
+// per-session claim memo.
+//
+// Its other half is read by the test below: four rows of one session whose
+// claim this replica WINS cost one acquisition. The losing half was unread, and
+// it is the half a busy deployment spends its time in -- a deferring replica
+// re-asking per row pays N acquisitions for N rows of one session, which is a
+// step-4 cost regression on exactly the path contention creates.
+func TestADeferredSessionsRowsCostOneAcquisition(t *testing.T) {
+	f := newSweepFixture(t, 1)
+	for i := range 4 {
+		f.admit(sweepTenant, "session-a", fmt.Sprintf("command-%02d", i), sweepBase.Add(time.Minute))
+	}
+	// Another replica is working on this session now. MaxReconciliationClaimTTL
+	// is five minutes, so the horizon is placed inside it and the sweep runs
+	// before it lapses.
+	if _, err := f.store.AcquireReconciliationClaim(context.Background(), sessionstore.AcquireReconciliationClaimRequest{
+		TenantID: sweepTenant, SessionID: "session-a", HolderID: "replica-other",
+		ExpiresAt: sweepBase.Add(4 * time.Minute),
+	}); err != nil {
+		t.Fatalf("AcquireReconciliationClaim: %v", err)
+	}
+	f.clock.Set(sweepBase.Add(2 * time.Minute))
+
+	results := f.pass()
+	deferred := 0
+	for _, result := range results {
+		deferred += result.Dispositions[DispositionDeferred]
+	}
+	if deferred != 4 || totalRejected(results) != 0 {
+		t.Fatalf("four rows behind another replica's claim gave %d deferrals and %d settlements",
+			deferred, totalRejected(results))
+	}
+	if got := f.seam.count("AcquireReconciliationClaim"); got != 1 {
+		t.Errorf("four deferred rows of one session cost %d claim acquisitions, want 1", got)
+	}
+	if got := f.seam.count("ReleaseReconciliationClaim"); got != 0 {
+		t.Errorf("a deferring sweep released %d claims it never took", got)
+	}
+}
+
+// TestTheSettledRejectionIsNotAdvertisedRetryable reads a client-visible
+// decision that had a reason written beside it and no assertion anywhere.
+//
+// Retrying THIS command id cannot succeed -- the record is terminal and a retry
+// returns the rejection -- so advertising it retryable would send a client into
+// a loop. Resubmitting the work under a NEW command id remains available and is
+// a different request. The message is empty for the reason every other refusal
+// in this package carries none: core makes message optional and code the member
+// a client branches on.
+func TestTheSettledRejectionIsNotAdvertisedRetryable(t *testing.T) {
+	f := newSweepFixture(t, 4)
+	f.admit(sweepTenant, "session-a", "command-a", sweepBase.Add(time.Minute))
+	f.clock.Set(sweepBase.Add(time.Hour))
+
+	if got := totalRejected(f.pass()); got != 1 {
+		t.Fatalf("the command was not settled: %d", got)
+	}
+	record := f.record(sweepTenant, "session-a", "command-a")
+	if record.Rejection == nil {
+		t.Fatal("the settled record carries no rejection")
+	}
+	if record.Rejection.Retryable {
+		t.Error("the settled rejection is advertised retryable; retrying this command id returns the rejection forever")
+	}
+	if record.Rejection.Message != "" {
+		t.Errorf("the settled rejection carries the message %q; the code is the member a client branches on", record.Rejection.Message)
+	}
+	if record.Rejection.Code != sessionwire.ErrorCodeRuntimeUnavailable {
+		t.Errorf("the settled rejection's code is %q", record.Rejection.Code)
+	}
+}
+
+// TestCostFollowsTheShardCountAcrossEveryConfiguredCount is step 4's for-all on
+// the axis the cost claim is actually ABOUT, and which the original measurement
+// held fixed at four.
+//
+// "Cost follows fixed shards" is a statement about the shard count, so it is
+// measured at six of them rather than demonstrated at one. The floor is exact
+// and not a bound: a quiet pass is one page per shard, so the count IS the
+// cost, and a reconciler that read two pages per shard or one page per pass
+// would disagree at every point but four.
+func TestCostFollowsTheShardCountAcrossEveryConfiguredCount(t *testing.T) {
+	for _, shards := range []int{1, 2, 3, 5, 8, 16} {
+		t.Run(fmt.Sprintf("%d shards", shards), func(t *testing.T) {
+			f := newSweepFixture(t, shards)
+			f.clock.Set(sweepBase.Add(time.Hour))
+			results := f.pass()
+			if got := totalQueries(results); got != shards {
+				t.Fatalf("a quiet pass over %d shards cost %d queries", shards, got)
+			}
+			if seen := f.seam.providerQueries(); seen != shards {
+				t.Fatalf("the seam counted %d queries over %d shards", seen, shards)
+			}
+			if len(results) != shards {
+				t.Fatalf("the pass made %d sweeps over %d shards", len(results), shards)
+			}
+		})
+	}
+}
+
+// TestCostDoesNotFollowPerSessionTerminalDepth varies terminal history WITHIN
+// one session rather than across sessions.
+//
+// The original measurement spread 200 settled commands over 200 sessions, which
+// leaves the reading open to a reconciler whose cost is per SESSION rather than
+// per due row. One session carrying 300 settled commands separates them: if
+// anything here enumerated a session's inbox, this is where it would show.
+func TestCostDoesNotFollowPerSessionTerminalDepth(t *testing.T) {
+	measure := func(t *testing.T, name string, commands int) int {
+		t.Helper()
+		var cost int
+		t.Run(name, func(t *testing.T) {
+			f := newSweepFixture(t, 4)
+			for i := range commands {
+				f.admit(sweepTenant, "session-deep", fmt.Sprintf("command-%03d", i), sweepBase.Add(time.Minute))
+			}
+			f.clock.Set(sweepBase.Add(time.Hour))
+			// Passes until the shard is drained. One pass is bounded at
+			// MaxPages*PageLimit rows, which is the periodic bound working:
+			// 300 due rows in one shard take several passes, and that is the
+			// point of the bound rather than a defect in this arrangement.
+			settled := 0
+			for range 16 {
+				moved := totalRejected(f.pass())
+				settled += moved
+				if moved == 0 {
+					break
+				}
+			}
+			if settled != commands {
+				t.Fatalf("the arranging passes settled %d of %d commands", settled, commands)
+			}
+			f.seam.reset()
+			results := f.pass()
+			if got := totalRejected(results); got != 0 {
+				t.Fatalf("the measured pass still had %d due rows", got)
+			}
+			cost = totalQueries(results)
+			if seen := f.seam.providerQueries(); seen != cost {
+				t.Fatalf("the result reports %d queries and the seam counted %d", cost, seen)
+			}
+		})
+		return cost
+	}
+
+	shallow := measure(t, "one settled command in the session", 1)
+	deep := measure(t, "three hundred settled commands in the session", 300)
+	if shallow != 4 {
+		t.Fatalf("a quiet pass over four shards cost %d queries", shallow)
+	}
+	if deep != shallow {
+		t.Errorf("the cost moved with one session's terminal depth: %d at one command, %d at three hundred", shallow, deep)
+	}
+}
+
 // TestOneSessionsDueCommandsCostOneClaimAndOneRelease is the other half of "cost
 // follows current due work": due work is counted in ROWS for the settlement and
 // in SESSIONS for the claim, because the claim is per session and a page
@@ -1610,6 +1908,31 @@ func unclassifiedSettlementCodes() map[sessionstore.InboxErrorCode]string {
 //
 // It resolves the module from this module's own build rather than from a path
 // somebody wrote down, so the source it reads is the source the build resolves.
+//
+// # The unit of analysis, stated as what it can actually SEE
+//
+// A gate found this scan's stated reach wider than its real reach, which is the
+// fourth source-parsing guard in this workspace to have a hole found on first
+// review, so the boundary is written from what scanStringConstants keys on
+// rather than from what it is for:
+//
+//   - The subject is ONE named file. A code declared in another file of the
+//     pinned module is outside the derivation entirely, and nothing here can
+//     report that -- the anti-vacuity floor still sees the other codes.
+//   - The subject is a CONST declaration. A `var` block of the same type is
+//     invisible, and TestTheConstantScanReportsWhatItCannotRead measures that
+//     rather than leaving it promised.
+//   - A value this scan cannot READ is a HARD FAILURE naming itself, not a
+//     silent drop. A concatenation, a call, a reference to another constant and
+//     an implicit repetition each produce a report, because under-inclusion is
+//     the dangerous direction: it shrinks the derived subject while every floor
+//     stays satisfied.
+//
+// What remains outside, and its bound: a code added to another file or as a
+// `var` is absent from the subject and this cannot say so. The blast radius is
+// bounded by settlementRefusal being FAIL-CLOSED -- such a code becomes a fault
+// and stops the sweep -- so the residue is a spurious sweep failure, never a
+// settlement this reconciler had no licence for.
 func declaredStringConstants(t *testing.T, file, typeName string) []string {
 	t.Helper()
 
@@ -1618,8 +1941,38 @@ func declaredStringConstants(t *testing.T, file, typeName string) []string {
 	if err != nil {
 		t.Fatalf("parse the pinned %s: %v", file, err)
 	}
-	var out []string
-	for _, decl := range parsed.Decls {
+	scan := scanStringConstants(parsed, typeName)
+	if len(scan.unreadable) != 0 {
+		t.Fatalf("the pinned %s declares %d constant(s) of type %s this scan cannot read:\n\t%s\n"+
+			"Each is silently ABSENT from the derived subject while every anti-vacuity floor stays "+
+			"satisfied, so the scan fails here rather than reporting a subject it knows is short",
+			file, len(scan.unreadable), typeName, strings.Join(scan.unreadable, "\n\t"))
+	}
+	if len(scan.values) == 0 {
+		t.Fatalf("no %s constants were found in the pinned %s; the parse is broken", typeName, file)
+	}
+	slices.Sort(scan.values)
+	return scan.values
+}
+
+// constantScan is one file's readable constants of a named string type,
+// together with a report of every declaration of that type the scan could not
+// read.
+type constantScan struct {
+	values     []string
+	unreadable []string
+}
+
+// scanStringConstants is the parse, separated from the file so it can be driven
+// against sources a pinned module does not contain.
+//
+// The carried type follows Go's own rule and is ENDED by an untyped
+// declaration, so `const ( A T = "a"; B = "b" )` does not report B as a T. The
+// previous version carried it and over-included; that direction is fail-safe,
+// but a scan whose reach nobody can state is the thing being fixed.
+func scanStringConstants(file *ast.File, typeName string) constantScan {
+	var scan constantScan
+	for _, decl := range file.Decls {
 		gen, ok := decl.(*ast.GenDecl)
 		if !ok || gen.Tok != token.CONST {
 			continue
@@ -1630,30 +1983,138 @@ func declaredStringConstants(t *testing.T, file, typeName string) []string {
 			if !ok {
 				continue
 			}
-			if ident, named := value.Type.(*ast.Ident); named {
+			switch {
+			case value.Type != nil:
+				ident, named := value.Type.(*ast.Ident)
+				if !named {
+					// A qualified or composite type is not this one, and
+					// carrying the previous name past it would be a guess.
+					declaredType = ""
+					continue
+				}
 				declaredType = ident.Name
+			case len(value.Values) > 0:
+				declaredType = ""
 			}
 			if declaredType != typeName {
+				continue
+			}
+			names := specNames(value)
+			if len(value.Values) == 0 {
+				scan.unreadable = append(scan.unreadable,
+					names+" repeats the previous expression, which this scan does not evaluate")
 				continue
 			}
 			for _, expr := range value.Values {
 				lit, ok := expr.(*ast.BasicLit)
 				if !ok || lit.Kind != token.STRING {
+					scan.unreadable = append(scan.unreadable,
+						names+" is not a plain string literal, so its value cannot be read without evaluation")
 					continue
 				}
 				unquoted, err := strconv.Unquote(lit.Value)
 				if err != nil {
-					t.Fatalf("unquote %s: %v", lit.Value, err)
+					scan.unreadable = append(scan.unreadable, names+" is a string literal this scan cannot unquote")
+					continue
 				}
-				out = append(out, unquoted)
+				scan.values = append(scan.values, unquoted)
 			}
 		}
 	}
-	if len(out) == 0 {
-		t.Fatalf("no %s constants were found in the pinned %s; the parse is broken", typeName, file)
+	return scan
+}
+
+func specNames(value *ast.ValueSpec) string {
+	names := make([]string, 0, len(value.Names))
+	for _, ident := range value.Names {
+		names = append(names, ident.Name)
 	}
-	slices.Sort(out)
-	return out
+	return strings.Join(names, ", ")
+}
+
+// TestTheConstantScanReportsWhatItCannotRead is the derivation's own control,
+// and it is the part that was missing: a scan attacked only with the real
+// pinned file reports the same answer whether it works or is stuck, and a
+// silently short subject satisfies every floor above it.
+//
+// The pairs are controlled -- each synthetic source differs from the accepted
+// one in exactly the construct under test.
+func TestTheConstantScanReportsWhatItCannotRead(t *testing.T) {
+	t.Parallel()
+
+	const typeName = "Code"
+	for _, test := range []struct {
+		name       string
+		source     string
+		values     []string
+		unreadable int
+	}{
+		{
+			name:   "the accepted form",
+			source: "package p\ntype Code string\nconst (\n\tA Code = \"a\"\n\tB Code = \"b\"\n)\n",
+			values: []string{"a", "b"},
+		},
+		{
+			name:       "a concatenation is reported, not dropped",
+			source:     "package p\nconst prefix = \"x\"\nconst (\n\tA Code = \"a\"\n\tB Code = prefix + \"b\"\n)\n",
+			values:     []string{"a"},
+			unreadable: 1,
+		},
+		{
+			name:       "a reference to another constant is reported",
+			source:     "package p\nconst other = \"o\"\nconst (\n\tA Code = other\n)\n",
+			unreadable: 1,
+		},
+		{
+			name:       "an implicit repetition is reported",
+			source:     "package p\nconst (\n\tA Code = \"a\"\n\tB\n)\n",
+			values:     []string{"a"},
+			unreadable: 1,
+		},
+		{
+			name:   "an untyped declaration ends the carried type",
+			source: "package p\nconst (\n\tA Code = \"a\"\n\tB = \"b\"\n)\n",
+			values: []string{"a"},
+		},
+		{
+			name:   "a var block of the same type is OUTSIDE the subject",
+			source: "package p\nvar (\n\tA Code = \"a\"\n)\n",
+		},
+		{
+			name:   "another type in the same file is not this one",
+			source: "package p\nconst (\n\tA Other = \"a\"\n)\n",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			parsed, err := parser.ParseFile(token.NewFileSet(), "probe.go", test.source, 0)
+			if err != nil {
+				t.Fatalf("parse the probe: %v", err)
+			}
+			scan := scanStringConstants(parsed, typeName)
+			if !slices.Equal(scan.values, test.values) {
+				t.Errorf("values = %q, want %q", scan.values, test.values)
+			}
+			if len(scan.unreadable) != test.unreadable {
+				t.Errorf("unreadable = %q, want %d entries", scan.unreadable, test.unreadable)
+			}
+		})
+	}
+
+	// The positive control over the REAL subject: the pinned file this
+	// derivation actually reads has nothing the scan cannot read, so the hard
+	// failure above is not merely latent.
+	dir := sessionstoreSourceDir(t)
+	parsed, err := parser.ParseFile(token.NewFileSet(), filepath.Join(dir, "errors.go"), nil, 0)
+	if err != nil {
+		t.Fatalf("parse the pinned errors.go: %v", err)
+	}
+	scan := scanStringConstants(parsed, "InboxErrorCode")
+	if len(scan.unreadable) != 0 {
+		t.Errorf("the pinned errors.go has %d unreadable InboxErrorCode declarations: %q", len(scan.unreadable), scan.unreadable)
+	}
+	if len(scan.values) < 10 {
+		t.Errorf("the pinned errors.go yielded %d InboxErrorCode values; the control is broken", len(scan.values))
+	}
 }
 
 // pinnedSessionstoreVersion is the sessionstore version this module's go.mod
