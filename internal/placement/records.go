@@ -27,11 +27,20 @@ var ErrInvalidSweeperConfig = errors.New("placement: invalid record sweeper conf
 // whole structural claim of the target half. SessionStore revalidates every due
 // row against that row's OWN STORED EXPIRY at a fresh clock reading and closes
 // the write with a compare-and-swap onto the revision the due page reported
-// (sessionstore@v0.4.0/host_targets.go:1631 reconcileHostTargetRow). A Host
-// that heartbeated after the page was read therefore either presents an
-// unlapsed expiry, in which case the sweep leaves it alone, or has already
-// advanced the revision, in which case the write loses. Factory must not
-// re-derive that judgement: a due observation this side of the seam is a hint
+// (sessionstore@v0.4.0/host_targets.go:1631 reconcileHostTargetRow).
+//
+// THE TWO MECHANISMS CATCH DIFFERENT HEARTBEATS, and the distinction was stated
+// wrongly here before. reconcileHostTargetRow takes the due page's FROZEN BYTES
+// (stored storage.OrderedRecord) and NEVER RE-READS THE ROW; only the clock it
+// compares against is fresh. So a heartbeat that landed AFTER the page was read
+// cannot present an unlapsed expiry to the revalidation at all -- its only
+// catcher is the compare-and-swap, which loses against the revision that
+// heartbeat advanced. The expiry revalidation catches the EARLIER landing: one
+// already carried in the page's bytes when they were captured, which a weakly
+// consistent due view can still name as due.
+//
+// The conclusion is unchanged and rests on the pair: Factory must not re-derive
+// that judgement, because a due observation this side of the seam is a hint
 // about which rows to LOOK at and is never evidence that a Host is gone.
 type TargetSweep interface {
 	ReconcileHostTargets(context.Context, sessionstore.ReconcileHostTargetsRequest) (sessionstore.HostTargetReconcileResult, error)

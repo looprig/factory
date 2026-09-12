@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"reflect"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -288,14 +290,32 @@ func TestARenewedAdvertisementIsNotRemovedByAnOldDueObservation(t *testing.T) {
 	if result.Unranked != 1 {
 		t.Fatalf("sweep = %+v, want exactly the crashed Host unranked", result)
 	}
-	// The renewed row was SAVED, by one of the two mechanisms that save one.
-	// Which of them wins is a property of when the heartbeat landed relative to
-	// the page's bytes -- Retained when the page already carried the fresh
-	// expiry, Contended when it carried the stale one and the compare-and-swap
-	// then lost -- and both mean the row was not removed. Asserting one of them
-	// specifically would be asserting the injection's timing, not the property.
-	if result.Retained+result.Contended != 1 {
-		t.Fatalf("sweep = %+v, want the renewed row accounted for as saved", result)
+	// The renewed row was SAVED, and in THIS fixture it is always saved by the
+	// compare-and-swap, so the assertion names that mechanism rather than
+	// accepting either.
+	//
+	// The earlier disjunction (Retained+Contended == 1) was justified by
+	// "which of them wins is a timing property". That is true of production
+	// and NOT true here. afterListDue is a synchronous callback on the
+	// fixture's own goroutine: the renewal lands strictly AFTER the due page's
+	// bytes were captured, and reconcileHostTargetRow revalidates those frozen
+	// bytes without re-reading the row, so the expiry it sees is always the
+	// stale one and Retained (the store's StillLive) is UNREACHABLE, not
+	// merely improbable. Measured Contended=1, Retained=0 on every run of both
+	// review gates (5/5 and 25/25).
+	//
+	// What would have to change for the disjunction to be needed: the renewal
+	// would have to be able to land BEFORE the page's bytes are captured and
+	// still be named by the page -- i.e. a weakly consistent due view, or an
+	// asynchronous injection racing ListDue rather than following it. Under
+	// either, Retained becomes reachable and this assertion must widen again.
+	// Retained's own mapping does not depend on this test: it is pinned by
+	// TestAProviderFaultKeepsThePositionTheSweepHadReached.
+	if result.Contended != 1 {
+		t.Fatalf("sweep = %+v, want the renewed row saved by the compare-and-swap", result)
+	}
+	if result.Retained != 0 {
+		t.Fatalf("sweep = %+v, want StillLive unreachable in this synchronous fixture", result)
 	}
 	if capacity, ok := ranked["host-b"]; !ok || capacity != 7 {
 		t.Fatalf("after the sweep the directory ranks %v, want host-b at the RENEWED capacity 7", ranked)
@@ -345,6 +365,13 @@ func TestASweepReportsWhatTheStoreRemovedRatherThanWhatItLookedAt(t *testing.T) 
 	if result.Unranked == result.Scanned {
 		t.Fatalf("sweep = %+v, want Unranked to differ from Scanned when a row was saved", result)
 	}
+	// The five outcomes must account for every scanned row. Be honest about
+	// what this fixture exercises: only Unranked and Contended are nonzero
+	// here, so this checks the sum with three terms at zero. It is not the
+	// reader for the other three mappings -- Retained, Unreadable and
+	// Unverified are each driven nonzero and asserted by
+	// TestAProviderFaultKeepsThePositionTheSweepHadReached, which is where a
+	// mutation replacing any of them with a constant dies.
 	if result.Unranked+result.Retained+result.Contended+result.Unreadable+result.Unverified != result.Scanned {
 		t.Fatalf("sweep = %+v, want the five outcomes to account for every scanned row", result)
 	}
@@ -427,12 +454,27 @@ func TestASweepResumesItsOwnContinuationRatherThanRestartingAtTheHead(t *testing
 type scriptedTargets struct {
 	seen  []sessionwire.Cursor
 	steps []func() (sessionstore.HostTargetReconcileResult, error)
+
+	// bounds records the page bounds each call FORWARDED, which the cursor
+	// alone does not say. Without it Limit and MaxPages are pinned only
+	// against each other: substituting one configured field for the other is
+	// invisible to every assertion, and a fixture whose PageLimit equals its
+	// MaxPages cannot tell them apart even in principle. scriptedSweeper
+	// configures 4 and 2 precisely so the two cannot stand in for one another.
+	bounds []sweepBounds
+}
+
+// sweepBounds is one call's forwarded page budget.
+type sweepBounds struct {
+	Limit    int
+	MaxPages int
 }
 
 func (s *scriptedTargets) ReconcileHostTargets(
 	_ context.Context, req sessionstore.ReconcileHostTargetsRequest,
 ) (sessionstore.HostTargetReconcileResult, error) {
 	s.seen = append(s.seen, req.Cursor)
+	s.bounds = append(s.bounds, sweepBounds{Limit: req.Limit, MaxPages: req.MaxPages})
 	if len(s.seen) > len(s.steps) {
 		return sessionstore.HostTargetReconcileResult{Exhausted: true}, nil
 	}
@@ -500,6 +542,14 @@ func TestARefusedContinuationRearmsTheSweepInsteadOfWedgingIt(t *testing.T) {
 	if !reflect.DeepEqual(targets.seen, want) {
 		t.Fatalf("continuations presented = %v, want %v", targets.seen, want)
 	}
+	// The CONFIGURED bounds, not merely nonzero ones, and not each other:
+	// scriptedSweeper sets PageLimit 4 and MaxPages 2, so a sweeper that
+	// forwarded MaxPages as Limit (or the reverse) fails here. Re-arming the
+	// continuation must not disturb them either.
+	wantBounds := []sweepBounds{{Limit: 4, MaxPages: 2}, {Limit: 4, MaxPages: 2}, {Limit: 4, MaxPages: 2}}
+	if !reflect.DeepEqual(targets.bounds, wantBounds) {
+		t.Fatalf("bounds forwarded = %+v, want %+v", targets.bounds, wantBounds)
+	}
 }
 
 // TestAProviderFaultKeepsThePositionTheSweepHadReached is the control for the
@@ -518,8 +568,17 @@ func TestAProviderFaultKeepsThePositionTheSweepHadReached(t *testing.T) {
 			return sessionstore.HostTargetReconcileResult{Scanned: 4, Withdrawn: 4, NextCursor: "continue-1"}, nil
 		},
 		func() (sessionstore.HostTargetReconcileResult, error) {
+			// EVERY counter is distinct and every one is nonzero. This is
+			// the only place Unreadable and Unverified are driven at all --
+			// the real-store fixtures produce neither, so without this both
+			// mappings could be replaced by the constant 0 undetected, even
+			// though the store genuinely produces both in production (a frame
+			// it could not decode; a withdrawal that committed but failed the
+			// reply checks). Distinct values also mean no two of the six can
+			// be substituted for each other.
 			return sessionstore.HostTargetReconcileResult{
-				Scanned: 2, Withdrawn: 1, StillLive: 1, NextCursor: "continue-2",
+				Scanned: 15, Withdrawn: 1, StillLive: 2, Contended: 3,
+				Unreadable: 4, Unverified: 5, NextCursor: "continue-2",
 			}, &sessionstore.HostTargetError{
 				Code: sessionstore.HostTargetErrorBackend, Field: "list_due",
 			}
@@ -534,7 +593,8 @@ func TestAProviderFaultKeepsThePositionTheSweepHadReached(t *testing.T) {
 	if err == nil {
 		t.Fatalf("second SweepTargets returned no error, want the provider fault")
 	}
-	if failed.Unranked != 1 || failed.Retained != 1 || failed.Scanned != 2 {
+	if failed.Scanned != 15 || failed.Unranked != 1 || failed.Retained != 2 ||
+		failed.Contended != 3 || failed.Unreadable != 4 || failed.Unverified != 5 {
 		t.Fatalf("failed sweep = %+v, want the work it did reported beside the error", failed)
 	}
 	if _, err := sweeper.SweepTargets(context.Background()); err != nil {
@@ -543,6 +603,87 @@ func TestAProviderFaultKeepsThePositionTheSweepHadReached(t *testing.T) {
 	want := []sessionwire.Cursor{"", "continue-1", "continue-2"}
 	if !reflect.DeepEqual(targets.seen, want) {
 		t.Fatalf("continuations presented = %v, want %v", targets.seen, want)
+	}
+	wantBounds := []sweepBounds{{Limit: 4, MaxPages: 2}, {Limit: 4, MaxPages: 2}, {Limit: 4, MaxPages: 2}}
+	if !reflect.DeepEqual(targets.bounds, wantBounds) {
+		t.Fatalf("bounds forwarded = %+v, want %+v", targets.bounds, wantBounds)
+	}
+}
+
+// concurrentTargets is the fake for the CONCURRENCY probe only.
+//
+// It keeps no unsynchronised state of its own -- calls are counted with an
+// atomic and the returned continuation is derived, not stored -- so the ONLY
+// unsynchronised state left in the system under test is RecordSweeper.cursor.
+// That is deliberate: it means a -race report from the test below can come
+// from nothing but the sweeper's own field.
+type concurrentTargets struct {
+	calls atomic.Int64
+}
+
+func (c *concurrentTargets) ReconcileHostTargets(
+	_ context.Context, req sessionstore.ReconcileHostTargetsRequest,
+) (sessionstore.HostTargetReconcileResult, error) {
+	n := c.calls.Add(1)
+	// A NONEMPTY continuation every time, so every call WRITES s.cursor and
+	// every call READS it. A fake returning "" would leave the write storing
+	// the value already there, which is still a data race but a far less
+	// visible one.
+	return sessionstore.HostTargetReconcileResult{
+		Scanned: 1, Withdrawn: 1, NextCursor: sessionwire.Cursor(fmt.Sprintf("continue-%d", n)),
+	}, nil
+}
+
+// TestConcurrentSweepsDoNotTearTheContinuation gives records.go's mutex comment
+// a reader.
+//
+// The comment claims a specific hazard -- "a torn continuation is a Go data
+// race, and the cursor is the only state here" -- and until this test nothing
+// in the suite drove SweepTargets from two goroutines, so removing the
+// Lock/Unlock pair would not have been caught by anything. The claim was wider
+// than its probe.
+//
+// Be exact about what the reader is: it is the RACE DETECTOR, not an
+// assertion. Dropping the mutex does not make any count below wrong
+// deterministically -- a lost cursor update is a legitimate value -- so this
+// test only bites under -race, which is how this repository's checks run it.
+// The count assertion is here to prove the goroutines actually ran, not to
+// detect the tear.
+func TestConcurrentSweepsDoNotTearTheContinuation(t *testing.T) {
+	// NOT t.Parallel. The reader here is the race detector, and a parallel
+	// test lets its report land on whichever test happens to be running, so
+	// the kill stops being attributable to this one.
+	targets := &concurrentTargets{}
+	sweeper := scriptedSweeper(t, targets)
+
+	const goroutines, each = 8, 25
+	var wg sync.WaitGroup
+	wg.Add(goroutines)
+	for i := 0; i < goroutines; i++ {
+		go func() {
+			defer wg.Done()
+			for j := 0; j < each; j++ {
+				if _, err := sweeper.SweepTargets(context.Background()); err != nil {
+					t.Errorf("SweepTargets: %v", err)
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
+
+	if got := targets.calls.Load(); got != goroutines*each {
+		t.Fatalf("sweeps performed = %d, want %d", got, goroutines*each)
+	}
+	// Every call returned a continuation, so the sweeper must be holding one.
+	// This is the one observable that a serialised read-modify-write of the
+	// cursor happened at all.
+	result, err := sweeper.SweepTargets(context.Background())
+	if err != nil {
+		t.Fatalf("final SweepTargets: %v", err)
+	}
+	if !result.Resumed {
+		t.Fatalf("final sweep = %+v, want it to present a retained continuation", result)
 	}
 }
 
