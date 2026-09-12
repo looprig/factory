@@ -2254,3 +2254,369 @@ func TestARefusedCommandStopsAtItsGuardAndTouchesNothingFurther(t *testing.T) {
 		})
 	}
 }
+
+// --- A3.1 at sessionstore v0.8.0: what blocks steps 2 and 5 now ------------
+//
+// v0.8.0 dissolved every STORE-SIDE reason steps 2 and 5 of the A3.1 runbook
+// were unimplementable. Each was read in the module cache at the pinned
+// version and is recorded here rather than re-asserted, because each is a
+// property of a dependency and not of this package:
+//
+//   - publicCreateID files a reservation at OrderingScope scope.TenantNamespace
+//     with StableKey the CommandID (public_create.go:234), so one CommandID
+//     naming a SECOND SessionID collides with the first reservation and
+//     publicCreateWinner refuses it InboxErrorCommandMismatch. That is exactly
+//     the cross-session enforcement step 2 asks for and v0.4.0 could not
+//     express with mutable DesiredIdempotencyKey.
+//   - admitDispositionCommand's retry comparison is PublicCreate, Kind,
+//     PayloadDigest and PayloadSize (disposition_inbox.go:232). Payload and
+//     PayloadObject are EXCLUDED, so re-PUTting a body under a fresh object
+//     generation is no longer a mismatch. That is exactly the hazard that made
+//     step 5 break step 1's retry rule.
+//   - RejectDispositionCommand (disposition_claim.go:382) requires no residency
+//     epoch and no lease: a caller naming none is confined by the claim rule
+//     alone. So a pre-dispatch command need not stay pending forever, which was
+//     the last reason binding disposition would have been WORSE than refusing.
+//
+// And the legacy hazard is re-verified UNCHANGED: inbox.go is byte-identical
+// between v0.7.0 and v0.8.0, sameCommand still compares PayloadRef
+// (inbox.go:375), and PutObject still mints a fresh generation per call. So an
+// oversized payload behind a legacy PayloadRef still turns every retry into a
+// permanent CommandMismatch. Step 5 is unimplementable on the legacy inbox at
+// this pin for the same reason it was at v0.4.0.
+//
+// What remains is therefore not a missing store primitive. It is that every
+// disposition entry point requires a complete immutable SessionBinding whose
+// ProtocolMode is disposition, a nonzero SessionBinding must carry all four
+// members (session_binding.go:32 validate), and THIS MODULE CREATES ONLY
+// LEGACY SESSIONS: admitLegacyCreate builds its CreateCatalogEntryRequest with
+// no Binding at all, so createCatalogEntry takes the mode = ProtocolModeLegacy
+// arm. The two tests below hold that, in the two directions it can fail.
+
+// bindingSites reports every place a sessionstore.SessionBinding is reachable
+// from a root type, and — this is the whole point of the function — which
+// DIRECTION it is reachable in.
+//
+// The distinction is what the first draft of this guard got wrong, and it is
+// not pedantic. A SessionBinding in an INBOUND position is a field this module
+// must AUTHOR before it can call anything; reaching one there is evidence of
+// the blocker, not of its absence. A SessionBinding in an OUTBOUND position is
+// a value a collaborator hands back, which this module may read and pass on.
+// A walker that did not separate them reported "Config can source a binding"
+// on the strength of CreateCatalogEntry's REQUEST parameter, which sources
+// nothing.
+//
+// Cycle protection is per-path rather than global for the same reason: a
+// global seen-set makes the answer depend on Go's alphabetical method order,
+// so whichever of CreateCatalogEntry and GetCatalogEntry sorted first would
+// mask the other. Depth is bounded so a recursive type cannot hang the test.
+func bindingSites(root reflect.Type) []string {
+	const maxDepth = 12
+	var sites []string
+	var walk func(reflect.Type, string, bool, map[reflect.Type]bool, int)
+	walk = func(t reflect.Type, path string, outbound bool, onPath map[reflect.Type]bool, depth int) {
+		if t == nil || depth > maxDepth || onPath[t] {
+			return
+		}
+		onPath[t] = true
+		defer delete(onPath, t)
+		if t == reflect.TypeOf(sessionstore.SessionBinding{}) {
+			direction := "in"
+			if outbound {
+				direction = "out"
+			}
+			sites = append(sites, direction+":"+path)
+			return
+		}
+		switch t.Kind() {
+		case reflect.Pointer, reflect.Slice, reflect.Array, reflect.Chan:
+			walk(t.Elem(), path+"[]", outbound, onPath, depth+1)
+		case reflect.Map:
+			walk(t.Elem(), path+"[k]", outbound, onPath, depth+1)
+		case reflect.Struct:
+			for i := range t.NumField() {
+				walk(t.Field(i).Type, path+"."+t.Field(i).Name, outbound, onPath, depth+1)
+			}
+		case reflect.Interface:
+			for i := range t.NumMethod() {
+				m := t.Method(i)
+				for j := range m.Type.NumIn() {
+					walk(m.Type.In(j), fmt.Sprintf("%s.%s(arg%d)", path, m.Name, j), false, onPath, depth+1)
+				}
+				for j := range m.Type.NumOut() {
+					walk(m.Type.Out(j), fmt.Sprintf("%s.%s(res%d)", path, m.Name, j), true, onPath, depth+1)
+				}
+			}
+		case reflect.Func:
+			for j := range t.NumIn() {
+				walk(t.In(j), fmt.Sprintf("%s(arg%d)", path, j), false, onPath, depth+1)
+			}
+			for j := range t.NumOut() {
+				walk(t.Out(j), fmt.Sprintf("%s(res%d)", path, j), true, onPath, depth+1)
+			}
+		}
+	}
+	walk(root, "Config", true, map[reflect.Type]bool{}, 0)
+	slices.Sort(sites)
+	return sites
+}
+
+// TestEverySessionBindingThisModuleCanReachIsTiedToASessionThatAlreadyExists is
+// the tripwire that re-opens A3.1 steps 2 and 5.
+//
+// It pins the EXACT set of reachable sites, in both directions, because either
+// direction changing means something different and both mean A3.1 must be
+// re-read:
+//
+//   - A new OUTBOUND site is a new way to OBTAIN a binding. If it is not keyed
+//     on an existing catalog record, step 2 may have become implementable: a
+//     create could then name a disposition binding it did not invent.
+//   - A new INBOUND site is a new store call this module would have to author a
+//     binding FOR, which is the blocker itself arriving somewhere new.
+//
+// Every outbound site today is a CatalogEntry for a session that already
+// exists, so none can supply the binding a session's CREATE has to choose — and StorageBindingID,
+// BindingVersion and RuntimeSessionID name a deployment's immutable storage
+// configuration and a runtime-assigned identity, which this module has no
+// input for. Minting them would durably and IRREVERSIBLY pin a session to a
+// configuration no ResolveObjectStore is required to know; SessionBinding is
+// immutable after create, so there is no repair. That is why AdmitCreate
+// refuses rather than guesses.
+//
+// If this test fails, the instruction is GO AND FINISH A3.1, not delete the
+// assertion.
+func TestEverySessionBindingThisModuleCanReachIsTiedToASessionThatAlreadyExists(t *testing.T) {
+	// Each site is RULED individually below, because listing five and saying
+	// "none of them helps" is a sentence wider than its probe.
+	want := []string{
+		// (1) INBOUND. The binding this module would have to AUTHOR, and the
+		// only one. admitLegacyCreate builds this request with no Binding at
+		// all, so createCatalogEntry takes its mode = ProtocolModeLegacy arm
+		// and every Factory-created session is legacy. This is the blocker.
+		"in:Config.Catalog.CreateCatalogEntry(arg1).Binding",
+		// (2) OUTBOUND, but it is the binding THIS CALL just supplied, echoed
+		// back on the record the store created or found. It can only ever be
+		// the zero value here, by (1). It sources nothing.
+		"out:Config.Catalog.CreateCatalogEntry(res0).Record.Binding",
+		// (3) OUTBOUND, and it is the reservation's OWN copy of (2) — present
+		// only on a version-3 catalog written by PreparePublicCreate, which
+		// this module never calls. Immutable provenance of a create that
+		// already happened.
+		"out:Config.Catalog.CreateCatalogEntry(res0).Record.PublicCreate[].Identity.Binding",
+		// (4) OUTBOUND and genuinely readable: the binding of a session that
+		// ALREADY EXISTS. This is the one that matters, and it is exactly why
+		// step 5 is downstream of step 2 rather than independently blocked —
+		// a disposition-bound session's binding could be read and passed to
+		// AdmitDispositionCommand, but this module can produce no such session.
+		"out:Config.Catalog.GetCatalogEntry(res0).Record.Binding",
+		// (5) OUTBOUND, the read counterpart of (3). Same ruling.
+		"out:Config.Catalog.GetCatalogEntry(res0).Record.PublicCreate[].Identity.Binding",
+	}
+	got := bindingSites(reflect.TypeOf(Config{}))
+	if !slices.Equal(got, want) {
+		t.Fatalf("the SessionBinding sites reachable from admission.Config changed.\n got: %q\nwant: %q\n"+
+			"An OUTBOUND site not keyed on an existing session may mean A3.1 step 2 is now implementable; "+
+			"an INBOUND one is a new call this module must author a binding for. Re-read the runbook before touching this list.",
+			got, want)
+	}
+}
+
+// TestTheBindingWalkerSeparatesAValueItCanReadFromOneItMustAuthor is the
+// positive control for the tripwire above, and it exists because that tripwire
+// is in part a NEGATIVE claim — that no outbound site is free of an existing
+// session — which a walker that saw nothing would satisfy for free.
+//
+// Every row is a shape a real binding source could arrive in. The two
+// direction rows are the ones that matter: they are the reason the first draft
+// of this guard reported the opposite of the truth.
+func TestTheBindingWalkerSeparatesAValueItCanReadFromOneItMustAuthor(t *testing.T) {
+	type source interface {
+		Binding(context.Context) (sessionstore.SessionBinding, error)
+	}
+	type sink interface {
+		Resolve(context.Context, sessionstore.SessionBinding) error
+	}
+	for _, test := range []struct {
+		name string
+		root reflect.Type
+		want []string
+	}{
+		{"a bare struct member is outbound", reflect.TypeOf(struct {
+			B sessionstore.SessionBinding
+		}{}), []string{"out:Config.B"}},
+		{"an interface result is outbound", reflect.TypeOf(struct {
+			S source
+		}{}), []string{"out:Config.S.Binding(res0)"}},
+		{"an interface parameter is inbound", reflect.TypeOf(struct {
+			S sink
+		}{}), []string{"in:Config.S.Resolve(arg1)"}},
+		{"a func field reports both directions separately", reflect.TypeOf(struct {
+			F func(context.Context, sessionstore.SessionBinding) (sessionstore.SessionBinding, error)
+		}{}), []string{"in:Config.F(arg1)", "out:Config.F(res0)"}},
+		{"a pointer through a slice two hops away", reflect.TypeOf(struct {
+			P *struct{ Inner []sessionstore.SessionBinding }
+		}{}), []string{"out:Config.P[].Inner[]"}},
+		// The negative control. Structurally identical to the outbound
+		// interface row but naming a DIFFERENT sessionstore type, so a walker
+		// that reported a site unconditionally fails here while passing every
+		// row above.
+		{"a collaborator carrying no binding reports nothing", reflect.TypeOf(struct {
+			S interface {
+				Target(context.Context) (sessionstore.HostTargetKey, error)
+			}
+		}{}), nil},
+		// The second negative control, and the sharper one: a type that
+		// CONTAINS the three opaque strings a binding is made of but is not a
+		// binding. It proves the walker matches the type and not a shape.
+		{"a lookalike carrying the same members reports nothing", reflect.TypeOf(struct {
+			L struct {
+				StorageBindingID string
+				BindingVersion   string
+				RuntimeSessionID string
+				ProtocolMode     sessionstore.ProtocolMode
+			}
+		}{}), nil},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := bindingSites(test.root); !slices.Equal(got, test.want) {
+				t.Fatalf("bindingSites = %q, want %q", got, test.want)
+			}
+		})
+	}
+}
+
+// TestTheFailClosedReasonsNameTheBlockerThatActuallyRemains holds the two
+// exported refusal reasons to the blocker measured at the CURRENT pin.
+//
+// It is a test rather than a comment because both messages were TRUE at
+// sessionstore v0.4.0 and are FALSE at v0.8.0: the store now ships an
+// immutable create reservation and an identity-bearing descriptor. A refusal
+// that explains itself by naming a primitive the dependency already has is
+// worse than one that says nothing, because it sends the next reader to the
+// wrong repository to unblock work that is blocked here.
+func TestTheFailClosedReasonsNameTheBlockerThatActuallyRemains(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		err  error
+	}{
+		{"oversized payload", ErrPayloadProtocolUnavailable},
+		{"V1 create identity", ErrCreateIdentityProtocolUnavailable},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			got := test.err.Error()
+			if !strings.Contains(got, "session binding") {
+				t.Errorf("message %q does not name the immutable session binding, which is the blocker at the current pin", got)
+			}
+			for _, stale := range []string{
+				"immutable create-command reservation",
+				"identity-bearing inbox protocol",
+			} {
+				if strings.Contains(got, stale) {
+					t.Errorf("message %q still cites %q as missing, which sessionstore v0.8.0 ships", got, stale)
+				}
+			}
+		})
+	}
+}
+
+// TestTheAdmittedTimestampsAreNormalisedToUTCWhateverZoneTheClockReadsIn
+// reads the `.UTC()` in admit and admitLegacyCreate, which nothing read.
+//
+// THIS IS A FIXTURE-CONSTANT HOLE, not an ordinary unread line, and it is
+// recorded as one because the distinction is what makes it invisible. Every
+// fixture in this package reads serviceNow, which is time.UTC with a zero
+// sub-second field, so `Clock.Now().UTC()` and `Clock.Now()` return the SAME
+// VALUE in every existing test: deleting both `.UTC()` calls left the whole
+// package green. Varying the instant would not have found it either — moving
+// serviceNow to a +07:00 zone with a nonzero nanosecond ALSO left the package
+// green, because every assertion on these two timestamps uses time.Equal,
+// which compares the instant and ignores the location. The property had no
+// reader in either direction.
+//
+// What it protects: AcceptedAt and ApplyDeadline travel into the store inside
+// AdmitCommandRequest. The store canonicalises them itself, so the DURABLE
+// bytes do not depend on this — which is exactly why nothing here failed. What
+// depends on it is every caller that receives the entry back and formats or
+// compares it with ==, and a Factory whose process TZ is not UTC would hand
+// those callers a local-zone instant.
+//
+// The gate path's `now` (AdmitGateResponse) deliberately carries no `.UTC()`.
+// That was examined rather than assumed: it is used only for After comparisons
+// against a projection deadline and an owner expiry, is never stored, and a
+// comparison is zone-independent. So the two spellings are not an
+// inconsistency to reconcile; only the stored pair is normalised.
+func TestTheAdmittedTimestampsAreNormalisedToUTCWhateverZoneTheClockReadsIn(t *testing.T) {
+	// Deliberately NOT serviceNow: a positive offset, and a sub-second field
+	// that is not zero, so neither fixture constant this package shares can
+	// satisfy the assertions below.
+	skewed := time.Date(2026, 9, 5, 19, 0, 0, 123456789, time.FixedZone("plus7", 7*60*60))
+
+	newSkewed := func(t *testing.T) *serviceFixture {
+		t.Helper()
+		f := newServiceFixture(t)
+		resolvableSession(f)
+		svc, err := NewService(Config{Authorizer: f.auth, Targets: f.targets, Catalog: f.catalog,
+			Commands: f.commands, Directory: f.directory, Clock: serviceClock{skewed},
+			IDs: f.ids, ApplyDeadline: time.Minute})
+		if err != nil {
+			t.Fatal(err)
+		}
+		f.service = svc
+		return f
+	}
+
+	for _, test := range []struct {
+		name string
+		call func(*testing.T, *serviceFixture)
+	}{
+		{"an existing session's command", func(t *testing.T, f *serviceFixture) {
+			if _, created, err := f.service.AdmitInput(context.Background(), f.principal, sessionwire.InputRequest{
+				CommandEnvelope: envelope("command-utc"), SessionID: "session-a", Blocks: []byte(`[{"text":"hi"}]`),
+			}); err != nil || !created {
+				t.Fatalf("admission = (%v, %v)", created, err)
+			}
+		}},
+		{"a legacy create", func(t *testing.T, f *serviceFixture) {
+			f.catalog.getErr = &sessionstore.CatalogError{Code: sessionstore.CatalogErrorNotFound}
+			if _, err := f.service.AdmitLegacyCreate(context.Background(), f.principal, LegacyCreateRequest{
+				AgentID: "agent-a", Blocks: []byte(`[{"text":"hi"}]`),
+			}); err != nil {
+				t.Fatalf("legacy create: %v", err)
+			}
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			f := newSkewed(t)
+			test.call(t, f)
+
+			// The positive control. Without it every assertion below would be
+			// satisfied by a service that never reached the inbox at all: the
+			// zero time.Time is in UTC.
+			if f.commands.calls == 0 {
+				t.Fatal("no command reached the inbox, so the timestamps below are the zero value")
+			}
+			got := f.commands.lastAdmit
+			for _, ts := range []struct {
+				name  string
+				value time.Time
+			}{
+				{"AcceptedAt", got.AcceptedAt},
+				{"ApplyDeadline", got.ApplyDeadline},
+			} {
+				if ts.value.Location() != time.UTC {
+					t.Errorf("%s location = %v, want UTC", ts.name, ts.value.Location())
+				}
+				// And the instant must be untouched: normalising a zone must
+				// not be confused with truncating or shifting the reading.
+				// Without this a mutant that returned time.Now().UTC(), or one
+				// that truncated to the second, would pass the check above.
+				if ts.name == "AcceptedAt" && !ts.value.Equal(skewed) {
+					t.Errorf("AcceptedAt = %v, want the clock's own instant %v", ts.value, skewed)
+				}
+				if ts.name == "ApplyDeadline" && !ts.value.Equal(skewed.Add(time.Minute)) {
+					t.Errorf("ApplyDeadline = %v, want %v", ts.value, skewed.Add(time.Minute))
+				}
+			}
+		})
+	}
+}

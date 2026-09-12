@@ -510,7 +510,7 @@ func TestARefusedContinuationRearmsTheSweepInsteadOfWedgingIt(t *testing.T) {
 		func() (sessionstore.HostTargetReconcileResult, error) {
 			// THE POSITION IS RETURNED ALONGSIDE THE REFUSAL, and this fake is
 			// deliberately LOOSER than the pinned store on exactly that axis.
-			// sessionstore v0.7.0 refuses a continuation in
+			// sessionstore v0.8.0 refuses a continuation in
 			// decodeHostTargetSweepCursor, before any provider work, and
 			// returns the ZERO result (host_targets.go:1494) -- so against the
 			// pinned store the re-arm below is indistinguishable from the

@@ -27,7 +27,7 @@ var ErrInvalidSweeperConfig = errors.New("placement: invalid record sweeper conf
 // whole structural claim of the target half. SessionStore revalidates every due
 // row against that row's OWN STORED EXPIRY at a fresh clock reading and closes
 // the write with a compare-and-swap onto the revision the due page reported
-// (sessionstore@v0.7.0/host_targets.go:1631 reconcileHostTargetRow).
+// (sessionstore@v0.8.0/host_targets.go:1631 reconcileHostTargetRow).
 //
 // THE TWO MECHANISMS CATCH DIFFERENT HEARTBEATS, and the distinction was stated
 // wrongly here before. reconcileHostTargetRow takes the due page's FROZEN BYTES
@@ -52,7 +52,7 @@ type TargetSweep interface {
 // that could acquire would be a second placement reconciler, and the work a
 // claim suppresses is Reconciler's. Get is absent for a sharper reason —
 // GetReconciliationClaim refuses a lapsed claim rather than returning it
-// (sessionstore@v0.7.0/reconcile.go:450), so it cannot answer the question this
+// (sessionstore@v0.8.0/reconcile.go:450), so it cannot answer the question this
 // sweep asks, and a caller that read it first would still have to attempt the
 // release to learn anything.
 type ClaimSweep interface {
@@ -259,7 +259,7 @@ func translateTargetSweep(result sessionstore.HostTargetReconcileResult, resumed
 //
 // ITS REACH IS THIS REPLICA'S OWN CLAIMS, and that is a limit of the pinned
 // store rather than a choice. A reconciliation claim is filed with an EMPTY due
-// state (sessionstore@v0.7.0/reconcile.go:708 reconciliationClaimDue), so there
+// state (sessionstore@v0.8.0/reconcile.go:708 reconciliationClaimDue), so there
 // is no deadline view to walk and no operation that enumerates claims at all:
 // the sessions have to come from the caller. And a release is refused for any
 // holder but the claim's own, so another replica's lapsed claim can be reported

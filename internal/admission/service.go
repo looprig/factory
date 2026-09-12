@@ -30,18 +30,43 @@ const (
 	CommandGateResponse = command.KindGateResponse
 )
 
-// ErrPayloadProtocolUnavailable reports an input that cannot be admitted by
-// the released inbox protocol without weakening retry conflict detection.
-// Inbox v1 retains either bytes or an ObjectReference, but not the immutable
-// payload digest needed to compare a retry after PutObject minted a new object
-// generation. The future disposition descriptor supplies that identity.
-var ErrPayloadProtocolUnavailable = errors.New("admission: oversized payload requires an identity-bearing inbox protocol")
+// ErrPayloadProtocolUnavailable reports an input whose payload is too large
+// for the inbox this module can write to.
+//
+// THE MISSING PIECE IS NOT A STORE PRIMITIVE, and the earlier wording of this
+// comment said it was, which was true at sessionstore v0.4.0 and is false at
+// the pinned version. The disposition inbox admits an oversized body by
+// reference and compares a retry on PayloadDigest and PayloadSize rather than
+// on the object reference, so re-PUTting under a fresh generation is no longer
+// a mismatch: the hazard that made this unimplementable is gone.
+//
+// What is missing is the SESSION BINDING that reaches it. Every disposition
+// entry point requires a complete immutable binding whose ProtocolMode is
+// disposition, and this module creates only legacy sessions, so it has no
+// session to admit such a command to. On the legacy inbox the original hazard
+// stands unchanged at this pin — the retry comparison still includes the
+// object reference, and PutObject still mints a fresh generation per call — so
+// admitting the reference there would make every legitimate retry a permanent
+// CommandMismatch. Refusing is the correct answer until create is unblocked.
+var ErrPayloadProtocolUnavailable = errors.New("admission: oversized payload needs a disposition session binding this module cannot author")
 
-// ErrCreateIdentityProtocolUnavailable reports that the released Store cannot
-// bind a client create CommandID independently of its proposed SessionID.
-// Catalog desired idempotency is mutable placement state and is not used as a
-// substitute for the missing immutable reservation.
-var ErrCreateIdentityProtocolUnavailable = errors.New("admission: V1 create requires an immutable create-command reservation")
+// ErrCreateIdentityProtocolUnavailable reports that a V1 create cannot be made
+// durable with the create identity the protocol requires.
+//
+// The store-side reason is also gone at the pinned version: a public-create
+// reservation is filed under the TENANT keyed by CommandID, which is the
+// cross-session enforcement the mutable catalog idempotency key could never
+// express, and a pre-dispatch command can now be rejected without a residency
+// so it need not sit pending forever.
+//
+// What blocks it is the immutable SESSION BINDING that reservation carries.
+// Three of its four members — StorageBindingID, BindingVersion and
+// RuntimeSessionID — name a deployment's storage configuration and a
+// runtime-assigned identity, and this module is composed with no source for
+// any of them. A binding is immutable after create, so minting one would
+// durably and irreversibly pin the session to a configuration no resolver is
+// required to know, with no repair. Refusing beats guessing.
+var ErrCreateIdentityProtocolUnavailable = errors.New("admission: V1 create needs an immutable session binding this module cannot author")
 
 type Error struct {
 	Code  sessionwire.ErrorCode
