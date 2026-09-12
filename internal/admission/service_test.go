@@ -108,9 +108,19 @@ type serviceCatalog struct {
 	entry       sessionstore.CatalogEntry
 	getErr      error
 	createCalls int
+	// lastGet and lastCreate retain the REQUESTS, not just the call, because
+	// the tenant a durable read is scoped by is carried in the request and a
+	// counter cannot see it.
+	lastGet    sessionstore.GetCatalogEntryRequest
+	lastCreate sessionstore.CreateCatalogEntryRequest
+	// createReturn, when set, is the entry CreateCatalogEntry answers with
+	// instead of echoing the request: the durable "somebody else already owns
+	// this session id" outcome the echoing fake cannot produce.
+	createReturn *sessionstore.CatalogEntry
 }
 
-func (c *serviceCatalog) GetCatalogEntry(context.Context, sessionstore.GetCatalogEntryRequest) (sessionstore.CatalogEntry, error) {
+func (c *serviceCatalog) GetCatalogEntry(_ context.Context, req sessionstore.GetCatalogEntryRequest) (sessionstore.CatalogEntry, error) {
+	c.lastGet = req
 	if err := c.enter("GetCatalogEntry"); err != nil {
 		return sessionstore.CatalogEntry{}, err
 	}
@@ -119,8 +129,14 @@ func (c *serviceCatalog) GetCatalogEntry(context.Context, sessionstore.GetCatalo
 
 func (c *serviceCatalog) CreateCatalogEntry(_ context.Context, req sessionstore.CreateCatalogEntryRequest) (sessionstore.CatalogEntry, bool, error) {
 	c.createCalls++
+	c.lastCreate = req
 	if err := c.enter("CreateCatalogEntry"); err != nil {
 		return sessionstore.CatalogEntry{}, false, err
+	}
+	if c.createReturn != nil {
+		c.entry = *c.createReturn
+		c.getErr = nil
+		return c.entry, false, nil
 	}
 	c.entry = sessionstore.CatalogEntry{Record: sessionstore.CatalogRecord{
 		TenantID: req.TenantID, SessionID: req.SessionID, AgentID: req.AgentID,
@@ -137,14 +153,27 @@ type serviceCommands struct {
 	faultInjector
 	records map[sessionwire.CommandID]sessionstore.InboxEntry
 	calls   int
+	// lastAdmit and lastGet retain the REQUESTS for the same reason the
+	// catalog fake does: tenant scoping lives in the request.
+	lastAdmit sessionstore.AdmitCommandRequest
+	lastGet   sessionstore.GetCommandRequest
+	// notFound, when set, is the error a miss answers with. The released
+	// store has TWO not-found spellings -- an InboxError and the keyspace's
+	// binding-not-found -- and a fake that could only produce one would leave
+	// the other arm of commandNotFound unreadable.
+	notFound error
 }
 
 func (c *serviceCommands) GetCommand(_ context.Context, req sessionstore.GetCommandRequest) (sessionstore.InboxEntry, error) {
+	c.lastGet = req
 	if err := c.enter("GetCommand"); err != nil {
 		return sessionstore.InboxEntry{}, err
 	}
 	entry, ok := c.records[req.CommandID]
 	if !ok {
+		if c.notFound != nil {
+			return sessionstore.InboxEntry{}, c.notFound
+		}
 		return sessionstore.InboxEntry{}, &sessionstore.InboxError{Code: sessionstore.InboxErrorNotFound}
 	}
 	return entry, nil
@@ -152,6 +181,7 @@ func (c *serviceCommands) GetCommand(_ context.Context, req sessionstore.GetComm
 
 func (c *serviceCommands) AdmitCommand(_ context.Context, req sessionstore.AdmitCommandRequest) (sessionstore.InboxEntry, bool, error) {
 	c.calls++
+	c.lastAdmit = req
 	if err := c.enter("AdmitCommand"); err != nil {
 		return sessionstore.InboxEntry{}, false, err
 	}
@@ -177,10 +207,16 @@ type serviceDirectory struct {
 	ok    bool
 	err   error
 	calls int
+	// lastTenant and lastSession retain the ARGUMENTS, because the tenant an
+	// ownership question is asked about is an argument here rather than a
+	// request field.
+	lastTenant  sessionwire.TenantID
+	lastSession sessionwire.SessionID
 }
 
-func (d *serviceDirectory) Owner(context.Context, sessionwire.TenantID, sessionwire.SessionID) (sessionwire.HostLinkRegistryObservation, bool, error) {
+func (d *serviceDirectory) Owner(_ context.Context, tenant sessionwire.TenantID, session sessionwire.SessionID) (sessionwire.HostLinkRegistryObservation, bool, error) {
 	d.calls++
+	d.lastTenant, d.lastSession = tenant, session
 	if err := d.enter("Owner"); err != nil {
 		return sessionwire.HostLinkRegistryObservation{}, false, err
 	}
@@ -1507,4 +1543,714 @@ func redeclares(body *ast.BlockStmt, name string) bool {
 		return !found
 	})
 	return found
+}
+
+// ---------------------------------------------------------------------------
+// A3.1 completion. Each test below was written against a SURVIVING mutant of
+// the production line it names: the line could be deleted or weakened and the
+// pre-existing suite stayed green. The mutant is named in the comment so the
+// claim is checkable rather than asserted.
+// ---------------------------------------------------------------------------
+
+// gateFixture is the fully resumable gate-response starting point: an open,
+// resident, version-matched projection and a fresh owner that matches the
+// record in every member. Every test below moves ONE thing away from it.
+func gateFixture(t *testing.T) (*serviceFixture, sessionwire.GateResponseRequest) {
+	t.Helper()
+	f := newServiceFixture(t)
+	resolvableSession(f)
+	return f, sessionwire.GateResponseRequest{
+		CommandEnvelope: envelope("gate-command"), SessionID: "session-a", GateID: "gate-a",
+		Action: "submit", Values: map[string]json.RawMessage{"answer": json.RawMessage(`"yes"`)},
+		ExpectedOpenEventID: "event-a",
+	}
+}
+
+// TestAProjectionThatIsNotResidentIsNotAnswerable reads the ANSWERABILITY
+// member of the durable projection, which nothing read.
+//
+// Mutant: deleting the `gate.Answerability != GateAnswerabilityResident` arm
+// of gateAdmission left the whole module green. The existing table's "cold",
+// "releasing", "not accepting" and "expired" rows all move the DIRECTORY's
+// observation, so they exercise freshMatchingOwner and never the projection --
+// two independent halves of runbook step 4's "matching durable public gate
+// projection PLUS a fresh resident/accepting owner", of which only one was read.
+//
+// The rows are derived from Core's declared answerability values rather than
+// listed, so a value added to the vocabulary joins this test on the day it is
+// declared instead of defaulting to answerable.
+func TestAProjectionThatIsNotResidentIsNotAnswerable(t *testing.T) {
+	// The five values the pinned Core declares. THIS IS A LIST, NOT A
+	// CLOSURE: Core exports no enumeration and its validity predicate is
+	// unexported, so a SIXTH value added to the vocabulary joins the wire
+	// without joining this table. What is checked below is the weaker thing
+	// that IS checkable here -- that the vocabulary is closed at all, so a
+	// sixth value cannot arrive without a Core release, which is the point at
+	// which this list must be re-read.
+	answerabilities := []sessionwire.GateAnswerability{
+		sessionwire.GateAnswerabilityResident,
+		sessionwire.GateAnswerabilitySuspended,
+		sessionwire.GateAnswerabilitySubmitted,
+		sessionwire.GateAnswerabilityUnavailable,
+		sessionwire.GateAnswerabilityExpired,
+	}
+	for _, value := range append(answerabilities, "invented-by-this-test") {
+		projection := sessionwire.GateProjection{
+			GateID: "gate-a", Kind: "question", OpenedEventID: "event-a", OpenedJournalSeq: 7,
+			Deadline: serviceNow.Add(time.Hour), Answerability: value,
+		}
+		// The subject is the ANSWERABILITY field alone: the projection above
+		// is otherwise incomplete, so asserting err == nil would assert about
+		// the prompt instead. A declared value must not be the field Core
+		// complains about; the invented one must be.
+		var validation *sessionwire.RequestValidationError
+		rejected := errors.As(projection.Validate(), &validation) && validation.Field == "answerability"
+		if declared := value != "invented-by-this-test"; declared == rejected {
+			t.Fatalf("Core's own validation of the answerability %q rejected = %v; this list no longer matches the vocabulary", value, rejected)
+		}
+	}
+	resident := 0
+	for _, answerability := range answerabilities {
+		t.Run(string(answerability), func(t *testing.T) {
+			f, req := gateFixture(t)
+			f.catalog.entry.Record.OpenGates[0].Answerability = answerability
+			_, created, err := f.service.AdmitGateResponse(context.Background(), f.principal, req)
+			if answerability == sessionwire.GateAnswerabilityResident {
+				if err != nil || !created {
+					t.Fatalf("a resident projection was refused: (%v, %v)", created, err)
+				}
+				if f.commands.calls == 0 {
+					t.Fatal("the accepted control never reached the inbox, so the refusals below assert nothing")
+				}
+				return
+			}
+			if !IsCode(err, sessionwire.ErrorCodeGateNotResumable) {
+				t.Fatalf("error = %v, want gate_not_resumable", err)
+			}
+			if f.commands.calls != 0 {
+				t.Fatal("a non-resident projection reached the inbox")
+			}
+		})
+	}
+	for _, answerability := range answerabilities {
+		if answerability == sessionwire.GateAnswerabilityResident {
+			resident++
+		}
+	}
+	if resident != 1 {
+		t.Fatalf("the accepted control appears %d times, want exactly 1", resident)
+	}
+}
+
+// TestTheGateIncarnationMatchesByEitherWitnessAndNeverByAbsence covers both
+// disjuncts of the version comparison and the emptiness guard on the first.
+//
+// Two mutants survived here. Deleting the ExpectedOpenJournalSeq disjunct
+// entirely left the module green -- no test supplied a journal sequence, so
+// the sequence-witnessed spelling of a gate answer, which Core declares as one
+// of exactly two, was never admitted at all. And dropping the
+// `ExpectedOpenEventID != ""` guard also left it green.
+//
+// The second mutant's reachability is worth stating precisely, because the
+// obvious reading of it is wrong. Core's GateResponseRequest.Validate requires
+// EXACTLY ONE witness (commands.go:265-274, `hasEventID == hasSequence` is
+// invalid), so a request carrying neither cannot reach gateAdmission and the
+// guard is NOT defending against that. What it defends against is the other
+// side: a STORED PROJECTION whose OpenedEventID is empty. Without the guard, a
+// sequence-witnessed request -- whose ExpectedOpenEventID is necessarily empty
+// -- matches such a projection on the first disjunct regardless of the
+// sequence it named, and answers a gate incarnation it never observed. The row
+// below drives exactly that.
+//
+// Every row supplies exactly one witness, because Core refuses the rest before
+// this code is reached; the one row that supplies both asserts that refusal
+// rather than smuggling an unreachable state into the table.
+func TestTheGateIncarnationMatchesByEitherWitnessAndNeverByAbsence(t *testing.T) {
+	const (
+		accepted = "accepted"
+		resolved = "gate_resolved"
+		invalid  = "invalid_request"
+	)
+	for _, test := range []struct {
+		name           string
+		gateEventID    string
+		gateSeq        uint64
+		requestEventID string
+		requestSeq     uint64
+		want           string
+	}{
+		{"an event id witnesses the open", "event-a", 7, "event-a", 0, accepted},
+		{"a journal sequence witnesses the open", "event-a", 7, "", 7, accepted},
+		{"a sequence witnesses an open whose event id is absent", "", 7, "", 7, accepted},
+		{"a stale event id is a resolved incarnation", "event-a", 7, "event-b", 0, resolved},
+		{"a stale journal sequence is a resolved incarnation", "event-a", 7, "", 6, resolved},
+		{"an absent projection event id does not match an absent witness", "", 7, "", 6, resolved},
+		{"a projection witnessing nothing matches nothing", "", 0, "", 5, resolved},
+		{"an event id cannot be checked against a projection carrying none", "", 5, "event-a", 0, resolved},
+		{"Core refuses a request naming both witnesses", "event-a", 7, "event-a", 7, invalid},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			f, req := gateFixture(t)
+			f.catalog.entry.Record.OpenGates[0].OpenedEventID = sessionwire.EventID(test.gateEventID)
+			f.catalog.entry.Record.OpenGates[0].OpenedJournalSeq = test.gateSeq
+			req.ExpectedOpenEventID = sessionwire.EventID(test.requestEventID)
+			req.ExpectedOpenJournalSeq = test.requestSeq
+			_, created, err := f.service.AdmitGateResponse(context.Background(), f.principal, req)
+			switch test.want {
+			case accepted:
+				if err != nil || !created {
+					t.Fatalf("a witnessed incarnation was refused: (%v, %v)", created, err)
+				}
+				if f.commands.calls == 0 {
+					t.Fatal("the accepted row reached no durable write")
+				}
+			case invalid:
+				if !IsCode(err, sessionwire.ErrorCodeInvalidRequest) {
+					t.Fatalf("error = %v, want invalid_request", err)
+				}
+			default:
+				if !IsCode(err, sessionwire.ErrorCodeGateResolved) {
+					t.Fatalf("error = %v, want gate_resolved", err)
+				}
+				if f.commands.calls != 0 {
+					t.Fatal("an unwitnessed incarnation reached the inbox")
+				}
+			}
+		})
+	}
+}
+
+// TestAnOwnerThatIsNotThisSessionsIsNotAFreshMatch reads the IDENTITY half of
+// freshMatchingOwner, which nothing read.
+//
+// Mutant: replacing the placement.ReusableOwner call with its liveness clauses
+// alone -- resident, accepting, unexpired, and no comparison against the
+// record -- left the module green. Every pre-existing row moved a liveness
+// member, so "a FRESH RESIDENT owner" was covered and "the SESSION's own
+// owner" was not: an observation for another tenant's session would have been
+// handed this session's gate answer.
+//
+// The five members are derived from the comparison placement actually makes,
+// stated here as the list it is: tenant, session, agent, runtime, placement.
+// It is a list, not a closure -- a sixth member added to ReusableOwner joins
+// that function's own tests, not this one, and this test would not notice.
+func TestAnOwnerThatIsNotThisSessionsIsNotAFreshMatch(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		disagree func(*sessionwire.HostLinkRegistryObservation)
+	}{
+		{"another tenant", func(o *sessionwire.HostLinkRegistryObservation) { o.TenantID = "tenant-b" }},
+		{"another session", func(o *sessionwire.HostLinkRegistryObservation) { o.SessionID = "session-b" }},
+		{"another agent", func(o *sessionwire.HostLinkRegistryObservation) { o.AgentID = "agent-b" }},
+		{"another runtime", func(o *sessionwire.HostLinkRegistryObservation) { o.RuntimeCompatibilityID = "runtime-v2" }},
+		{"another placement", func(o *sessionwire.HostLinkRegistryObservation) {
+			o.Placement = sessionwire.HostPlacementDedicated
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			f, req := gateFixture(t)
+			// The control: unmutated, this same fixture is accepted. Without
+			// it every row below would pass against a service that refused
+			// everything.
+			control, _ := gateFixture(t)
+			if _, created, err := control.service.AdmitGateResponse(context.Background(), control.principal, req); err != nil || !created {
+				t.Fatalf("the matching control was refused: (%v, %v)", created, err)
+			}
+			test.disagree(&f.directory.owner)
+			_, _, err := f.service.AdmitGateResponse(context.Background(), f.principal, req)
+			if !IsCode(err, sessionwire.ErrorCodeGateNotResumable) {
+				t.Fatalf("error = %v, want gate_not_resumable", err)
+			}
+			if f.commands.calls != 0 {
+				t.Fatal("an owner that is not this session's reached the inbox")
+			}
+		})
+	}
+}
+
+// TestAConflictingReuseIsClassifiedCommandRejected reads the CODE, which
+// nothing read.
+//
+// Mutant: deleting the InboxErrorCommandMismatch arm of admit -- so the
+// store's mismatch left as a raw store error with no public code -- left the
+// module green. Both pre-existing conflict tests assert only `err == nil`
+// fails, which is satisfied by any error at all, including a dependency fault
+// spelled as one. That is a sentence ("conflicting reuse FAILS") wider than
+// its probe ("something non-nil came back"): runbook steps 1 and 2 ask for a
+// conflicting reuse to be REFUSED, and a refusal is a classified public code.
+func TestAConflictingReuseIsClassifiedCommandRejected(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		first  func(*serviceFixture) error
+		second func(*serviceFixture) error
+	}{
+		{"a different payload under one command id",
+			func(f *serviceFixture) error {
+				_, _, err := f.service.AdmitInput(context.Background(), f.principal, sessionwire.InputRequest{
+					CommandEnvelope: envelope("command-a"), SessionID: "session-a", Blocks: []byte(`[{"text":"first"}]`)})
+				return err
+			},
+			func(f *serviceFixture) error {
+				_, _, err := f.service.AdmitInput(context.Background(), f.principal, sessionwire.InputRequest{
+					CommandEnvelope: envelope("command-a"), SessionID: "session-a", Blocks: []byte(`[{"text":"second"}]`)})
+				return err
+			}},
+		{"a different kind under one command id",
+			func(f *serviceFixture) error {
+				_, _, err := f.service.AdmitInterrupt(context.Background(), f.principal, sessionwire.InterruptRequest{
+					CommandEnvelope: envelope("command-a"), SessionID: "session-a"})
+				return err
+			},
+			func(f *serviceFixture) error {
+				_, _, err := f.service.AdmitRestore(context.Background(), f.principal, sessionwire.RestoreRequest{
+					CommandEnvelope: envelope("command-a"), SessionID: "session-a"})
+				return err
+			}},
+		{"a different gate answer under one command id",
+			func(f *serviceFixture) error {
+				_, _, err := f.service.AdmitGateResponse(context.Background(), f.principal, sessionwire.GateResponseRequest{
+					CommandEnvelope: envelope("command-a"), SessionID: "session-a", GateID: "gate-a", Action: "submit",
+					Values: map[string]json.RawMessage{"answer": json.RawMessage(`"yes"`)}, ExpectedOpenEventID: "event-a"})
+				return err
+			},
+			func(f *serviceFixture) error {
+				_, _, err := f.service.AdmitGateResponse(context.Background(), f.principal, sessionwire.GateResponseRequest{
+					CommandEnvelope: envelope("command-a"), SessionID: "session-a", GateID: "gate-a", Action: "submit",
+					Values: map[string]json.RawMessage{"answer": json.RawMessage(`"no"`)}, ExpectedOpenEventID: "event-a"})
+				return err
+			}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			f := newServiceFixture(t)
+			resolvableSession(f)
+			if err := test.first(f); err != nil {
+				t.Fatalf("the first command was refused: %v", err)
+			}
+			err := test.second(f)
+			if !IsCode(err, sessionwire.ErrorCodeCommandRejected) {
+				t.Fatalf("error = %v, want command_rejected", err)
+			}
+			// The cause survives for an operator even though the code is what
+			// the caller sees.
+			var inbox *sessionstore.InboxError
+			if !errors.As(err, &inbox) || inbox.Code != sessionstore.InboxErrorCommandMismatch {
+				t.Fatalf("the store's mismatch did not survive as the cause: %v", err)
+			}
+		})
+	}
+}
+
+// TestAResolvedTargetForAnotherAgentIsRuntimeUnavailable reads the recheck of
+// the resolver's answer, which nothing read.
+//
+// Mutant: deleting `target.Key.AgentID != req.AgentID` from both create paths
+// left the module green -- the only "unknown target" row flips the resolver's
+// BOOLEAN, so a resolver that confidently answered `known` with another
+// agent's launch identity was accepted and would have launched the wrong
+// agent under the caller's session id. Runbook step 3 asks for known runtime
+// COMPATIBILITY, not merely for a non-empty answer.
+//
+// The discriminator matters: this must be runtime_unavailable with NO cause,
+// not the create-reservation refusal, which also carries runtime_unavailable.
+// Asserting the code alone would pass on the wrong path.
+func TestAResolvedTargetForAnotherAgentIsRuntimeUnavailable(t *testing.T) {
+	t.Run("V1 create", func(t *testing.T) {
+		f := newServiceFixture(t)
+		f.targets.target.Key.AgentID = "agent-b"
+		_, _, err := f.service.AdmitCreate(context.Background(), f.principal, sessionwire.CreateRequest{
+			CommandEnvelope: envelope("create-a"), SessionID: "session-a", AgentID: "agent-a"})
+		if !IsCode(err, sessionwire.ErrorCodeRuntimeUnavailable) {
+			t.Fatalf("error = %v, want runtime_unavailable", err)
+		}
+		if errors.Is(err, ErrCreateIdentityProtocolUnavailable) {
+			t.Fatal("the mismatched agent was refused by the create-reservation guard, not by the target check")
+		}
+		if f.catalog.createCalls != 0 || f.commands.calls != 0 {
+			t.Fatal("a mismatched target wrote durable state")
+		}
+	})
+	t.Run("legacy create", func(t *testing.T) {
+		f := newServiceFixture(t)
+		f.targets.target.Key.AgentID = "agent-b"
+		_, err := f.service.AdmitLegacyCreate(context.Background(), f.principal, LegacyCreateRequest{AgentID: "agent-a"})
+		if !IsCode(err, sessionwire.ErrorCodeRuntimeUnavailable) {
+			t.Fatalf("error = %v, want runtime_unavailable", err)
+		}
+		if f.catalog.createCalls != 0 || f.commands.calls != 0 {
+			t.Fatal("a mismatched target wrote durable state")
+		}
+		// The control: the same call with a matching target IS admitted, so
+		// the two assertions above are not trivially true.
+		ok := newServiceFixture(t)
+		if _, err := ok.service.AdmitLegacyCreate(context.Background(), ok.principal, LegacyCreateRequest{AgentID: "agent-a"}); err != nil {
+			t.Fatalf("the matching control was refused: %v", err)
+		}
+		if ok.catalog.createCalls == 0 || ok.commands.calls == 0 {
+			t.Fatal("the accepted control wrote nothing, so the refusals above assert nothing")
+		}
+	})
+}
+
+// TestLegacyCreateRefusesACatalogEntryItDidNotCreate reads the post-create
+// identity recheck, which nothing read.
+//
+// Mutant: replacing the `entry.Record.AgentID != req.AgentID ||
+// entry.Record.DesiredIdempotencyKey != string(req.CommandID)` condition with
+// a constant false left the module green. The fake echoed every create back,
+// so the case the guard exists for -- a durable entry already at that session
+// id, belonging to another agent or another create command -- could not be
+// produced at all. That is a fake looser than the dependency: the released
+// CreateCatalogEntry returns the INCUMBENT with created false.
+func TestLegacyCreateRefusesACatalogEntryItDidNotCreate(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		incumbent sessionstore.CatalogRecord
+	}{
+		{"another agent already holds the session id", sessionstore.CatalogRecord{
+			AgentID: "agent-b", DesiredIdempotencyKey: "generated-2"}},
+		{"another create command already holds the session id", sessionstore.CatalogRecord{
+			AgentID: "agent-a", DesiredIdempotencyKey: "someone-elses-command"}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			f := newServiceFixture(t)
+			f.catalog.createReturn = &sessionstore.CatalogEntry{Record: test.incumbent, Revision: 1}
+			_, err := f.service.AdmitLegacyCreate(context.Background(), f.principal, LegacyCreateRequest{AgentID: "agent-a"})
+			if !IsCode(err, sessionwire.ErrorCodeCommandRejected) {
+				t.Fatalf("error = %v, want command_rejected", err)
+			}
+			if f.commands.calls != 0 {
+				t.Fatal("a create whose catalog entry is not its own reached the inbox")
+			}
+		})
+	}
+}
+
+// TestAnAbsentSessionIsSessionNotFoundInEitherSpelling reads BOTH arms of
+// catalogNotFound, neither of which anything read.
+//
+// Two mutants survived: disabling the CatalogError arm, and disabling the
+// KeyspaceError arm. Together that means the session_not_found refusal -- one
+// of the classified public codes this service mints -- had no test at all;
+// TestEveryClassifiedRefusalIsReachableFromADrivenEntryPoint proves its call
+// site is REACHABLE in the call graph, which is a different claim from any
+// caller ever receiving it.
+//
+// Both spellings are driven because the released store produces both: the
+// catalog's own not-found and the keyspace binding's, and a reader that
+// handled one would silently turn the other into an unclassified fault.
+func TestAnAbsentSessionIsSessionNotFoundInEitherSpelling(t *testing.T) {
+	for _, spelling := range []struct {
+		name string
+		err  error
+	}{
+		{"the catalog's not-found", &sessionstore.CatalogError{Code: sessionstore.CatalogErrorNotFound}},
+		{"the keyspace's binding-not-found", &sessionstore.KeyspaceError{Code: sessionstore.KeyspaceBindingNotFound}},
+	} {
+		for _, entry := range []struct {
+			name string
+			call func(*serviceFixture) error
+		}{
+			{"input", func(f *serviceFixture) error {
+				_, _, err := f.service.AdmitInput(context.Background(), f.principal, sessionwire.InputRequest{
+					CommandEnvelope: envelope("command-a"), SessionID: "session-a", Blocks: []byte(`[{"text":"hi"}]`)})
+				return err
+			}},
+			{"interrupt", func(f *serviceFixture) error {
+				_, _, err := f.service.AdmitInterrupt(context.Background(), f.principal, sessionwire.InterruptRequest{
+					CommandEnvelope: envelope("command-a"), SessionID: "session-a"})
+				return err
+			}},
+			{"restore", func(f *serviceFixture) error {
+				_, _, err := f.service.AdmitRestore(context.Background(), f.principal, sessionwire.RestoreRequest{
+					CommandEnvelope: envelope("command-a"), SessionID: "session-a"})
+				return err
+			}},
+			{"gate response", func(f *serviceFixture) error {
+				_, _, err := f.service.AdmitGateResponse(context.Background(), f.principal, sessionwire.GateResponseRequest{
+					CommandEnvelope: envelope("command-a"), SessionID: "session-a", GateID: "gate-a", Action: "submit",
+					Values: map[string]json.RawMessage{"answer": json.RawMessage(`"yes"`)}, ExpectedOpenEventID: "event-a"})
+				return err
+			}},
+		} {
+			t.Run(spelling.name+"/"+entry.name, func(t *testing.T) {
+				f := newServiceFixture(t)
+				resolvableSession(f)
+				// The control: this same call succeeds while the session
+				// exists, so the refusal below is caused by its absence and
+				// not by anything else in the fixture.
+				control := newServiceFixture(t)
+				resolvableSession(control)
+				if err := entry.call(control); err != nil {
+					t.Fatalf("the present-session control was refused: %v", err)
+				}
+				if control.commands.calls == 0 {
+					t.Fatal("the control reached no durable write, so the assertion below is vacuous")
+				}
+				f.catalog.getErr = spelling.err
+				err := entry.call(f)
+				if !IsCode(err, sessionwire.ErrorCodeSessionNotFound) {
+					t.Fatalf("error = %v, want session_not_found", err)
+				}
+				if f.commands.calls != 0 {
+					t.Fatal("an absent session reached the inbox")
+				}
+			})
+		}
+	}
+}
+
+// TestARetryIsRecognisedInEitherNotFoundSpelling reads the KeyspaceError arm
+// of commandNotFound, which nothing read.
+//
+// Mutant: deleting that arm left the module green. The consequence is not
+// cosmetic. commandNotFound answers "this command is NOT already durable"; a
+// spelling it fails to recognise becomes a raw error out of the retry probe,
+// so a caller retrying after an unknown outcome is handed a dependency fault
+// instead of its original record -- exactly inverting what runbook step 2's
+// reuse rule exists to provide. The pre-existing fake could only produce the
+// InboxError spelling, which is a fake narrower than the dependency.
+func TestARetryIsRecognisedInEitherNotFoundSpelling(t *testing.T) {
+	for _, spelling := range []struct {
+		name string
+		err  error
+	}{
+		{"the inbox's not-found", &sessionstore.InboxError{Code: sessionstore.InboxErrorNotFound}},
+		{"the keyspace's binding-not-found", &sessionstore.KeyspaceError{Code: sessionstore.KeyspaceBindingNotFound}},
+	} {
+		t.Run(spelling.name, func(t *testing.T) {
+			f := newServiceFixture(t)
+			resolvableSession(f)
+			f.commands.notFound = spelling.err
+			req := sessionwire.InputRequest{CommandEnvelope: envelope("command-a"), SessionID: "session-a", Blocks: []byte(`[{"text":"hi"}]`)}
+			first, created, err := f.service.AdmitInput(context.Background(), f.principal, req)
+			if err != nil || !created {
+				t.Fatalf("first = (%v, %v)", created, err)
+			}
+			retry, created, err := f.service.AdmitInput(context.Background(), f.principal, req)
+			if err != nil || created || !reflect.DeepEqual(retry, first) {
+				t.Fatalf("retry = (%+v, %v, %v)", retry, created, err)
+			}
+		})
+	}
+}
+
+// TestAcceptanceRecordsTheClockAndTheConfiguredApplyDeadline reads the two
+// times the admitted record carries, neither of which anything read.
+//
+// Mutant: replacing `now.Add(s.cfg.ApplyDeadline)` with `now` left the module
+// green, so a build in which no command ever became due would have passed --
+// and the due-work reconciler A8.1 built is driven entirely by that deadline.
+// The deadline is asserted as a FUNCTION of the configured duration rather
+// than against a constant, so a service configured differently is covered by
+// the same rows.
+func TestAcceptanceRecordsTheClockAndTheConfiguredApplyDeadline(t *testing.T) {
+	for _, deadline := range []time.Duration{time.Minute, 90 * time.Second, time.Hour} {
+		t.Run(deadline.String(), func(t *testing.T) {
+			f := newServiceFixture(t)
+			resolvableSession(f)
+			svc, err := NewService(Config{Authorizer: f.auth, Targets: f.targets, Catalog: f.catalog,
+				Commands: f.commands, Directory: f.directory, Clock: serviceClock{serviceNow},
+				IDs: f.ids, ApplyDeadline: deadline})
+			if err != nil {
+				t.Fatal(err)
+			}
+			entry, created, err := svc.AdmitInput(context.Background(), f.principal, sessionwire.InputRequest{
+				CommandEnvelope: envelope("command-a"), SessionID: "session-a", Blocks: []byte(`[{"text":"hi"}]`)})
+			if err != nil || !created {
+				t.Fatalf("admission = (%v, %v)", created, err)
+			}
+			if !entry.Record.AcceptedAt.Equal(serviceNow) {
+				t.Errorf("AcceptedAt = %v, want %v", entry.Record.AcceptedAt, serviceNow)
+			}
+			if want := serviceNow.Add(deadline); !entry.Record.ApplyDeadline.Equal(want) {
+				t.Errorf("ApplyDeadline = %v, want %v", entry.Record.ApplyDeadline, want)
+			}
+			if entry.Record.ApplyDeadline.Equal(entry.Record.AcceptedAt) {
+				t.Error("the apply deadline is the acceptance instant, so nothing ever becomes due")
+			}
+		})
+	}
+}
+
+// TestEveryDurableIdentityIsScopedToThePrincipalsTenant reads the tenant on
+// every request this service issues.
+//
+// Mutant: blanking the tenant on the catalog read left the module green. Only
+// the inbox write's tenant was read anywhere, and by one integration test. The
+// A2.1 carry-forward names tenant scoping of the SessionStore query as the
+// obligation A2 owns and A1.2 satisfies only vacuously; this is that
+// obligation at the admission seam.
+//
+// The control is a SECOND principal: the same call under tenant-b must carry
+// tenant-b, so a service that hard-coded the fixture's tenant fails even
+// though every single-tenant assertion would pass.
+func TestEveryDurableIdentityIsScopedToThePrincipalsTenant(t *testing.T) {
+	for _, tenant := range []string{"tenant-a", "tenant-b"} {
+		t.Run(tenant, func(t *testing.T) {
+			f := newServiceFixture(t)
+			resolvableSession(f)
+			f.catalog.entry.Record.TenantID = sessionwire.TenantID(tenant)
+			f.directory.owner.TenantID = sessionwire.TenantID(tenant)
+			principal, err := identity.NewPrincipal(sessionwire.TenantID(tenant), "actor-a", identity.KindActor)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, _, err := f.service.AdmitGateResponse(context.Background(), principal, sessionwire.GateResponseRequest{
+				CommandEnvelope: envelope("command-a"), SessionID: "session-a", GateID: "gate-a", Action: "submit",
+				Values: map[string]json.RawMessage{"answer": json.RawMessage(`"yes"`)}, ExpectedOpenEventID: "event-a",
+			}); err != nil {
+				t.Fatalf("admission: %v", err)
+			}
+			want := sessionwire.TenantID(tenant)
+			for _, got := range []struct {
+				site  string
+				value sessionwire.TenantID
+			}{
+				{"the catalog read", f.catalog.lastGet.TenantID},
+				{"the retry probe", f.commands.lastGet.TenantID},
+				{"the ownership question", f.directory.lastTenant},
+				{"the inbox write", f.commands.lastAdmit.TenantID},
+			} {
+				if got.value != want {
+					t.Errorf("%s was scoped to %q, want %q", got.site, got.value, want)
+				}
+			}
+		})
+	}
+}
+
+// TestARefusedCommandStopsAtItsGuardAndTouchesNothingFurther is the positive
+// control for the two NEGATIVE assertions runbook steps 3 and 4 make.
+//
+// Step 3 says an unknown runtime produces "no inbox record" and step 4 says a
+// non-resumable gate does "not place/restore a Host". Both are assertions that
+// something did NOT happen, and both were written as `f.commands.calls != 0`
+// -- which cannot fail on a path that reaches no dependency for any reason,
+// including a service that refuses everything or a fixture that never drove
+// anything.
+//
+// So the subject here is the whole observed CALL TRACE, held by SET EQUALITY
+// rather than by a "did not" on one counter:
+//
+//   - The accepted row is the control. It observes a trace CONTAINING the
+//     durable write, which is what proves the probe can see one at all.
+//   - Each refused row must observe exactly its own prefix. An extra call --
+//     a durable write, or a placement drive if Config ever declared one --
+//     makes the observed set differ and fails, and so does a MISSING call, so
+//     the guard cannot be satisfied by a service that stopped doing its work.
+//
+// The residue, stated rather than closed: the trace can only see collaborators
+// the fakes implement, which are exactly Config's interface-kind fields minus
+// Clock. That is not a file-name or naming rule -- admissionDependencies
+// derives the set from Config, and the check below fails if a dependency
+// appears there that no fake records. A side effect reached WITHOUT a Config
+// dependency is outside this guard; service.go has no such path today because
+// its only non-stdlib collaborators are s.cfg fields, and
+// TestNoDependencyFaultBecomesAPublicCode holds that set.
+func TestARefusedCommandStopsAtItsGuardAndTouchesNothingFurther(t *testing.T) {
+	trace := func(f *serviceFixture) []string {
+		var out []string
+		for _, injector := range []*faultInjector{
+			&f.auth.faultInjector, &f.targets.faultInjector, &f.catalog.faultInjector,
+			&f.commands.faultInjector, &f.directory.faultInjector, &f.ids.faultInjector,
+		} {
+			for method := range injector.called {
+				out = append(out, method)
+			}
+		}
+		slices.Sort(out)
+		return out
+	}
+
+	// The fakes must cover every dependency Config declares, or this trace is
+	// blind to one and would call an unobserved side effect "nothing".
+	recorded := map[string]bool{"Clock": true}
+	for name := range admissionDependencies(t) {
+		if _, armable := armFault(newServiceFixture(t), name, ""); armable {
+			recorded[name] = true
+		}
+	}
+	for name := range admissionDependencies(t) {
+		if !recorded[name] {
+			t.Fatalf("Config declares %s, which no fake records; this trace cannot see its side effects", name)
+		}
+	}
+
+	for _, test := range []struct {
+		name      string
+		configure func(*serviceFixture)
+		call      func(*serviceFixture) error
+		want      []string
+	}{
+		{
+			name:      "an accepted gate response is the control and DOES write",
+			configure: func(*serviceFixture) {},
+			call: func(f *serviceFixture) error {
+				_, _, err := f.service.AdmitGateResponse(context.Background(), f.principal, sessionwire.GateResponseRequest{
+					CommandEnvelope: envelope("command-a"), SessionID: "session-a", GateID: "gate-a", Action: "submit",
+					Values: map[string]json.RawMessage{"answer": json.RawMessage(`"yes"`)}, ExpectedOpenEventID: "event-a"})
+				return err
+			},
+			want: []string{"AdmitCommand", "AuthorizeControl", "GetCatalogEntry", "GetCommand", "IsKnown", "NewUUID", "Owner"},
+		},
+		{
+			name:      "an unknown runtime stops before the inbox",
+			configure: func(f *serviceFixture) { f.targets.known = false },
+			call: func(f *serviceFixture) error {
+				_, _, err := f.service.AdmitInterrupt(context.Background(), f.principal, sessionwire.InterruptRequest{
+					CommandEnvelope: envelope("command-a"), SessionID: "session-a"})
+				return err
+			},
+			want: []string{"AuthorizeControl", "GetCatalogEntry", "GetCommand", "IsKnown"},
+		},
+		{
+			name:      "a cold owner stops before the inbox and drives no placement",
+			configure: func(f *serviceFixture) { f.directory.ok = false },
+			call: func(f *serviceFixture) error {
+				_, _, err := f.service.AdmitGateResponse(context.Background(), f.principal, sessionwire.GateResponseRequest{
+					CommandEnvelope: envelope("command-a"), SessionID: "session-a", GateID: "gate-a", Action: "submit",
+					Values: map[string]json.RawMessage{"answer": json.RawMessage(`"yes"`)}, ExpectedOpenEventID: "event-a"})
+				return err
+			},
+			want: []string{"AuthorizeControl", "GetCatalogEntry", "GetCommand", "IsKnown", "Owner"},
+		},
+		{
+			name:      "a resolved gate stops before the inbox and drives no placement",
+			configure: func(f *serviceFixture) { f.catalog.entry.Record.OpenGates = nil },
+			call: func(f *serviceFixture) error {
+				_, _, err := f.service.AdmitGateResponse(context.Background(), f.principal, sessionwire.GateResponseRequest{
+					CommandEnvelope: envelope("command-a"), SessionID: "session-a", GateID: "gate-a", Action: "submit",
+					Values: map[string]json.RawMessage{"answer": json.RawMessage(`"yes"`)}, ExpectedOpenEventID: "event-a"})
+				return err
+			},
+			want: []string{"AuthorizeControl", "GetCatalogEntry", "GetCommand", "IsKnown"},
+		},
+		{
+			name:      "a denied principal stops at the authorizer",
+			configure: func(f *serviceFixture) { f.auth.err = errors.New("denied") },
+			call: func(f *serviceFixture) error {
+				_, _, err := f.service.AdmitInput(context.Background(), f.principal, sessionwire.InputRequest{
+					CommandEnvelope: envelope("command-a"), SessionID: "session-a", Blocks: []byte(`[{"text":"hi"}]`)})
+				return err
+			},
+			want: []string{"AuthorizeControl"},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			f := newServiceFixture(t)
+			resolvableSession(f)
+			test.configure(f)
+			err := test.call(f)
+			accepted := strings.Contains(test.name, "accepted")
+			if accepted != (err == nil) {
+				t.Fatalf("error = %v, accepted = %v", err, accepted)
+			}
+			if got := trace(f); !slices.Equal(got, test.want) {
+				t.Fatalf("call trace = %v, want %v", got, test.want)
+			}
+			if accepted != slices.Contains(test.want, "AdmitCommand") {
+				t.Fatal("the control's expectation disagrees with its outcome")
+			}
+		})
+	}
 }
