@@ -16,7 +16,7 @@
 // package-local calls: a sweeper there can reach the answer path without a seam
 // to walk and without a store to name. Here it cannot reach it at all, because
 // this package does not import internal/admission and holds no way to express a
-// command. TestTheGateSweepImportsNoAdmissionOrPlacementPlane and
+// command. TestTheGateSweepImportsNoPlaneThatCanAnswerAGate and
 // TestTheGateSweepReachesNoGateResolutionCapability hold both halves.
 package reconcile
 
@@ -435,12 +435,34 @@ func (s *GateSweeper) retire(ctx context.Context, remnant sessionstore.RemnantGa
 	// The request is built MEMBER BY MEMBER rather than converted from the
 	// remnant, and staticcheck reports the conversion as available (S1016).
 	// SessionStore keeps the two shapes as separate types deliberately -- one
-	// is a sweep RESULT and the other an operation REQUEST -- and the
-	// consequence it names is the one that decides this: a member added to the
-	// page for a caller's convenience must not silently become a member the
-	// operation is asked to honour. A conversion would forward it; these four
-	// assignments would not compile against a request that grew a fifth.
-	//lint:ignore S1016 the two shapes are deliberately distinct; see sessionstore.RemnantGateIntent
+	// is a sweep RESULT and the other an operation REQUEST -- and this call
+	// site keeps them apart in the one case that matters.
+	//
+	// THE THREE WAYS THE TWO SHAPES CAN DIVERGE, SCORED HONESTLY, because the
+	// conversion is NOT uniformly the weaker construct and an earlier version of
+	// this comment claimed it was:
+	//
+	//   - BOTH types grow the same member, in lockstep. The conversion forwards
+	//     it silently, so this operation would begin honouring a member added to
+	//     a PAGE for a reader's convenience, with no edit here and no diff to
+	//     review. The four keyed assignments leave it zero, which is the
+	//     conservative answer and the reason for the deviation.
+	//   - Only the REQUEST grows a member. The conversion stops compiling --
+	//     loudly, which is better -- while these assignments compile and leave
+	//     it zero.
+	//   - Only the PAGE grows a member. Same: the conversion is the loud one.
+	//
+	// So the conversion is stricter in two cases of three, and the justification
+	// is the FIRST case alone: explicit construction does not inherit an
+	// upstream lockstep addition. It is NOT that "these assignments would not
+	// compile against a request that grew a fifth" -- a keyed composite literal
+	// compiles perfectly well against a struct with extra fields, and that
+	// earlier claim was simply wrong about Go.
+	//
+	// What covers the two cases the conversion would have caught is
+	// TestTheRetirementRequestIsBuiltFromTheRemnantMemberByMember, which pins
+	// both shapes' field sets by reflection, so a divergence is loud here too.
+	//lint:ignore S1016 explicit construction; an upstream lockstep addition must not be inherited
 	err := s.cfg.Intents.RetireGateDeadlineIntent(ctx, sessionstore.RetireGateDeadlineIntentRequest{
 		TenantID:  remnant.TenantID,
 		SessionID: remnant.SessionID,

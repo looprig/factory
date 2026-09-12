@@ -4,9 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"go/ast"
 	"go/parser"
 	"go/token"
+	"io"
 	"math/rand"
 	"os"
 	"path/filepath"
@@ -95,12 +95,112 @@ type orderedHooks struct {
 
 	failNamespaceRead string
 	readFailed        bool
+	readSkips         int
 
-	// writes counts every mutating provider call by namespace marker. It is
-	// the probe for "this operation wrote nothing", which no durable read can
-	// answer: a repeat that rewrote the same bytes is indistinguishable from
-	// one that did not, except at the seam.
+	// writes counts every mutating provider call, keyed by the ordered
+	// namespace or by the primitive's own name. It is the probe for "this
+	// operation wrote nothing", which no durable read can answer: a repeat that
+	// rewrote the same bytes is indistinguishable from one that did not, except
+	// at the seam.
+	//
+	// It is SHARED with the ledger, KV and blob decorators rather than private
+	// to the ordered index, and that is the whole point of §C of this file's
+	// design: an earlier version counted OrderedIndex alone and described itself
+	// as unable to miss anything. It could. SessionStore's journal writes
+	// through storage.Ledger, so a synthesized GateResolved frame would have
+	// produced zero ordered-index writes and been invisible.
 	writes map[string]int
+
+	// created records the identity of every gate-intent row this fixture wrote,
+	// which is how a test reaches a row it needs to corrupt: the ordering scope
+	// is derived inside SessionStore from a session's physical namespace and
+	// cannot be rebuilt from outside.
+	created []storage.OrderedID
+}
+
+// primitiveHooks counts mutations on the three storage primitives that are not
+// the ordered index, into the SAME log.
+//
+// storage.Composite embeds Ledger, KV and Blobs anonymously, so they are
+// replaced by assignment to the embedded field. Blobs additionally has to
+// forward BlobReaderCloseBound: SessionStore refuses at Open any Blobs that is
+// not a storage.BlobReaderLifecycle, so a decorator that dropped it would not
+// fail an assertion -- it would fail construction.
+type ledgerHooks struct {
+	inner storage.Ledger
+	note  func(string)
+}
+
+func (h *ledgerHooks) Append(ctx context.Context, name string, expected uint64, payload []byte) error {
+	h.note("ledger")
+	return h.inner.Append(ctx, name, expected, payload)
+}
+
+func (h *ledgerHooks) Read(ctx context.Context, name string, from uint64) (storage.Cursor, error) {
+	return h.inner.Read(ctx, name, from)
+}
+
+func (h *ledgerHooks) Tip(ctx context.Context, name string) (uint64, error) {
+	return h.inner.Tip(ctx, name)
+}
+
+func (h *ledgerHooks) Delete(ctx context.Context, name string) error {
+	h.note("ledger")
+	return h.inner.Delete(ctx, name)
+}
+
+type kvHooks struct {
+	inner storage.KV
+	note  func(string)
+}
+
+func (h *kvHooks) Get(ctx context.Context, key string) ([]byte, uint64, error) {
+	return h.inner.Get(ctx, key)
+}
+
+func (h *kvHooks) Put(ctx context.Context, key string, expectedRev uint64, val []byte) (uint64, error) {
+	h.note("kv")
+	return h.inner.Put(ctx, key, expectedRev, val)
+}
+
+func (h *kvHooks) Keys(ctx context.Context, prefix string) ([]string, error) {
+	return h.inner.Keys(ctx, prefix)
+}
+
+func (h *kvHooks) Delete(ctx context.Context, key string) error {
+	h.note("kv")
+	return h.inner.Delete(ctx, key)
+}
+
+type blobHooks struct {
+	inner storage.Blobs
+	note  func(string)
+}
+
+func (h *blobHooks) Put(ctx context.Context, key string, r io.Reader) error {
+	h.note("blobs")
+	return h.inner.Put(ctx, key, r)
+}
+
+func (h *blobHooks) Get(ctx context.Context, key string) (io.ReadCloser, error) {
+	return h.inner.Get(ctx, key)
+}
+
+func (h *blobHooks) Delete(ctx context.Context, key string) error {
+	h.note("blobs")
+	return h.inner.Delete(ctx, key)
+}
+
+func (h *blobHooks) List(ctx context.Context, prefix string) ([]string, error) {
+	return h.inner.List(ctx, prefix)
+}
+
+func (h *blobHooks) BlobReaderCloseBound() time.Duration {
+	lifecycle, ok := h.inner.(storage.BlobReaderLifecycle)
+	if !ok {
+		return 0
+	}
+	return lifecycle.BlobReaderCloseBound()
 }
 
 var errInjectedProvider = errors.New("injected provider failure")
@@ -115,15 +215,25 @@ func (h *orderedHooks) failWrites(marker string) {
 // a provider fault is injected INSIDE a store operation whose own error
 // classification is the thing under test.
 func (h *orderedHooks) failReads(marker string) {
+	h.failReadsAfter(marker, 0)
+}
+
+// failReadsAfter refuses the (skip+1)-th matching read, so a fault can be aimed
+// at a named point in a multi-page pass rather than only at its first row.
+func (h *orderedHooks) failReadsAfter(marker string, skip int) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	h.failNamespaceRead, h.readFailed = marker, false
+	h.failNamespaceRead, h.readFailed, h.readSkips = marker, false, skip
 }
 
 func (h *orderedHooks) shouldFailRead(namespace string) bool {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if h.failNamespaceRead == "" || h.readFailed || !strings.Contains(namespace, h.failNamespaceRead) {
+		return false
+	}
+	if h.readSkips > 0 {
+		h.readSkips--
 		return false
 	}
 	h.readFailed = true
@@ -148,6 +258,20 @@ func (h *orderedHooks) writeCount(marker string) int {
 		}
 	}
 	return total
+}
+
+// createdIn reports the identities this fixture created in namespaces matching
+// a marker, in creation order.
+func (h *orderedHooks) createdIn(marker string) []storage.OrderedID {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	var out []storage.OrderedID
+	for _, id := range h.created {
+		if strings.Contains(id.Namespace, marker) {
+			out = append(out, id)
+		}
+	}
+	return out
 }
 
 func (h *orderedHooks) noteWrite(namespace string) {
@@ -183,6 +307,9 @@ func (h *orderedHooks) Create(
 		return storage.OrderedRecord{}, false, errInjectedProvider
 	}
 	h.noteWrite(id.Namespace)
+	h.mu.Lock()
+	h.created = append(h.created, id)
+	h.mu.Unlock()
 	return h.inner.Create(ctx, id, rankingScope, value, rank, due)
 }
 
@@ -274,6 +401,11 @@ func newGateFixtureWith(t *testing.T, shards, pageLimit, maxPages int, wrap func
 	composite := memstore.New()
 	hooks := &orderedHooks{inner: composite.OrderedIndex}
 	composite.OrderedIndex = hooks
+	// All four primitives report into the ordered decorator's single log, so
+	// writeCount("") really is every durable mutation this store can make.
+	composite.Ledger = &ledgerHooks{inner: composite.Ledger, note: hooks.noteWrite}
+	composite.KV = &kvHooks{inner: composite.KV, note: hooks.noteWrite}
+	composite.Blobs = &blobHooks{inner: composite.Blobs, note: hooks.noteWrite}
 
 	store, err := sessionstore.Open(context.Background(), composite,
 		sessionstore.WithClock(clock), sessionstore.WithControlShards(shards))
@@ -1003,6 +1135,14 @@ func TestAnExhaustedShardReArmsAtTheHeadAgainstAFreshBound(t *testing.T) {
 		t.Fatalf("first pass retired %d, want 1", first.Retired)
 	}
 	firstBound := recorder.snapshot()[0].bound
+	// The seam's VALUE, not only its shape. The Clock interface is pinned to
+	// exactly Now by the reflection guard, but until this assertion existed
+	// nothing read what Now returned: replacing s.cfg.Clock.Now() with
+	// time.Now() survived the whole suite, because only the monotonicity of
+	// successive bounds was ever checked.
+	if !firstBound.Equal(f.clock.Now()) {
+		t.Errorf("the first pass bounded the view at %v, want the injected clock's %v", firstBound, f.clock.Now())
+	}
 
 	// A gate whose deadline is AFTER every bound the first pass asked about.
 	f.prepare("session-b")
@@ -1386,8 +1526,24 @@ func TestAnUnclassifiableRetirementFailureEndsThePassAndReportsTheWorkItDid(t *t
 // would admit a command in a third place. A probe over the catalog alone would
 // pass while the deadline was destroyed. The total provider write count is
 // carried for the same reason from the other end: it is the one observation
-// that is not an enumeration of objects and so cannot miss one this fixture did
-// not think of.
+// that is not an enumeration of objects, so it does not depend on this fixture
+// having thought of the object.
+//
+// ITS SCOPE IS THE FOUR CONTENT PRIMITIVES, stated exactly rather than as
+// "every namespace". orderedHooks, ledgerHooks, kvHooks and blobHooks all
+// report into one log, so it sums every Create/Update/Delete on the
+// OrderedIndex, every Ledger Append and Delete, every KV Put and Delete, and
+// every Blobs Put and Delete. An earlier version decorated the OrderedIndex
+// ALONE while making the unqualified claim: SessionStore's journal writes
+// through storage.Ledger, so a synthesized GateResolved frame would have
+// produced zero ordered-index writes and been invisible. That was the same
+// one-object-of-a-two-object-invariant shape this probe exists to avoid, one
+// level down.
+//
+// storage.Leaser is deliberately NOT counted, and that is a limit rather than
+// an argument: a lease is an ownership grant carrying no caller content, so it
+// cannot carry a gate resolution -- but it is a durable provider interaction
+// this counter does not see.
 type openGateProbe struct {
 	projections     []sessionwire.GateProjection
 	catalogRevision uint64
@@ -1515,6 +1671,34 @@ func TestTheStillOpenProbeSeesEveryObjectAResolutionDisturbs(t *testing.T) {
 	gates, remnants, _ := f.dueNow()
 	if len(gates) != 0 || len(remnants) != 0 {
 		t.Errorf("after a real resolution the due view holds gates %v and remnants %v, want neither", gates, remnants)
+	}
+
+	// THE FIFTH MEMBER NEEDS ITS OWN PHASE. In the still-open fixture the
+	// remnant list is empty before and after, so dueAsRemnant is exactly the
+	// member where DeepEqual compares two nils -- deleting its comparison
+	// survived the whole suite until this was written, which is the precise
+	// shape the docstring above claims it catches. It is controlled here by
+	// giving it something to move: an aged remnant appears, and then leaves.
+	f.remnantOn("remnant-session", "remnant-gate")
+	f.clock.advance(sessionstore.MinGateIntentRemnantAge + time.Minute)
+	withRemnant := f.probe(gateSession)
+	if len(withRemnant.dueAsRemnant) != 1 {
+		t.Fatalf("the remnant phase built %v, want one remnant", withRemnant.dueAsRemnant)
+	}
+	if moved := withRemnant.differences(before); !slices.Contains(moved, "due_remnants") {
+		t.Errorf("a remnant appearing did not move due_remnants; the member is inert. moved = %v", moved)
+	}
+
+	pending := f.remnantsNow()
+	if len(pending) != 1 {
+		t.Fatalf("remnantsNow = %v, want one", pending)
+	}
+	retired := GateSweepResult{Dispositions: map[GateDisposition]int{}}
+	if err := f.sweeper.retire(context.Background(), pending[0], &retired); err != nil {
+		t.Fatalf("retiring the control remnant: %v", err)
+	}
+	if moved := f.probe(gateSession).differences(withRemnant); !slices.Contains(moved, "due_remnants") {
+		t.Errorf("a remnant being retired did not move due_remnants; the member is inert. moved = %v", moved)
 	}
 }
 
@@ -1667,10 +1851,25 @@ func forbiddenResolutionWord(identifier string) (string, bool) {
 //
 // It is REFLECTION over compiled types rather than a scan of source text, which
 // is what makes it closed against spelling: a member is either in the type or
-// it is not. Its one real limit is that it sees the DECLARED surface -- a
-// method taking `any`, or a field whose dynamic value is a store, is invisible
-// to any static walk -- which is why the method sets are pinned exactly below
-// and why the import guard exists beside it.
+// it is not. Its one real limit is that it sees the DECLARED surface, and that
+// limit has a concrete, demonstrated exploit rather than a theoretical one. A
+// seam here is an interface whose DYNAMIC type is *sessionstore.Store, and
+// sessionstore is on the import allow-list, so:
+//
+//	if st, ok := s.cfg.Intents.(*sessionstore.Store); ok { st.ResolveGate(...) }
+//
+// reaches the forbidden write with no forbidden type in any signature and no
+// forbidden import. NEITHER STRUCTURAL GUARD CAN SEE IT, and neither ever will:
+// a type assertion to a permitted concrete type is invisible to a walk over
+// declared types and to a scan of import paths alike. The spec gate ran exactly
+// this and confirmed both guards silent.
+//
+// What catches it is the BEHAVIOURAL probe, and only if a fixture reaches the
+// branch -- which is why TestAPageCarryingSeveralStillOpenGatesIsStillLeftAlone
+// exists: gated on len(page.Gates) >= 2 the same violation once passed the
+// entire suite, because no page in it ever carried two still-open gates. The
+// three guards are a TRIPLE, not a pair, and the behavioural one is load-bearing
+// rather than a convenience.
 func resolutionReach(t reflect.Type, seen map[reflect.Type]bool, path string) []string {
 	if t == nil || seen[t] {
 		return nil
@@ -1842,14 +2041,72 @@ func TestTheResolutionWalkSeesResolutionCapabilityWhereItIsPresent(t *testing.T)
 // (factory/identity, sessionstore, storage, core) that later grew a gate
 // resolution API would satisfy it. The last of those is the one the reflection
 // guard above covers, which is why the pair is the guard and neither half is.
-func TestTheGateSweepImportsNoPlaneThatCanAnswerAGate(t *testing.T) {
-	const modulePath = "github.com/looprig/factory"
-	allowed := map[string]bool{
-		modulePath + "/identity":                 true,
-		"github.com/looprig/sessionstore":        true,
-		"github.com/looprig/storage":             true,
-		"github.com/looprig/core/sessionwire/v1": true,
+// factoryModulePath is this module, spelled once.
+const factoryModulePath = "github.com/looprig/factory"
+
+// permittedImports is this package's whole declared reach.
+//
+// None of the four can answer, deny, suspend, restore or resolve a gate today,
+// and the last of them is the residue the reflection guard covers: an ALLOWED
+// dependency that later grew a gate-resolution API would satisfy this guard.
+var permittedImports = map[string]bool{
+	factoryModulePath + "/identity":          true,
+	"github.com/looprig/sessionstore":        true,
+	"github.com/looprig/storage":             true,
+	"github.com/looprig/core/sessionwire/v1": true,
+}
+
+// importPermitted is the guard's DECISION, extracted so it can be controlled.
+//
+// It was inline until the quality gate pointed out that the guard's control
+// validated the allow-list's DATA (five paths are absent from a map) and never
+// exercised the classification itself -- so mutating the guard's own report
+// survived the whole suite. A decision that is not a named function cannot have
+// a mechanism control.
+func importPermitted(path string) bool {
+	if !strings.Contains(path, ".") {
+		// A standard-library path has no domain and cannot be a Looprig plane.
+		return true
 	}
+	return permittedImports[path]
+}
+
+// TestTheImportDecisionAdmitsThisPackagesReachAndRefusesThePlanes is the
+// MECHANISM control for the guard below.
+//
+// It runs the guard's own allow/deny decision over synthetic paths in both
+// directions, so a decision that stopped deciding -- an allow-list that grew a
+// wildcard, a classifier that returned true for everything -- fails here even
+// though no file in the package changed.
+func TestTheImportDecisionAdmitsThisPackagesReachAndRefusesThePlanes(t *testing.T) {
+	for _, permitted := range []string{
+		"context", "errors", "fmt", "sync", "time",
+		factoryModulePath + "/identity",
+		"github.com/looprig/sessionstore",
+		"github.com/looprig/storage",
+		"github.com/looprig/core/sessionwire/v1",
+	} {
+		if !importPermitted(permitted) {
+			t.Errorf("the decision refuses %q, which this package legitimately imports", permitted)
+		}
+	}
+	for _, refused := range []string{
+		factoryModulePath + "/internal/admission",
+		factoryModulePath + "/internal/placement",
+		factoryModulePath + "/internal/httpapi",
+		factoryModulePath + "/internal/routing",
+		factoryModulePath + "/internal/realtime/clientlink",
+		factoryModulePath, // the root package, which composes the answer path
+		"github.com/looprig/harness/pkg/rig",
+		"github.com/looprig/core/sessionwire/v2", // a version bump is not pre-approved
+	} {
+		if importPermitted(refused) {
+			t.Errorf("the decision permits %q, which is outside this package's reach", refused)
+		}
+	}
+}
+
+func TestTheGateSweepImportsNoPlaneThatCanAnswerAGate(t *testing.T) {
 
 	entries, err := os.ReadDir(".")
 	if err != nil {
@@ -1872,34 +2129,17 @@ func TestTheGateSweepImportsNoPlaneThatCanAnswerAGate(t *testing.T) {
 				t.Fatalf("%s: unquoting %s: %v", name, spec.Path.Value, err)
 			}
 			imports++
-			if !strings.Contains(path, ".") {
-				continue // a standard-library path has no domain and cannot be a Looprig plane
-			}
-			if allowed[path] {
+			if importPermitted(path) {
 				continue
 			}
 			t.Errorf("%s imports %q, which is outside this package's declared reach", name, path)
 		}
-		ast.Inspect(parsed, func(ast.Node) bool { return true })
 	}
 	if files == 0 {
 		t.Fatal("the guard parsed no production files, so it is vacuous")
 	}
 	if imports == 0 {
 		t.Fatal("the guard read no imports, so it would pass on a file it failed to parse")
-	}
-	// The guard's own positive control: the forbidden set must actually be
-	// forbidden, or an empty allow-list check would pass by accident.
-	for _, forbidden := range []string{
-		modulePath + "/internal/admission",
-		modulePath + "/internal/placement",
-		modulePath + "/internal/httpapi",
-		modulePath + "/internal/routing",
-		"github.com/looprig/harness/pkg/rig",
-	} {
-		if allowed[forbidden] {
-			t.Errorf("%q is in the allow-list, so the guard permits the capability it exists to ban", forbidden)
-		}
 	}
 }
 
@@ -1944,8 +2184,10 @@ func (f *gateFixture) retireHistory(sessions, count int) {
 // the thousands throughout, and the assertion is an equality that does not
 // mention it: the rows a full drain examines equal the live rows and nothing
 // else. The seed is logged so a failure is reproducible, and the drawn sizes
-// are required to differ, or the "for all sizes" reading would be a
-// coincidence.
+// are drawn distinct by the loop itself -- `slices.Contains` rejects a repeat --
+// so the "for all sizes" reading is not a coincidence. There is deliberately no
+// trailing re-check of that: an assertion the draw loop makes unreachable reads
+// as a second probe and is not one.
 func TestHistoricalRetiredGatesAreAbsentFromDuePagesAtEverySize(t *testing.T) {
 	seed := time.Now().UnixNano()
 	t.Logf("size seed = %d", seed)
@@ -2026,9 +2268,6 @@ func TestHistoricalRetiredGatesAreAbsentFromDuePagesAtEverySize(t *testing.T) {
 				t.Errorf("after the drain the due view holds gates %v and remnants %v", gates, remnants)
 			}
 		})
-	}
-	if len(sizes) < 3 || sizes[0] == sizes[1] {
-		t.Fatalf("the sizes did not vary: %v", sizes)
 	}
 }
 
@@ -2315,8 +2554,443 @@ func TestAPassCountsEveryStoreCallThatReachesAProvider(t *testing.T) {
 	if result.Queries == result.Pages {
 		t.Errorf("Queries (%d) equals Pages, so retirements are not being counted", result.Queries)
 	}
-	// ControlShards is read once per pass and must NOT be in the count.
-	if result.Queries > pages+retirements {
-		t.Errorf("Queries = %d exceeds the provider calls made (%d)", result.Queries, pages+retirements)
+}
+
+// ---------------------------------------------------------------------------
+// Fix round. Each test below closes a place where a sentence was wider than its
+// probe, and the first two close gaps that let a real regression ship green.
+// ---------------------------------------------------------------------------
+
+// TestAShrinkObservedWithTheRotorInRangeStillDropsThePositions is the sibling of
+// TestAShrunkShardCountRestartsTheRotorAndDropsTheCursorsThatWentWithIt, and it
+// exists because that test cannot reach this case.
+//
+// THE TWO ARE DIFFERENT EVENTS AND ONLY ONE WAS COVERED. `begin` drops
+// out-of-range positions on EVERY pass rather than only on the pass that finds
+// the rotor past the end. The sibling test deliberately parks the rotor at
+// shard 3, out of range -- which it must, to exercise the rotor RESET -- and
+// that is the one arrangement in which a prune gated on
+// `if s.next >= shards` still fires. So against that test alone, "prune in the
+// branch" and "prune every pass" are indistinguishable, and the original defect
+// this task found by TDD could be reintroduced with the whole suite green.
+//
+// Here the rotor is IN RANGE at the shrink: two whole rounds leave it at zero,
+// and the shrink is 6 -> 4. A conditional prune does nothing at all, so shards
+// 4 and 5 keep positions that the re-grow then presents to a view that has been
+// rebuilt.
+//
+// The general lesson, which is the reason this comment is long: closing one
+// mutant moved a fixture in a way that silently opened another, and nothing went
+// red when it happened. A mutation table is a snapshot of one arrangement, not a
+// property of the suite.
+func TestAShrinkObservedWithTheRotorInRangeStillDropsThePositions(t *testing.T) {
+	f, recorder := newRecordingFixture(t, 6, 1, 1)
+	for i := range 24 {
+		session := sessionwire.SessionID(fmt.Sprintf("session-%02d", i))
+		f.prepare(session)
+		f.open(session, sessionwire.GateID(fmt.Sprintf("gate-%02d", i)), f.clock.Now().Add(time.Minute))
+	}
+	f.clock.advance(sessionstore.MinGateIntentRemnantAge + time.Minute)
+
+	// Two whole rounds and not one pass more: the rotor returns to zero, and
+	// every shard is left mid-walk holding a position.
+	for range 2 {
+		f.sweepAll()
+	}
+	wide := recorder.snapshot()
+	heldAtShrink := map[int]sessionwire.Cursor{}
+	for _, exchange := range wide {
+		heldAtShrink[exchange.shard] = exchange.cursorOut
+	}
+	dropped := []int{}
+	for shard := 4; shard < 6; shard++ {
+		if heldAtShrink[shard] != "" {
+			dropped = append(dropped, shard)
+		}
+	}
+	if len(dropped) == 0 {
+		t.Fatal("neither shard outside the shrunk range held a position at the shrink, so nothing can be dropped")
+	}
+
+	// The shrink, observed with the rotor IN RANGE. Nothing about the rotor has
+	// to move for this to be a shrink.
+	recorder.mu.Lock()
+	recorder.shardsOverride = 4
+	recorder.mu.Unlock()
+	for range 4 {
+		if _, err := f.sweeper.Sweep(context.Background(), servicePrincipal(t)); err != nil {
+			t.Fatalf("Sweep after the shrink: %v", err)
+		}
+	}
+	for _, exchange := range recorder.snapshot()[len(wide):] {
+		if exchange.shard >= 4 {
+			t.Errorf("a pass after the shrink read shard %d, which no longer exists", exchange.shard)
+		}
+	}
+
+	// The re-grow, which is what makes the drop observable.
+	shrunk := len(recorder.snapshot())
+	recorder.mu.Lock()
+	recorder.shardsOverride = 0
+	recorder.mu.Unlock()
+	for range 12 {
+		if _, err := f.sweeper.Sweep(context.Background(), servicePrincipal(t)); err != nil {
+			t.Fatalf("Sweep after the re-grow: %v", err)
+		}
+	}
+	firstAfterRegrow := map[int]sessionwire.Cursor{}
+	for _, exchange := range recorder.snapshot()[shrunk:] {
+		if exchange.shard < 4 {
+			continue
+		}
+		if _, seen := firstAfterRegrow[exchange.shard]; !seen {
+			firstAfterRegrow[exchange.shard] = exchange.cursorIn
+		}
+	}
+	if len(firstAfterRegrow) == 0 {
+		t.Fatal("the re-grown rotor never revisited a dropped shard, so the assertion is vacuous")
+	}
+	for _, shard := range dropped {
+		got, visited := firstAfterRegrow[shard]
+		if !visited {
+			continue
+		}
+		if got != "" {
+			t.Errorf("shard %d's first pass after the re-grow presented %q, want the head:"+
+				" a shrink seen with the rotor in range did not drop its position", shard, got)
+		}
+	}
+}
+
+// TestAPageCarryingSeveralStillOpenGatesIsStillLeftAlone closes step 3's
+// coverage on the ORDINARY page shape.
+//
+// Every other still-open fixture here carries exactly one open gate per page --
+// the anti-starvation test builds two but sets PageLimit to 1 on purpose, so
+// they arrive separately. The spec gate showed what that leaves open: a sweeper
+// that resolves every still-open gate WHENEVER A PAGE REPORTS TWO OR MORE
+// passes the entire suite, all three guards silent, because no page in it ever
+// carried two.
+//
+// That is not a contrived condition. The due view is deadline-ascending and the
+// main fixture's PageLimit is 8, so a shard with several expired-but-unanswered
+// gates produces this page immediately; it is the shape a busy deployment has
+// most of the time. The probe is the existing one, unchanged.
+func TestAPageCarryingSeveralStillOpenGatesIsStillLeftAlone(t *testing.T) {
+	f, recorder := newRecordingFixture(t, 1, 8, 4)
+	const openGates = 4
+	for i := range openGates {
+		session := sessionwire.SessionID(fmt.Sprintf("open-%d", i))
+		f.prepare(session)
+		f.open(session, sessionwire.GateID(fmt.Sprintf("open-gate-%d", i)),
+			f.clock.Now().Add(time.Duration(i+1)*time.Minute))
+	}
+	f.clock.advance(sessionstore.MinGateIntentRemnantAge + time.Hour)
+
+	before := make([]openGateProbe, openGates)
+	for i := range openGates {
+		before[i] = f.probe(sessionwire.SessionID(fmt.Sprintf("open-%d", i)))
+	}
+
+	result := f.sweepAll()
+
+	// The non-vacuity that the whole test turns on: ONE page really did carry
+	// several still-open gates. Without it this is just another single-gate
+	// case wearing a bigger fixture.
+	widest := 0
+	for _, exchange := range recorder.snapshot() {
+		if exchange.openGates > widest {
+			widest = exchange.openGates
+		}
+	}
+	if widest < 2 {
+		t.Fatalf("the widest page carried %d still-open gates, want at least 2", widest)
+	}
+
+	if result.OpenPastDeadline != openGates {
+		t.Fatalf("result = %+v, want all %d open gates counted", result, openGates)
+	}
+	if result.Retired != 0 || result.Remnants != 0 || len(result.Dispositions) != 0 {
+		t.Fatalf("result = %+v, want no retirement and no disposition", result)
+	}
+	for i := range openGates {
+		session := sessionwire.SessionID(fmt.Sprintf("open-%d", i))
+		if moved := before[i].differences(f.probe(session)); len(moved) != 0 {
+			t.Errorf("the sweep moved %v on %s; step 3 permits none of them", moved, session)
+		}
+	}
+	gates, remnants, _ := f.dueNow()
+	if len(gates) != openGates || len(remnants) != 0 {
+		t.Fatalf("after the sweep the due view holds %d gates and remnants %v, want all %d still due",
+			len(gates), remnants, openGates)
+	}
+}
+
+// TestTheProviderWriteCounterCountsEveryStoragePrimitive is the non-vacuity
+// control for the widest member of openGateProbe.
+//
+// `writeCount("")` is only "the observation that cannot miss an object this
+// fixture did not think of" if the decorators it sums really are installed on
+// every primitive that can carry durable content. An earlier version of this
+// fixture decorated OrderedIndex ALONE and said otherwise in its docstring: a
+// synthesized resolution that appended a journal frame writes through
+// storage.Ledger and would have been invisible.
+//
+// Residue, stated precisely rather than left implied: storage.Leaser is NOT
+// counted. A lease is an ownership grant carrying no caller content, so it
+// cannot carry a gate resolution -- but it is a durable provider interaction
+// this counter does not see, and that is a limit rather than an argument.
+func TestTheProviderWriteCounterCountsEveryStoragePrimitive(t *testing.T) {
+	f := newGateFixture(t, 1, 8, 4)
+
+	// KV: session witnesses and the protocol binding are written there.
+	f.prepare(gateSession)
+	if f.hooks.writeCount("kv") == 0 {
+		t.Error("the KV decorator counted nothing after a session was created; it is not installed")
+	}
+	// OrderedIndex: the catalog record and the gate intent.
+	f.open(gateSession, "gate-a", f.clock.Now().Add(time.Minute))
+	if f.hooks.writeCount("gates") == 0 {
+		t.Error("the ordered decorator counted no gate-namespace write after an open")
+	}
+
+	// Ledger: opening a journal writer appends an epoch fence through it.
+	ledgerBefore := f.hooks.writeCount("ledger")
+	writer, err := f.store.OpenJournal(context.Background(), sessionstore.OpenJournalRequest{
+		TenantID: gateTenant, SessionID: gateSession,
+	})
+	if err != nil {
+		t.Fatalf("OpenJournal: %v", err)
+	}
+	t.Cleanup(func() { _ = writer.Close(context.Background()) })
+	if f.hooks.writeCount("ledger") == ledgerBefore {
+		t.Error("the ledger decorator counted nothing after a journal was opened; it is not installed")
+	}
+
+	// And the total is the sum, so a write to any one of them moves it.
+	total := f.hooks.writeCount("")
+	if total <= f.hooks.writeCount("gates") {
+		t.Errorf("the total write count (%d) does not exceed the gate-namespace count (%d),"+
+			" so it is not summing the other primitives", total, f.hooks.writeCount("gates"))
+	}
+}
+
+// TestARetirementFaultResumesFromThePositionThePageWasReadFrom is the probe for
+// page()'s most emphatic comment, which until now had none.
+//
+// When a retirement fails partway through a page, the position persisted is the
+// one that page was read FROM, not the one it ended at. The remnants after the
+// failure were never dealt with, and a store fault is not a property of a row,
+// so the next pass must meet the same page again rather than step over work it
+// never did.
+//
+// The existing unclassifiable-failure case cannot see this: it uses PageLimit 8
+// with three remnants, so the failing page is also the last one and BOTH
+// branches return the empty cursor. Here PageLimit is 2 over six remnants and
+// the fault lands on the second page, so the two branches differ by a whole
+// page of work.
+func TestARetirementFaultResumesFromThePositionThePageWasReadFrom(t *testing.T) {
+	f, recorder := newRecordingFixture(t, 1, 2, 8)
+	const remnants = 6
+	for i := range remnants {
+		f.remnantOn(sessionwire.SessionID(fmt.Sprintf("session-%d", i)), sessionwire.GateID(fmt.Sprintf("gate-%d", i)))
+	}
+	f.clock.advance(sessionstore.MinGateIntentRemnantAge + time.Minute)
+
+	// Each retirement performs exactly one gate-namespace Get (the intent row);
+	// the catalog re-read is a different namespace. Page one retires two, so
+	// skipping two aims the fault at the first retirement of page TWO.
+	f.hooks.failReadsAfter("gates", 2)
+
+	failed, err := f.sweeper.Sweep(context.Background(), servicePrincipal(t))
+	if err == nil {
+		t.Fatalf("the injected fault did not end the pass: %+v", failed)
+	}
+	if failed.Pages != 2 {
+		t.Fatalf("the failing pass read %d pages, want 2 -- the fault must land on the second", failed.Pages)
+	}
+	if failed.Retired != 2 {
+		t.Fatalf("the failing pass retired %d, want the two from page one: %+v", failed.Retired, failed)
+	}
+	f.hooks.failReads("")
+
+	exchanges := recorder.snapshot()
+	firstPage, secondPage := exchanges[0], exchanges[1]
+	if firstPage.cursorOut == "" || secondPage.cursorOut == "" {
+		t.Fatalf("a page ended with no continuation, so the two branches do not differ")
+	}
+	if firstPage.cursorOut == secondPage.cursorOut {
+		t.Fatalf("both pages ended at the same position, so the assertion cannot discriminate")
+	}
+
+	next := f.sweepOnce()
+	resumed := recorder.snapshot()[len(exchanges)]
+	// The position the FAILING page was read from is the first page's
+	// continuation. The position it ENDED at is the second page's.
+	if resumed.cursorIn != firstPage.cursorOut {
+		if resumed.cursorIn == secondPage.cursorOut {
+			t.Fatalf("the pass after the fault resumed from the position the failing page ENDED at," +
+				" stepping over the remnants it never retired")
+		}
+		t.Fatalf("the pass after the fault presented %q, want the position the failing page was read from", resumed.cursorIn)
+	}
+	if !next.Resumed {
+		t.Error("the pass after the fault did not report Resumed")
+	}
+	// Nothing was lost: a clean drain still retires every remaining remnant.
+	if total := next.Retired + f.drain(16).Retired; total != remnants-2 {
+		t.Errorf("the passes after the fault retired %d, want the remaining %d", total, remnants-2)
+	}
+}
+
+// TestAnUndecodableIntentIsCountedUnreadableAndNeverRetired pins the counter the
+// owed list names as the ONLY signal that a shard is accumulating rows nothing
+// can decode -- and which, until now, could have reported zero forever.
+//
+// SessionStore's due page counts such a row and steps over it rather than
+// failing the page, because neither a retirement nor a report can be built from
+// bytes nothing could read. Forwarding that count is this package's whole
+// obligation, and it is a real one: aiming a retirement at such a row is the
+// mistake the store's own split exists to prevent.
+func TestAnUndecodableIntentIsCountedUnreadableAndNeverRetired(t *testing.T) {
+	f := newGateFixture(t, 1, 8, 4)
+	f.remnantOn("session-good", "gate-good")
+	f.remnantOn("session-bad", "gate-bad")
+	f.clock.advance(sessionstore.MinGateIntentRemnantAge + time.Minute)
+
+	if _, remnants, _ := f.dueNow(); len(remnants) != 2 {
+		t.Fatalf("remnants before the corruption = %v, want two", remnants)
+	}
+
+	// Corrupt exactly one intent's stored bytes, through the provider, leaving
+	// its due state intact so it still arrives in the page.
+	ids := f.hooks.createdIn("gates")
+	if len(ids) != 2 {
+		t.Fatalf("the fixture created %d gate intents, want 2", len(ids))
+	}
+	corrupted := ids[1]
+	stored, err := f.hooks.inner.Get(context.Background(), corrupted)
+	if err != nil {
+		t.Fatalf("Get(%v): %v", corrupted, err)
+	}
+	if _, err := f.hooks.inner.Update(context.Background(), corrupted, stored.Revision,
+		[]byte("these bytes are not a gate intent"), stored.Rank, stored.Due); err != nil {
+		t.Fatalf("corrupting the intent: %v", err)
+	}
+
+	result := f.sweepAll()
+	if result.Unreadable != 1 {
+		t.Fatalf("result = %+v, want exactly one unreadable row", result)
+	}
+	if result.Remnants != 1 || result.Retired != 1 {
+		t.Fatalf("result = %+v, want the ONE readable remnant retired", result)
+	}
+	if result.Examined != 2 {
+		t.Errorf("Examined = %d, want both rows: an unreadable row is examined, not skipped", result.Examined)
+	}
+	// The corrupted row is untouched -- not retired, not tombstoned.
+	after, err := f.hooks.inner.Get(context.Background(), corrupted)
+	if err != nil {
+		t.Fatalf("Get after the sweep: %v", err)
+	}
+	if after.Deleted {
+		t.Error("the sweep retired a row nothing could decode")
+	}
+	if after.Revision != stored.Revision+1 {
+		t.Errorf("the corrupted row moved to revision %d, want the corruption's own %d",
+			after.Revision, stored.Revision+1)
+	}
+	// The control: a sweep with NOTHING corrupted reports zero unreadable, so
+	// the counter tracks the corruption rather than being always-on.
+	clean := newGateFixture(t, 1, 8, 4)
+	clean.remnantOn("session-good", "gate-good")
+	clean.clock.advance(sessionstore.MinGateIntentRemnantAge + time.Minute)
+	if control := clean.sweepAll(); control.Unreadable != 0 || control.Retired != 1 {
+		t.Errorf("the uncorrupted control reported %+v, want no unreadable row and one retirement", control)
+	}
+}
+
+// TestClassifyRetirementDiscriminatesOnFieldAsWellAsCode pins the half of the
+// vocabulary the behavioural tests cannot reach.
+//
+// The four arms the real store produces are each driven end to end elsewhere.
+// What no fixture can produce against the pin is a NotFound or a Conflict
+// carrying a DIFFERENT field, and the distinction is load-bearing: `absent`
+// removes work from a sweep's report, so widening it to any NotFound would let
+// an unrelated absence be recorded as a row this sweep handled.
+//
+// It is a table over constructed errors, and the reason that is honest here is
+// that the four real shapes are separately produced by the REAL store in the
+// behavioural tests -- this table pins the discrimination, not the shapes.
+func TestClassifyRetirementDiscriminatesOnFieldAsWellAsCode(t *testing.T) {
+	for _, c := range []struct {
+		name  string
+		err   error
+		want  GateDisposition
+		known bool
+	}{
+		{"success", nil, GateDispositionRetired, true},
+		{"too soon", &sessionstore.CatalogError{Code: sessionstore.CatalogErrorTooSoon, Field: "recorded_at"}, GateDispositionTooSoon, true},
+		{"conflict on the gate", &sessionstore.CatalogError{Code: sessionstore.CatalogErrorConflict, Field: "gate_id"}, GateDispositionReopened, true},
+		{"conflict on the row", &sessionstore.CatalogError{Code: sessionstore.CatalogErrorConflict, Field: "gate_intent"}, GateDispositionRaceLost, true},
+		{"absent row", &sessionstore.CatalogError{Code: sessionstore.CatalogErrorNotFound, Field: "gate_intent"}, GateDispositionAbsent, true},
+
+		// The discriminations. Each is a NotFound or a Conflict that is NOT
+		// about the intent row, and each must end the pass rather than be
+		// recorded as an outcome about a gate.
+		{"absence of something else", &sessionstore.CatalogError{Code: sessionstore.CatalogErrorNotFound, Field: "catalog"}, 0, false},
+		{"absence with no field", &sessionstore.CatalogError{Code: sessionstore.CatalogErrorNotFound}, 0, false},
+		{"conflict on something else", &sessionstore.CatalogError{Code: sessionstore.CatalogErrorConflict, Field: "lease_epoch"}, 0, false},
+		{"too soon is not field-keyed", &sessionstore.CatalogError{Code: sessionstore.CatalogErrorTooSoon, Field: "anything"}, GateDispositionTooSoon, true},
+
+		// And the codes that are never an outcome.
+		{"identity", &sessionstore.CatalogError{Code: sessionstore.CatalogErrorIdentity, Field: "gate_intent"}, 0, false},
+		{"deleted", &sessionstore.CatalogError{Code: sessionstore.CatalogErrorDeleted, Field: "gate_intent"}, 0, false},
+		{"malformed", &sessionstore.CatalogError{Code: sessionstore.CatalogErrorMalformed, Field: "gate_intent"}, 0, false},
+		{"backend", &sessionstore.CatalogError{Code: sessionstore.CatalogErrorBackend, Field: "gate_intent"}, 0, false},
+		{"invalid", &sessionstore.CatalogError{Code: sessionstore.CatalogErrorInvalid, Field: "gate_id"}, 0, false},
+		{"not a catalog error at all", errors.New("a provider fault"), 0, false},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			got, known := classifyRetirement(c.err)
+			if known != c.known {
+				t.Fatalf("classifyRetirement(%v) known = %v, want %v", c.err, known, c.known)
+			}
+			if known && got != c.want {
+				t.Errorf("classifyRetirement(%v) = %v, want %v", c.err, got, c.want)
+			}
+		})
+	}
+}
+
+// TestTheRetirementRequestIsBuiltFromTheRemnantMemberByMember is the backstop
+// for the S1016 deviation.
+//
+// The request is constructed field by field rather than converted, so a member
+// added to BOTH shapes in lockstep is left zero rather than silently forwarded.
+// The cost of that choice is that a member added to EITHER shape alone is quiet
+// where the conversion would have failed to compile. This test is what makes it
+// loud again: both field sets are read by reflection and required to match each
+// other and the four members this package assigns.
+func TestTheRetirementRequestIsBuiltFromTheRemnantMemberByMember(t *testing.T) {
+	fields := func(v any) []string {
+		typ := reflect.TypeOf(v)
+		out := make([]string, 0, typ.NumField())
+		for i := range typ.NumField() {
+			out = append(out, typ.Field(i).Name)
+		}
+		return out
+	}
+	want := []string{"TenantID", "SessionID", "GateID", "Revision"}
+	page := fields(sessionstore.RemnantGateIntent{})
+	request := fields(sessionstore.RetireGateDeadlineIntentRequest{})
+	if !reflect.DeepEqual(page, want) {
+		t.Errorf("RemnantGateIntent declares %v, want exactly %v -- retire() assigns those four", page, want)
+	}
+	if !reflect.DeepEqual(request, want) {
+		t.Errorf("RetireGateDeadlineIntentRequest declares %v, want exactly %v", request, want)
+	}
+	if !reflect.DeepEqual(page, request) {
+		t.Errorf("the two shapes have diverged: page %v, request %v", page, request)
 	}
 }
