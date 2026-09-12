@@ -116,7 +116,7 @@ func (rt *Router) serveObject(metadataOnly bool) http.Handler {
 		reader := ObjectReader(rt.reads)
 		var unbound sessionstore.SessionBinding
 		// Zero-value comparison is sufficient only because the Summary guard
-		// above ran sessionstore@v0.4.0's canonicalCatalogRecord, which validates
+		// above ran sessionstore@v0.7.0's canonicalCatalogRecord, which validates
 		// any non-zero binding: a partial binding cannot reach here as a valid
 		// record. If SessionStore ever relaxes that, this test is not enough.
 		if entry.Record.Binding != unbound {

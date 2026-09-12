@@ -1963,13 +1963,28 @@ func unclassifiedSettlementCodes() map[sessionstore.InboxErrorCode]string {
 		sessionstore.InboxErrorCommandMismatch: "a mismatch is an admission answer; a settlement names no payload",
 		sessionstore.InboxErrorIdentity:        "a row disagreeing with its own filing needs an operator",
 		sessionstore.InboxErrorEpoch:           "the settlement names no epoch, so the fence cannot refuse it",
-		sessionstore.InboxErrorDeadline:        "only a claiming transition checks the apply deadline",
-		sessionstore.InboxErrorState:           "only a claiming transition refuses on state",
-		sessionstore.InboxErrorUnknown:         "an unclassified provider failure is a fault",
-		sessionstore.InboxErrorBackend:         "a provider failure is a fault",
-		sessionstore.InboxErrorMalformed:       "a row this store cannot decode needs an operator",
-		sessionstore.InboxErrorVersion:         "a record version this build does not understand needs an operator",
-		sessionstore.InboxErrorTooLarge:        "a settlement shrinks no record, so this cannot be a row's state",
+		// Added by sessionstore v0.7.0, which took this vocabulary from 19 to
+		// 20. It is the SECOND consumption-cursor fence, beside
+		// InboxErrorEpoch, and it is recorded here on the same ground: it is
+		// produced at exactly one site, consumption.go:669 inside
+		// SaveDispositionCommandCursor, and this sweep saves no cursor. A
+		// settlement names no cursor position, so the fence cannot refuse it.
+		//
+		// It is deliberately NOT given a Disposition. The release note is
+		// explicit that "order" means RE-READ AND RETRY and must not be mapped
+		// onto ErrEpochSuperseded -- so classifying it as DispositionRaceLost,
+		// the arm a superseded write lands in, would tell a sweep it had lost a
+		// race it never entered and settle on a stale read. The fault arm is
+		// the fail-closed direction: it costs a named sweep failure an operator
+		// sees, rather than a wrong settlement nobody does.
+		sessionstore.InboxErrorOrder:     "the settlement names no cursor position, so the consumption fence cannot refuse it",
+		sessionstore.InboxErrorDeadline:  "only a claiming transition checks the apply deadline",
+		sessionstore.InboxErrorState:     "only a claiming transition refuses on state",
+		sessionstore.InboxErrorUnknown:   "an unclassified provider failure is a fault",
+		sessionstore.InboxErrorBackend:   "a provider failure is a fault",
+		sessionstore.InboxErrorMalformed: "a row this store cannot decode needs an operator",
+		sessionstore.InboxErrorVersion:   "a record version this build does not understand needs an operator",
+		sessionstore.InboxErrorTooLarge:  "a settlement shrinks no record, so this cannot be a row's state",
 	}
 }
 
@@ -2005,7 +2020,7 @@ func unclassifiedSettlementCodes() map[sessionstore.InboxErrorCode]string {
 //     what is claimed is only that these enumerated forms do. Under-inclusion
 //     is the dangerous direction: it shrinks the derived subject while every
 //     anti-vacuity floor stays satisfied -- the floor below is 10 against a
-//     real subject of 19, so nine codes could vanish with every floor green.
+//     real subject of 20, so ten codes could vanish with every floor green.
 //
 // # What remains outside, stated as a residue rather than as a boundary
 //
@@ -2465,7 +2480,7 @@ func TestTheConstantScanReportsWhatItCannotRead(t *testing.T) {
 // directory, and a derived subject read from the wrong one is a guard that
 // looks derived and is not. internal/placement pins core the same way and for
 // the same reason.
-const pinnedSessionstoreVersion = "v0.4.0"
+const pinnedSessionstoreVersion = "v0.7.0"
 
 const pinnedSessionstoreModule = "github.com/looprig/sessionstore"
 
