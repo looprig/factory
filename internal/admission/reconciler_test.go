@@ -1992,28 +1992,42 @@ func unclassifiedSettlementCodes() map[sessionstore.InboxErrorCode]string {
 //   - The subject is a CONST declaration. A `var` block of the same type is
 //     invisible, and TestTheConstantScanReportsWhatItCannotRead measures that
 //     rather than leaving it promised.
-//   - Within that subject, a declaration of the type whose value this scan
-//     cannot READ is a HARD FAILURE naming itself, not a silent drop. A
-//     concatenation, a call, a reference to another constant, an implicit
-//     repetition, an untyped conversion to the type, and a declaration through
-//     a file-local alias of the type each produce a report. Under-inclusion is
-//     the dangerous direction: it shrinks the derived subject while every
-//     anti-vacuity floor stays satisfied.
+//   - Within that subject, the forms ENUMERATED HERE each produce a HARD
+//     FAILURE naming themselves rather than a silent drop: a concatenation, a
+//     call, a reference to another constant, an implicit repetition, an
+//     untyped conversion to the type -- parenthesised or nested in a larger
+//     constant expression -- and a declaration through a file-local alias of
+//     the type, with parentheses stripped from the type, the alias and the
+//     conversion. THIS IS A LIST, NOT A CLOSURE. The previous version of this
+//     bullet said that NO declaration inside the subject is a silent drop, and
+//     a third re-gate falsified it with five spellings that compile, survive
+//     gofmt and sit inside the stated unit. All five now report or are read;
+//     what is claimed is only that these enumerated forms do. Under-inclusion
+//     is the dangerous direction: it shrinks the derived subject while every
+//     anti-vacuity floor stays satisfied -- the floor below is 10 against a
+//     real subject of 19, so nine codes could vanish with every floor green.
 //
 // # What remains outside, stated as a residue rather than as a boundary
 //
 // The first version of this comment claimed the residue was "another file or a
-// `var`", and a re-gate found two forms silently dropped INSIDE the stated
-// unit: `const B = Code("b")` and a declaration through a file-local alias.
-// Both are now reported. This is the second hole found in this one scan, so
-// the residue is written as a list of things that ARE missed rather than as a
-// boundary that sounds closed:
+// `var`". A re-gate found two forms silently dropped INSIDE the stated unit
+// (`const B = Code("b")` and a declaration through a file-local alias), and a
+// THIRD re-gate found five more, all of them parenthesisation or expression
+// nesting. That is three holes in one scan, so the residue is written as a
+// list of things that ARE missed rather than as a boundary that sounds closed,
+// and the list is not claimed to be complete either:
 //
 //   - a code declared in another FILE of the pinned package;
 //   - a code declared as a `var` rather than a `const`;
 //   - a code declared through a type alias declared in another file, which
 //     fileLocalAliasesOf cannot see;
-//   - a code declared inside a function body, which is not in File.Decls.
+//   - a code declared inside a function body, which is not in File.Decls;
+//   - a code whose untyped value is of the subject type through a constant
+//     EXPRESSION that names no conversion -- `const F = A + "x"` with A
+//     already a code. conversionTo searches for the SYNTAX `Code(...)`
+//     anywhere in the expression, which is what closed `Code("e") + "x"`; it
+//     cannot see a type that is only inferred, and settling that needs a type
+//     checker rather than a parser.
 //
 // Each of those is absent from the subject and THIS CANNOT SAY SO. The blast
 // radius is bounded by settlementRefusal being FAIL-CLOSED -- such a code
@@ -2072,7 +2086,7 @@ func scanStringConstants(file *ast.File, typeName string) constantScan {
 			}
 			switch {
 			case value.Type != nil:
-				ident, named := value.Type.(*ast.Ident)
+				ident, named := unparenthesise(value.Type).(*ast.Ident)
 				if !named {
 					// A qualified or composite type is not this one, and
 					// carrying the previous name past it would be a guess.
@@ -2158,7 +2172,7 @@ func fileLocalAliasesOf(file *ast.File, typeName string) map[string]bool {
 			if !ok || typ.Assign == token.NoPos {
 				continue
 			}
-			if ident, named := typ.Type.(*ast.Ident); named {
+			if ident, named := unparenthesise(typ.Type).(*ast.Ident); named {
 				edges[typ.Name.Name] = ident.Name
 			}
 		}
@@ -2185,26 +2199,63 @@ func fileLocalAliasesOf(file *ast.File, typeName string) map[string]bool {
 // conversionTo reports whether any of a spec's values is a conversion to the
 // subject type or to one of its file-local aliases, and names the one it found.
 //
-// It keys on the syntax `Name(...)` with Name an identifier, which is exactly
-// what a conversion to a locally-named type looks like. A call to an ordinary
-// FUNCTION of the same name is indistinguishable from it without types -- and
-// is reported, which is the safe direction: a hard failure asks a human, where
-// a silent drop shortens the derived subject with every floor still satisfied.
+// It keys on the syntax `Name(...)` with Name an identifier once parentheses
+// are stripped, which is exactly what a conversion to a locally-named type
+// looks like. A call to an ordinary FUNCTION of the same name is
+// indistinguishable from it without types -- and is reported, which is the
+// safe direction: a hard failure asks a human, where a silent drop shortens
+// the derived subject with every floor still satisfied.
+//
+// It searches the WHOLE value expression, not just its top level, because
+// `const E = Code("e") + "x"` is a constant of the subject type and is an
+// *ast.BinaryExpr: stripping parentheses does not reach it. The same reach
+// over-reports in the same safe direction -- `const N = len(Code("a"))` is an
+// int and is reported anyway -- and it still only adds to `unreadable`, never
+// to `values`, so no arm here can WIDEN the derived subject.
 func conversionTo(values []ast.Expr, typeName string, aliases map[string]bool) (bool, string) {
+	found, name := false, ""
 	for _, expr := range values {
-		call, ok := expr.(*ast.CallExpr)
-		if !ok {
-			continue
-		}
-		ident, named := call.Fun.(*ast.Ident)
-		if !named {
-			continue
-		}
-		if ident.Name == typeName || aliases[ident.Name] {
-			return true, ident.Name
+		ast.Inspect(expr, func(node ast.Node) bool {
+			if found {
+				return false
+			}
+			call, ok := node.(*ast.CallExpr)
+			if !ok {
+				return true
+			}
+			ident, named := unparenthesise(call.Fun).(*ast.Ident)
+			if !named {
+				return true
+			}
+			if ident.Name == typeName || aliases[ident.Name] {
+				found, name = true, ident.Name
+				return false
+			}
+			return true
+		})
+		if found {
+			return true, name
 		}
 	}
 	return false, ""
+}
+
+// unparenthesise strips redundant parentheses from an expression.
+//
+// It exists as ONE helper rather than as three inline type switches because
+// the omission it fixes was one mistake made at three independent sites --
+// value.Type here, call.Fun in conversionTo, and typ.Type in
+// fileLocalAliasesOf -- each of which required a bare *ast.Ident and silently
+// dropped a spelling gofmt considers canonical. A fourth site cannot be added
+// without reaching for this.
+func unparenthesise(expr ast.Expr) ast.Expr {
+	for {
+		paren, ok := expr.(*ast.ParenExpr)
+		if !ok {
+			return expr
+		}
+		expr = paren.X
+	}
 }
 
 func specNames(value *ast.ValueSpec) string {
@@ -2304,6 +2355,73 @@ func TestTheConstantScanReportsWhatItCannotRead(t *testing.T) {
 		{
 			name:   "an alias of something else is not an alias of the subject",
 			source: "package p\ntype Alias = Other\nconst (\n\tA Alias = \"a\"\n)\n",
+		},
+		// The five spellings a THIRD re-gate found silently dropped inside the
+		// stated unit. Four are parenthesisation, which is one omission at
+		// three sites; the fifth is a conversion nested in a larger constant
+		// expression, which parenthesis-unwrapping alone does not reach. Each
+		// is canonical Go that gofmt leaves alone, so each could appear
+		// verbatim in a future sessionstore release. Every one carries the
+		// negative control that keeps its arm from widening the subject.
+		{
+			name:   "a parenthesised TYPE in a typed spec is read",
+			source: "package p\ntype Code string\nconst (\n\tA (Code) = \"a\"\n)\n",
+			values: []string{"a"},
+		},
+		{
+			name:   "a parenthesised type of a DIFFERENT type is still not this one",
+			source: "package p\nconst (\n\tA (Other) = \"a\"\n)\n",
+		},
+		{
+			name:       "a parenthesised conversion VALUE is reported",
+			source:     "package p\nconst (\n\tA Code = \"a\"\n)\nconst B = (Code(\"b\"))\n",
+			values:     []string{"a"},
+			unreadable: 1,
+		},
+		{
+			name:   "a parenthesised conversion value of a DIFFERENT type is not this scan's business",
+			source: "package p\nconst B = (Other(\"b\"))\n",
+		},
+		{
+			name:       "a parenthesised type NAME in a conversion is reported",
+			source:     "package p\nconst C = (Code)(\"c\")\n",
+			unreadable: 1,
+		},
+		{
+			name:   "a parenthesised type name of a DIFFERENT type in a conversion is not this one",
+			source: "package p\nconst C = (Other)(\"c\")\n",
+		},
+		{
+			name:       "a conversion NESTED in a larger constant expression is reported",
+			source:     "package p\nconst E = Code(\"e\") + \"x\"\n",
+			unreadable: 1,
+		},
+		{
+			name:   "a nested conversion to a DIFFERENT type is not this scan's business",
+			source: "package p\nconst E = Other(\"e\") + \"x\"\n",
+		},
+		{
+			name:       "a parenthesised ALIAS declaration is followed",
+			source:     "package p\ntype Alias = (Code)\nconst (\n\tF Alias = \"f\"\n)\n",
+			unreadable: 1,
+		},
+		{
+			name:   "a parenthesised DEFINED type is still a different type",
+			source: "package p\ntype Defined (Code)\nconst (\n\tA (Defined) = \"a\"\n)\n",
+		},
+		{
+			name:       "the nested search over-reports in the SAFE direction",
+			source:     "package p\nconst N = len(Code(\"a\"))\n",
+			unreadable: 1,
+		},
+		{
+			// RESIDUE, made observable rather than promised: this IS a
+			// constant of the subject type and the scan drops it silently,
+			// because nothing in the expression spells the conversion. It is
+			// recorded here so the residue bullet above is a checked claim.
+			name:   "a subject-typed constant naming NO conversion is silently dropped",
+			source: "package p\nconst (\n\tA Code = \"a\"\n)\nconst F = A + \"x\"\n",
+			values: []string{"a"},
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
