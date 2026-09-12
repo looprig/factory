@@ -1585,13 +1585,29 @@ func TestTheQueryCounterMatchesTheSeamOnAPassThatExercisesEverySite(t *testing.T
 			f.seam.count("ListDueCommands"), f.seam.count("AcquireReconciliationClaim"),
 			f.seam.count("RejectCommand"), f.seam.count("ReleaseReconciliationClaim"))
 	}
-	// The same identity stated from the other side, so a pair of compensating
-	// errors -- one site over-counting and another under-counting -- cannot
-	// satisfy the totals comparison. Each site is named.
-	composed := f.seam.count("ListDueCommands") + f.seam.count("AcquireReconciliationClaim") +
+	// The third layer, described as what it ACTUALLY buys rather than as a
+	// second reading of the counter.
+	//
+	// It does NOT defend against a pair of compensating errors in the
+	// reconciler's own counter: both comparisons put the same single scalar
+	// totalQueries(results) on the left, nothing attributes Queries per site,
+	// and against today's seam this identity is logically equivalent to the one
+	// above. A gate demonstrated exactly that -- acquire counting twice with
+	// release counting nothing survived both. The reader that breaks the
+	// symmetry those errors cancel in is the ASYMMETRIC pass, and it lives in
+	// TestADeferredSessionsRowsCostOneAcquisition.
+	//
+	// What this buys is the other direction: providerQueries() sums EVERY
+	// counted seam method except ControlShards, while the sum below names four.
+	// A sixth store call added to this reconciler is therefore counted by the
+	// derived total and missing from the named one, and they disagree -- so a
+	// future seam method that is reached but never named here fails rather than
+	// quietly joining the cost without a reader.
+	named := f.seam.count("ListDueCommands") + f.seam.count("AcquireReconciliationClaim") +
 		f.seam.count("RejectCommand") + f.seam.count("ReleaseReconciliationClaim")
-	if totalQueries(results) != composed {
-		t.Fatalf("the counter totals %d and its four named sites total %d", totalQueries(results), composed)
+	if got := f.seam.providerQueries(); got != named {
+		t.Fatalf("the seam counted %d provider calls and its four NAMED methods account for %d; "+
+			"this sweep reaches a store method no reader here names", got, named)
 	}
 }
 
@@ -1631,17 +1647,47 @@ func TestAFailedSweepStillReleasesTheClaimsItTook(t *testing.T) {
 		t.Fatalf("a failing sweep took %d claims and released %d; the rest are stranded for the whole TTL",
 			result.Claimed, result.Released)
 	}
-	// The positive observable in the store, not only on the result: the claim
-	// this replica took is no longer live, so another replica may take the work
-	// immediately rather than waiting out a horizon.
+	// The store-side observable, written so that it FIRES ON A GREEN RUN.
+	//
+	// Its first version was `if err == nil && holder == "replica-a"`, which a
+	// re-gate showed asserts nothing on a pass: every read returns an error --
+	// ReconcileErrorLapsed for the session that was claimed and released,
+	// ReconcileErrorNotFound for the ones this bounded sweep never reached --
+	// so the body never ran. A check that treats every read error as a pass
+	// reads identically whether the release happened or the record was never
+	// there, which is the negative-observable shape this repository has paid
+	// for.
+	//
+	// So the sessions are COUNTED by what the store says about them, and the
+	// count of RELEASED claims is required to equal the count the sweep took.
+	lapsed, held, absent := 0, 0, 0
 	for i := range 3 {
 		session := sessionwire.SessionID(fmt.Sprintf("session-%02d", i))
 		entry, err := f.store.GetReconciliationClaim(context.Background(), sessionstore.GetReconciliationClaimRequest{
 			TenantID: sweepTenant, SessionID: session,
 		})
-		if err == nil && entry.Claim.HolderID == "replica-a" {
-			t.Errorf("%s is still claimed by the replica whose sweep failed, until %v", session, entry.Claim.ExpiresAt)
+		switch {
+		case err == nil:
+			held++
+			if entry.Claim.HolderID == "replica-a" {
+				t.Errorf("%s is still claimed by the replica whose sweep failed, until %v", session, entry.Claim.ExpiresAt)
+			}
+		case isReconcileCode(err, sessionstore.ReconcileErrorLapsed):
+			lapsed++
+		case isReconcileCode(err, sessionstore.ReconcileErrorNotFound):
+			// This bounded sweep never reached that session.
+			absent++
+		default:
+			t.Fatalf("reading %s's claim: %v", session, err)
 		}
+	}
+	if lapsed != result.Claimed {
+		t.Errorf("the failing sweep took %d claims and the store reports %d released "+
+			"(%d still live, %d never claimed); a claim left live holds every other replica off for the whole TTL",
+			result.Claimed, lapsed, held, absent)
+	}
+	if lapsed+absent+held != 3 {
+		t.Fatalf("the three sessions account for %d lapsed, %d live and %d absent claims", lapsed, held, absent)
 	}
 }
 
@@ -1683,6 +1729,30 @@ func TestADeferredSessionsRowsCostOneAcquisition(t *testing.T) {
 	}
 	if got := f.seam.count("ReleaseReconciliationClaim"); got != 0 {
 		t.Errorf("a deferring sweep released %d claims it never took", got)
+	}
+
+	// THE ASYMMETRIC PASS IS WHERE THE COUNTER'S COMPENSATING ERRORS DIE, and
+	// that is this test's second job.
+	//
+	// Every other pass in this file is symmetric -- one acquisition per
+	// release, one settlement per row -- so a counter that over-counts at one
+	// site and under-counts at another by the same amount cancels exactly and
+	// satisfies the busy-pass cross-check. A gate built that mutant (acquire
+	// counting twice, release counting nothing) and it survived the whole
+	// suite. Here acquisitions are 1 and releases are 0, so nothing cancels.
+	//
+	// The expected total is stated as a LITERAL composition rather than only as
+	// an equality with the seam, because a counter and a seam that were both
+	// wrong in the same direction would still agree: one page for the single
+	// shard, one acquisition, no settlement, no release.
+	const wantQueries = 1 + 1
+	if got := totalQueries(results); got != wantQueries {
+		t.Errorf("a deferring pass reports %d queries, want %d (one page, one acquisition, no write, no release)",
+			got, wantQueries)
+	}
+	if got, want := totalQueries(results), f.seam.providerQueries(); got != want {
+		t.Errorf("on an asymmetric pass the result reports %d queries and the seam counted %d; "+
+			"the counter is wrong at a site whose error the symmetric passes cancel", got, want)
 	}
 }
 
@@ -1922,17 +1992,33 @@ func unclassifiedSettlementCodes() map[sessionstore.InboxErrorCode]string {
 //   - The subject is a CONST declaration. A `var` block of the same type is
 //     invisible, and TestTheConstantScanReportsWhatItCannotRead measures that
 //     rather than leaving it promised.
-//   - A value this scan cannot READ is a HARD FAILURE naming itself, not a
-//     silent drop. A concatenation, a call, a reference to another constant and
-//     an implicit repetition each produce a report, because under-inclusion is
-//     the dangerous direction: it shrinks the derived subject while every floor
-//     stays satisfied.
+//   - Within that subject, a declaration of the type whose value this scan
+//     cannot READ is a HARD FAILURE naming itself, not a silent drop. A
+//     concatenation, a call, a reference to another constant, an implicit
+//     repetition, an untyped conversion to the type, and a declaration through
+//     a file-local alias of the type each produce a report. Under-inclusion is
+//     the dangerous direction: it shrinks the derived subject while every
+//     anti-vacuity floor stays satisfied.
 //
-// What remains outside, and its bound: a code added to another file or as a
-// `var` is absent from the subject and this cannot say so. The blast radius is
-// bounded by settlementRefusal being FAIL-CLOSED -- such a code becomes a fault
-// and stops the sweep -- so the residue is a spurious sweep failure, never a
-// settlement this reconciler had no licence for.
+// # What remains outside, stated as a residue rather than as a boundary
+//
+// The first version of this comment claimed the residue was "another file or a
+// `var`", and a re-gate found two forms silently dropped INSIDE the stated
+// unit: `const B = Code("b")` and a declaration through a file-local alias.
+// Both are now reported. This is the second hole found in this one scan, so
+// the residue is written as a list of things that ARE missed rather than as a
+// boundary that sounds closed:
+//
+//   - a code declared in another FILE of the pinned package;
+//   - a code declared as a `var` rather than a `const`;
+//   - a code declared through a type alias declared in another file, which
+//     fileLocalAliasesOf cannot see;
+//   - a code declared inside a function body, which is not in File.Decls.
+//
+// Each of those is absent from the subject and THIS CANNOT SAY SO. The blast
+// radius is bounded by settlementRefusal being FAIL-CLOSED -- such a code
+// becomes a fault and stops the sweep -- so the residue costs a spurious sweep
+// failure, never a settlement this reconciler had no licence for.
 func declaredStringConstants(t *testing.T, file, typeName string) []string {
 	t.Helper()
 
@@ -1971,6 +2057,7 @@ type constantScan struct {
 // previous version carried it and over-included; that direction is fail-safe,
 // but a scan whose reach nobody can state is the thing being fixed.
 func scanStringConstants(file *ast.File, typeName string) constantScan {
+	aliases := fileLocalAliasesOf(file, typeName)
 	var scan constantScan
 	for _, decl := range file.Decls {
 		gen, ok := decl.(*ast.GenDecl)
@@ -1992,8 +2079,33 @@ func scanStringConstants(file *ast.File, typeName string) constantScan {
 					declaredType = ""
 					continue
 				}
+				// A FILE-LOCAL ALIAS IS THE SUBJECT TYPE UNDER ANOTHER NAME, so
+				// a constant declared through one is a member of the subject
+				// this scan does not resolve. It is REPORTED rather than
+				// skipped: the previous version ended the carried type and fell
+				// through the "not my type" test, which is a silent drop inside
+				// the scan's own stated unit.
+				if ident.Name != typeName && aliases[ident.Name] {
+					scan.unreadable = append(scan.unreadable, specNames(value)+
+						" is declared through the file-local alias "+ident.Name+
+						" of "+typeName+", which this scan does not resolve into the subject")
+					declaredType = ""
+					continue
+				}
 				declaredType = ident.Name
 			case len(value.Values) > 0:
+				// AN UNTYPED CONVERSION IS THE OTHER SILENT DROP. `const B =
+				// Code("b")` is legal, idiomatic Go and is a constant of the
+				// subject type, but the spec carries no Type, so the statement
+				// that (correctly) ends the carried type used to throw it away
+				// before any report could be appended.
+				if converted, name := conversionTo(value.Values, typeName, aliases); converted {
+					scan.unreadable = append(scan.unreadable, specNames(value)+
+						" is an untyped declaration whose value converts to "+name+
+						", which this scan does not read as a declaration of that type")
+					declaredType = ""
+					continue
+				}
 				declaredType = ""
 			}
 			if declaredType != typeName {
@@ -2022,6 +2134,77 @@ func scanStringConstants(file *ast.File, typeName string) constantScan {
 		}
 	}
 	return scan
+}
+
+// fileLocalAliasesOf reports every name this FILE declares as a type alias of
+// typeName, transitively.
+//
+// It is deliberately file-local and deliberately only an ALIAS (`type A = T`),
+// never a defined type (`type A T`): a defined type is a different type whose
+// constants are not members of the subject, and treating the two alike would be
+// over-inclusion dressed as thoroughness. An alias declared in ANOTHER file of
+// the pinned package is outside this scan and is named in the residue.
+func fileLocalAliasesOf(file *ast.File, typeName string) map[string]bool {
+	// Collect every alias edge first, then close over them, so an alias of an
+	// alias is found whatever order the declarations appear in.
+	edges := map[string]string{}
+	for _, decl := range file.Decls {
+		gen, ok := decl.(*ast.GenDecl)
+		if !ok || gen.Tok != token.TYPE {
+			continue
+		}
+		for _, spec := range gen.Specs {
+			typ, ok := spec.(*ast.TypeSpec)
+			if !ok || typ.Assign == token.NoPos {
+				continue
+			}
+			if ident, named := typ.Type.(*ast.Ident); named {
+				edges[typ.Name.Name] = ident.Name
+			}
+		}
+	}
+	out := map[string]bool{}
+	for name := range edges {
+		seen := map[string]bool{}
+		for at := name; ; {
+			next, ok := edges[at]
+			if !ok || seen[at] {
+				break
+			}
+			seen[at] = true
+			if next == typeName {
+				out[name] = true
+				break
+			}
+			at = next
+		}
+	}
+	return out
+}
+
+// conversionTo reports whether any of a spec's values is a conversion to the
+// subject type or to one of its file-local aliases, and names the one it found.
+//
+// It keys on the syntax `Name(...)` with Name an identifier, which is exactly
+// what a conversion to a locally-named type looks like. A call to an ordinary
+// FUNCTION of the same name is indistinguishable from it without types -- and
+// is reported, which is the safe direction: a hard failure asks a human, where
+// a silent drop shortens the derived subject with every floor still satisfied.
+func conversionTo(values []ast.Expr, typeName string, aliases map[string]bool) (bool, string) {
+	for _, expr := range values {
+		call, ok := expr.(*ast.CallExpr)
+		if !ok {
+			continue
+		}
+		ident, named := call.Fun.(*ast.Ident)
+		if !named {
+			continue
+		}
+		if ident.Name == typeName || aliases[ident.Name] {
+			return true, ident.Name
+		}
+	}
+	return false, ""
 }
 
 func specNames(value *ast.ValueSpec) string {
@@ -2083,6 +2266,44 @@ func TestTheConstantScanReportsWhatItCannotRead(t *testing.T) {
 		{
 			name:   "another type in the same file is not this one",
 			source: "package p\nconst (\n\tA Other = \"a\"\n)\n",
+		},
+		// The two forms a re-gate found silently dropped INSIDE the stated
+		// unit -- one file, a const declaration -- each with the negative
+		// control that keeps the new arm from swallowing an unrelated
+		// declaration.
+		{
+			name:       "an untyped conversion to the subject type is reported",
+			source:     "package p\nconst (\n\tA Code = \"a\"\n)\nconst B = Code(\"b\")\n",
+			values:     []string{"a"},
+			unreadable: 1,
+		},
+		{
+			name:   "an untyped conversion to a DIFFERENT type is not this scan's business",
+			source: "package p\nconst (\n\tA Code = \"a\"\n)\nconst B = Other(\"b\")\n",
+			values: []string{"a"},
+		},
+		{
+			name:       "a constant declared through a file-local alias is reported",
+			source:     "package p\ntype Alias = Code\nconst (\n\tA Alias = \"a\"\n)\n",
+			unreadable: 1,
+		},
+		{
+			name:       "an alias of an alias is followed",
+			source:     "package p\ntype Inner = Code\ntype Outer = Inner\nconst (\n\tA Outer = \"a\"\n)\n",
+			unreadable: 1,
+		},
+		{
+			name:       "a conversion through an alias is reported",
+			source:     "package p\ntype Alias = Code\nconst B = Alias(\"b\")\n",
+			unreadable: 1,
+		},
+		{
+			name:   "a DEFINED type of the same underlying type is a different type",
+			source: "package p\ntype Defined Code\nconst (\n\tA Defined = \"a\"\n)\n",
+		},
+		{
+			name:   "an alias of something else is not an alias of the subject",
+			source: "package p\ntype Alias = Other\nconst (\n\tA Alias = \"a\"\n)\n",
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
