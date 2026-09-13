@@ -201,10 +201,22 @@ func TestAuthorizationFailuresNeverBecomeAnInternalError(t *testing.T) {
 }
 
 // TestACatalogFailureMapsToOneStablePublicCode drives every CatalogErrorCode
-// the released module declares. The list is derived from the constants rather
-// than from the branches under test, so a code sessionstore adds and this
-// mapping forgets lands on the DEFAULT -- 500, never a 404 that would report a
-// session absent because the store misbehaved.
+// the released module declared WHEN THIS LIST WAS WRITTEN, which is fourteen at
+// sessionstore v0.8.0.
+//
+// The list names the constants rather than the branches under test, which is
+// what keeps it from being a tautology over the mapping it checks. It is NOT
+// self-maintaining, and an earlier wording claimed it was: "a code sessionstore
+// adds and this mapping forgets lands on the DEFAULT" is true of the PRODUCTION
+// mapping -- which enumerates absence and defaults everything else to 500 -- and
+// false of this test, which is a hand-written slice that a new code does not
+// join. This test would never drive it and would stay green having observed
+// nothing.
+//
+// What fails on growth is internal/command's
+// TestTheStoreErrorVocabularyHasNotGrownSinceTheAbsenceSetWasDerived, one
+// tripwire for this list and the two others like it. A value added to the
+// vocabulary joins THIS test on the day somebody lists it.
 func TestACatalogFailureMapsToOneStablePublicCode(t *testing.T) {
 	t.Parallel()
 

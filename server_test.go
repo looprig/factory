@@ -139,6 +139,16 @@ func allSeams() []reflect.Type {
 		iface[httpapi.Authorizer](),
 		iface[httpapi.SessionReader](),
 		iface[httpapi.Directory](),
+		// The REST control routes' durable command plane and their best-effort
+		// local delivery. They are here rather than in publicSeams for
+		// clientlink.Admitter's reason: the first is satisfied by
+		// internal/admission.Service and the second by internal/routing's
+		// binding table, and a deployer implements neither. A3.3 serves the
+		// four control routes over them; what is still not composed is
+		// factory.New handing them in, which is A9.1's along with the
+		// ClientLink's.
+		iface[httpapi.ControlAdmitter](),
+		iface[httpapi.CommandDelivery](),
 		iface[clientlink.Authenticator](),
 		iface[clientlink.Authorizer](),
 		// The ClientLink's durable command plane. It is here rather than in

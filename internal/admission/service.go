@@ -397,13 +397,20 @@ func catalogTarget(record sessionstore.CatalogRecord) sessionstore.HostTargetKey
 	return sessionstore.HostTargetKey{AgentID: record.AgentID, RuntimeCompatibilityID: record.RuntimeCompatibilityID, Placement: record.DesiredPlacement}
 }
 
+// catalogNotFound is internal/command's absence authority, called rather than
+// restated. A3.3 removed the second one.
+//
+// This package used to read two of the released store's four spellings of "there
+// is no such session", while internal/httpapi read all four: the same deleted or
+// identity-mismatched session answered a durable READ with 404 session_not_found
+// and a control COMMAND with a bare fault. That is `A9.1-notfound`, and two
+// readers of one store vocabulary is exactly the shape the shared package
+// exists to remove -- the same argument the command kinds moved for.
+//
+// See command.SessionAbsent for which codes are absence and why everything else
+// stays a fault.
 func catalogNotFound(err error) bool {
-	var target *sessionstore.CatalogError
-	if errors.As(err, &target) && target.Code == sessionstore.CatalogErrorNotFound {
-		return true
-	}
-	var keyspace *sessionstore.KeyspaceError
-	return errors.As(err, &keyspace) && keyspace.Code == sessionstore.KeyspaceBindingNotFound
+	return command.SessionAbsent(err)
 }
 
 func commandNotFound(err error) bool {

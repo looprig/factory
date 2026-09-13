@@ -2333,6 +2333,9 @@ func expectedRoutes() map[string]expectation {
 		return expectation{auth: auth, session: session, implemented: true}
 	}
 	control := func(command sessionstore.CommandKind, session bool) expectation {
+		return expectation{auth: authControl, command: command, body: bodyJSON, session: session, implemented: true}
+	}
+	pendingControl := func(command sessionstore.CommandKind, session bool) expectation {
 		return expectation{auth: authControl, command: command, body: bodyJSON, session: session}
 	}
 	routes := map[string]expectation{
@@ -2354,8 +2357,11 @@ func expectedRoutes() map[string]expectation {
 		// a state-changing command and is authorized as one: AuthorizeControl
 		// never reads the SessionID, so a session that does not exist yet is no
 		// reason to fall back to the list rule.
-		"GET /v1/sessions":  expectation{auth: authSessionList, implemented: true},
-		"POST /v1/sessions": control(commandCreate, false),
+		"GET /v1/sessions": expectation{auth: authSessionList, implemented: true},
+		// The create is the one control that is NOT served, and the reason is
+		// the immutable session binding this composition cannot author, not an
+		// unwritten handler. See routeTable.
+		"POST /v1/sessions": pendingControl(commandCreate, false),
 		// Durable reads within one session, all three served by this build.
 		// They are replay-free projections of durable state, so each remains
 		// answerable while every Host is stopped.
@@ -2458,7 +2464,10 @@ func TestTheRestatementIsIndependentOfTheTable(t *testing.T) {
 		t.Error("the restatement does not expect the tenant list to be served, so withdrawing its handler is unreported")
 	}
 	if base["POST /v1/sessions"].implemented {
-		t.Error("the restatement expects the session create to be served, which A3.1 owns")
+		t.Error("the restatement expects the session create to be served; it cannot be, for want of a session binding")
+	}
+	if !base["POST /v1/sessions/{sid}/input"].implemented {
+		t.Error("the restatement does not expect input to be served, so withdrawing its handler is unreported")
 	}
 	if base["GET /v1/agents"] != base["GET /v1/capabilities"] {
 		t.Error("the restatement lets /v1/capabilities differ from /v1/agents, which are one aggregate under two paths")
@@ -2479,6 +2488,20 @@ func TestTheRestatementIsIndependentOfTheTable(t *testing.T) {
 // It is keyed by METHOD and route together because a route can serve one method
 // this task implements and another a later task owns; a route-level key would
 // have sanctioned the create along with the list.
+// controlSanction is the one argument the four control routes share, written
+// once because it is one argument: they differ only in the command kind they
+// are authorized under, and four copies would be four places for it to be
+// revised in one.
+const controlSanction = "admits ONE state-changing command under authControl, which is the decision " +
+	"AuthorizeControl exists to make, taken with this route's own command kind before the body is read " +
+	"and before any durable state is consulted -- so a caller who may not command this session learns " +
+	"nothing by sending a body or by naming a session. The session is the PATH's, validated as an " +
+	"identity and then resolved through scope.catalogEntry from principal.Tenant(), so a session in " +
+	"another tenant is answered by the same sessionNotFound() construction absence produces; a body " +
+	"naming a different session is refused rather than admitted under either. The command identity is " +
+	"the CALLER's: a repeat of the identical request returns the original durable record rather than " +
+	"admitting a second command, which is the property the V1 body CommandID exists for."
+
 func sanctionedImplementedMethods() map[string]string {
 	// HEAD is GET's rule exactly, so its sanction is GET's sanction. Writing
 	// it twice would be two places for one argument to be revised in one.
@@ -2527,6 +2550,12 @@ func sanctionedImplementedMethods() map[string]string {
 			"prepared payload, a credential or a signed URL -- and the page is SessionStore's, " +
 			"forwarded whole, so there is no member for a stronger rule to protect that this one does " +
 			"not already cover",
+		"POST /v1/sessions/{sid}/input":     controlSanction,
+		"POST /v1/sessions/{sid}/interrupt": controlSanction,
+		"POST /v1/sessions/{sid}/restore":   controlSanction,
+		"POST /v1/sessions/{sid}/gates/{gid}": controlSanction + " The gate response additionally names a {gid}, " +
+			"which is compared against the decoded body's gate_id for the same reason the session is: the " +
+			"authorization decision and the admitted command must not come from two readings of one request",
 		"GET /v1/sessions": "serves the principal's OWN tenant's durable session page under " +
 			"authSessionList, which is the decision AuthorizeSessionList exists to make. The page " +
 			"is built by scope.sessionPage from principal.Tenant(), so the tenant is the " +

@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"slices"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -22,6 +23,7 @@ import (
 
 	sessionwire "github.com/looprig/core/sessionwire/v1"
 	"github.com/looprig/factory/identity"
+	"github.com/looprig/factory/internal/command"
 	"github.com/looprig/sessionstore"
 )
 
@@ -2619,4 +2621,194 @@ func TestTheAdmittedTimestampsAreNormalisedToUTCWhateverZoneTheClockReadsIn(t *t
 			}
 		})
 	}
+}
+
+// TestADeletedOrForeignSessionIsTheSameAbsenceAsANeverCreatedOne is A3.3's
+// reader for the `A9.1-notfound` carry-forward, and the two rows here are the
+// two spellings this package did NOT recognise.
+//
+// catalogNotFound read the catalog's not-found and the keyspace's binding, and
+// omitted CatalogErrorDeleted and CatalogErrorIdentity -- so one session
+// answered a durable READ with 404 session_not_found (internal/httpapi's
+// catalogFailure reads all four) and a control COMMAND with a bare fault: 500
+// internal_error over REST, a temporary transport error over the ClientLink.
+// Two readers of one store vocabulary, disagreeing about which spellings mean
+// absence.
+//
+// The identity arm is the one that matters publicly. It is what the store
+// returns for a record whose stored tenant does not match the one asked for, so
+// under a store that classified a cross-tenant read that way, a caller could
+// tell a session that exists in another tenant from one that never existed --
+// by the status alone, with no body to read. It is unreachable against the
+// released store, which hashes the tenant into the session's scope and fails at
+// the binding check first; that is a property of a dependency's layout and is
+// pinned rather than relied on.
+//
+// The predicate is now internal/command's SessionAbsent, called by both
+// packages. See TestEveryStoreSpellingOfAbsenceIsOneAnswer for its own reader
+// and for the fault directions it must NOT claim.
+func TestADeletedOrForeignSessionIsTheSameAbsenceAsANeverCreatedOne(t *testing.T) {
+	for _, spelling := range []struct {
+		name string
+		err  error
+	}{
+		{"the catalog's deleted", &sessionstore.CatalogError{Code: sessionstore.CatalogErrorDeleted}},
+		{"the catalog's identity mismatch", &sessionstore.CatalogError{Code: sessionstore.CatalogErrorIdentity}},
+	} {
+		t.Run(spelling.name, func(t *testing.T) {
+			f := newServiceFixture(t)
+			resolvableSession(f)
+			// The control: the same call on the same fixture succeeds while
+			// the session resolves, so the refusal below is caused by the
+			// spelling under test and not by anything else.
+			control := newServiceFixture(t)
+			resolvableSession(control)
+			if _, _, err := control.service.AdmitInput(context.Background(), control.principal, sessionwire.InputRequest{
+				CommandEnvelope: envelope("command-a"), SessionID: "session-a", Blocks: []byte(`[{"text":"hi"}]`)}); err != nil {
+				t.Fatalf("the present-session control was refused: %v", err)
+			}
+			if control.commands.calls == 0 {
+				t.Fatal("the control reached no durable write, so the assertion below is vacuous")
+			}
+
+			f.catalog.getErr = spelling.err
+			_, _, err := f.service.AdmitInput(context.Background(), f.principal, sessionwire.InputRequest{
+				CommandEnvelope: envelope("command-a"), SessionID: "session-a", Blocks: []byte(`[{"text":"hi"}]`)})
+			if !IsCode(err, sessionwire.ErrorCodeSessionNotFound) {
+				t.Fatalf("error = %v, want session_not_found: this spelling means the session is not there, "+
+					"and answering it as a fault tells a caller the deployment is broken", err)
+			}
+			if f.commands.calls != 0 {
+				t.Fatal("an absent session reached the inbox")
+			}
+		})
+	}
+}
+
+// TestEveryCodeThisServiceMintsHasAnEdgeRuling is the derived half of A3.3's
+// refusal-status authority, and its subject is THIS package's sources.
+//
+// internal/command holds the code -> HTTP status table, and both edges consult
+// it. What no test THERE can see is a code this service mints that the table
+// has no ruling for: the table's own sweep ranges over the table. So the set is
+// derived here, from the call sites of refusal(), which is the one constructor
+// of a classified public code -- an *Error is minted nowhere else.
+//
+// The consequence of a missing ruling is not cosmetic. httpapi answers an
+// unruled code 500 internal_error, which is the fail-closed direction and is
+// still wrong for the caller: a decision about their command reported as a
+// fault in Factory. The day a later task mints a sixth code, this fails and the
+// instruction is to decide what it means to a client, not to delete the row.
+//
+// # The bridge, and why it is written out
+//
+// A parsed selector is a NAME; the authority is keyed by a VALUE. No reflect
+// call maps one to the other for a constant, so the two are joined by a table
+// that fails closed on a name it does not know -- which is exactly the case a
+// new code produces. The same shape as httpapi's coreErrorCodes, and for the
+// same reason: naming Core's identifiers makes an upstream rename a compile
+// failure here rather than a silent divergence.
+func TestEveryCodeThisServiceMintsHasAnEdgeRuling(t *testing.T) {
+	t.Parallel()
+
+	bridge := map[string]sessionwire.ErrorCode{
+		"ErrorCodeInvalidRequest":      sessionwire.ErrorCodeInvalidRequest,
+		"ErrorCodeUnsupportedVersion":  sessionwire.ErrorCodeUnsupportedVersion,
+		"ErrorCodeSessionNotFound":     sessionwire.ErrorCodeSessionNotFound,
+		"ErrorCodeCommandRejected":     sessionwire.ErrorCodeCommandRejected,
+		"ErrorCodeGateResolved":        sessionwire.ErrorCodeGateResolved,
+		"ErrorCodeGateNotResumable":    sessionwire.ErrorCodeGateNotResumable,
+		"ErrorCodeGateExpired":         sessionwire.ErrorCodeGateExpired,
+		"ErrorCodeGateResponseInvalid": sessionwire.ErrorCodeGateResponseInvalid,
+		"ErrorCodeRuntimeUnavailable":  sessionwire.ErrorCodeRuntimeUnavailable,
+	}
+
+	minted := mintedRefusalCodes(t, ".")
+	if len(minted) < 2 {
+		t.Fatalf("the scan found %d minted codes; this service mints more than that, so the scan is broken", len(minted))
+	}
+	for _, name := range minted {
+		code, known := bridge[name]
+		if !known {
+			t.Errorf("this service mints sessionwire.%s, which this bridge does not name: "+
+				"add it here AND give it a ruling in internal/command", name)
+			continue
+		}
+		if _, ruled := command.RefusalStatus(code); !ruled {
+			t.Errorf("this service mints %q and internal/command has no status ruling for it; "+
+				"an edge answers it 500 internal_error, which reports a decision about the caller's "+
+				"command as a fault in Factory", code)
+		}
+	}
+}
+
+// mintedRefusalCodes parses this package's production sources and returns the
+// IDENTIFIER of every sessionwire error code passed to refusal().
+//
+// It reports a call it cannot read rather than skipping it, because a site
+// whose code is computed is a site this derivation cannot vouch for, and a
+// derivation that silently narrows its own subject grants coverage where it
+// claims to demand it -- the same correction packageCallGraph already carries.
+func mintedRefusalCodes(t *testing.T, root string) []string {
+	t.Helper()
+
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		t.Fatalf("read %s: %v", root, err)
+	}
+	fset := token.NewFileSet()
+	seen := map[string]bool{}
+	calls := 0
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		matched, matchErr := build.Default.MatchFile(root, name)
+		if matchErr != nil {
+			t.Fatalf("match %s: %v", name, matchErr)
+		}
+		if !matched {
+			continue
+		}
+		file, parseErr := parser.ParseFile(fset, filepath.Join(root, name), nil, 0)
+		if parseErr != nil {
+			t.Fatalf("parse %s: %v", name, parseErr)
+		}
+		ast.Inspect(file, func(node ast.Node) bool {
+			call, ok := node.(*ast.CallExpr)
+			if !ok {
+				return true
+			}
+			fn, ok := call.Fun.(*ast.Ident)
+			if !ok || fn.Name != "refusal" || len(call.Args) == 0 {
+				return true
+			}
+			calls++
+			selector, ok := call.Args[0].(*ast.SelectorExpr)
+			if !ok {
+				t.Errorf("%s: refusal() is called with a code this scan cannot read (%T); "+
+					"a computed code is a site this derivation cannot vouch for",
+					fset.Position(call.Pos()), call.Args[0])
+				return true
+			}
+			pkg, ok := selector.X.(*ast.Ident)
+			if !ok || pkg.Name != "sessionwire" {
+				t.Errorf("%s: refusal() is called with a code from %v rather than sessionwire",
+					fset.Position(call.Pos()), selector.X)
+				return true
+			}
+			seen[selector.Sel.Name] = true
+			return true
+		})
+	}
+	if calls == 0 {
+		t.Fatal("no production file calls refusal(), so this derivation proves nothing")
+	}
+	names := make([]string, 0, len(seen))
+	for name := range seen {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
 }

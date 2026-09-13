@@ -121,6 +121,25 @@ type RouterConfig struct {
 	// learn which configured launch targets are currently advertised.
 	Directory Directory
 
+	// Admissions is the durable command plane the control routes admit into.
+	//
+	// A nil Admissions FAILS CLOSED rather than being rejected by NewRouter,
+	// and that is ObjectPolicy's rule for ObjectPolicy's reason: a deployment
+	// composed for durable reading alone -- which is what factory.New builds
+	// today, and every test of the read plane -- is a supported composition,
+	// and requiring a command plane it never calls would make the read surface
+	// unbuildable. A control request against such a composition is answered
+	// 503 unavailable, which says the deployment cannot carry it out now
+	// rather than that the caller's command was refused.
+	Admissions ControlAdmitter
+
+	// Delivery is the optional local wake-up for an already admitted command.
+	//
+	// Nil means no attempt is made, which changes NO response: the durable
+	// record is the acknowledgement and delivery is best effort either way.
+	// See Router.deliverAdmitted.
+	Delivery CommandDelivery
+
 	// Department is the launch targets this deployment is configured to offer.
 	//
 	// It may be EMPTY, and an empty Department is a supported composition
@@ -196,6 +215,8 @@ type Router struct {
 	ids                IDSource
 	ui                 http.Handler
 	limits             RouteLimits
+	admissions         ControlAdmitter
+	delivery           CommandDelivery
 	objectPolicy       ObjectPolicy
 	resolveObjectStore func(context.Context, sessionstore.SessionBinding) (ObjectReader, error)
 	objectLimits       ObjectLimits
@@ -261,6 +282,8 @@ func NewRouter(cfg RouterConfig) (*Router, error) {
 		ids:                cfg.IDs,
 		ui:                 cfg.UI,
 		limits:             cfg.Limits,
+		admissions:         cfg.Admissions,
+		delivery:           cfg.Delivery,
 		objectPolicy:       cfg.ObjectPolicy,
 		resolveObjectStore: cfg.ResolveObjectStore,
 		objectLimits:       cfg.ObjectLimits,
@@ -678,6 +701,21 @@ type methodRule struct {
 	// stops a later task shipping a handler on a rule nobody re-read.
 	owner string
 
+	// reason is why this method is not served, in the words a CALLER can act
+	// on, and it is written into the 501 rather than kept for a reviewer.
+	//
+	// It exists because an owner tag is a fact about this repository's task
+	// roster and answers nothing a client asked. "A3.1" stayed on the session
+	// create through two tasks that could not have implemented it, and by the
+	// time A3.3 read it the tag named a task whose own remaining work was
+	// blocked elsewhere -- so the response said the build had no handler and
+	// the table said the wrong task owed one. A reason is checked against the
+	// blocker each time it is read, which an owner tag is not.
+	//
+	// It is REQUIRED wherever owner is, and empty wherever owner is empty;
+	// TestEveryPendingMethodExplainsItselfToTheCaller holds both directions.
+	reason string
+
 	// handle is this method's own answer. It is nil for a method with an owner.
 	handle func(*Router) http.Handler
 }
@@ -752,11 +790,25 @@ func readRules(rule methodRule) []methodRule {
 // independent restatement by TestEveryRouteDeclaresWhatItsShapeRequires; the
 // table is not its own authority.
 func routeTable() []route {
-	control := func(command sessionstore.CommandKind, owner string) []methodRule {
-		return []methodRule{{method: http.MethodPost, auth: authControl, command: command, body: bodyJSON, owner: owner}}
+	// control is a state-changing command this build ADMITS: the route decodes
+	// the V1 envelope, hands it to the admission service and answers from the
+	// authoritative durable record.
+	control := func(kind sessionstore.CommandKind) []methodRule {
+		return []methodRule{{
+			method: http.MethodPost, auth: authControl, command: kind, body: bodyJSON,
+			handle: func(rt *Router) http.Handler { return rt.serveControl(kind) },
+		}}
 	}
-	pending := func(auth authRule, owner string) []methodRule {
-		return readRules(methodRule{auth: auth, owner: owner})
+	// pendingControl is a command this build cannot admit, with the reason a
+	// caller is given.
+	pendingControl := func(kind sessionstore.CommandKind, owner, reason string) []methodRule {
+		return []methodRule{{
+			method: http.MethodPost, auth: authControl, command: kind, body: bodyJSON,
+			owner: owner, reason: reason,
+		}}
+	}
+	pending := func(auth authRule, owner, reason string) []methodRule {
+		return readRules(methodRule{auth: auth, owner: owner, reason: reason})
 	}
 	served := func(auth authRule, handle func(*Router) http.Handler) []methodRule {
 		return readRules(methodRule{auth: auth, handle: handle})
@@ -768,7 +820,29 @@ func routeTable() []route {
 		{pattern: "/v1/capabilities", rules: agents},
 		{pattern: "/v1/sessions", rules: append(
 			served(authSessionList, func(rt *Router) http.Handler { return rt.serveSessionList() }),
-			control(commandCreate, "A3.1")...)},
+			// The create is the ONE control this build does not serve, and the
+			// reason is not that nobody has written the handler.
+			//
+			// A V1 create files a durable public-create reservation carrying an
+			// immutable SessionBinding, and three of that binding's four
+			// members -- StorageBindingID, BindingVersion, RuntimeSessionID --
+			// name a deployment's storage configuration and a runtime-assigned
+			// identity that this module is composed with no source for. A
+			// binding is immutable after create, so minting one would durably
+			// and irreversibly pin the session to a configuration no resolver
+			// is required to know, with no repair path. internal/admission
+			// therefore refuses with ErrCreateIdentityProtocolUnavailable, and
+			// a route wired to it would answer runtime_unavailable: a
+			// differently-spelled 501 that a client would read as a decision
+			// about its command.
+			//
+			// So the refusal stays 501 and names the blocker. The LEGACY create
+			// decoder (runbook A3.3 step 2) belongs with it: admission exposes
+			// exactly one legacy entry point, AdmitLegacyCreate, it is a
+			// create, and a compatibility decoder on a route that is not served
+			// would be dead code.
+			pendingControl(commandCreate, "A9.1",
+				"a V1 create needs an immutable session binding this deployment composition cannot author")...)},
 		{pattern: "/v1/sessions/{sid}/status",
 			rules:   served(authSessionRead, func(rt *Router) http.Handler { return rt.serveSessionStatus() }),
 			session: true},
@@ -780,16 +854,17 @@ func routeTable() []route {
 			session: true},
 		{pattern: "/v1/sessions/{sid}/objects/{oid}", rules: served(authObjectRead, func(rt *Router) http.Handler { return rt.serveObject(false) }), session: true},
 		{pattern: "/v1/sessions/{sid}/objects/{oid}/metadata", rules: served(authObjectRead, func(rt *Router) http.Handler { return rt.serveObject(true) }), session: true},
-		{pattern: "/v1/sessions/{sid}/input", rules: control(commandInput, "A3.1"), session: true},
-		{pattern: "/v1/sessions/{sid}/interrupt", rules: control(commandInterrupt, "A3.1"), session: true},
-		{pattern: "/v1/sessions/{sid}/restore", rules: control(commandRestore, "A3.1"), session: true},
-		{pattern: "/v1/sessions/{sid}/gates/{gid}", rules: control(commandGateResponse, "A3.1"), session: true},
+		{pattern: "/v1/sessions/{sid}/input", rules: control(commandInput), session: true},
+		{pattern: "/v1/sessions/{sid}/interrupt", rules: control(commandInterrupt), session: true},
+		{pattern: "/v1/sessions/{sid}/restore", rules: control(commandRestore), session: true},
+		{pattern: "/v1/sessions/{sid}/gates/{gid}", rules: control(commandGateResponse), session: true},
 		// A6.1 built the ClientLink -- internal/realtime/clientlink.Handler is
 		// an http.Handler that authenticates, authorizes and multiplexes. What
 		// is still owed here is COMPOSITION: factory.New must construct one and
 		// pass it in, and Stop must shut it down, which is A9.1's stage-2 work
 		// alongside the admission service and the reconcilers.
-		{pattern: "/v1/realtime", rules: pending(authAuthenticated, "A9.1"), streams: true},
+		{pattern: "/v1/realtime", rules: pending(authAuthenticated, "A9.1",
+			"this build composes no ClientLink handler; the engine exists and nothing constructs one"), streams: true},
 		{pattern: "/v1/csrf-token", rules: served(authAuthenticated, func(rt *Router) http.Handler { return rt.guard.TokenHandler() })},
 	}
 }
@@ -807,12 +882,15 @@ func (rt *Router) serveRoute(entry route) http.Handler {
 	// handler constructed inside the request path would rebuild whatever the
 	// method's chain holds on every call, and the mux already caches nothing.
 	handlers := make(map[string]http.Handler, len(entry.rules))
-	unimplemented := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		writeAPIError(w, notImplemented())
-	}))
 	for _, rule := range entry.rules {
 		if rule.handle == nil {
-			handlers[rule.method] = unimplemented
+			// The reason is bound HERE, per method, rather than shared: two
+			// methods of one route may be pending for different reasons, and
+			// /v1/sessions is exactly that shape waiting to happen.
+			reason := rule.reason
+			handlers[rule.method] = http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				writeAPIError(w, notImplemented(reason))
+			})
 			continue
 		}
 		handlers[rule.method] = rule.handle(rt)
@@ -1075,11 +1153,28 @@ func invalidSessionID() apiError {
 	}
 }
 
-func notImplemented() apiError {
+// notImplemented answers a method this build serves no handler for, and NAMES
+// THE BLOCKER.
+//
+// The message used to be the fixed text below with nothing after it, which told
+// a caller only that the route exists and does nothing -- and left the actual
+// reason in a table column reading "A3.1" long after that had stopped being
+// true. A reason a caller reads is a reason somebody has to re-read.
+//
+// An empty reason degrades to the fixed sentence rather than producing a
+// dangling colon. It is unreachable through the route table, which requires a
+// reason wherever there is an owner, and it is not a branch this file relies on
+// being unreachable: notImplemented is exported to no one but is reachable from
+// any later handler.
+func notImplemented(reason string) apiError {
+	message := "this build serves no handler for that route"
+	if reason != "" {
+		message += ": " + reason
+	}
 	return apiError{
 		status:  http.StatusNotImplemented,
 		code:    ErrorCodeNotImplemented,
-		message: "this build serves no handler for that route",
+		message: message,
 	}
 }
 

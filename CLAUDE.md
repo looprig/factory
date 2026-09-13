@@ -963,14 +963,90 @@ returns `ErrCreateIdentityProtocolUnavailable`; the create path is A3.1's
 remaining work, and the durable cases here use the legacy create to establish a
 session.
 
-**A constraint on A3.3, recorded where A3.3 will read it.** `httpapi`'s
-`retryableStatus` returns **true** for 502/503/504, so the obvious
-`runtime_unavailable` → 503 mapping would make the identical refusal
-`retryable:true` over REST and `retryable:false` here. No divergence exists today
-— the control routes answer 501 — but it is the default outcome unless A3.3
-stops it. Whichever way it is settled, the answer must be **one** authority
-consulted by both edges, not two literals; this is the third instance of the
-shape `A9.1-notfound` already names.
+**`A3.3-retryable` is settled, and the answer is 422.** `runtime_unavailable`
+does **not** map to 503. The set was **enumerated at the pin**: six `refusal()`
+sites in `internal/admission/service.go` carrying **four distinct conditions** —
+a create's `AgentID` naming no configured target (`:184`, `:358`), the create
+reservation this composition cannot author (`:186`), an **existing** session's
+pinned target no longer being configured (`:272`), and a payload past
+`MaxInboxPayloadBytes` (`:279`, `:391`). **Every one is permanent** until the
+deployment's configuration or the request itself changes, and that — not any
+inability to tell a transient member apart — is the argument: `retryable:true`
+promises that repeating the identical bytes could succeed, and none of the four
+can. A failed target-directory read is **not** in the set; it is returned as a
+plain wrapped fault carrying no public code (`service.go:115`, `:269`), a fold
+an earlier task already removed (`service.go:91-114`). `reconciler.go:446`
+mints the same code into a durable `Record.Rejection`, which reaches a client
+through `StatusFor` inside a **2xx** body, never through this table. 503 would
+also make the identical refusal `retryable:true` over REST and `false` on the
+ClientLink. Every classified refusal is a **4xx**: 400
+`invalid_request`, 404 `session_not_found`, 409 for the four state-conflict
+codes (the legacy surface's own answer for `gate_not_ready`), 422
+`runtime_unavailable`. It is **one authority, not two literals**:
+`internal/command.RefusalStatus` holds the table, `RetryableStatus` holds the
+502/503/504 rule that `httpapi.retryableStatus` now delegates to, and this
+edge's `refusalBody` reads `retryable` from it rather than writing `false`.
+
+### The controls are one contract, and it is now measured (A3.3)
+
+**Four of the five control routes are served; the create is not.** `input`,
+`interrupt`, `restore` and `gates/{gid}` decode Core's own request type, admit
+through `internal/admission` and answer from the authoritative inbox record.
+The create stays **501 and names its blocker** — a V1 create files a
+reservation carrying an immutable `SessionBinding` whose `StorageBindingID`,
+`BindingVersion` and `RuntimeSessionID` this composition has no source for, and
+a binding is immutable after create — rather than naming a task tag.
+`methodRule.reason` carries that sentence into the response body, because an
+owner column answers nothing a caller asked and `owner: "A3.1"` outlived the
+task it named. Runbook step 2's legacy create decoder goes with it: admission
+exposes exactly one legacy entry point and it is a create.
+
+**Four decisions are shared with the ClientLink and live in `internal/command`**
+— the refusal status, the retryable rule, the four store spellings of "no such
+session" (`SessionAbsent`), and the five-state projection into Core's
+`CommandStatus` (`StatusFor`). `parity_test.go` drives both edges over one
+admitter and requires **byte-identical** refusal envelopes and acceptance
+bodies; the create is excluded there by an assertion that fails the day it is
+served.
+
+**The body's `session_id` is compared against the path's `{sid}`** (and
+`gate_id` against `{gid}`), and a disagreement is refused rather than rewritten:
+`serveRoute` authorizes the PATH's session and the service admits the BODY's, so
+without the comparison one session is authorized and another admitted — the
+defect A6.2 removed from the RPC path, which closes it by having one reader.
+
+**The success status is the legacy surface's, per route**: 200 for input,
+interrupt and restore, **202** for the gate response, measured in
+`harness/pkg/serve`. It does **not** vary by durable state — a rejected command
+is still a command that was durably admitted, and Core's `status` member is what
+a client branches on.
+
+**`A9.1-notfound` is settled too.** `internal/admission`'s `catalogNotFound` read
+two of the store's four spellings of absence while `internal/httpapi` read four,
+so a deleted or identity-mismatched session answered a READ 404 and a COMMAND
+with a bare fault. Both now call `command.SessionAbsent`.
+
+**`CatalogErrorIdentity` is in that set by a deliberate ruling, not because it
+is the cross-tenant arm.** It is the store's **stable-key collision guard** —
+`GetCatalogEntry` → `readCatalogEntry` → `catalogEntry` (`catalog.go:730`) mints
+it when a decoded record's own identity disagrees with the one asked for — and
+it is on the **live read path**, not hypothetical. The cross-tenant case arrives
+one layer earlier as `binding_not_found`. It is answered 404 because the record
+the store declined to vouch for **may be another tenant's**, so any answer that
+distinguishes it from absence risks confirming that some other session occupies
+the id, and because `httpapi` has answered it 404 since before A3.3 — a fault
+here would make a command and a read disagree about one session. The cost is
+stated rather than discovered: an operator loses the 500 on the control path,
+exactly as they already had on the read path. `KeyspaceHashCollision` and
+`CatalogErrorIdentity` are **two different detectors** and are ruled
+differently on purpose.
+
+**The three hand-written vocabulary lists have one tripwire.**
+`TestTheStoreErrorVocabularyHasNotGrownSinceTheAbsenceSetWasDerived` parses the
+**pinned** sessionstore's sources and counts its two error vocabularies (14 and
+10 at v0.8.0). The lists themselves are fine; what was wrong was claiming they
+were self-maintaining. A value added to a vocabulary joins those tests **on the
+day somebody lists it**, and this is what makes that day arrive loudly.
 
 ### Subscriptions are tracked as delivery demand (A6.3)
 

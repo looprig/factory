@@ -2148,8 +2148,12 @@ type foreignModuleSeam interface {
 // TestAKeyspaceFaultIsNotAMissingSession is the other direction of the absence
 // mapping, and it is what keeps the new branch narrow.
 //
-// sessionstore's KeyspaceError carries ten codes and exactly one of them --
-// binding_not_found -- means "there is no such session". The rest are the
+// sessionstore's KeyspaceError carries ten codes AT v0.8.0, and exactly one of
+// them -- binding_not_found -- means "there is no such session". The count and
+// the list below are hand-written and do not maintain themselves; what fails
+// when the vocabulary grows is internal/command's
+// TestTheStoreErrorVocabularyHasNotGrownSinceTheAbsenceSetWasDerived, which is
+// the tripwire for this list and the two others like it. The rest are the
 // deployment disagreeing with itself: a witness that does not match its key, a
 // marker that cannot be read, a store opened under the wrong layout. Reporting
 // any of those as a 404 would tell a client its session is gone when the truth

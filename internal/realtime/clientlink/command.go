@@ -293,19 +293,13 @@ func (e *Engine) Admit(ctx context.Context, principal identity.Principal, method
 // defaulting it to accepted would report the one case that must never be
 // reported optimistically.
 func replyFor(entry sessionstore.InboxEntry) ([]byte, error) {
-	status := sessionwire.CommandStatus{
-		CommandID:     entry.Record.CommandID,
-		AcceptedOrder: entry.AcceptedOrder,
-	}
-	switch entry.Record.State {
-	case sessionstore.InboxStatePending, sessionstore.InboxStateClaimed, sessionstore.InboxStateApplying:
-		status.State = sessionwire.CommandStateAccepted
-	case sessionstore.InboxStateApplied:
-		status.State = sessionwire.CommandStateApplied
-	case sessionstore.InboxStateRejected:
-		status.State = sessionwire.CommandStateRejected
-		status.Error = entry.Record.Rejection
-	default:
+	// The PROJECTION is internal/command's, called rather than restated: A3.3
+	// gave the REST controls the same answer to build, and two projections of
+	// one five-state vocabulary is two places for one durable record to be
+	// described differently over two transports. The paragraphs above are the
+	// argument for the mapping and now live beside it, in command.StatusFor.
+	status, readable := command.StatusFor(entry)
+	if !readable {
 		return nil, fmt.Errorf("%w: state %q", ErrUnreadableRecord, entry.Record.State)
 	}
 	body, err := status.MarshalJSON()
@@ -347,7 +341,22 @@ func replyFor(entry sessionstore.InboxEntry) ([]byte, error) {
 // an *admission.Error, so Admit returns it as an error and the transport
 // answers with its own temporary failure.
 func refusalBody(code sessionwire.ErrorCode) ([]byte, error) {
-	body, err := json.Marshal(sessionwire.ErrorEnvelope{Error: sessionwire.ErrorDetail{Code: code}})
+	// retryable is READ FROM THE SHARED AUTHORITY rather than written false
+	// here, and the value it returns today is false for every code -- so this
+	// is not a behaviour change, it is the removal of the second literal.
+	//
+	// The paragraph above states the property; a literal states it only for as
+	// long as nobody edits the other edge. A3.3 had to choose a REST status for
+	// each of these codes, retryability over REST is a function of that status,
+	// and the two answers must be one: `runtime_unavailable` mapped to 503
+	// would have been retryable over REST and false here, for the identical
+	// refusal. A code the authority has no ruling for is not retryable, which
+	// is the fail-closed direction.
+	status, ruled := command.RefusalStatus(code)
+	body, err := json.Marshal(sessionwire.ErrorEnvelope{Error: sessionwire.ErrorDetail{
+		Code:      code,
+		Retryable: ruled && command.RetryableStatus(status),
+	}})
 	if err != nil {
 		// REACHABLE, and it was described as unreachable until a gate measured
 		// it. Core refuses to marshal an ErrorDetail with an empty code

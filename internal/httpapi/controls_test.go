@@ -1,0 +1,1061 @@
+package httpapi
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+	"time"
+
+	sessionwire "github.com/looprig/core/sessionwire/v1"
+	"github.com/looprig/factory/identity"
+	"github.com/looprig/factory/internal/admission"
+	"github.com/looprig/factory/internal/command"
+	"github.com/looprig/sessionstore"
+)
+
+// ---------------------------------------------------------------------------
+// The fakes.
+// ---------------------------------------------------------------------------
+
+// admittedCommand is what the fake admitter was asked, recorded as the CORE
+// REQUEST VALUE rather than as a summary of it.
+//
+// The whole request is kept because the property that matters is that the
+// bytes a caller sent reach the service unaltered: a fake recording only the
+// session and the command id could not tell an edge that forwarded the body
+// from one that rebuilt it.
+type admittedCommand struct {
+	principal identity.Principal
+	input     sessionwire.InputRequest
+	interrupt sessionwire.InterruptRequest
+	restore   sessionwire.RestoreRequest
+	gate      sessionwire.GateResponseRequest
+	kind      sessionstore.CommandKind
+}
+
+type fakeAdmitter struct {
+	calls []admittedCommand
+	// entry is what a successful admission returns.
+	entry sessionstore.InboxEntry
+	// err, when set, is returned INSTEAD of entry, after recording the call.
+	err error
+}
+
+func newFakeAdmitter() *fakeAdmitter {
+	return &fakeAdmitter{entry: sessionstore.InboxEntry{
+		Record:        sessionstore.InboxRecord{CommandID: "command-a", State: sessionstore.InboxStatePending},
+		AcceptedOrder: 3,
+	}}
+}
+
+func (f *fakeAdmitter) record(call admittedCommand) (sessionstore.InboxEntry, bool, error) {
+	f.calls = append(f.calls, call)
+	if f.err != nil {
+		return sessionstore.InboxEntry{}, false, f.err
+	}
+	return f.entry, true, nil
+}
+
+func (f *fakeAdmitter) AdmitInput(_ context.Context, p identity.Principal, req sessionwire.InputRequest) (sessionstore.InboxEntry, bool, error) {
+	return f.record(admittedCommand{principal: p, input: req, kind: commandInput})
+}
+
+func (f *fakeAdmitter) AdmitInterrupt(_ context.Context, p identity.Principal, req sessionwire.InterruptRequest) (sessionstore.InboxEntry, bool, error) {
+	return f.record(admittedCommand{principal: p, interrupt: req, kind: commandInterrupt})
+}
+
+func (f *fakeAdmitter) AdmitRestore(_ context.Context, p identity.Principal, req sessionwire.RestoreRequest) (sessionstore.InboxEntry, bool, error) {
+	return f.record(admittedCommand{principal: p, restore: req, kind: commandRestore})
+}
+
+func (f *fakeAdmitter) AdmitGateResponse(_ context.Context, p identity.Principal, req sessionwire.GateResponseRequest) (sessionstore.InboxEntry, bool, error) {
+	return f.record(admittedCommand{principal: p, gate: req, kind: commandGateResponse})
+}
+
+type deliveredCommand struct {
+	// The context is read AT THE CALL, not retained, because what the seam's
+	// contract is about is the context the attempt RUNS on. A retained context
+	// is cancelled by deliverAdmitted's own caller returning, whatever it was
+	// derived from, so inspecting it afterwards cannot tell a derived context
+	// from a locally-bounded one -- measured: a mutant substituting
+	// context.WithDeadline(context.Background(), <the same deadline>) survived
+	// an after-the-fact Done() check.
+	deadline    time.Time
+	hasDeadline bool
+	errAtCall   error
+
+	tenant   sessionwire.TenantID
+	session  sessionwire.SessionID
+	delivery sessionwire.HostLinkCommandDelivery
+}
+
+type fakeDelivery struct {
+	calls []deliveredCommand
+	err   error
+}
+
+// Deliver captures the CONTEXT as well as the arguments, because the seam's
+// contract includes which context the attempt runs on and nothing else could
+// see it. See TestTheDeliveryAttemptRunsOnTheRequestsOwnContext.
+func (f *fakeDelivery) Deliver(ctx context.Context, tenant sessionwire.TenantID, session sessionwire.SessionID, delivery sessionwire.HostLinkCommandDelivery) error {
+	deadline, hasDeadline := ctx.Deadline()
+	f.calls = append(f.calls, deliveredCommand{
+		deadline: deadline, hasDeadline: hasDeadline, errAtCall: ctx.Err(),
+		tenant: tenant, session: session, delivery: delivery,
+	})
+	return f.err
+}
+
+func withAdmitter(admitter ControlAdmitter) fixtureOption {
+	return func(cfg *RouterConfig, _ *fixture) { cfg.Admissions = admitter }
+}
+
+func withDelivery(delivery CommandDelivery) fixtureOption {
+	return func(cfg *RouterConfig, _ *fixture) { cfg.Delivery = delivery }
+}
+
+// ---------------------------------------------------------------------------
+// The four requests, and the one place their bodies are written.
+// ---------------------------------------------------------------------------
+
+// controlProbe is one control operation: its route, the body a caller sends,
+// the status a success answers, and what the recorded call must contain.
+type controlProbe struct {
+	name    string
+	target  string
+	body    string
+	success int
+	// admitted reports whether the fake was asked the right thing.
+	admitted func(admittedCommand) error
+}
+
+func controlProbes(session sessionwire.SessionID) []controlProbe {
+	sid := string(session)
+	return []controlProbe{
+		{
+			name:   "input",
+			target: "/v1/sessions/" + sid + "/input",
+			body: fmt.Sprintf(`{"version":%d,"command_id":"command-a","session_id":%q,"blocks":[{"type":"text","text":"hi"}]}`,
+				sessionwire.CurrentWireVersion, sid),
+			// The legacy surface answered POST .../input 200 with a body
+			// carrying command_id; see the success-status test.
+			success: http.StatusOK,
+			admitted: func(got admittedCommand) error {
+				if got.kind != commandInput {
+					return fmt.Errorf("admitted as %q, want %q", got.kind, commandInput)
+				}
+				if got.input.CommandID != "command-a" || got.input.SessionID != session {
+					return fmt.Errorf("admitted %+v", got.input)
+				}
+				if string(got.input.Blocks) != `[{"type":"text","text":"hi"}]` {
+					return fmt.Errorf("blocks reached the service as %s, want the caller's own bytes", got.input.Blocks)
+				}
+				return nil
+			},
+		},
+		{
+			name:   "interrupt",
+			target: "/v1/sessions/" + sid + "/interrupt",
+			body: fmt.Sprintf(`{"version":%d,"command_id":"command-a","session_id":%q}`,
+				sessionwire.CurrentWireVersion, sid),
+			success: http.StatusOK,
+			admitted: func(got admittedCommand) error {
+				if got.kind != commandInterrupt {
+					return fmt.Errorf("admitted as %q, want %q", got.kind, commandInterrupt)
+				}
+				if got.interrupt.CommandID != "command-a" || got.interrupt.SessionID != session {
+					return fmt.Errorf("admitted %+v", got.interrupt)
+				}
+				return nil
+			},
+		},
+		{
+			name:   "restore",
+			target: "/v1/sessions/" + sid + "/restore",
+			body: fmt.Sprintf(`{"version":%d,"command_id":"command-a","session_id":%q}`,
+				sessionwire.CurrentWireVersion, sid),
+			success: http.StatusOK,
+			admitted: func(got admittedCommand) error {
+				if got.kind != commandRestore {
+					return fmt.Errorf("admitted as %q, want %q", got.kind, commandRestore)
+				}
+				if got.restore.CommandID != "command-a" || got.restore.SessionID != session {
+					return fmt.Errorf("admitted %+v", got.restore)
+				}
+				return nil
+			},
+		},
+		{
+			name:   "gate response",
+			target: "/v1/sessions/" + sid + "/gates/gate-a",
+			body: fmt.Sprintf(`{"version":%d,"command_id":"command-a","session_id":%q,"gate_id":"gate-a",`+
+				`"action":"submit","values":{"answer":"yes"},"expected_open_event_id":"event-a"}`,
+				sessionwire.CurrentWireVersion, sid),
+			// The legacy surface answered the gate route 202, not 200, and
+			// this is the row that makes the success status a table rather
+			// than a constant.
+			success: http.StatusAccepted,
+			admitted: func(got admittedCommand) error {
+				if got.kind != commandGateResponse {
+					return fmt.Errorf("admitted as %q, want %q", got.kind, commandGateResponse)
+				}
+				if got.gate.CommandID != "command-a" || got.gate.SessionID != session || got.gate.GateID != "gate-a" {
+					return fmt.Errorf("admitted %+v", got.gate)
+				}
+				if got.gate.Action != "submit" || string(got.gate.Values["answer"]) != `"yes"` {
+					return fmt.Errorf("the gate answer reached the service as %+v", got.gate)
+				}
+				return nil
+			},
+		},
+	}
+}
+
+func postJSON(f *fixture, target, body string) *httptest.ResponseRecorder {
+	return f.serve(request(http.MethodPost, target, strings.NewReader(body)))
+}
+
+func decodeCommandStatus(t *testing.T, recorder *httptest.ResponseRecorder) sessionwire.CommandStatus {
+	t.Helper()
+
+	if got := recorder.Header().Get("Content-Type"); got != "application/json" {
+		t.Fatalf("Content-Type = %q, want application/json; body was %q", got, recorder.Body)
+	}
+	var status sessionwire.CommandStatus
+	if err := json.Unmarshal(recorder.Body.Bytes(), &status); err != nil {
+		t.Fatalf("body %q is not a Core CommandStatus: %v", recorder.Body, err)
+	}
+	return status
+}
+
+// ---------------------------------------------------------------------------
+// What a control route does with a well-formed command.
+// ---------------------------------------------------------------------------
+
+// TestEveryControlRouteAdmitsItsOwnCommandAndAnswersFromTheRecord is the whole
+// happy path, for all four routes.
+//
+// The assertion is in three parts because three different things could be
+// wrong: the service could be asked the wrong question (the kind and the
+// request value), the answer could be built from the wrong thing (the status is
+// the RECORD's, not the call's), and the caller's own bytes could be rebuilt
+// rather than forwarded (the blocks and the gate values).
+func TestEveryControlRouteAdmitsItsOwnCommandAndAnswersFromTheRecord(t *testing.T) {
+	t.Parallel()
+
+	for _, probe := range controlProbes(fixtureSession) {
+		t.Run(probe.name, func(t *testing.T) {
+			admitter := newFakeAdmitter()
+			f := newFixture(t, withAdmitter(admitter))
+
+			recorder := postJSON(f, probe.target, probe.body)
+
+			if recorder.Code != probe.success {
+				t.Fatalf("answered %d (%s), want %d", recorder.Code, recorder.Body, probe.success)
+			}
+			if len(admitter.calls) != 1 {
+				t.Fatalf("the service was asked %d times, want once", len(admitter.calls))
+			}
+			if err := probe.admitted(admitter.calls[0]); err != nil {
+				t.Error(err)
+			}
+			if got := admitter.calls[0].principal.Tenant(); got != fixtureTenant {
+				t.Errorf("admitted for tenant %q, want the authenticated %q", got, fixtureTenant)
+			}
+			status := decodeCommandStatus(t, recorder)
+			if status.CommandID != "command-a" {
+				t.Errorf("answered for command %q, want %q", status.CommandID, "command-a")
+			}
+			if status.State != sessionwire.CommandStateAccepted {
+				t.Errorf("answered state %q, want %q", status.State, sessionwire.CommandStateAccepted)
+			}
+			if status.AcceptedOrder != 3 {
+				t.Errorf("answered accepted order %d, want 3", status.AcceptedOrder)
+			}
+		})
+	}
+}
+
+// TestTheSuccessStatusIsTheLegacySurfacesOwn is the reader for "port compatible
+// status codes", and it is a TABLE because the legacy statuses are not one
+// number.
+//
+// Measured in harness/pkg/serve at the commit this task was written against:
+// handleInput and handleInterrupt answer `writeJSON(w, http.StatusOK, …)`,
+// handleRestore answers 200 on both of its arms, and handleGate answers
+// `http.StatusAccepted`. A client written against that surface reads
+// `command_id` out of a 200 from three of these routes, and Core's
+// CommandStatus carries `command_id` too -- so both halves of a legacy client's
+// success path survive. Answering a uniform 202 would have been defensible on
+// HTTP grounds and would have broken every caller that compares against 200.
+//
+// The gate's 202 is what makes this measurable at all: with one status for all
+// four, a handler that ignored the table and wrote a constant would pass.
+func TestTheSuccessStatusIsTheLegacySurfacesOwn(t *testing.T) {
+	t.Parallel()
+
+	distinct := map[int]bool{}
+	for _, probe := range controlProbes(fixtureSession) {
+		distinct[probe.success] = true
+	}
+	if len(distinct) < 2 {
+		t.Fatal("every control route expects the same success status, so a handler writing a constant is untested")
+	}
+	for _, probe := range controlProbes(fixtureSession) {
+		t.Run(probe.name, func(t *testing.T) {
+			f := newFixture(t, withAdmitter(newFakeAdmitter()))
+			if recorder := postJSON(f, probe.target, probe.body); recorder.Code != probe.success {
+				t.Errorf("answered %d, want the legacy surface's %d", recorder.Code, probe.success)
+			}
+		})
+	}
+}
+
+// TestEveryDurableStateIsAnsweredUnderTheSameSuccessStatus is the other half of
+// the status decision, and it is what makes the number a property of the ROUTE
+// rather than of the record it happened to read.
+//
+// A rejected command is a command that WAS durably admitted, and the inbox's
+// answer about it is a successful read of that fact; it is Core's `status`
+// member that says a Host refused it, which is the one member a client
+// branches on. Splitting the HTTP status by durable state would put that
+// distinction in two places and let them disagree -- and would report a durable
+// acceptance the caller must not retry as though the request had failed.
+func TestEveryDurableStateIsAnsweredUnderTheSameSuccessStatus(t *testing.T) {
+	t.Parallel()
+
+	probe := controlProbes(fixtureSession)[0]
+	for _, durable := range []struct {
+		state sessionstore.InboxState
+		want  sessionwire.CommandState
+	}{
+		{sessionstore.InboxStatePending, sessionwire.CommandStateAccepted},
+		{sessionstore.InboxStateClaimed, sessionwire.CommandStateAccepted},
+		{sessionstore.InboxStateApplying, sessionwire.CommandStateAccepted},
+		{sessionstore.InboxStateApplied, sessionwire.CommandStateApplied},
+		{sessionstore.InboxStateRejected, sessionwire.CommandStateRejected},
+	} {
+		t.Run(string(durable.state), func(t *testing.T) {
+			admitter := newFakeAdmitter()
+			admitter.entry.Record.State = durable.state
+			if durable.state == sessionstore.InboxStateRejected {
+				admitter.entry.Record.Rejection = &sessionwire.ErrorDetail{
+					Code: sessionwire.ErrorCodeCommandRejected, Message: "the host refused it"}
+			}
+			f := newFixture(t, withAdmitter(admitter))
+
+			recorder := postJSON(f, probe.target, probe.body)
+
+			if recorder.Code != probe.success {
+				t.Fatalf("a %q record answered %d (%s), want %d", durable.state, recorder.Code, recorder.Body, probe.success)
+			}
+			if got := decodeCommandStatus(t, recorder).State; got != durable.want {
+				t.Errorf("a %q record answered state %q, want %q", durable.state, got, durable.want)
+			}
+		})
+	}
+}
+
+// TestAnUnreadableRecordIsAFaultRatherThanASuccess: a state this build does not
+// know is a store disagreeing with this build, and 200 with a body describing
+// it optimistically is the one answer that must never be produced.
+func TestAnUnreadableRecordIsAFaultRatherThanASuccess(t *testing.T) {
+	t.Parallel()
+
+	admitter := newFakeAdmitter()
+	admitter.entry.Record.State = "settled"
+	f := newFixture(t, withAdmitter(admitter))
+	probe := controlProbes(fixtureSession)[0]
+
+	recorder := postJSON(f, probe.target, probe.body)
+
+	if recorder.Code != http.StatusInternalServerError {
+		t.Fatalf("an unrecognised durable state answered %d (%s), want 500", recorder.Code, recorder.Body)
+	}
+	if got := decodeEnvelope(t, recorder).Error.Code; got != ErrorCodeInternal {
+		t.Errorf("code = %q, want %q", got, ErrorCodeInternal)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// The body, and the identifiers in the path.
+// ---------------------------------------------------------------------------
+
+// TestABodyNamingAnotherSessionIsRefusedRatherThanAdmitted is the reader for
+// the comparison this edge exists to make.
+//
+// The authorization decision was made about the PATH's session, before the body
+// was read -- serveRoute takes it from {sid} and hands it to AuthorizeControl --
+// and the admission is made about the BODY's. A handler that did not compare
+// them would authorize one session and admit another, which is precisely the
+// defect A6.2 removed from the RPC path, where the authorized session and the
+// admitted session came from two decoders.
+//
+// Rewriting the body's session to match the path is the other available answer
+// and is worse: it silently admits a command the caller did not send. The
+// refusal is derived from the caller's own bytes and the path they chose, so it
+// discloses nothing about which sessions exist.
+func TestABodyNamingAnotherSessionIsRefusedRatherThanAdmitted(t *testing.T) {
+	t.Parallel()
+
+	for _, probe := range controlProbes("session-elsewhere") {
+		t.Run(probe.name, func(t *testing.T) {
+			admitter := newFakeAdmitter()
+			f := newFixture(t, withAdmitter(admitter))
+			// The PATH names the fixture's session; the BODY names another.
+			target := strings.Replace(probe.target, "session-elsewhere", string(fixtureSession), 1)
+
+			recorder := postJSON(f, target, probe.body)
+
+			if recorder.Code != http.StatusBadRequest {
+				t.Fatalf("answered %d (%s), want 400", recorder.Code, recorder.Body)
+			}
+			if got := decodeEnvelope(t, recorder).Error.Code; got != sessionwire.ErrorCodeInvalidRequest {
+				t.Errorf("code = %q, want %q", got, sessionwire.ErrorCodeInvalidRequest)
+			}
+			if len(admitter.calls) != 0 {
+				t.Fatalf("a command naming another session was admitted: %+v", admitter.calls)
+			}
+		})
+	}
+}
+
+// TestAGateResponseNamingAnotherGateIsRefused is the same comparison on the
+// second identifier the gate route carries.
+//
+// It is a separate case because {gid} is a separate path value with a separate
+// member to disagree with, and a handler comparing only the session would pass
+// every row of the test above.
+func TestAGateResponseNamingAnotherGateIsRefused(t *testing.T) {
+	t.Parallel()
+
+	admitter := newFakeAdmitter()
+	f := newFixture(t, withAdmitter(admitter))
+	probe := controlProbes(fixtureSession)[3]
+	target := strings.Replace(probe.target, "/gates/gate-a", "/gates/gate-b", 1)
+
+	recorder := postJSON(f, target, probe.body)
+
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("answered %d (%s), want 400", recorder.Code, recorder.Body)
+	}
+	if len(admitter.calls) != 0 {
+		t.Fatalf("a gate response naming another gate was admitted: %+v", admitter.calls)
+	}
+
+	// The control: the SAME request at the gate it names is admitted, so the
+	// refusal above is caused by the mismatch and not by the route refusing
+	// every gate response.
+	control := newFixture(t, withAdmitter(newFakeAdmitter()))
+	if got := postJSON(control, probe.target, probe.body); got.Code != probe.success {
+		t.Fatalf("the matching-gate control answered %d (%s), want %d", got.Code, got.Body, probe.success)
+	}
+}
+
+// TestABodyCoreRefusesIsInvalidRequestBeforeAnyAdmission drives the strict
+// decoder Core owns, at this edge, and requires the refusal to reach no durable
+// plane.
+//
+// Every row is a body the RPC edge refuses identically, because both decode
+// through the Core type's own UnmarshalJSON: "the bytes decode" and "the
+// request is a valid V1 command" are one answer, and it is Core's.
+func TestABodyCoreRefusesIsInvalidRequestBeforeAnyAdmission(t *testing.T) {
+	t.Parallel()
+
+	sid := string(fixtureSession)
+	for name, body := range map[string]string{
+		"not JSON at all":      `{`,
+		"an empty object":      `{}`,
+		"no command id":        `{"version":1,"session_id":"` + sid + `","blocks":[{"type":"text","text":"hi"}]}`,
+		"an unknown member":    `{"version":1,"command_id":"c","session_id":"` + sid + `","blocks":[{"type":"text","text":"hi"}],"extra":1}`,
+		"a duplicate member":   `{"version":1,"command_id":"c","command_id":"d","session_id":"` + sid + `","blocks":[{"type":"text","text":"hi"}]}`,
+		"a wrong-typed member": `{"version":1,"command_id":7,"session_id":"` + sid + `","blocks":[{"type":"text","text":"hi"}]}`,
+		"an unsupported version": `{"version":9,"command_id":"c","session_id":"` + sid +
+			`","blocks":[{"type":"text","text":"hi"}]}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			admitter := newFakeAdmitter()
+			f := newFixture(t, withAdmitter(admitter))
+
+			recorder := postJSON(f, "/v1/sessions/"+sid+"/input", body)
+
+			if recorder.Code != http.StatusBadRequest {
+				t.Fatalf("answered %d (%s), want 400", recorder.Code, recorder.Body)
+			}
+			if got := decodeEnvelope(t, recorder).Error.Code; got != sessionwire.ErrorCodeInvalidRequest {
+				t.Errorf("code = %q, want %q", got, sessionwire.ErrorCodeInvalidRequest)
+			}
+			if len(admitter.calls) != 0 {
+				t.Fatalf("a body Core refuses reached the admission service: %+v", admitter.calls)
+			}
+		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// The refusal mapping. This is the A3.3-retryable ruling, at the edge.
+// ---------------------------------------------------------------------------
+
+// TestEveryClassifiedRefusalIsAnsweredThroughTheSharedAuthority sweeps the
+// authority's OWN code set rather than a list beside it, so a code added to
+// admission without a ruling fails here as well as in internal/command.
+func TestEveryClassifiedRefusalIsAnsweredThroughTheSharedAuthority(t *testing.T) {
+	t.Parallel()
+
+	codes := command.RefusalCodes()
+	if len(codes) == 0 {
+		t.Fatal("the authority classifies nothing, so this sweep is vacuous")
+	}
+	probe := controlProbes(fixtureSession)[0]
+	for _, code := range codes {
+		t.Run(string(code), func(t *testing.T) {
+			admitter := newFakeAdmitter()
+			admitter.err = &admission.Error{Code: code}
+			f := newFixture(t, withAdmitter(admitter))
+
+			recorder := postJSON(f, probe.target, probe.body)
+
+			want, _ := command.RefusalStatus(code)
+			if recorder.Code != want {
+				t.Errorf("%q answered %d, want the authority's %d", code, recorder.Code, want)
+			}
+			envelope := decodeEnvelope(t, recorder)
+			if envelope.Error.Code != code {
+				t.Errorf("%q was answered with code %q; admission's classification is carried whole", code, envelope.Error.Code)
+			}
+			if envelope.Error.Retryable {
+				t.Errorf("%q was advertised retryable over REST; the ClientLink answers the identical refusal retryable:false", code)
+			}
+			if envelope.Error.Message != "" {
+				t.Errorf("%q carries the message %q; a message here is a second prose vocabulary the RPC edge would have "+
+					"to reproduce word for word for the two answers to stay identical", code, envelope.Error.Message)
+			}
+		})
+	}
+}
+
+// TestARuntimeUnavailableRefusalIsNotTheRetryable503 names the specific defect
+// the A3.3-retryable open item predicted, at the edge that would have produced
+// it. The authority's own test holds the same property one level down; this one
+// holds that this handler consults it.
+func TestARuntimeUnavailableRefusalIsNotTheRetryable503(t *testing.T) {
+	t.Parallel()
+
+	admitter := newFakeAdmitter()
+	admitter.err = &admission.Error{Code: sessionwire.ErrorCodeRuntimeUnavailable}
+	f := newFixture(t, withAdmitter(admitter))
+	probe := controlProbes(fixtureSession)[0]
+
+	recorder := postJSON(f, probe.target, probe.body)
+
+	if recorder.Code == http.StatusServiceUnavailable {
+		t.Fatal("runtime_unavailable answered 503, which retryableStatus reports retryable: " +
+			"admission mints this code for three permanent conditions as well as one transient one")
+	}
+	if decodeEnvelope(t, recorder).Error.Retryable {
+		t.Error("runtime_unavailable was advertised retryable")
+	}
+}
+
+// TestARefusalCarryingNoCodeIsAFault holds the authority's second return at
+// this edge. (*admission.Error).Error() explicitly contemplates Code == "", so
+// a zero-valued refusal from any present or future admission path arrives here,
+// and answering it with whatever status a lookup miss produced would be a
+// ruling nobody made.
+func TestARefusalCarryingNoCodeIsAFault(t *testing.T) {
+	t.Parallel()
+
+	for name, err := range map[string]error{
+		"a refusal with no code": &admission.Error{},
+		"a code with no ruling":  &admission.Error{Code: sessionwire.ErrorCodeGateResponseInvalid},
+	} {
+		t.Run(name, func(t *testing.T) {
+			admitter := newFakeAdmitter()
+			admitter.err = err
+			f := newFixture(t, withAdmitter(admitter))
+			probe := controlProbes(fixtureSession)[0]
+
+			recorder := postJSON(f, probe.target, probe.body)
+
+			if recorder.Code != http.StatusInternalServerError {
+				t.Fatalf("answered %d (%s), want 500", recorder.Code, recorder.Body)
+			}
+			if got := decodeEnvelope(t, recorder).Error.Code; got != ErrorCodeInternal {
+				t.Errorf("code = %q, want %q", got, ErrorCodeInternal)
+			}
+		})
+	}
+}
+
+// TestADependencyFaultIsNotADecisionAboutTheCommand is the other side of the
+// same seam: admission returns a fault AS ITSELF, carrying no public code, so
+// this edge must answer from its own fault channel rather than inventing a
+// classification.
+//
+// The three rows are the three conditions the mapping separates, and each has a
+// different consequence for a caller: a draining replica is retryable and
+// another replica will serve, a deadline is the router's own, and anything else
+// is a fault an operator hears about and a client does not hammer.
+func TestADependencyFaultIsNotADecisionAboutTheCommand(t *testing.T) {
+	t.Parallel()
+
+	probe := controlProbes(fixtureSession)[0]
+	for _, fault := range []struct {
+		name      string
+		err       error
+		status    int
+		code      sessionwire.ErrorCode
+		retryable bool
+	}{
+		{
+			name: "a draining store", err: &sessionstore.StoreClosedError{},
+			status: http.StatusServiceUnavailable, code: ErrorCodeUnavailable, retryable: true,
+		},
+		{
+			name: "the deadline this router imposed", err: context.DeadlineExceeded,
+			status: http.StatusGatewayTimeout, code: ErrorCodeTimeout, retryable: true,
+		},
+		{
+			name: "an unclassified failure", err: errors.New("the backend is confused"),
+			status: http.StatusInternalServerError, code: ErrorCodeInternal, retryable: false,
+		},
+	} {
+		t.Run(fault.name, func(t *testing.T) {
+			admitter := newFakeAdmitter()
+			admitter.err = fmt.Errorf("admission: observe the session's owner: %w", fault.err)
+			f := newFixture(t, withAdmitter(admitter))
+
+			recorder := postJSON(f, probe.target, probe.body)
+
+			if recorder.Code != fault.status {
+				t.Fatalf("answered %d (%s), want %d", recorder.Code, recorder.Body, fault.status)
+			}
+			envelope := decodeEnvelope(t, recorder)
+			if envelope.Error.Code != fault.code {
+				t.Errorf("code = %q, want %q", envelope.Error.Code, fault.code)
+			}
+			if envelope.Error.Retryable != fault.retryable {
+				t.Errorf("retryable = %t, want %t", envelope.Error.Retryable, fault.retryable)
+			}
+		})
+	}
+}
+
+// TestACancelledCallerIsNotCountedAsAServerFault: the caller went away, so
+// there is nobody to read a response and the status says so rather than adding
+// to the deployment's error rate.
+func TestACancelledCallerIsNotCountedAsAServerFault(t *testing.T) {
+	t.Parallel()
+
+	admitter := newFakeAdmitter()
+	admitter.err = fmt.Errorf("admission: %w", context.Canceled)
+	f := newFixture(t, withAdmitter(admitter))
+	probe := controlProbes(fixtureSession)[0]
+
+	if recorder := postJSON(f, probe.target, probe.body); recorder.Code != statusClientClosedRequest {
+		t.Fatalf("answered %d, want %d", recorder.Code, statusClientClosedRequest)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// The session the chain resolved.
+// ---------------------------------------------------------------------------
+
+// TestAControlOnAnAbsentSessionIsTheSame404TheReadsAnswer is the reader for the
+// not-found authority, END TO END and BYTE FOR BYTE.
+//
+// A2.1's rule is that a session in another tenant and one that never existed
+// produce the same response; this asserts that a control command produces the
+// same response as a READ of the same session, which is the direction the
+// A9.1-notfound divergence was in. All four store spellings are driven, because
+// the two readers of them disagreed about two.
+func TestAControlOnAnAbsentSessionIsTheSame404TheReadsAnswer(t *testing.T) {
+	t.Parallel()
+
+	for name, spelling := range map[string]error{
+		"the catalog's not-found":          &sessionstore.CatalogError{Code: sessionstore.CatalogErrorNotFound},
+		"the catalog's deleted":            &sessionstore.CatalogError{Code: sessionstore.CatalogErrorDeleted},
+		"the catalog's identity mismatch":  &sessionstore.CatalogError{Code: sessionstore.CatalogErrorIdentity},
+		"the keyspace's binding-not-found": &sessionstore.KeyspaceError{Code: sessionstore.KeyspaceBindingNotFound},
+	} {
+		t.Run(name, func(t *testing.T) {
+			admitter := newFakeAdmitter()
+			f := newFixture(t, withAdmitter(admitter))
+			f.reads.fail = spelling
+			probe := controlProbes(fixtureSession)[0]
+
+			control := postJSON(f, probe.target, probe.body)
+			read := f.get("/v1/sessions/" + string(fixtureSession) + "/status")
+
+			if control.Code != http.StatusNotFound {
+				t.Fatalf("the command answered %d (%s), want 404", control.Code, control.Body)
+			}
+			if read.Code != http.StatusNotFound {
+				t.Fatalf("the read answered %d (%s), want 404; this case cannot compare them", read.Code, read.Body)
+			}
+			if control.Body.String() != read.Body.String() {
+				t.Errorf("the command answered %s and the read %s; one absent session must be one public fact",
+					control.Body, read.Body)
+			}
+			if len(admitter.calls) != 0 {
+				t.Fatalf("a command on an absent session reached the admission service: %+v", admitter.calls)
+			}
+		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// The composition that has no command plane.
+// ---------------------------------------------------------------------------
+
+// TestAControlRouteWithNoAdmissionPlaneFailsClosed.
+//
+// A nil Admissions is a supported composition -- factory.New builds one today,
+// and so does every test of the read plane -- so the route answers rather than
+// panicking, and it answers the DEPLOYMENT's condition rather than a decision
+// about the caller's command. 503 is the same answer a draining store
+// produces, and for the same reason: another replica may be able to serve it.
+func TestAControlRouteWithNoAdmissionPlaneFailsClosed(t *testing.T) {
+	t.Parallel()
+
+	for _, probe := range controlProbes(fixtureSession) {
+		t.Run(probe.name, func(t *testing.T) {
+			f := newFixture(t)
+
+			recorder := postJSON(f, probe.target, probe.body)
+
+			if recorder.Code != http.StatusServiceUnavailable {
+				t.Fatalf("answered %d (%s), want 503", recorder.Code, recorder.Body)
+			}
+			if got := decodeEnvelope(t, recorder).Error.Code; got != ErrorCodeUnavailable {
+				t.Errorf("code = %q, want %q", got, ErrorCodeUnavailable)
+			}
+		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Step 3: best-effort delivery, and the acknowledgement that does not depend
+// on it.
+// ---------------------------------------------------------------------------
+
+// TestAnAdmittedCommandIsDeliveredBestEffort holds runbook step 3 in both
+// directions at once: the delivery IS attempted, with the durable record's own
+// public CommandID, and the response is the durable acknowledgement whether it
+// worked or not.
+func TestAnAdmittedCommandIsDeliveredBestEffort(t *testing.T) {
+	t.Parallel()
+
+	probe := controlProbes(fixtureSession)[0]
+	for name, deliveryErr := range map[string]error{
+		"a delivery that lands": nil,
+		"a delivery that fails": errors.New("no local subscriber holds a route"),
+	} {
+		t.Run(name, func(t *testing.T) {
+			delivery := &fakeDelivery{err: deliveryErr}
+			f := newFixture(t, withAdmitter(newFakeAdmitter()), withDelivery(delivery))
+
+			recorder := postJSON(f, probe.target, probe.body)
+
+			if recorder.Code != probe.success {
+				t.Fatalf("answered %d (%s), want the durable %d whatever delivery did",
+					recorder.Code, recorder.Body, probe.success)
+			}
+			if got := decodeCommandStatus(t, recorder).State; got != sessionwire.CommandStateAccepted {
+				t.Errorf("answered state %q, want %q", got, sessionwire.CommandStateAccepted)
+			}
+			if len(delivery.calls) != 1 {
+				t.Fatalf("delivery was attempted %d times, want once", len(delivery.calls))
+			}
+			got := delivery.calls[0]
+			if got.tenant != fixtureTenant || got.session != fixtureSession {
+				t.Errorf("delivered to %q/%q, want the authenticated tenant's own session", got.tenant, got.session)
+			}
+			if got.delivery.CommandID != "command-a" {
+				t.Errorf("delivered command %q, want the durable record's %q", got.delivery.CommandID, "command-a")
+			}
+		})
+	}
+}
+
+// TestARefusedCommandIsNeverDelivered is the negative half, and it carries its
+// positive control in the same function: the same fixture delivers when the
+// command IS admitted, so "nothing was delivered" is not also what a composition
+// with a broken delivery seam would produce.
+func TestARefusedCommandIsNeverDelivered(t *testing.T) {
+	t.Parallel()
+
+	probe := controlProbes(fixtureSession)[0]
+
+	refused := &fakeDelivery{}
+	admitter := newFakeAdmitter()
+	admitter.err = &admission.Error{Code: sessionwire.ErrorCodeCommandRejected}
+	f := newFixture(t, withAdmitter(admitter), withDelivery(refused))
+	if recorder := postJSON(f, probe.target, probe.body); recorder.Code == probe.success {
+		t.Fatalf("the refused command answered %d, which is the success status", recorder.Code)
+	}
+	if len(refused.calls) != 0 {
+		t.Errorf("a refused command was delivered: %+v", refused.calls)
+	}
+
+	accepted := &fakeDelivery{}
+	control := newFixture(t, withAdmitter(newFakeAdmitter()), withDelivery(accepted))
+	if recorder := postJSON(control, probe.target, probe.body); recorder.Code != probe.success {
+		t.Fatalf("the control answered %d (%s), want %d", recorder.Code, recorder.Body, probe.success)
+	}
+	if len(accepted.calls) != 1 {
+		t.Fatal("the control delivered nothing, so the assertion above is vacuous")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// The pending methods.
+// ---------------------------------------------------------------------------
+
+// TestEveryPendingMethodExplainsItselfToTheCaller holds methodRule.reason in
+// both directions, and requires the answer a CALLER gets to carry it.
+//
+// The owner column alone is a fact about this repository's task roster: the
+// create carried `owner: "A3.1"` through two tasks that could not have
+// implemented it, and a client reading the 501 was told only that the build has
+// no handler. A reason that reaches the response is one somebody re-reads.
+func TestEveryPendingMethodExplainsItselfToTheCaller(t *testing.T) {
+	t.Parallel()
+
+	f := newFixture(t, withAdmitter(newFakeAdmitter()))
+	pending := 0
+	for _, route := range routeTable() {
+		for _, rule := range route.rules {
+			key := rule.method + " " + route.pattern
+			if rule.owner == "" {
+				if rule.reason != "" {
+					t.Errorf("%s is served and still carries the reason %q", key, rule.reason)
+				}
+				continue
+			}
+			pending++
+			if rule.reason == "" {
+				t.Errorf("%s is owned by %s and gives the caller no reason", key, rule.owner)
+				continue
+			}
+			recorder := f.driveRule(route, rule)
+			if recorder.Code != http.StatusNotImplemented {
+				t.Errorf("%s answered %d, want 501", key, recorder.Code)
+				continue
+			}
+			if got := decodeEnvelope(t, recorder).Error.Message; !strings.Contains(got, rule.reason) {
+				t.Errorf("%s answered %q, which does not carry its reason %q", key, got, rule.reason)
+			}
+		}
+	}
+	if pending == 0 {
+		t.Fatal("no method is pending, so the reason column has no subject")
+	}
+}
+
+// TestTheCreateRefusalNamesTheBindingAndNotATaskTag is the specific reading of
+// the above that A3.3 owes: the create is 501 because this composition cannot
+// author the immutable SessionBinding a V1 create reservation carries, and the
+// refusal must say so rather than naming a task.
+//
+// It is pinned by WORD rather than by the rule's own string, because comparing
+// the response against `rule.reason` would pass for any reason at all --
+// including the "A3.1" tag this replaced.
+func TestTheCreateRefusalNamesTheBindingAndNotATaskTag(t *testing.T) {
+	t.Parallel()
+
+	f := newFixture(t, withAdmitter(newFakeAdmitter()))
+	recorder := postJSON(f, "/v1/sessions",
+		`{"version":1,"command_id":"command-a","session_id":"session-new","agent_id":"agent-a"}`)
+
+	if recorder.Code != http.StatusNotImplemented {
+		t.Fatalf("the create answered %d (%s), want 501", recorder.Code, recorder.Body)
+	}
+	message := decodeEnvelope(t, recorder).Error.Message
+	for _, word := range []string{"binding", "author"} {
+		if !strings.Contains(message, word) {
+			t.Errorf("the create refusal %q does not name %q; it must name the blocker", message, word)
+		}
+	}
+	if strings.Contains(message, "A3.1") || strings.Contains(message, "A9.1") {
+		t.Errorf("the create refusal %q names a task tag, which answers nothing a caller asked", message)
+	}
+}
+
+// TestARequestTypeTheComparisonCannotReadIsRefused drives decodeCommand's
+// default arm DIRECTLY, and it exists because the alternative was reporting a
+// surviving mutant as equivalent.
+//
+// The arm is unreachable through controlSpecs, which passes exactly the four
+// Core request types the switch names -- four call sites, enumerated by grep
+// over the package, and the function is unexported so there are no others. But
+// "no production producer" is not "no test can distinguish it": this package's
+// own test can call it, and the mutant that replaces the arm with `return nil`
+// is the one that matters, because it admits a fifth command kind WITHOUT
+// comparing the session the path named. That is the exact defect the comparison
+// exists to prevent, arriving through the door a later task opens by adding a
+// command to controlSpecs and forgetting the case.
+//
+// The control is the row below it: a type the switch DOES name, with a matching
+// session, is accepted -- so the refusal is caused by the type and not by the
+// function refusing everything.
+func TestARequestTypeTheComparisonCannotReadIsRefused(t *testing.T) {
+	t.Parallel()
+
+	type futureCommand struct {
+		Version   int    `json:"version"`
+		CommandID string `json:"command_id"`
+		SessionID string `json:"session_id"`
+	}
+	body := fmt.Sprintf(`{"version":%d,"command_id":"command-a","session_id":%q}`,
+		sessionwire.CurrentWireVersion, string(fixtureSession))
+
+	var unreadable futureCommand
+	if err := decodeCommand([]byte(body), &unreadable, fixtureSession); err == nil {
+		t.Error("a request type the session comparison cannot read was accepted; " +
+			"it would be admitted without the path's session ever being compared")
+	}
+
+	var known sessionwire.InterruptRequest
+	if err := decodeCommand([]byte(body), &known, fixtureSession); err != nil {
+		t.Errorf("the control was refused: %v; this case cannot tell a type refusal from a blanket one", err)
+	}
+}
+
+// TestAKindWithNoControlSpecIsAFaultRatherThanAHandler drives serveControl's
+// own table lookup, which routeTable cannot reach.
+//
+// The comparison's input is STRUCTURE -- which kinds controlSpecs names -- so
+// no request can distinguish it and no fixture built through the route table
+// can either. It is driven directly instead, because the arm it guards is what
+// a later task hits by adding a control route and forgetting the spec: the
+// alternative to failing closed is a nil spec whose zero success status is 0
+// and whose nil admit function panics on the first request.
+func TestAKindWithNoControlSpecIsAFaultRatherThanAHandler(t *testing.T) {
+	t.Parallel()
+
+	f := newFixture(t, withAdmitter(newFakeAdmitter()))
+	recorder := httptest.NewRecorder()
+	f.router.serveControl("no_such_kind").ServeHTTP(recorder, request(http.MethodPost, "/v1/sessions/x/input", strings.NewReader(`{}`)))
+
+	if recorder.Code != http.StatusInternalServerError {
+		t.Fatalf("a kind with no spec answered %d (%s), want 500", recorder.Code, recorder.Body)
+	}
+
+	// The control: a kind the table DOES name builds a handler that admits.
+	if got := postJSON(f, controlProbes(fixtureSession)[0].target, controlProbes(fixtureSession)[0].body); got.Code != http.StatusOK {
+		t.Fatalf("the control answered %d (%s), want 200", got.Code, got.Body)
+	}
+}
+
+// TestARecordCoreWillNotMarshalIsAFault covers the last comparison on the
+// success path: Core validates on MARSHAL, so a record that projects into a
+// coherent CommandStatus can still fail to become bytes.
+//
+// The fixture is a rejected command carrying no rejection detail, which Core's
+// CommandStatus.Validate refuses ("missing_required_field"). It is a fault in
+// durable state rather than something the caller did, and answering it as an
+// acceptance would put an empty body on a 200 -- the one answer a client cannot
+// classify at all.
+func TestARecordCoreWillNotMarshalIsAFault(t *testing.T) {
+	t.Parallel()
+
+	admitter := newFakeAdmitter()
+	admitter.entry.Record.State = sessionstore.InboxStateRejected
+	admitter.entry.Record.Rejection = nil
+	f := newFixture(t, withAdmitter(admitter))
+	probe := controlProbes(fixtureSession)[0]
+
+	recorder := postJSON(f, probe.target, probe.body)
+
+	if recorder.Code != http.StatusInternalServerError {
+		t.Fatalf("a record Core will not marshal answered %d (%s), want 500", recorder.Code, recorder.Body)
+	}
+	if got := decodeEnvelope(t, recorder).Error.Code; got != ErrorCodeInternal {
+		t.Errorf("code = %q, want %q", got, ErrorCodeInternal)
+	}
+}
+
+// TestTheDeliveryAttemptRunsOnTheRequestsOwnContext is the reader for an
+// invariant that was ARGUED and unread.
+//
+// deliverAdmitted's doc makes "on the request's own context" and "'Schedule' is
+// not read as 'detach'" load-bearing, and cites A6.2's measurement of what an
+// unbounded admission does to a link. Nothing checked it: substituting
+// context.Background() at the call site **survived the whole module suite**,
+// restoring exactly the unbounded-attempt shape the comment says A6.2 measured,
+// with make check green.
+//
+// Why nothing caught it is worth stating, because it is a limit of the method
+// rather than an oversight: the per-comparison sweep enumerates COMPARISONS,
+// and a context argument is not one. It is an ARGUMENT, so it was never in the
+// sweep's domain. A comparison-derived sweep finds unguarded BRANCHES; it does
+// not find unguarded CLAIMS.
+//
+// # Two rows, because the first is a weaker property than the comment states
+//
+// A bounded context is not a DERIVED one. The first row requires a deadline no
+// longer than the router's own, which kills the detached Background. It does
+// not kill a mutant that builds context.WithDeadline(context.Background(), <the
+// same deadline>) -- measured, that survived -- because such a context is
+// bounded identically and differs only in that the CALLER cannot stop it.
+//
+// The second row is that difference, driven: a request whose caller has already
+// gone away must reach the delivery seam with a context that reports the
+// cancellation AT THE CALL. It is read at the call rather than afterwards
+// because deliverAdmitted's own deferred cancel would cancel a locally-built
+// context too, which is exactly how the weaker probe was fooled.
+func TestTheDeliveryAttemptRunsOnTheRequestsOwnContext(t *testing.T) {
+	t.Parallel()
+
+	probe := controlProbes(fixtureSession)[0]
+
+	t.Run("it carries the request's own bound", func(t *testing.T) {
+		delivery := &fakeDelivery{}
+		f := newFixture(t, withAdmitter(newFakeAdmitter()), withDelivery(delivery))
+
+		if recorder := postJSON(f, probe.target, probe.body); recorder.Code != probe.success {
+			t.Fatalf("answered %d (%s), want %d", recorder.Code, recorder.Body, probe.success)
+		}
+		if len(delivery.calls) != 1 {
+			t.Fatalf("delivery was attempted %d times, want once", len(delivery.calls))
+		}
+		call := delivery.calls[0]
+		if !call.hasDeadline {
+			t.Fatal("the delivery attempt carries no deadline, so a wedged delivery plane is bounded by " +
+				"nothing; this is the detached shape deliverAdmitted's doc says it is not")
+		}
+		if remaining := time.Until(call.deadline); remaining > f.limits.RequestTimeout {
+			t.Errorf("the delivery attempt's deadline is %v away, longer than the router's own %v bound",
+				remaining, f.limits.RequestTimeout)
+		}
+		if call.errAtCall != nil {
+			t.Errorf("the delivery attempt's context was already %v at the call", call.errAtCall)
+		}
+	})
+
+	t.Run("a caller that went away stops it", func(t *testing.T) {
+		delivery := &fakeDelivery{}
+		f := newFixture(t, withAdmitter(newFakeAdmitter()), withDelivery(delivery))
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		r := request(http.MethodPost, probe.target, strings.NewReader(probe.body)).WithContext(ctx)
+
+		f.serve(r)
+
+		if len(delivery.calls) != 1 {
+			t.Fatalf("delivery was attempted %d times, want once: this row cannot see the property "+
+				"unless the attempt is made", len(delivery.calls))
+		}
+		if !errors.Is(delivery.calls[0].errAtCall, context.Canceled) {
+			t.Errorf("the caller was gone and the delivery attempt's context reported %v at the call; "+
+				"the attempt is bounded by a deadline of its own rather than derived from the request's, "+
+				"so nothing the caller does can stop it", delivery.calls[0].errAtCall)
+		}
+	})
+}

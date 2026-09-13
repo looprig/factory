@@ -8,6 +8,7 @@ import (
 
 	sessionwire "github.com/looprig/core/sessionwire/v1"
 	"github.com/looprig/factory/identity"
+	"github.com/looprig/factory/internal/command"
 	internalidentity "github.com/looprig/factory/internal/identity"
 	"github.com/looprig/sessionstore"
 )
@@ -179,13 +180,16 @@ type apiError struct {
 // client should be told to hammer -- and so is 403 csrf_token_expired, which is
 // recoverable but only after the client changes the request by fetching a new
 // token, which is not the same claim.
+//
+// The RULE moved to internal/command at A3.3 and is called rather than
+// restated. It has to be one rule because the ClientLink answers the same
+// question about the same refusals, and the status this edge chooses for a
+// classified refusal is chosen there: a table here and a boolean there is two
+// places for one answer, which is what the A3.3-retryable item asked to be
+// settled. This wrapper stays because every construction in this file is an
+// apiError and this is where a status becomes an envelope.
 func retryableStatus(status int) bool {
-	switch status {
-	case http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
-		return true
-	default:
-		return false
-	}
+	return command.RetryableStatus(status)
 }
 
 // fallbackErrorBody is the answer when this package cannot build an envelope.
@@ -312,8 +316,11 @@ func catalogFailure(err error) apiError {
 	if failure, ok := storeUnavailable(err); ok {
 		return failure
 	}
-	var keyspace *sessionstore.KeyspaceError
-	if errors.As(err, &keyspace) && keyspace.Code == sessionstore.KeyspaceBindingNotFound {
+	// The four spellings of absence are internal/command's, called rather than
+	// restated: internal/admission read two of them and this file read four,
+	// so one session answered a read 404 and a control command 500. See
+	// command.SessionAbsent.
+	if command.SessionAbsent(err) {
 		return sessionNotFound()
 	}
 	var catalog *sessionstore.CatalogError
@@ -321,8 +328,6 @@ func catalogFailure(err error) apiError {
 		return internalFailure()
 	}
 	switch catalog.Code {
-	case sessionstore.CatalogErrorNotFound, sessionstore.CatalogErrorDeleted, sessionstore.CatalogErrorIdentity:
-		return sessionNotFound()
 	case sessionstore.CatalogErrorCursor:
 		return apiError{
 			status:  http.StatusBadRequest,
