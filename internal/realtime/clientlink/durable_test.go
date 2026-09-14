@@ -281,11 +281,11 @@ func openStore(t *testing.T) *sessionstore.Store {
 	return store
 }
 
-// existingSession creates a durable session through the legacy create, which is
-// the only create the released store can complete today: the V1 create is
-// refused with runtime_unavailable until the immutable create-command
-// reservation exists (admission.ErrCreateIdentityProtocolUnavailable), which is
-// A3.1's remaining work and not this task's.
+// existingSession creates a durable session through the LEGACY create, and as of
+// A3.1 that is a choice rather than the only option: the V1 create is served
+// and makes a DISPOSITION session. The legacy path is kept here because this
+// file's subject is the legacy inbox -- AdmitInput and the rest admit into it --
+// and a disposition-bound session is not one those commands can be admitted to.
 func existingSession(t *testing.T, r *replica, principal identity.Principal) sessionwire.SessionID {
 	t.Helper()
 

@@ -718,6 +718,21 @@ func TestTheReplyDescribesTheDurableRecord(t *testing.T) {
 				if reply != nil {
 					t.Errorf("an undescribable record was answered with %s", reply)
 				}
+				// The STATE must reach the diagnostic. An operator has two
+				// candidate causes here -- an unrecognised state, or a
+				// rejected record with no detail for Core to marshal -- and
+				// cannot tell them apart from the sentinel alone. This row
+				// went untested when the projection moved to the decoder and
+				// the state was dropped from the message.
+				// The "no state at all" row is EXEMPT and says so rather than
+				// passing silently: Contains(err, "") is true for every
+				// message, so that row is not evidence about the diagnostic.
+				// The other two rows are, and they are what kills a mutant
+				// that drops the state.
+				if tt.state != "" && !strings.Contains(err.Error(), string(tt.state)) {
+					t.Errorf("the diagnostic %q does not name the state %q that made the record unreadable",
+						err, tt.state)
+				}
 				return
 			}
 			if err != nil {

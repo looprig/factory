@@ -42,31 +42,17 @@ const (
 //
 // What is missing is the SESSION BINDING that reaches it. Every disposition
 // entry point requires a complete immutable binding whose ProtocolMode is
-// disposition, and this module creates only legacy sessions, so it has no
-// session to admit such a command to. On the legacy inbox the original hazard
-// stands unchanged at this pin — the retry comparison still includes the
-// object reference, and PutObject still mints a fresh generation per call — so
-// admitting the reference there would make every legitimate retry a permanent
-// CommandMismatch. Refusing is the correct answer until create is unblocked.
+// disposition, and the four commands this error governs are admitted into the
+// LEGACY inbox, so there is no disposition record for such a reference to sit
+// on. A3.1 changed which commands that covers but not the rule: a CREATE now
+// takes the disposition path and stores an oversized payload by reference,
+// while input, interrupt, restore and gate response remain legacy. On the
+// legacy inbox the original hazard stands unchanged at this pin — the retry
+// comparison still includes the object reference, and PutObject still mints a
+// fresh generation per call — so admitting the reference there would make every
+// legitimate retry a permanent CommandMismatch. Refusing is still correct for
+// those four.
 var ErrPayloadProtocolUnavailable = errors.New("admission: oversized payload needs a disposition session binding this module cannot author")
-
-// ErrCreateIdentityProtocolUnavailable reports that a V1 create cannot be made
-// durable with the create identity the protocol requires.
-//
-// The store-side reason is also gone at the pinned version: a public-create
-// reservation is filed under the TENANT keyed by CommandID, which is the
-// cross-session enforcement the mutable catalog idempotency key could never
-// express, and a pre-dispatch command can now be rejected without a residency
-// so it need not sit pending forever.
-//
-// What blocks it is the immutable SESSION BINDING that reservation carries.
-// Three of its four members — StorageBindingID, BindingVersion and
-// RuntimeSessionID — name a deployment's storage configuration and a
-// runtime-assigned identity, and this module is composed with no source for
-// any of them. A binding is immutable after create, so minting one would
-// durably and irreversibly pin the session to a configuration no resolver is
-// required to know, with no repair. Refusing beats guessing.
-var ErrCreateIdentityProtocolUnavailable = errors.New("admission: V1 create needs an immutable session binding this module cannot author")
 
 type Error struct {
 	Code  sessionwire.ErrorCode

@@ -618,3 +618,61 @@ func TestEveryGuardInTheCreateChainIsReachedInOrder(t *testing.T) {
 		})
 	}
 }
+
+// TestTheRuntimeSessionIDFormatIsPinnedByGoldenVectors pins a DURABLE FORMAT.
+//
+// # Read this before changing any expected value below
+//
+// These are HARDCODED OUTPUTS, not re-derivations, and that is the entire
+// point. deriveRuntimeSessionID's result is written into a SessionBinding,
+// which is IMMUTABLE AFTER CREATE. Changing the preimage -- the namespace, the
+// separator, the length prefixes, the hash, the version or variant nibbles,
+// the member order -- does not merely change future ids:
+//
+//   - every in-flight retry breaks, because PreparePublicCreate compares the
+//     whole PublicCreateIdentity and the binding is part of it, so the old id
+//     and the new one are a CommandMismatch; and
+//   - every EXISTING session's binding becomes unreproducible, and there is no
+//     repair because the record cannot be rewritten.
+//
+// So if this test fails, the derivation changed and that is a BREAKING DURABLE
+// CHANGE. Do not "fix" it by recomputing the expected strings -- doing that
+// makes the test agree with whatever the code now does, which is exactly the
+// property a golden vector exists to deny it. Either revert the change or
+// treat it as a format version bump with a migration.
+//
+// # Why hardcoded rather than derived
+//
+// A test that recomputed the value from the same function would pass for every
+// possible derivation, which is the failure mode sessionstore has twice had to
+// close: a durable value pinned only by the code that produces it. One
+// assertion here kills five mutations that the behavioural tests split between
+// them -- and one, dropping the domain-separation namespace, that NOTHING else
+// in this module catches at all.
+func TestTheRuntimeSessionIDFormatIsPinnedByGoldenVectors(t *testing.T) {
+	for _, vector := range []struct {
+		tenant  sessionwire.TenantID
+		session sessionwire.SessionID
+		command sessionwire.CommandID
+		want    string
+	}{
+		{"tenant-a", "session-a", "command-a", "a769e205-f967-8441-a5eb-2f6a5ea6471b"},
+		// All-empty pins the NAMESPACE and the prefix scheme independently of
+		// any member's content: every byte of this preimage comes from the
+		// constant and the framing, so dropping either moves it.
+		{"", "", "", "edfaba9c-d966-8cbc-a6cf-695e9d667bd6"},
+		// Single characters pin the member ORDER, which equal-length members
+		// would otherwise hide.
+		{"t", "s", "c", "ced70bb3-4564-8b1b-bccb-4913cf32f2b6"},
+	} {
+		t.Run(string(vector.tenant)+"/"+string(vector.session)+"/"+string(vector.command), func(t *testing.T) {
+			if got := deriveRuntimeSessionID(vector.tenant, vector.session, vector.command); got != vector.want {
+				t.Fatalf("deriveRuntimeSessionID(%q, %q, %q) = %q, want %q\n"+
+					"This is a DURABLE format: it is pinned into an immutable SessionBinding. "+
+					"Do not update this expectation to match the code -- every existing session's "+
+					"binding becomes unreproducible and every in-flight retry becomes a CommandMismatch.",
+					vector.tenant, vector.session, vector.command, got, vector.want)
+			}
+		})
+	}
+}

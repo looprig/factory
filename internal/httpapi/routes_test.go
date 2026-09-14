@@ -872,7 +872,7 @@ func aPendingTarget() (method, target string, ok bool) {
 func TestNoPendingMethodNamesAnAcceptedTask(t *testing.T) {
 	t.Parallel()
 
-	accepted := []string{"A2.2", "A2.3", "A2.4", "A3.3", "A6.1", "A9.1"}
+	accepted := []string{"A2.2", "A2.3", "A2.4", "A3.1", "A3.3", "A6.1", "A9.1"}
 	pending := 0
 	for _, route := range routeTable() {
 		for _, rule := range route.rules {
@@ -2466,14 +2466,6 @@ func expectedRoutes() map[string]expectation {
 	control := func(command sessionstore.CommandKind, session bool) expectation {
 		return expectation{auth: authControl, command: command, body: bodyJSON, session: session, implemented: true}
 	}
-	// servedControl is what pendingControl became. Every control this build
-	// declares is now served, the create last, so the restatement has no
-	// pending shape left to express. The `session` argument stays because it
-	// is a property of the ROUTE rather than of its implementation status:
-	// /v1/sessions carries no {sid} and the other four do.
-	servedControl := func(command sessionstore.CommandKind, session bool) expectation {
-		return expectation{auth: authControl, command: command, body: bodyJSON, session: session, implemented: true}
-	}
 	routes := map[string]expectation{
 		// The caller's authenticated tenant identity, with no caller-selected
 		// resource and no durable read.
@@ -2499,10 +2491,12 @@ func expectedRoutes() map[string]expectation {
 		// never reads the SessionID, so a session that does not exist yet is no
 		// reason to fall back to the list rule.
 		"GET /v1/sessions": expectation{auth: authSessionList, implemented: true},
-		// The create is the one control that is NOT served, and the reason is
-		// the immutable session binding this composition cannot author, not an
-		// unwritten handler. See routeTable.
-		"POST /v1/sessions": servedControl(commandCreate, false),
+		// The create, SERVED as of A3.1: this composition authors the immutable
+		// session binding it had no source for through two tasks. It is the one
+		// control whose route carries no {sid} -- /v1/sessions is where a
+		// caller CHOOSES a session rather than addressing one -- which is why
+		// its session column is false while the other four are true.
+		"POST /v1/sessions": control(commandCreate, false),
 		// Durable reads within one session, all three served by this build.
 		// They are replay-free projections of durable state, so each remains
 		// answerable while every Host is stopped.

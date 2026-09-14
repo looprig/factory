@@ -1942,8 +1942,12 @@ func TestAResolvedTargetForAnotherAgentIsRuntimeUnavailable(t *testing.T) {
 		if !IsCode(err, sessionwire.ErrorCodeRuntimeUnavailable) {
 			t.Fatalf("error = %v, want runtime_unavailable", err)
 		}
-		if errors.Is(err, ErrCreateIdentityProtocolUnavailable) {
-			t.Fatal("the mismatched agent was refused by the create-reservation guard, not by the target check")
+		// The discriminator. runtime_unavailable has more than one producer
+		// on this path, so asserting the CODE alone would pass on the wrong
+		// one -- specifically on the unconfigured-binding guard, which sits
+		// one step further down the chain.
+		if errors.Is(err, ErrCreateBindingUnconfigured) {
+			t.Fatal("the mismatched agent was refused by the binding guard, not by the target check")
 		}
 		if f.catalog.createCalls != 0 || f.commands.calls != 0 {
 			t.Fatal("a mismatched target wrote durable state")
@@ -2365,13 +2369,17 @@ func TestARefusedCommandStopsAtItsGuardAndTouchesNothingFurther(t *testing.T) {
 // permanent CommandMismatch. Step 5 is unimplementable on the legacy inbox at
 // this pin for the same reason it was at v0.4.0.
 //
-// What remains is therefore not a missing store primitive. It is that every
-// disposition entry point requires a complete immutable SessionBinding whose
-// ProtocolMode is disposition, a nonzero SessionBinding must carry all four
-// members (session_binding.go:32 validate), and THIS MODULE CREATES ONLY
-// LEGACY SESSIONS: admitLegacyCreate builds its CreateCatalogEntryRequest with
-// no Binding at all, so createCatalogEntry takes the mode = ProtocolModeLegacy
-// arm. The two tests below hold that, in the two directions it can fail.
+// A3.1 CLOSED THIS. Every disposition entry point requires a complete
+// immutable SessionBinding whose ProtocolMode is disposition, and this module
+// now authors one: two members are deployment configuration supplied by
+// WithSessionBinding, RuntimeSessionID is derived from the create's own
+// identity, and ProtocolMode is hardcoded to disposition.
+//
+// What is still true, and is why the walker below is kept rather than deleted:
+// AdmitLegacyCreate builds its CreateCatalogEntryRequest with no Binding at
+// all, so createCatalogEntry takes the mode = ProtocolModeLegacy arm and the
+// REST compatibility create still makes LEGACY sessions. The two tests below
+// hold the authored set exactly, in the two directions it can fail.
 
 // bindingSites reports every place a sessionstore.SessionBinding is reachable
 // from a root type, and — this is the whole point of the function — which
@@ -2620,7 +2628,7 @@ func TestTheFailClosedReasonsNameTheBlockerThatActuallyRemains(t *testing.T) {
 		err  error
 	}{
 		{"oversized payload", ErrPayloadProtocolUnavailable},
-		{"V1 create identity", ErrCreateIdentityProtocolUnavailable},
+		{"V1 create binding", ErrCreateBindingUnconfigured},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			got := test.err.Error()

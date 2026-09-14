@@ -48,11 +48,16 @@ import (
 // # The create is excluded, and this file says why
 //
 // There is no create row. Factory cannot author the immutable SessionBinding a
-// V1 create reservation carries, so `AdmitCreate` refuses and the REST route
-// answers 501 by construction: an edge that does not serve an operation has no
-// answer to compare. TestTheCreateIsTheOneOperationWithoutParity holds that
-// exclusion in both directions, so the day the binding exists this file fails
-// until the row is added.
+// V1 create reservation carries, and this module had no source for three of its
+// four members.
+//
+// A3.1 SUPPLIED THEM, so the create is served and IS in parityOperations below,
+// alongside the other four. Every parity assertion in this file therefore
+// covers it. What is kept as its own test is the half the shared table cannot
+// express: the create is the one operation whose edges legitimately disagree
+// about the shape of a SUCCESS -- 201 with a body over REST, an envelope over
+// the RPC -- so TestTheCreateAnswersTheSameRefusalOverBothEdges drives the axis
+// where they must still agree exactly, which is a refusal.
 
 // ---------------------------------------------------------------------------
 // The shared admitter.
