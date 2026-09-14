@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"net"
+	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -153,6 +155,97 @@ func TestServeClosesTheListenerWhenStartRefusesIsTheOtherRouteOut(t *testing.T) 
 		t.Fatalf("Serve reported %v; a Stop that overtook it is the ordinary ending and is reported as success", err)
 	}
 	assertListenerClosed(t, listener)
+}
+
+// TestServeClosesTheListenerWhenStartReallyFails is the THIRD route out of
+// Serve past the claim, and the last one.
+//
+// Serve's own documentation commits to a property over ROUTES -- "every route
+// out of this method past the claim either serves the listener or closes it"
+// -- and a property over routes is only held when every route has a row. Two
+// were rowed and this one, the sibling branch three lines from the one
+// …WhenStartRefuses… rows, was not: deleting its close survived the whole
+// suite. That is the blocker's own shape a second time, one branch over, and
+// it is why the three cases are enumerated from the switch rather than from
+// the failures that happened to be found.
+//
+// The failure is induced by emptying the build version the ClientLink engine
+// requires, which is a production error path: clientlink.NewEngine refuses an
+// empty Version, startRealtime wraps that, and Start returns it. It is done
+// from inside the package because no composition factory.New accepts can reach
+// it -- New defaults the version and re-validates every limit the engine
+// checks, so a deployer cannot compose a Start that fails this way, and a case
+// that could only drive it through a composition New rejects would be driving
+// New rather than Serve.
+//
+// # Why NOT by nulling a composed component, which was tried first
+//
+// Setting components.admissions to nil does NOT make the engine refuse.
+// clientlink.Config.Admitter is an INTERFACE and the field assigned to it is a
+// *admission.Service, so a nil pointer becomes a non-nil interface holding a
+// nil pointer and `cfg.Admitter == nil` is false. Start then succeeded, Serve
+// blocked in net/http with no Stop coming, and the case hung for its whole
+// timeout. Recorded because it is a live trap for anyone writing the next
+// probe here: the engine's nil guards cannot see a typed nil, and nothing in
+// this module hands it one today only because New requires every seam.
+func TestServeClosesTheListenerWhenStartReallyFails(t *testing.T) {
+	t.Parallel()
+
+	server := raceServer(t)
+	listener := localListener(t)
+
+	// The ClientLink engine requires a non-empty build version. Without one
+	// Start fails with a real error -- neither ErrAlreadyStarted nor
+	// ErrServerStopped -- which is the arm under test.
+	server.cfg.version = ""
+
+	// Serve runs on its own goroutine and the receive is BOUNDED, for the
+	// reason await states: a mutant that stops Serve from consulting Start at
+	// all leaves this call blocked in net/http forever, and an unbounded
+	// receive would turn that mutant into a hang rather than a scorable
+	// failure. Measured -- it did exactly that on the first draft of this row.
+	served := make(chan error, 1)
+	go func() { served <- server.Serve(listener) }()
+	err := await(t, "Serve", served)
+	switch {
+	case err == nil:
+		t.Fatal("Serve reported success although Start failed")
+	case errors.Is(err, ErrServerStopped), errors.Is(err, ErrAlreadyStarted):
+		t.Fatalf("Serve returned %v, which is one of the OTHER two arms; this case is no longer driving the real-error arm", err)
+	}
+	assertListenerClosed(t, listener)
+}
+
+// TestEveryRouteOutOfServeIsRowed is the anti-vacuity guard for the three
+// cases above, and it is a comment made checkable rather than a new claim.
+//
+// Serve's error handling is a switch with three arms, and the failure this
+// file exists for is a route that has no row. A fourth arm added later would
+// be a fourth route, and nothing in Go would make anyone notice; this reads
+// the source and fails when the arm count moves, naming the three cases whose
+// enumeration has to be re-derived.
+func TestEveryRouteOutOfServeIsRowed(t *testing.T) {
+	t.Parallel()
+
+	source, err := os.ReadFile("serve.go")
+	if err != nil {
+		t.Fatalf("read serve.go: %v", err)
+	}
+	body := string(source)
+	start := strings.Index(body, "switch err := s.Start(context.Background()); {")
+	if start < 0 {
+		t.Fatal("Serve no longer starts the background planes through a switch; re-derive the routes out of it")
+	}
+	end := strings.Index(body[start:], "\n\t}\n")
+	if end < 0 {
+		t.Fatal("could not find the end of Serve's Start switch")
+	}
+	arms := strings.Count(body[start:start+end], "\n\tcase ") + strings.Count(body[start:start+end], "\n\tdefault:")
+	if arms != 3 {
+		t.Fatalf("Serve's Start switch has %d arms, want 3. Each is a ROUTE out of Serve past the state claim, and each needs a "+
+			"case asserting the listener is served or closed on it -- the three today are "+
+			"TestAStopThatOvertakesServeStillClosesTheListener, …WhenStartRefusesIsTheOtherRouteOut and …WhenStartReallyFails.", arms)
+	}
 }
 
 // TestStopClosesEveryLocalPlaneItComposed is Stop's THIRD phase, rowed.

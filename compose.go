@@ -177,9 +177,25 @@ func composeComponents(cfg config, credentials *internalidentity.Authenticator) 
 // It is here rather than in composeComponents because clientlink.NewHandler
 // runs the centrifuge node before it returns -- deliberately, so a composition
 // cannot succeed and then refuse every connection -- and a running node is a
-// lifetime. Until it exists /v1/realtime answers 503 through realtimeGate,
-// which is the same fail-closed shape the nil object policy has: composed,
-// stated, and never a silent success.
+// lifetime. Until it exists /v1/realtime answers 503, which is the same
+// fail-closed shape the nil object policy has: composed, stated, and never a
+// silent success.
+//
+// # What makes the node RUNNING but unpublished safe, and what does not
+//
+// The node is running before the mutex below publishes it, so between those
+// two statements a node exists that nothing can reach or shut down. That is a
+// window of the same family as the one Serve's state claim closes, and
+// realtimeMu is NOT what keeps it shut: this mutex guards the FIELD, not the
+// interval. What keeps it shut is that Server.Start and Server.Stop are
+// serialized on Server.lifecycle and both callers of this function hold it, so
+// no Stop can observe the interval at all.
+//
+// Stated because the protection is not local. A later change that removed the
+// outer serialization -- believing realtimeMu sufficient, which it looks like
+// from here -- would make a Stop landing inside this call leave a running
+// centrifuge node behind for the life of the process, with no reference to it
+// anywhere.
 func (c *components) startRealtime(cfg config, credentials *internalidentity.Authenticator) error {
 	handler, err := clientlink.NewHandler(clientlink.Config{
 		Authenticator: credentials,
