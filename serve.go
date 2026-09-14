@@ -140,15 +140,31 @@ const (
 //
 // Serve is optional. An embedder that owns its own http.Server uses Handler and
 // never calls this.
+// # Why the state claim is the FIRST thing this method does
+//
+// It has to be, and the cost of getting it wrong is a leaked socket rather
+// than a confusing error. Everything Stop can close about the public surface
+// it reaches through s.http, so a Stop that lands while s.http is still nil
+// skips Shutdown entirely. If this method can then return WITHOUT having
+// handed the listener to net/http, nobody closes it: the caller's socket stays
+// open and unserved, which is exactly the failure "Shutdown stops public
+// admission/listener" exists to prevent.
+//
+// An earlier draft of this stage called Start BEFORE the claim, on the reading
+// that background planes should exist before the network is admitted -- which
+// is right, and the PLACEMENT was wrong. A node boot and three goroutine
+// launches sat between entering Serve and claiming the state, and a Stop in
+// that window made Serve return ErrServerStopped with the listener orphaned.
+// It reproduced roughly one run in three under load.
+//
+// The general shape, worth carrying: MOVING WORK AHEAD OF A LOCK OR STATE
+// CLAIM WIDENS A WINDOW THAT USED TO BE ZERO. The claim is cheap and it is
+// what makes every later step safe to interleave, so it goes first and the
+// work goes after it.
 func (s *Server) Serve(ln net.Listener) error {
-	// Background components are started BEFORE the listener, and the order is
-	// the reverse of Stop's on purpose: nothing may be admitted from the
-	// network until the planes that carry an admitted command exist. A caller
-	// that already started them explicitly gets ErrAlreadyStarted, which is
-	// not a failure of Serve.
-	if err := s.Start(context.Background()); err != nil && !errors.Is(err, ErrAlreadyStarted) {
-		return err
-	}
+	// (1) THE CLAIM. State and the http.Server together, under one lock hold,
+	// before any other work. From here on a concurrent Stop finds a non-nil
+	// server and its Shutdown is what closes the listener below.
 	s.mu.Lock()
 	switch s.state {
 	case stateServing:
@@ -168,9 +184,35 @@ func (s *Server) Serve(ln net.Listener) error {
 	server := s.http
 	s.mu.Unlock()
 
-	// A Stop that arrives between the unlock and this call is not a lost
+	// (2) THE BACKGROUND PLANES, still before the listener is accepted on,
+	// which is the property Start's placement here exists for: nothing may be
+	// admitted from the network until the planes that carry an admitted
+	// command exist. A caller that already started them explicitly gets
+	// ErrAlreadyStarted, which is not a failure of Serve.
+	//
+	// A Start that FAILS closes the listener rather than returning it open.
+	// Past the claim above this call owns the socket, and a caller handed back
+	// an error has no way to know whether it was ever accepted on.
+	switch err := s.Start(context.Background()); {
+	case err == nil, errors.Is(err, ErrAlreadyStarted):
+	case errors.Is(err, ErrServerStopped):
+		// A Stop overtook this call and has already torn everything down.
+		// That is the ordinary ending, reported as success for the reason
+		// stated above -- and the listener is closed HERE rather than left to
+		// net/http, because this path never reaches server.Serve.
+		_ = ln.Close()
+		return nil
+	default:
+		_ = ln.Close()
+		return err
+	}
+
+	// (3) THE LISTENER. A Stop that arrived at any point above is not a lost
 	// shutdown: Shutdown marks the server closed, and net/http's Serve returns
-	// ErrServerClosed immediately for a server already in that state.
+	// ErrServerClosed immediately for a server already in that state -- AFTER
+	// its own deferred l.Close(), which is what closes the caller's socket on
+	// that path. So every route out of this method past the claim either
+	// serves the listener or closes it.
 	if err := server.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		return err
 	}
@@ -202,6 +244,17 @@ func (s *Server) Serve(ln net.Listener) error {
 // the components Stop shut down are not restarted, so a caller that wants to
 // run again composes a new Server.
 func (s *Server) Start(ctx context.Context) error {
+	// Start and Stop are SERIALIZED against each other, and the reason is the
+	// same one that made Serve's claim go first. Start's work is not atomic --
+	// it boots a node, then publishes the loop context, then launches the
+	// sweeps -- so a Stop interleaved with it would tear down the half that
+	// existed when it looked and leave the half that arrived afterwards
+	// running for the lifetime of the process. The mutex is separate from
+	// s.mu because Stop WAITS for the sweeps to return, which s.mu may not be
+	// held across.
+	s.lifecycle.Lock()
+	defer s.lifecycle.Unlock()
+
 	s.mu.Lock()
 	if s.state == stateStopped {
 		s.mu.Unlock()
@@ -286,11 +339,15 @@ func (s *Server) runOnce(ctx context.Context, pass sweep) {
 // component it stopped has stopped.
 //
 // The order is the one the runbook states: PUBLIC ADMISSION first -- the
-// listener and the in-flight requests it accepted -- and then the background
-// components, so nothing new is admitted while they are being torn down. Today
-// there is exactly one component, because the reconcilers and the ClientLink
-// and HostLink engines are later tasks; when they exist they stop after the
-// call below, not before it.
+// listener, the in-flight requests it accepted, and the ClientLink node -- and
+// then the background components, so nothing new is admitted while they are
+// being torn down.
+//
+// There are THREE phases and four components, and each phase is labelled at
+// the code below rather than only here. (This comment said "today there is
+// exactly one component" until A9.1 stage 2 composed the rest; it is stated in
+// full now because a shutdown order that is documented wrongly is worse than
+// one that is not documented at all.)
 //
 // Stop never touches a Host runtime. Factory is not their supervisor: a session
 // outlives every Factory replica, and a Stop that reached into placement would
@@ -299,6 +356,12 @@ func (s *Server) runOnce(ctx context.Context, pass sweep) {
 // It is idempotent, because a signal handler and a deferred stop reach it
 // together, and it is safe to call on a Server that never served.
 func (s *Server) Stop(ctx context.Context) error {
+	// See Start for why these two are serialized. A Stop that arrives while a
+	// Start is half done waits for it and then tears down everything, rather
+	// than tearing down what happened to exist when it looked.
+	s.lifecycle.Lock()
+	defer s.lifecycle.Unlock()
+
 	s.mu.Lock()
 	if s.state == stateStopped {
 		s.mu.Unlock()

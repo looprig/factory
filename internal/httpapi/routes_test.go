@@ -836,6 +836,42 @@ func aPendingTarget() (string, string) {
 	panic("no route serves a pending method, so the not-implemented case has no subject")
 }
 
+// TestNoPendingMethodNamesAnAcceptedTask is the guard the owner column's own
+// documentation asks for and did not have.
+//
+// That documentation records the failure directly: `"A3.1" stayed on the
+// session create through two tasks that could not have implemented it`. It
+// happened again in the other direction -- A9.1 stage 2 tagged the create with
+// its own task id, and A9.1 stage 2 is the task being accepted, which is not
+// discharging it. An owner tag naming a COMPLETED task tells the next reader to
+// look at a closed task for a blocker that is still open.
+//
+// The list is of tasks this repository has ACCEPTED. It is deliberately a
+// list rather than a rule, because "is this task done" is not a fact any code
+// here holds; adding a name to it is a thing a human does when a task is
+// accepted, and this test is what makes that addition bite.
+func TestNoPendingMethodNamesAnAcceptedTask(t *testing.T) {
+	t.Parallel()
+
+	accepted := []string{"A2.2", "A2.3", "A2.4", "A3.3", "A6.1", "A9.1"}
+	pending := 0
+	for _, route := range routeTable() {
+		for _, rule := range route.rules {
+			if rule.owner == "" {
+				continue
+			}
+			pending++
+			if slices.Contains(accepted, rule.owner) {
+				t.Errorf("%s %s names owner %q, which is an accepted task; name the task that actually owes it",
+					rule.method, route.pattern, rule.owner)
+			}
+		}
+	}
+	if pending == 0 {
+		t.Fatal("no method is pending, so this guard has no subject")
+	}
+}
+
 func TestAPendingTargetIsReallyPending(t *testing.T) {
 	t.Parallel()
 

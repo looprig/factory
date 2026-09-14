@@ -151,6 +151,10 @@ type Server struct {
 
 	// mu guards the serving lifecycle only. The composition above it is
 	// immutable after New, so nothing else needs it.
+	// lifecycle serializes Start against Stop. See Start for why a second
+	// mutex is needed rather than a wider hold of mu.
+	lifecycle sync.Mutex
+
 	mu      sync.Mutex
 	state   serverState
 	started bool

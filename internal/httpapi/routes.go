@@ -857,7 +857,7 @@ func routeTable() []route {
 			// exactly one legacy entry point, AdmitLegacyCreate, it is a
 			// create, and a compatibility decoder on a route that is not served
 			// would be dead code.
-			pendingControl(commandCreate, "A9.1",
+			pendingControl(commandCreate, "A3.1",
 				"a V1 create needs an immutable session binding this deployment composition cannot author")...)},
 		{pattern: "/v1/sessions/{sid}/status",
 			rules:   served(authSessionRead, func(rt *Router) http.Handler { return rt.serveSessionStatus() }),
