@@ -34,6 +34,19 @@ var (
 	// ErrInvalidLimits reports a limit value or relationship this composition
 	// refuses.
 	ErrInvalidLimits = errors.New("factory: invalid limits")
+	// ErrNotAServiceIdentity reports a WithServiceIdentity principal that is
+	// not a service identity. See that option for why it is refused here.
+	ErrNotAServiceIdentity = errors.New("factory: the sweep identity is not a service principal")
+	// ErrEmptyReplicaID reports an empty WithReplicaID.
+	ErrEmptyReplicaID = errors.New("factory: the replica identifier is empty")
+	// ErrEmptyVersion reports an empty WithVersion.
+	ErrEmptyVersion = errors.New("factory: the build version is empty")
+	// ErrObjectPolicyWithoutResolver reports an ObjectPolicy composed with no
+	// ObjectStoreResolver behind it. See WithObjectPolicy.
+	ErrObjectPolicyWithoutResolver = errors.New("factory: WithObjectPolicy requires WithObjectStoreResolver")
+	// ErrInvalidLaunchTemplate reports a configured launch target this
+	// composition refuses.
+	ErrInvalidLaunchTemplate = errors.New("factory: invalid launch template")
 )
 
 // OptionError names the option a composition failure belongs to.
@@ -94,6 +107,22 @@ type config struct {
 	reconcile ReconcileLimits
 	client    ClientLinkLimits
 	host      HostLinkLimits
+
+	catalog        Catalog
+	gates          Gates
+	hostTargets    HostTargets
+	hostCredential HostLinkCredential
+
+	service    identity.Principal
+	serviceSet bool
+	replicaID  string
+	version    string
+
+	workloads    WorkloadController
+	department   []LaunchTemplate
+	objectPolicy ObjectPolicy
+	objectStores ObjectStoreResolver
+	objects      ObjectLimits
 
 	ui   http.Handler
 	uiFS fs.FS

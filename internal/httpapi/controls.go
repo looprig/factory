@@ -431,3 +431,38 @@ func controlUnavailable() apiError {
 		message: "this deployment cannot admit commands at the moment",
 	}
 }
+
+// serveRealtime hands an authenticated request to the composed ClientLink.
+//
+// The supplier is consulted per REQUEST rather than once, because the node is
+// started after the router is built; reading it once would capture the nil a
+// composition holds between New and Start and answer 503 forever.
+//
+// Authentication has already happened above this handler, and the ClientLink
+// authenticates its own connect credential again. That is not redundant: the
+// two credentials are the same material verified by the same Verifier, but the
+// HTTP one bounds who may reach the upgrade at all, and a replica that admitted
+// every unauthenticated peer to the transport would have to refuse them after
+// the handshake, which costs a connection slot per attempt.
+func (rt *Router) serveRealtime() http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if rt.realtime == nil {
+			writeAPIError(w, realtimeUnavailable())
+			return
+		}
+		handler := rt.realtime()
+		if handler == nil {
+			writeAPIError(w, realtimeUnavailable())
+			return
+		}
+		handler.ServeHTTP(w, r)
+	})
+}
+
+func realtimeUnavailable() apiError {
+	return apiError{
+		status:  http.StatusServiceUnavailable,
+		code:    ErrorCodeUnavailable,
+		message: "this deployment is not serving realtime connections at the moment",
+	}
+}

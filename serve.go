@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"sync"
 	"time"
 )
 
@@ -23,6 +24,11 @@ var (
 	// shuts down and two listeners would leave that order unstated for one of
 	// them.
 	ErrAlreadyServing = errors.New("factory: server is already serving")
+
+	// ErrAlreadyStarted reports a second Start. Background components are
+	// started once, because starting them twice would run two sweep loops per
+	// pass and two ClientLink nodes on one composition.
+	ErrAlreadyStarted = errors.New("factory: server is already started")
 )
 
 // HTTPLimits bounds the connections Serve accepts.
@@ -135,6 +141,14 @@ const (
 // Serve is optional. An embedder that owns its own http.Server uses Handler and
 // never calls this.
 func (s *Server) Serve(ln net.Listener) error {
+	// Background components are started BEFORE the listener, and the order is
+	// the reverse of Stop's on purpose: nothing may be admitted from the
+	// network until the planes that carry an admitted command exist. A caller
+	// that already started them explicitly gets ErrAlreadyStarted, which is
+	// not a failure of Serve.
+	if err := s.Start(context.Background()); err != nil && !errors.Is(err, ErrAlreadyStarted) {
+		return err
+	}
 	s.mu.Lock()
 	switch s.state {
 	case stateServing:
@@ -163,6 +177,111 @@ func (s *Server) Serve(ln net.Listener) error {
 	return nil
 }
 
+// Start runs this replica's background components.
+//
+// It exists as a separate method from Serve because a LIBRARY embedding owns
+// its own http.Server and reaches the surface through Handler; without Start
+// such a deployment would compose every reconciler and run none of them, and
+// the symptom -- commands that are accepted and never settled -- would appear
+// nowhere near the composition that caused it. Serve calls it, so a deployment
+// that owns the socket through this module does not have to.
+//
+// The order inside it is stated rather than incidental:
+//
+//  1. The ClientLink node, because clientlink.NewHandler RUNS it and a
+//     connection arriving the instant the listener opens must find a node, not
+//     a half-built one. Until this succeeds /v1/realtime answers 503.
+//  2. The periodic sweeps, each on its own goroutine and its own timer, so one
+//     slow pass delays only its own sweep.
+//
+// The HostLink pool and the routing table are NOT started: both are demand
+// driven, hold no goroutine until a session is bound, and are stopped by Stop
+// whether or not they ever were.
+//
+// Start is not restartable. A stopped Server refuses it, for Serve's reason:
+// the components Stop shut down are not restarted, so a caller that wants to
+// run again composes a new Server.
+func (s *Server) Start(ctx context.Context) error {
+	s.mu.Lock()
+	if s.state == stateStopped {
+		s.mu.Unlock()
+		return ErrServerStopped
+	}
+	if s.started {
+		s.mu.Unlock()
+		return ErrAlreadyStarted
+	}
+	s.started = true
+	s.mu.Unlock()
+
+	if err := s.components.startRealtime(s.cfg, s.credentials); err != nil {
+		return err
+	}
+
+	// The sweeps take their own context, derived from Background rather than
+	// from ctx. A caller's context bounds the START, not the lifetime: a Start
+	// made under a request context would stop every reconciler when that
+	// request ended, which is a replica that silently stops reconciling.
+	loopCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
+	done := make(chan struct{})
+	s.mu.Lock()
+	s.stop = cancel
+	s.done = done
+	s.mu.Unlock()
+
+	sweeps := s.components.sweeps(s.cfg)
+	var wg sync.WaitGroup
+	for _, pass := range sweeps {
+		wg.Add(1)
+		go func(pass sweep) {
+			defer wg.Done()
+			s.runSweep(loopCtx, pass)
+		}(pass)
+	}
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+	return nil
+}
+
+// runSweep drives one periodic pass until the loop context is cancelled.
+//
+// The interval is a GAP between passes rather than a period: the next timer is
+// armed after the previous pass returns, so a pass slower than the interval
+// delays the next one instead of overlapping with it. Overlapping passes of
+// one sweeper on one replica would contend for their own claims, which is work
+// spent proving a replica is not another replica.
+//
+// A pass FAILURE is not fatal and is not retried faster. Every sweep here is
+// periodic by construction: whatever it could not do this pass is still due on
+// the next one, and a tighter retry against a store that is already failing is
+// how a control plane turns an outage into a stampede.
+func (s *Server) runSweep(ctx context.Context, pass sweep) {
+	for {
+		s.runOnce(ctx, pass)
+		timer := time.NewTimer(s.cfg.reconcile.Interval)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return
+		case <-timer.C:
+		}
+	}
+}
+
+// runOnce bounds one pass and separates a cancelled pass from a failed one.
+//
+// The deadline is the sweep INTERVAL and not a separate limit, because a pass
+// that has not finished by the time the next one is due has already lost the
+// cadence; giving it longer would let one slow shard hold the loop.
+func (s *Server) runOnce(ctx context.Context, pass sweep) {
+	passCtx, cancel := context.WithTimeout(ctx, s.cfg.reconcile.Interval)
+	defer cancel()
+	_ = pass.run(passCtx)
+	s.components.reapIdle()
+}
+
 // Stop shuts the Server down in a fixed order and does not return until each
 // component it stopped has stopped.
 //
@@ -187,16 +306,61 @@ func (s *Server) Stop(ctx context.Context) error {
 	}
 	s.state = stateStopped
 	server := s.http
+	cancel := s.stop
+	done := s.done
 	s.mu.Unlock()
 
 	// A Server that never served has no public surface to close, and that is
 	// the ordinary case for a library embedding: it holds Handler and owns its
 	// own http.Server. Marking the state above is what such a Stop is FOR --
 	// it refuses a later Serve.
+	// (1) PUBLIC ADMISSION. The listener and the requests it already accepted,
+	// then the ClientLink node. Both are closed before anything below, so no
+	// new command can be admitted into planes that are being torn down.
+	var firstErr error
 	if server != nil {
 		if err := server.Shutdown(ctx); err != nil {
-			return err
+			firstErr = err
 		}
 	}
-	return nil
+	if err := s.components.stopRealtime(ctx); err != nil && firstErr == nil {
+		firstErr = err
+	}
+
+	// (2) THE PERIODIC SWEEPS. Cancelled and then WAITED for, so a returned
+	// Stop means no sweep is still writing to a store. The wait is bounded by
+	// the caller's context: a sweep wedged in a dependency must not make Stop
+	// unkillable.
+	if cancel != nil {
+		cancel()
+	}
+	if done != nil {
+		select {
+		case <-done:
+		case <-ctx.Done():
+			if firstErr == nil {
+				firstErr = ctx.Err()
+			}
+		}
+	}
+
+	// (3) THE LOCAL ROUTING STATE, then the links it was routing over. Demand
+	// first, because it holds the polls that would otherwise rebind a session
+	// whose link is being closed underneath it.
+	//
+	// None of this touches a Host RUNTIME. A session outlives every Factory
+	// replica, so a Stop that reached into placement would end sessions
+	// because a deployment restarted a front end. What closes here is this
+	// replica's connections and its local table, and the Host sees a peer go
+	// away -- which is the same thing it sees when a replica crashes.
+	if err := s.components.demand.Close(ctx); err != nil && firstErr == nil {
+		firstErr = err
+	}
+	if err := s.components.bindings.Close(ctx); err != nil && firstErr == nil {
+		firstErr = err
+	}
+	if err := s.components.pool.Close(ctx); err != nil && firstErr == nil {
+		firstErr = err
+	}
+	return firstErr
 }

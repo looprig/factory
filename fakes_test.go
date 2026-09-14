@@ -61,6 +61,37 @@ func (FakeSeams) GetObject(context.Context, sessionstore.GetObjectRequest) (io.R
 	return nil, nil
 }
 
+// ControlShards is the store's persisted shard count. It answers the
+// SessionStore minimum rather than zero: a sweeper refuses to run against a
+// store reporting fewer shards than the minimum, so a zero here would make
+// every composition test exercise the refusal path instead of the composition.
+func (FakeSeams) ControlShards() int { return sessionstore.MinControlShards }
+
+func (FakeSeams) CreateCatalogEntry(context.Context, sessionstore.CreateCatalogEntryRequest) (sessionstore.CatalogEntry, bool, error) {
+	return sessionstore.CatalogEntry{}, false, nil
+}
+
+func (FakeSeams) UpdateCatalogDesiredState(context.Context, sessionstore.UpdateCatalogDesiredStateRequest) (sessionstore.CatalogEntry, error) {
+	return sessionstore.CatalogEntry{}, nil
+}
+
+func (FakeSeams) ListDueGates(context.Context, sessionstore.ListDueGatesRequest) (sessionstore.DueGatePage, error) {
+	return sessionstore.DueGatePage{}, nil
+}
+
+func (FakeSeams) RetireGateDeadlineIntent(context.Context, sessionstore.RetireGateDeadlineIntentRequest) error {
+	return nil
+}
+
+func (FakeSeams) ReconcileHostTargets(context.Context, sessionstore.ReconcileHostTargetsRequest) (sessionstore.HostTargetReconcileResult, error) {
+	return sessionstore.HostTargetReconcileResult{}, nil
+}
+
+// ServiceToken is the HostLink credential. It answers a fixed value rather
+// than an error so that a composition test exercises composition; a dial that
+// reached a real Host is not something any test here does.
+func (FakeSeams) ServiceToken(context.Context) (string, error) { return "service-token", nil }
+
 func (FakeSeams) AdmitCommand(context.Context, sessionstore.AdmitCommandRequest) (sessionstore.InboxEntry, bool, error) {
 	return sessionstore.InboxEntry{}, false, nil
 }
@@ -151,6 +182,15 @@ type FakeUUIDs struct{}
 
 func (FakeUUIDs) NewUUID() (string, error) { return FakeUUID, nil }
 
+// FakeServiceIdentity is the service principal the composed sweeps run as.
+func FakeServiceIdentity() identity.Principal {
+	principal, err := identity.NewPrincipal(FakeTenant, "factory-sweeper", identity.KindService)
+	if err != nil {
+		panic("FakeServiceIdentity: " + err.Error())
+	}
+	return principal
+}
+
 // ValidCSRF is a CSRF configuration that validates.
 func ValidCSRF() identity.CSRFConfig {
 	key := make([]byte, identity.MinCSRFSharedKeyBytes)
@@ -176,6 +216,12 @@ func RequiredOptions() []Option {
 		WithCommands(seams),
 		WithDirectory(seams),
 		WithPlacementController(seams),
+		WithCatalog(seams),
+		WithGates(seams),
+		WithHostTargets(seams),
+		WithHostLinkCredential(seams),
+		WithServiceIdentity(FakeServiceIdentity()),
+		WithReplicaID("replica-a"),
 		WithCSRF(ValidCSRF()),
 	}
 }

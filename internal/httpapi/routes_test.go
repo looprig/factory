@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -809,28 +810,40 @@ func concreteTarget(pattern string) string {
 	return strings.Join(segments, "/")
 }
 
-// aPendingReadTarget is a concrete path for some GET a later runbook task still
+// aPendingTarget is a concrete method and path some later runbook task still
 // owns. It panics when there is none, because at that point every case built on
 // it is testing nothing and the caller must be told rather than passed an empty
 // string.
-func aPendingReadTarget() string {
+//
+// It was aPendingReadTarget, restricted to GET, and the restriction outlived
+// its subject: A9.1 stage 2 composed the ClientLink, /v1/realtime was the last
+// pending READ, and the helper fired its panic exactly as it was designed to.
+// The panic was the CORRECT outcome of a fixture whose case had gone -- not a
+// defect -- and widening it to any method is the repair rather than a
+// weakening: the property the cases below actually assert is that a 501 is
+// rendered in the ordinary envelope, which was never about the method.
+//
+// The ORDER of the search is the table's, so the answer moves when the table
+// does instead of being pinned to one route.
+func aPendingTarget() (string, string) {
 	for _, route := range routeTable() {
 		for _, rule := range route.rules {
-			if rule.method == http.MethodGet && rule.owner != "" {
-				return concreteTarget(route.pattern)
+			if rule.owner != "" {
+				return rule.method, concreteTarget(route.pattern)
 			}
 		}
 	}
-	panic("no route serves a pending GET, so the not-implemented case has no subject")
+	panic("no route serves a pending method, so the not-implemented case has no subject")
 }
 
-func TestAPendingReadTargetIsReallyPending(t *testing.T) {
+func TestAPendingTargetIsReallyPending(t *testing.T) {
 	t.Parallel()
 
-	target := aPendingReadTarget()
+	method, target := aPendingTarget()
 	f := newFixture(t)
-	if recorder := f.get(target); recorder.Code != http.StatusNotImplemented {
-		t.Fatalf("%s answered %d, want 501", target, recorder.Code)
+	recorder := f.serve(request(method, target, bytes.NewReader([]byte("{}"))))
+	if recorder.Code != http.StatusNotImplemented {
+		t.Fatalf("%s %s answered %d, want 501", method, target, recorder.Code)
 	}
 }
 
@@ -943,7 +956,8 @@ func TestNoAPIFailureFallsThroughToTheSPA(t *testing.T) {
 			// condition it names. Deriving it means the case moves itself, and
 			// the day nothing is pending it fails loudly instead.
 			build: func(*fixture) *http.Request {
-				return request(http.MethodGet, aPendingReadTarget(), nil)
+				method, target := aPendingTarget()
+				return request(method, target, bytes.NewReader([]byte("{}")))
 			},
 		},
 	}
@@ -2350,7 +2364,12 @@ func expectedRoutes() map[string]expectation {
 		"GET /v1/capabilities": expectation{auth: authAuthenticated, implemented: true},
 		// A WebSocket is held open for the life of the connection, so a
 		// handler deadline would close it on a timer.
-		"GET /v1/realtime": expectation{auth: authAuthenticated, streams: true},
+		// The ClientLink upgrade, SERVED by this build since A9.1 stage 2. A
+		// composition that supplies no ClientLink -- or one whose node has not
+		// been started -- answers 503 through RouterConfig.Realtime, which is
+		// the same fail-closed shape a build with no command plane has, and is
+		// why this is implemented rather than pending.
+		"GET /v1/realtime": expectation{auth: authAuthenticated, streams: true, implemented: true},
 		// The caller's own token, served by this build.
 		"GET /v1/csrf-token": expectation{auth: authAuthenticated, implemented: true},
 		// The tenant's own list, and the create that adds to it. The create is
@@ -2556,6 +2575,17 @@ func sanctionedImplementedMethods() map[string]string {
 		"POST /v1/sessions/{sid}/gates/{gid}": controlSanction + " The gate response additionally names a {gid}, " +
 			"which is compared against the decoded body's gate_id for the same reason the session is: the " +
 			"authorization decision and the admitted command must not come from two readings of one request",
+		"GET /v1/realtime": "upgrades the CALLER's own connection under authAuthenticated, and " +
+			"the stronger rule belongs one layer down rather than here. The upgrade selects no " +
+			"resource: there is no path parameter, no query parameter and no body, so there is " +
+			"nothing tenant-scoped for AuthorizeSessionRead or AuthorizeControl to protect at this " +
+			"point. What the connection may then DO is decided per operation by the ClientLink " +
+			"engine -- AuthorizeSubscribe for every channel and AuthorizeControl for every command " +
+			"RPC -- against the principal its own connect credential names, so a successful upgrade " +
+			"authorizes nothing beyond itself. The accepted cost, written down rather than " +
+			"discovered: an authenticated principal with no session at all can still occupy one of " +
+			"this replica's connection slots, which ClientLinkLimits.MaxConnections bounds and " +
+			"nothing here does",
 		"GET /v1/sessions": "serves the principal's OWN tenant's durable session page under " +
 			"authSessionList, which is the decision AuthorizeSessionList exists to make. The page " +
 			"is built by scope.sessionPage from principal.Tenant(), so the tenant is the " +

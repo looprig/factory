@@ -72,7 +72,13 @@ type SessionReader interface {
 }
 
 // Commands is the durable command plane.
+//
+// ControlShards is on it because the periodic sweeps ask the store how many
+// service-control shards it persisted, on every pass rather than once: the
+// count is a decision of the backend and not a setting of this replica, and a
+// replica caching it would keep sweeping a shard space that had changed.
 type Commands interface {
+	ControlShards() int
 	AdmitCommand(ctx context.Context, req sessionstore.AdmitCommandRequest) (sessionstore.InboxEntry, bool, error)
 	GetCommand(ctx context.Context, req sessionstore.GetCommandRequest) (sessionstore.InboxEntry, error)
 	RejectCommand(ctx context.Context, req sessionstore.RejectCommandRequest) (sessionstore.InboxEntry, error)
@@ -91,6 +97,23 @@ type Directory interface {
 type PlacementController interface {
 	EnsurePlacement(ctx context.Context, desired sessionstore.DesiredWorkload) error
 	ReleasePlacement(ctx context.Context, tenant sessionwire.TenantID, session sessionwire.SessionID) error
+}
+
+// WorkloadController creates and updates the platform workload a dedicated
+// session needs.
+//
+// It is OPTIONAL and only the controller binary supplies it. H5 (answered
+// 2026-09-04) puts the platform adapter in a separate controller, so
+// cmd/factory composes none and a dedicated placement there fails with a named
+// refusal rather than silently doing nothing.
+//
+// The intent is the whole currency: Factory-authored desire, carrying its own
+// generation and an opaque workload payload this module never parses. A
+// Kubernetes PodSpec, a Nomad job and a future platform's manifest are the
+// same value to it, which is what keeps the platform out of this module's
+// import graph.
+type WorkloadController interface {
+	EnsureWorkload(ctx context.Context, intent sessionstore.PlacementIntent) error
 }
 
 // Clock is the time seam.
@@ -121,14 +144,22 @@ type UUIDSource interface {
 // answers an empty list and an object read answers "unavailable" rather than
 // serving bytes no policy authorized.
 type Server struct {
-	cfg    config
-	router *httpapi.Router
+	cfg         config
+	router      *httpapi.Router
+	credentials *internalidentity.Authenticator
+	components  *components
 
 	// mu guards the serving lifecycle only. The composition above it is
 	// immutable after New, so nothing else needs it.
-	mu    sync.Mutex
-	state serverState
-	http  *http.Server
+	mu      sync.Mutex
+	state   serverState
+	started bool
+	http    *http.Server
+	// stop cancels the sweep loops; done is closed when every one of them has
+	// returned. Stop WAITS on it, so "Stop returned" means no sweep is still
+	// touching a store.
+	stop context.CancelFunc
+	done chan struct{}
 }
 
 // New validates a composition and returns it.
@@ -177,6 +208,12 @@ func New(opts ...Option) (*Server, error) {
 		{"WithCommands", cfg.commands != nil},
 		{"WithDirectory", cfg.directory != nil},
 		{"WithPlacementController", cfg.placement != nil},
+		{"WithCatalog", cfg.catalog != nil},
+		{"WithGates", cfg.gates != nil},
+		{"WithHostTargets", cfg.hostTargets != nil},
+		{"WithHostLinkCredential", cfg.hostCredential != nil},
+		{"WithServiceIdentity", cfg.serviceSet},
+		{"WithReplicaID", cfg.replicaID != ""},
 		{"WithCSRF", cfg.csrfSet},
 	} {
 		if !required.present {
@@ -194,6 +231,17 @@ func New(opts ...Option) (*Server, error) {
 	// about; TestMissingSeamsAreReportedBeforeAConflictingUI holds the order.
 	if cfg.ui != nil && cfg.uiFS != nil {
 		return nil, ErrConflictingUI
+	}
+
+	// An object policy with no resolver behind it is refused HERE rather than
+	// discovered at the first legacy-bound object read. internal/httpapi
+	// resolves a store only for a NON-ZERO binding and falls back to the read
+	// plane for a zero one; a nil policy refuses first and unconditionally, so
+	// the fallback is unreachable until a policy exists. Composing the policy
+	// alone is exactly the change that makes it reachable with nothing behind
+	// it, and it is a composition mistake rather than a request-time one.
+	if cfg.objectPolicy != nil && cfg.objectStores == nil {
+		return nil, ErrObjectPolicyWithoutResolver
 	}
 
 	if err := cfg.csrf.Validate(); err != nil {
@@ -218,6 +266,13 @@ func New(opts ...Option) (*Server, error) {
 	// running replica verifies with.
 	cfg.csrf = cfg.csrf.Clone()
 
+	if cfg.version == "" {
+		cfg.version = DefaultVersion
+	}
+	if cfg.objects == (ObjectLimits{}) {
+		cfg.objects = DefaultObjectLimits()
+	}
+
 	// A static bundle becomes a handler at composition time, so UI() has one
 	// answer shape and a serving path that does not branch on which option the
 	// deployer used.
@@ -225,11 +280,28 @@ func New(opts ...Option) (*Server, error) {
 		cfg.ui = http.FileServerFS(cfg.uiFS)
 	}
 
-	router, err := composeRouter(cfg)
+	credentials, err := composeCredentials(cfg)
 	if err != nil {
 		return nil, err
 	}
-	return &Server{cfg: cfg, router: router}, nil
+	parts, err := composeComponents(cfg, credentials)
+	if err != nil {
+		return nil, err
+	}
+	router, err := composeRouter(cfg, credentials, parts)
+	if err != nil {
+		return nil, err
+	}
+	return &Server{cfg: cfg, router: router, credentials: credentials, components: parts, done: closedChannel()}, nil
+}
+
+// closedChannel is the done channel of a Server that never started, so Stop
+// waits on a channel that is already closed rather than branching on whether
+// there is anything to wait for.
+func closedChannel() chan struct{} {
+	ch := make(chan struct{})
+	close(ch)
+	return ch
 }
 
 // composeRouter builds the authenticator, the guard and the router.
@@ -237,7 +309,7 @@ func New(opts ...Option) (*Server, error) {
 // It runs at composition rather than at the first request, so a deployment that
 // cannot serve fails where an operator is watching. Every rejection below is
 // attributed to the option that carries the offending value.
-func composeRouter(cfg config) (*httpapi.Router, error) {
+func composeCredentials(cfg config) (*internalidentity.Authenticator, error) {
 	// The default tenant is validated HERE, ahead of NewAuthenticator, so the
 	// attribution below is exact rather than guessed. NewAuthenticator checks
 	// the verifier, then the cookie name, then the default tenant; the verifier
@@ -257,7 +329,11 @@ func composeRouter(cfg config) (*httpapi.Router, error) {
 	if err != nil {
 		return nil, &OptionError{Option: "WithSessionCookieName", Err: err}
 	}
+	return credentials, nil
+}
 
+// composeRouter builds the guard and the router over the composed components.
+func composeRouter(cfg config, credentials *internalidentity.Authenticator, parts *components) (*httpapi.Router, error) {
 	guard, err := httpapi.NewGuard(httpapi.GuardConfig{
 		CSRF:        cfg.csrf,
 		Credentials: credentials,
@@ -282,6 +358,25 @@ func composeRouter(cfg config) (*httpapi.Router, error) {
 		Guard:       guard,
 		IDs:         cfg.uuids,
 		UI:          cfg.ui,
+		// The four control routes admit into the composed service, so a
+		// deployed binary answers them for real instead of 503.
+		Admissions: parts.admissions,
+		// The best-effort local wake-up for a command this replica just
+		// admitted. It is the routing table rather than the pool: a delivery
+		// does not open a route, so a session this replica holds no demand for
+		// is a no-op here and the durable record is still the acknowledgement.
+		Delivery: parts.bindings,
+		Realtime: parts.realtimeHandler,
+		Department: func() []httpapi.LaunchTemplate {
+			published := make([]httpapi.LaunchTemplate, len(cfg.department))
+			for i, template := range cfg.department {
+				published[i] = template.published()
+			}
+			return published
+		}(),
+		ObjectPolicy:       cfg.objectPolicy,
+		ResolveObjectStore: resolveObjectStore(cfg.objectStores),
+		ObjectLimits:       cfg.objects,
 	})
 	if err != nil {
 		// Unreachable from a composition New accepted: every value NewRouter

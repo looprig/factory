@@ -14,6 +14,8 @@ import (
 	"github.com/looprig/factory/internal/placement"
 	"github.com/looprig/factory/internal/realtime/clientlink"
 	"github.com/looprig/factory/internal/realtime/hostlink"
+	"github.com/looprig/factory/internal/reconcile"
+	"github.com/looprig/factory/internal/routing"
 )
 
 func iface[T any]() reflect.Type { return reflect.TypeOf((*T)(nil)).Elem() }
@@ -50,10 +52,40 @@ func TestTheComposedAuthenticatorSatisfiesBothConsumers(t *testing.T) {
 // row used to hold.
 func publicSeams() map[reflect.Type][]reflect.Type {
 	return map[reflect.Type][]reflect.Type{
-		iface[factory.Authorizer]():          {iface[httpapi.Authorizer](), iface[clientlink.Authorizer](), iface[admission.Authorizer]()},
-		iface[factory.SessionReader]():       {iface[httpapi.SessionReader]()},
-		iface[factory.Commands]():            {iface[admission.Commands]()},
-		iface[factory.Directory]():           {iface[admission.Directory](), iface[httpapi.Directory](), iface[placement.Directory]()},
+		iface[factory.Authorizer](): {iface[httpapi.Authorizer](), iface[clientlink.Authorizer](), iface[admission.Authorizer]()},
+		// The read plane. routing.TipReader is paired here because the demand
+		// plane reads the journal TIP through the same object: a second seam
+		// for one method would be a second answer to which store a replica
+		// reads.
+		iface[factory.SessionReader](): {iface[httpapi.SessionReader](), iface[routing.TipReader]()},
+		// Commands is paired with FOUR consumers, not one, and each names a
+		// different half of the durable command plane: the admission service
+		// writes and reads a command, the reconciler pages the due view and
+		// settles, and BOTH reconcilers claim. The union is what a deployer
+		// supplies as one store, and pairing all four is what stops a later
+		// task widening one of them without widening the seam.
+		iface[factory.Commands](): {
+			iface[admission.Commands](), iface[admission.DueCommands](),
+			iface[admission.Settlement](), iface[admission.Claims](),
+			iface[placement.Claims](),
+		},
+		// The durable session record. GetCatalogEntry also appears on
+		// SessionReader; that is one method on one object reached through two
+		// seams, because each consumer declares the read beside a write the
+		// read plane must not carry.
+		iface[factory.Catalog](): {iface[admission.Catalog](), iface[placement.Catalog]()},
+		// The service-control gate-deadline plane. Its two consumers are
+		// deliberately separate interfaces in internal/reconcile -- the due
+		// view and the ONE write -- so the union here is exactly "read what is
+		// due, retire an intent" and carries no way to answer a gate.
+		iface[factory.Gates]():              {iface[reconcile.DueGates](), iface[reconcile.GateIntents]()},
+		iface[factory.HostTargets]():        {iface[placement.TargetSweep]()},
+		iface[factory.HostLinkCredential](): {iface[hostlink.Credential]()},
+		iface[factory.WorkloadController](): {iface[placement.WorkloadController]()},
+		iface[factory.Directory](): {
+			iface[admission.Directory](), iface[httpapi.Directory](),
+			iface[placement.Directory](), iface[routing.Resolver](),
+		},
 		iface[factory.PlacementController](): {iface[admission.PlacementController]()},
 		// internal/identity declares a Clock with only Now, because expiry is
 		// the only time it reads. Pairing it here is what keeps the union
@@ -63,7 +95,11 @@ func publicSeams() map[reflect.Type][]reflect.Type {
 		// the debounced demand release is the only time it reads. It is paired
 		// here for internal/identity's reason: a narrower consumer must still
 		// be satisfied by the one object a deployer supplies.
-		iface[factory.Clock]():      {iface[admission.Clock](), iface[internalidentity.Clock](), iface[placement.Clock](), iface[clientlink.Clock]()},
+		iface[factory.Clock](): {
+			iface[admission.Clock](), iface[internalidentity.Clock](),
+			iface[placement.Clock](), iface[clientlink.Clock](),
+			iface[reconcile.Clock](), iface[routing.Clock](),
+		},
 		iface[factory.UUIDSource](): {iface[admission.UUIDSource]()},
 	}
 }
@@ -190,9 +226,13 @@ func allSeams() []reflect.Type {
 		// composition decision A9.1 owns, not one a task adding a consumer may
 		// make by pairing a row here. What this list still buys them is
 		// TestNoSeamNamesAStoragePrimitive.
-		iface[placement.Catalog](),
-		iface[placement.Claims](),
-		iface[placement.WorkloadController](),
+		// internal/routing's remaining seams. They are here rather than in
+		// publicSeams because this composition implements them: Binder is the
+		// HostLink pool behind poolBinder, Hinter has no implementation at all
+		// (see unpublishedHints), and Publisher, Tail and Rebinder belong to
+		// the repair relay, which this composition does not build.
+		iface[routing.Binder](),
+		iface[routing.Hinter](),
 	}
 }
 

@@ -133,6 +133,23 @@ type RouterConfig struct {
 	// rather than that the caller's command was refused.
 	Admissions ControlAdmitter
 
+	// Realtime is the optional ClientLink entry point mounted at /v1/realtime.
+	//
+	// A nil Realtime FAILS CLOSED rather than being rejected by NewRouter, for
+	// Admissions' reason and with Admissions' answer: a deployment composed
+	// for durable reading alone is supported, and a realtime request against
+	// one is answered 503 unavailable -- the deployment cannot carry it out
+	// now, rather than the route not existing.
+	//
+	// It is a SUPPLIER and not a handler because the two halves have different
+	// lifetimes. The router is built by factory.New and the ClientLink node is
+	// RUN by factory.Server.Start -- clientlink.NewHandler runs it before it
+	// returns, deliberately, so a composition cannot succeed and then refuse
+	// every connection -- so a handler field would force New to acquire a
+	// lifetime. A supplier answering nil until Start has run gives the same
+	// 503, from the same line, with no second code path.
+	Realtime func() http.Handler
+
 	// Delivery is the optional local wake-up for an already admitted command.
 	//
 	// Nil means no attempt is made, which changes NO response: the durable
@@ -216,6 +233,7 @@ type Router struct {
 	ui                 http.Handler
 	limits             RouteLimits
 	admissions         ControlAdmitter
+	realtime           func() http.Handler
 	delivery           CommandDelivery
 	objectPolicy       ObjectPolicy
 	resolveObjectStore func(context.Context, sessionstore.SessionBinding) (ObjectReader, error)
@@ -283,6 +301,7 @@ func NewRouter(cfg RouterConfig) (*Router, error) {
 		ui:                 cfg.UI,
 		limits:             cfg.Limits,
 		admissions:         cfg.Admissions,
+		realtime:           cfg.Realtime,
 		delivery:           cfg.Delivery,
 		objectPolicy:       cfg.ObjectPolicy,
 		resolveObjectStore: cfg.ResolveObjectStore,
@@ -807,9 +826,6 @@ func routeTable() []route {
 			owner: owner, reason: reason,
 		}}
 	}
-	pending := func(auth authRule, owner, reason string) []methodRule {
-		return readRules(methodRule{auth: auth, owner: owner, reason: reason})
-	}
 	served := func(auth authRule, handle func(*Router) http.Handler) []methodRule {
 		return readRules(methodRule{auth: auth, handle: handle})
 	}
@@ -858,13 +874,12 @@ func routeTable() []route {
 		{pattern: "/v1/sessions/{sid}/interrupt", rules: control(commandInterrupt), session: true},
 		{pattern: "/v1/sessions/{sid}/restore", rules: control(commandRestore), session: true},
 		{pattern: "/v1/sessions/{sid}/gates/{gid}", rules: control(commandGateResponse), session: true},
-		// A6.1 built the ClientLink -- internal/realtime/clientlink.Handler is
-		// an http.Handler that authenticates, authorizes and multiplexes. What
-		// is still owed here is COMPOSITION: factory.New must construct one and
-		// pass it in, and Stop must shut it down, which is A9.1's stage-2 work
-		// alongside the admission service and the reconcilers.
-		{pattern: "/v1/realtime", rules: pending(authAuthenticated, "A9.1",
-			"this build composes no ClientLink handler; the engine exists and nothing constructs one"), streams: true},
+		// A6.1 built the ClientLink and A9.1 stage 2 composes it. The route is
+		// SERVED rather than pending, and a build that composes no ClientLink
+		// -- or one whose node has not been started -- answers 503 through
+		// RouterConfig.Realtime, exactly as a build with no command plane
+		// answers a control route.
+		{pattern: "/v1/realtime", rules: served(authAuthenticated, func(rt *Router) http.Handler { return rt.serveRealtime() }), streams: true},
 		{pattern: "/v1/csrf-token", rules: served(authAuthenticated, func(rt *Router) http.Handler { return rt.guard.TokenHandler() })},
 	}
 }
