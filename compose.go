@@ -58,6 +58,12 @@ func composeComponents(cfg config, credentials *internalidentity.Authenticator) 
 		Directory:  cfg.directory,
 		Clock:      cfg.clock,
 		IDs:        cfg.uuids,
+		// The public-create plane and the binding travel together: the store
+		// is always supplied and the binding is the deployment's choice, so a
+		// composition with no WithSessionBinding refuses a create in
+		// admission rather than at the route. See Config.createsServed.
+		PublicCreates: cfg.publicCreates,
+		Binding:       cfg.sessionBinding,
 		// The apply deadline an accepted command is given is the SAME number
 		// the sweeper settles against. Two values here would be a command
 		// rejected before it was due, or one the sweeper never reached.

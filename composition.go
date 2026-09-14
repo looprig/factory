@@ -6,6 +6,7 @@ import (
 
 	sessionwire "github.com/looprig/core/sessionwire/v1"
 	"github.com/looprig/factory/identity"
+	"github.com/looprig/factory/internal/admission"
 	"github.com/looprig/factory/internal/httpapi"
 	"github.com/looprig/sessionstore"
 )
@@ -300,6 +301,60 @@ func WithObjectPolicy(p ObjectPolicy) Option {
 			return nilDependency("WithObjectPolicy")
 		}
 		cfg.objectPolicy = p
+		return nil
+	})
+}
+
+// SessionBindingTemplate is the deployment-configuration half of the immutable
+// SessionBinding every session this Factory creates is pinned to.
+//
+// It names the two members ObjectStoreResolver keys on, and that is not a
+// coincidence -- it is the argument for supplying it here at all. The other two
+// members of a store SessionBinding are not a deployment's to choose:
+// RuntimeSessionID is derived per create from the create's own identity, and
+// ProtocolMode is fixed to disposition because a legacy-bound session is one no
+// Host can take residency on.
+type SessionBindingTemplate = admission.SessionBindingTemplate
+
+// PublicCreates is the durable public-create plane a V1 create admits into. It
+// is the DISPOSITION family, which a *sessionstore.Store satisfies.
+type PublicCreates = admission.PublicCreateStore
+
+// WithPublicCreates supplies the durable plane a V1 create admits into.
+// Optional, and it travels with WithSessionBinding: both halves are required
+// before a create is served, and neither implies the other -- a plane with no
+// configured binding has nothing to pin, and a binding with no plane has
+// nowhere to put it.
+func WithPublicCreates(p PublicCreates) Option {
+	return option("WithPublicCreates", func(cfg *config) error {
+		if p == nil {
+			return nilDependency("WithPublicCreates")
+		}
+		cfg.publicCreates = p
+		return nil
+	})
+}
+
+// WithSessionBinding supplies the storage configuration every created session
+// is permanently pinned to. Without it a V1 create is refused
+// runtime_unavailable and every other operation is unaffected.
+//
+// It is REFUSED without WithObjectStoreResolver, for a sharper reason than
+// WithObjectPolicy's. A SessionBinding is IMMUTABLE AFTER CREATE: a session
+// pinned to a StorageBindingID this deployment's resolver cannot resolve has
+// permanently unreadable objects, and there is no repair short of an offline
+// migration. Requiring the resolver does not prove the resolver knows THIS
+// binding -- nothing at composition time can -- but it does refuse the one
+// composition that is certainly wrong, which is pinning sessions to a storage
+// configuration in a deployment that resolves no storage at all.
+func WithSessionBinding(storageBindingID, bindingVersion string) Option {
+	return option("WithSessionBinding", func(cfg *config) error {
+		if storageBindingID == "" || bindingVersion == "" {
+			return ErrIncompleteSessionBinding
+		}
+		cfg.sessionBinding = SessionBindingTemplate{
+			StorageBindingID: storageBindingID, BindingVersion: bindingVersion,
+		}
 		return nil
 	})
 }

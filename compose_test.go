@@ -1136,3 +1136,117 @@ func TestStopWaitsForASweepThatIsStillInFlight(t *testing.T) {
 		t.Fatal("Stop did not return after the held sweep was released")
 	}
 }
+
+// stubPublicCreates is a create plane that admits nothing. Composition never
+// calls it, so what it answers does not matter; that it is NON-NIL does.
+type stubPublicCreates struct{}
+
+var errNoCreatePlane = errors.New("stub create plane: this composition admits no create")
+
+func (stubPublicCreates) PreparePublicCreate(context.Context, sessionstore.PreparePublicCreateRequest) (sessionstore.PublicCreatePreparation, error) {
+	return sessionstore.PublicCreatePreparation{}, errNoCreatePlane
+}
+
+func (stubPublicCreates) PutCommandPayload(context.Context, sessionstore.PutCommandPayloadRequest) (sessionwire.ObjectMetadata, error) {
+	return sessionwire.ObjectMetadata{}, errNoCreatePlane
+}
+
+func (stubPublicCreates) AdmitPublicCreate(context.Context, sessionstore.AdmitPublicCreateRequest) (sessionstore.DispositionInboxEntry, bool, error) {
+	return sessionstore.DispositionInboxEntry{}, false, errNoCreatePlane
+}
+
+// TestTheCreateCompositionIsRefusedUnlessEveryHalfIsPresent rows the
+// ENUMERATION of create compositions rather than the one that works.
+//
+// Three options interact and the rules are not symmetric, which is exactly the
+// shape a single happy-path test would miss:
+//
+//   - Neither half is a supported composition: a Factory that serves no create
+//     is a deployment choice, not a defect, and every other operation works.
+//   - EITHER half alone is refused. A deployment that composed one meant to
+//     serve creates, and learning that at composition beats learning it from
+//     the first caller's runtime_unavailable.
+//   - A binding with no ObjectStoreResolver is refused for a stronger reason
+//     than the object policy's: a binding is IMMUTABLE AFTER CREATE, so a
+//     session pinned to storage this deployment cannot resolve has permanently
+//     unreadable objects.
+func TestTheCreateCompositionIsRefusedUnlessEveryHalfIsPresent(t *testing.T) {
+	t.Parallel()
+
+	resolver := factory.WithObjectStoreResolver(func(context.Context, sessionstore.SessionBinding) (factory.ObjectReader, error) {
+		return nil, errProbeUnavailable
+	})
+	binding := factory.WithSessionBinding("storage-a", "v1")
+	plane := factory.WithPublicCreates(stubPublicCreates{})
+
+	for _, test := range []struct {
+		name    string
+		options []factory.Option
+		want    error
+	}{
+		{"no create composition at all", nil, nil},
+		{"every half", []factory.Option{resolver, binding, plane}, nil},
+		// A plane alone is accepted: it pins nothing, so nothing is
+		// irreversible, and admission refuses the create for want of a
+		// binding. This row is what stops the pairing rule being written as
+		// "both or neither" when it is not.
+		{"a plane alone", []factory.Option{plane}, factory.ErrCreatePlaneIncomplete},
+		{"a binding with a plane but no resolver", []factory.Option{binding, plane}, factory.ErrSessionBindingWithoutResolver},
+		{"a binding with a resolver but no plane", []factory.Option{resolver, binding}, factory.ErrCreatePlaneIncomplete},
+		{"a binding alone", []factory.Option{binding}, factory.ErrSessionBindingWithoutResolver},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			_, err := factory.New(append(factory.RequiredOptions(), test.options...)...)
+			if test.want == nil {
+				if err != nil {
+					t.Fatalf("New = %v, want a composition", err)
+				}
+				return
+			}
+			if !errors.Is(err, test.want) {
+				t.Fatalf("New = %v, want %v", err, test.want)
+			}
+		})
+	}
+}
+
+// TestAnIncompleteSessionBindingIsRefusedByTheOption rows the enumeration of
+// half-filled bindings. A binding is immutable after create, so an empty member
+// cannot be filled in later: it has to be refused at the option.
+func TestAnIncompleteSessionBindingIsRefusedByTheOption(t *testing.T) {
+	t.Parallel()
+
+	for _, test := range []struct {
+		name             string
+		storage, version string
+		accept           bool
+	}{
+		{"both members", "storage-a", "v1", true},
+		{"no storage binding", "", "v1", false},
+		{"no version", "storage-a", "", false},
+		{"neither member", "", "", false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			options := append(factory.RequiredOptions(),
+				factory.WithObjectStoreResolver(func(context.Context, sessionstore.SessionBinding) (factory.ObjectReader, error) {
+					return nil, errProbeUnavailable
+				}),
+				factory.WithPublicCreates(stubPublicCreates{}),
+				factory.WithSessionBinding(test.storage, test.version))
+			_, err := factory.New(options...)
+			if test.accept {
+				if err != nil {
+					t.Fatalf("New = %v, want a composition", err)
+				}
+				return
+			}
+			if !errors.Is(err, factory.ErrIncompleteSessionBinding) {
+				t.Fatalf("New = %v, want ErrIncompleteSessionBinding", err)
+			}
+		})
+	}
+}

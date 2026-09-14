@@ -765,8 +765,8 @@ type stubAdmitter struct{}
 
 var errStubAdmitter = errors.New("stub admitter: this case admits nothing")
 
-func (stubAdmitter) AdmitCreate(context.Context, identity.Principal, sessionwire.CreateRequest) (sessionstore.InboxEntry, bool, error) {
-	return sessionstore.InboxEntry{}, false, errStubAdmitter
+func (stubAdmitter) AdmitCreate(context.Context, identity.Principal, sessionwire.CreateRequest) (sessionstore.DispositionInboxEntry, bool, error) {
+	return sessionstore.DispositionInboxEntry{}, false, errStubAdmitter
 }
 
 func (stubAdmitter) AdmitInput(context.Context, identity.Principal, sessionwire.InputRequest) (sessionstore.InboxEntry, bool, error) {

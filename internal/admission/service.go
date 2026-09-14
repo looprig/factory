@@ -143,15 +143,32 @@ type TargetResolver interface {
 }
 
 type Config struct {
-	Authorizer    Authorizer
-	Targets       TargetResolver
-	Catalog       Catalog
-	Commands      CommandStore
-	Directory     OwnerDirectory
-	Clock         Clock
-	IDs           UUIDSource
+	Authorizer Authorizer
+	Targets    TargetResolver
+	Catalog    Catalog
+	Commands   CommandStore
+	Directory  OwnerDirectory
+	Clock      Clock
+	IDs        UUIDSource
+
+	// PublicCreates is the durable public-create plane a V1 create admits
+	// into. It is OPTIONAL, and its absence is a supported composition rather
+	// than a broken one: without it, and without Binding, AdmitCreate refuses
+	// and every other entry point is unaffected.
+	PublicCreates PublicCreateStore
+
+	// Binding is the deployment-configuration half of the immutable binding a
+	// V1 create pins. Optional for the same reason.
+	Binding SessionBindingTemplate
+
 	ApplyDeadline time.Duration
 }
+
+// createsServed reports whether this composition can serve a V1 create. BOTH
+// halves are required and neither implies the other: a store with no
+// configured binding has nothing to pin, and a configured binding with no
+// store has nowhere to put it.
+func (c Config) createsServed() bool { return c.PublicCreates != nil && c.Binding.configured() }
 
 type Service struct{ cfg Config }
 
@@ -165,25 +182,39 @@ func NewService(cfg Config) (*Service, error) {
 	return &Service{cfg: cfg}, nil
 }
 
-func (s *Service) AdmitCreate(ctx context.Context, principal identity.Principal, req sessionwire.CreateRequest) (sessionstore.InboxEntry, bool, error) {
+// AdmitCreate admits a V1 create: runbook A3.1 steps 2 and 5.
+//
+// It returns a DISPOSITION entry, not a legacy InboxEntry, and the difference
+// is the whole point rather than a type detail. A create is the one command
+// that CHOOSES a session's protocol, and the only choice that produces a
+// session a Host can ever take residency on is disposition.
+//
+// The payload ceiling is deliberately NOT checked here the way it is for the
+// four existing commands. admissiblePayload refuses an oversized body because
+// the legacy inbox cannot retain its identity; this path can, so an oversized
+// create is stored by reference instead of refused. That is step 5.
+func (s *Service) AdmitCreate(ctx context.Context, principal identity.Principal, req sessionwire.CreateRequest) (sessionstore.DispositionInboxEntry, bool, error) {
 	if err := req.Validate(); err != nil {
-		return sessionstore.InboxEntry{}, false, refusal(sessionwire.ErrorCodeInvalidRequest, err)
+		return sessionstore.DispositionInboxEntry{}, false, refusal(sessionwire.ErrorCodeInvalidRequest, err)
 	}
 	payload, err := canonicalCommand(req)
-	if err := admissiblePayload(payload, err); err != nil {
-		return sessionstore.InboxEntry{}, false, err
+	if err != nil {
+		return sessionstore.DispositionInboxEntry{}, false, refusal(sessionwire.ErrorCodeInvalidRequest, err)
 	}
 	if err := s.cfg.Authorizer.AuthorizeControl(ctx, principal, req.SessionID, CommandCreate); err != nil {
-		return sessionstore.InboxEntry{}, false, err
+		return sessionstore.DispositionInboxEntry{}, false, err
 	}
 	target, known, targetErr := s.cfg.Targets.ResolveAgent(ctx, req.AgentID)
 	if targetErr != nil {
-		return sessionstore.InboxEntry{}, false, resolveTargetFault(targetErr)
+		return sessionstore.DispositionInboxEntry{}, false, resolveTargetFault(targetErr)
 	}
 	if !known || target.Key.AgentID != req.AgentID {
-		return sessionstore.InboxEntry{}, false, refusal(sessionwire.ErrorCodeRuntimeUnavailable, nil)
+		return sessionstore.DispositionInboxEntry{}, false, refusal(sessionwire.ErrorCodeRuntimeUnavailable, nil)
 	}
-	return sessionstore.InboxEntry{}, false, refusal(sessionwire.ErrorCodeRuntimeUnavailable, ErrCreateIdentityProtocolUnavailable)
+	if !s.cfg.createsServed() {
+		return sessionstore.DispositionInboxEntry{}, false, refusal(sessionwire.ErrorCodeRuntimeUnavailable, ErrCreateBindingUnconfigured)
+	}
+	return s.admitPublicCreate(ctx, principal.Tenant(), req, target, payload)
 }
 
 func (s *Service) AdmitInput(ctx context.Context, principal identity.Principal, req sessionwire.InputRequest) (sessionstore.InboxEntry, bool, error) {

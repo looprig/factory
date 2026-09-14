@@ -35,6 +35,7 @@ type admittedCommand struct {
 	interrupt sessionwire.InterruptRequest
 	restore   sessionwire.RestoreRequest
 	gate      sessionwire.GateResponseRequest
+	create    sessionwire.CreateRequest
 	kind      sessionstore.CommandKind
 }
 
@@ -59,6 +60,30 @@ func (f *fakeAdmitter) record(call admittedCommand) (sessionstore.InboxEntry, bo
 		return sessionstore.InboxEntry{}, false, f.err
 	}
 	return f.entry, true, nil
+}
+
+// AdmitCreate answers in the DISPOSITION family. The projection of the two
+// families onto one public status is internal/command's, so the recorded entry
+// is built from the same fields the legacy one carries and the existing
+// assertions about the response body read one shape.
+func (f *fakeAdmitter) AdmitCreate(_ context.Context, p identity.Principal, req sessionwire.CreateRequest) (sessionstore.DispositionInboxEntry, bool, error) {
+	entry, created, err := f.record(admittedCommand{principal: p, create: req, kind: commandCreate})
+	if err != nil {
+		return sessionstore.DispositionInboxEntry{}, created, err
+	}
+	return sessionstore.DispositionInboxEntry{
+		Record: sessionstore.DispositionInboxRecord{
+			Descriptor: sessionstore.DispositionCommandDescriptor{
+				PublicCreate: true, CommandID: entry.Record.CommandID,
+				// The session is the REQUEST's, as the store's is: a create
+				// names a session that does not exist yet, so the record can
+				// only carry the one the caller proposed.
+				SessionID: req.SessionID, Kind: commandCreate,
+			},
+			State: entry.Record.State,
+		},
+		Revision: entry.Revision, AcceptedOrder: entry.AcceptedOrder,
+	}, created, nil
 }
 
 func (f *fakeAdmitter) AdmitInput(_ context.Context, p identity.Principal, req sessionwire.InputRequest) (sessionstore.InboxEntry, bool, error) {
@@ -853,77 +878,56 @@ func TestEveryPendingMethodExplainsItselfToTheCaller(t *testing.T) {
 			}
 		}
 	}
-	if pending == 0 {
-		t.Fatal("no method is pending, so the reason column has no subject")
+	// Zero as of A3.1: every method is served. What this test still holds is
+	// the other direction, asserted in the loop above -- a SERVED method must
+	// carry no reason, so a cleared owner cannot leave a stale explanation
+	// behind that nothing renders.
+	if pending != 0 {
+		t.Logf("%d methods are still pending", pending)
 	}
 }
 
-// TestTheCreateRefusalNamesTheBindingAndNotATaskTag is the specific reading of
-// the above that A3.3 owes: the create is 501 because this composition cannot
-// author the immutable SessionBinding a V1 create reservation carries, and the
-// refusal must say so rather than naming a task.
+// TestTheCreateIsServedAndAnswersTheDurableRecord is what
+// TestTheCreateRefusalNamesTheBindingAndNotATaskTag became.
 //
-// It is pinned by WORD rather than by the rule's own string, because comparing
-// the response against `rule.reason` would pass for any reason at all --
-// including the "A3.1" tag this replaced.
-func TestTheCreateRefusalNamesTheBindingAndNotATaskTag(t *testing.T) {
+// That test pinned the create's 501 and required the refusal to name the
+// BINDING rather than a task tag, because "A3.1" had sat in the reason column
+// through two tasks and told a caller nothing. A3.1 supplies the binding, so
+// the create is served and the refusal it guarded no longer exists.
+//
+// What replaces it is the assertion the old one could not make: the create
+// answers from the authoritative durable record, with 201 rather than the 200
+// the other four controls use, because it is the only control that brings a
+// resource into existence.
+func TestTheCreateIsServedAndAnswersTheDurableRecord(t *testing.T) {
 	t.Parallel()
 
-	f := newFixture(t, withAdmitter(newFakeAdmitter()))
+	admitter := newFakeAdmitter()
+	f := newFixture(t, withAdmitter(admitter))
 	recorder := postJSON(f, "/v1/sessions",
 		`{"version":1,"command_id":"command-a","session_id":"session-new","agent_id":"agent-a"}`)
 
-	if recorder.Code != http.StatusNotImplemented {
-		t.Fatalf("the create answered %d (%s), want 501", recorder.Code, recorder.Body)
+	if recorder.Code != http.StatusCreated {
+		t.Fatalf("the create answered %d (%s), want 201", recorder.Code, recorder.Body)
 	}
-	message := decodeEnvelope(t, recorder).Error.Message
-	for _, word := range []string{"binding", "author"} {
-		if !strings.Contains(message, word) {
-			t.Errorf("the create refusal %q does not name %q; it must name the blocker", message, word)
-		}
+	if len(admitter.calls) != 1 || admitter.calls[0].kind != commandCreate {
+		t.Fatalf("the route did not admit exactly one create: %+v", admitter.calls)
 	}
-	if strings.Contains(message, "A3.1") || strings.Contains(message, "A9.1") {
-		t.Errorf("the create refusal %q names a task tag, which answers nothing a caller asked", message)
+	// The SESSION reaches admission from the BODY. There is no {sid} on this
+	// route, so a handler that read the path would have admitted the zero
+	// session.
+	if got := admitter.calls[0].create.SessionID; got != "session-new" {
+		t.Errorf("admitted session %q, want the body's", got)
 	}
-}
-
-// TestARequestTypeTheComparisonCannotReadIsRefused drives decodeCommand's
-// default arm DIRECTLY, and it exists because the alternative was reporting a
-// surviving mutant as equivalent.
-//
-// The arm is unreachable through controlSpecs, which passes exactly the four
-// Core request types the switch names -- four call sites, enumerated by grep
-// over the package, and the function is unexported so there are no others. But
-// "no production producer" is not "no test can distinguish it": this package's
-// own test can call it, and the mutant that replaces the arm with `return nil`
-// is the one that matters, because it admits a fifth command kind WITHOUT
-// comparing the session the path named. That is the exact defect the comparison
-// exists to prevent, arriving through the door a later task opens by adding a
-// command to controlSpecs and forgetting the case.
-//
-// The control is the row below it: a type the switch DOES name, with a matching
-// session, is accepted -- so the refusal is caused by the type and not by the
-// function refusing everything.
-func TestARequestTypeTheComparisonCannotReadIsRefused(t *testing.T) {
-	t.Parallel()
-
-	type futureCommand struct {
-		Version   int    `json:"version"`
-		CommandID string `json:"command_id"`
-		SessionID string `json:"session_id"`
+	if got := admitter.calls[0].create.CommandID; got != "command-a" {
+		t.Errorf("admitted command %q, want the body's", got)
 	}
-	body := fmt.Sprintf(`{"version":%d,"command_id":"command-a","session_id":%q}`,
-		sessionwire.CurrentWireVersion, string(fixtureSession))
-
-	var unreadable futureCommand
-	if err := decodeCommand([]byte(body), &unreadable, fixtureSession); err == nil {
-		t.Error("a request type the session comparison cannot read was accepted; " +
-			"it would be admitted without the path's session ever being compared")
+	var status sessionwire.CommandStatus
+	if err := json.Unmarshal(recorder.Body.Bytes(), &status); err != nil {
+		t.Fatalf("the create answered a body that is not a CommandStatus: %v (%s)", err, recorder.Body)
 	}
-
-	var known sessionwire.InterruptRequest
-	if err := decodeCommand([]byte(body), &known, fixtureSession); err != nil {
-		t.Errorf("the control was refused: %v; this case cannot tell a type refusal from a blanket one", err)
+	if status.CommandID != "command-a" || status.State != sessionwire.CommandStateAccepted {
+		t.Errorf("status = %+v, want the durable record's accepted command", status)
 	}
 }
 
@@ -1058,4 +1062,108 @@ func TestTheDeliveryAttemptRunsOnTheRequestsOwnContext(t *testing.T) {
 				"so nothing the caller does can stop it", delivery.calls[0].errAtCall)
 		}
 	})
+}
+
+// TestAnAdmittedCreateIsDeliveredToTheSessionItsBodyNamed is the create's half
+// of the delivery contract, and it exists because the other four commands
+// cannot cover it.
+//
+// Every session-scoped control takes its delivery target from the URL, which
+// decodeCommand has already held equal to the body's -- so for those four the
+// two sources are indistinguishable and a handler reading either passes. The
+// create has NO {sid} in its path, so the URL source yields the empty session
+// and only the body's is correct. Two mutations survived the whole suite
+// before this test existed: dropping the create's session from the projection,
+// and making serveControl ignore the override and always use the URL's.
+func TestAnAdmittedCreateIsDeliveredToTheSessionItsBodyNamed(t *testing.T) {
+	t.Parallel()
+
+	const created = sessionwire.SessionID("session-new")
+	delivery := &fakeDelivery{}
+	f := newFixture(t, withAdmitter(newFakeAdmitter()), withDelivery(delivery))
+
+	recorder := postJSON(f, "/v1/sessions",
+		`{"version":1,"command_id":"command-a","session_id":"`+string(created)+`","agent_id":"agent-a"}`)
+	if recorder.Code != http.StatusCreated {
+		t.Fatalf("the create answered %d (%s), want 201", recorder.Code, recorder.Body)
+	}
+	if len(delivery.calls) != 1 {
+		t.Fatalf("delivery was attempted %d times, want once", len(delivery.calls))
+	}
+	got := delivery.calls[0]
+	if got.session != created {
+		t.Errorf("delivered to session %q, want the body's %q; the create's path carries no session, "+
+			"so a handler reading the URL delivers to nothing", got.session, created)
+	}
+	// The session must differ from the fixture's own, or a handler that read a
+	// fixture default would pass this.
+	if created == fixtureSession {
+		t.Fatal("the created session is the fixture's, so reading either source would pass")
+	}
+	if got.tenant != fixtureTenant {
+		t.Errorf("delivered to tenant %q, want the authenticated %q", got.tenant, fixtureTenant)
+	}
+	if got.delivery.CommandID != "command-a" {
+		t.Errorf("delivered command %q, want the durable record's", got.delivery.CommandID)
+	}
+}
+
+// TestAMalformedCreateBodyIsRefusedBeforeAdmission rows the create's decoder.
+//
+// A mutation that DISCARDED decodeCreate's unmarshal error survived the whole
+// suite, and the reason it was invisible is worth stating: with the error
+// dropped the request struct is simply left partly filled, and admission's own
+// Validate then refuses it with the same invalid_request a caller sees anyway.
+// The two paths are indistinguishable from the STATUS alone.
+//
+// What distinguishes them is (a) whether admission was reached at all, and (b)
+// the duplicate-field row, which Core's decoder refuses and a dropped error
+// would silently resolve to one of the two values -- admitting a command the
+// caller did not unambiguously send.
+func TestAMalformedCreateBodyIsRefusedBeforeAdmission(t *testing.T) {
+	t.Parallel()
+
+	for _, test := range []struct {
+		name string
+		body string
+	}{
+		{"not JSON at all", `{`},
+		{"a duplicate command id", `{"version":1,"command_id":"a","command_id":"b","session_id":"session-new","agent_id":"agent-a"}`},
+		{"a duplicate session id", `{"version":1,"command_id":"a","session_id":"s1","session_id":"s2","agent_id":"agent-a"}`},
+		{"a body that is not an object", `["not","a","create"]`},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			admitter := newFakeAdmitter()
+			f := newFixture(t, withAdmitter(admitter))
+			recorder := postJSON(f, "/v1/sessions", test.body)
+
+			if recorder.Code == http.StatusCreated {
+				t.Fatalf("a malformed create was admitted: %s", recorder.Body)
+			}
+			if recorder.Code/100 != 4 {
+				t.Errorf("answered %d (%s), want a client refusal", recorder.Code, recorder.Body)
+			}
+			// The discriminating assertion: the decoder refused it, so the
+			// service was never asked. Without this the rows above pass
+			// against a handler that decodes nothing and lets admission
+			// refuse a zero request.
+			if len(admitter.calls) != 0 {
+				t.Errorf("a malformed create reached the admission service: %+v", admitter.calls)
+			}
+		})
+	}
+	// The positive control: a WELL-FORMED body does reach admission and is
+	// created, so the assertions above are about malformedness rather than
+	// about a handler that admits nothing.
+	admitter := newFakeAdmitter()
+	f := newFixture(t, withAdmitter(admitter))
+	if recorder := postJSON(f, "/v1/sessions",
+		`{"version":1,"command_id":"command-a","session_id":"session-new","agent_id":"agent-a"}`); recorder.Code != http.StatusCreated {
+		t.Fatalf("the well-formed control answered %d (%s), want 201", recorder.Code, recorder.Body)
+	}
+	if len(admitter.calls) != 1 {
+		t.Fatalf("the well-formed control reached admission %d times, want once", len(admitter.calls))
+	}
 }

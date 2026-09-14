@@ -44,6 +44,16 @@ var (
 	// ErrObjectPolicyWithoutResolver reports an ObjectPolicy composed with no
 	// ObjectStoreResolver behind it. See WithObjectPolicy.
 	ErrObjectPolicyWithoutResolver = errors.New("factory: WithObjectPolicy requires WithObjectStoreResolver")
+	// ErrSessionBindingWithoutResolver reports a SessionBinding composed with
+	// no ObjectStoreResolver behind it. See WithSessionBinding.
+	ErrSessionBindingWithoutResolver = errors.New("factory: WithSessionBinding requires WithObjectStoreResolver")
+	// ErrIncompleteSessionBinding reports a WithSessionBinding missing a
+	// member. A binding is immutable after create, so a partial one cannot be
+	// completed later.
+	ErrIncompleteSessionBinding = errors.New("factory: the session binding names no storage binding or no version")
+	// ErrCreatePlaneIncomplete reports exactly one half of the create
+	// composition. See WithSessionBinding.
+	ErrCreatePlaneIncomplete = errors.New("factory: serving V1 creates requires both WithSessionBinding and WithPublicCreates")
 	// ErrInvalidLaunchTemplate reports a configured launch target this
 	// composition refuses.
 	ErrInvalidLaunchTemplate = errors.New("factory: invalid launch template")
@@ -118,11 +128,13 @@ type config struct {
 	replicaID  string
 	version    string
 
-	workloads    WorkloadController
-	department   []LaunchTemplate
-	objectPolicy ObjectPolicy
-	objectStores ObjectStoreResolver
-	objects      ObjectLimits
+	workloads      WorkloadController
+	department     []LaunchTemplate
+	objectPolicy   ObjectPolicy
+	objectStores   ObjectStoreResolver
+	sessionBinding SessionBindingTemplate
+	publicCreates  PublicCreates
+	objects        ObjectLimits
 
 	ui   http.Handler
 	uiFS fs.FS

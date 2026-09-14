@@ -55,9 +55,18 @@ const (
 // under one session and admitted under another.
 type rpcCommand struct {
 	session sessionwire.SessionID
-	// admit hands the decoded request to the service. It closes over the
-	// concrete Core type, so no type switch and no `any` reaches the seam.
-	admit func(context.Context, Admitter, identity.Principal) (sessionstore.InboxEntry, bool, error)
+	// admit hands the decoded request to the service and projects the durable
+	// answer. It closes over the concrete Core type, so no type switch and no
+	// `any` reaches the seam.
+	//
+	// It returns the PROJECTED status rather than the record because the two
+	// command families return different record types -- a create is admitted
+	// into the disposition inbox and everything else into the legacy one -- and
+	// the projection is the point at which that difference stops mattering.
+	// Keeping the raw record here would force a type switch or an `any` at
+	// exactly the seam this signature exists to keep concrete. The bool is
+	// "this record can be described publicly"; see command.StatusFor.
+	admit func(context.Context, Admitter, identity.Principal) (sessionwire.CommandStatus, bool, error)
 }
 
 // commandSpec is what one method IS: the durable kind it is authorized under,
@@ -116,8 +125,13 @@ func decodeCreate(data []byte) (rpcCommand, error) {
 	if err := json.Unmarshal(data, &req); err != nil {
 		return rpcCommand{}, err
 	}
-	return rpcCommand{session: req.SessionID, admit: func(ctx context.Context, a Admitter, p identity.Principal) (sessionstore.InboxEntry, bool, error) {
-		return a.AdmitCreate(ctx, p, req)
+	return rpcCommand{session: req.SessionID, admit: func(ctx context.Context, a Admitter, p identity.Principal) (sessionwire.CommandStatus, bool, error) {
+		entry, _, err := a.AdmitCreate(ctx, p, req)
+		if err != nil {
+			return sessionwire.CommandStatus{}, false, err
+		}
+		status, readable := command.StatusForDisposition(entry)
+		return status, readable, nil
 	}}, nil
 }
 
@@ -126,8 +140,13 @@ func decodeInput(data []byte) (rpcCommand, error) {
 	if err := json.Unmarshal(data, &req); err != nil {
 		return rpcCommand{}, err
 	}
-	return rpcCommand{session: req.SessionID, admit: func(ctx context.Context, a Admitter, p identity.Principal) (sessionstore.InboxEntry, bool, error) {
-		return a.AdmitInput(ctx, p, req)
+	return rpcCommand{session: req.SessionID, admit: func(ctx context.Context, a Admitter, p identity.Principal) (sessionwire.CommandStatus, bool, error) {
+		entry, _, err := a.AdmitInput(ctx, p, req)
+		if err != nil {
+			return sessionwire.CommandStatus{}, false, err
+		}
+		status, readable := command.StatusFor(entry)
+		return status, readable, nil
 	}}, nil
 }
 
@@ -136,8 +155,13 @@ func decodeInterrupt(data []byte) (rpcCommand, error) {
 	if err := json.Unmarshal(data, &req); err != nil {
 		return rpcCommand{}, err
 	}
-	return rpcCommand{session: req.SessionID, admit: func(ctx context.Context, a Admitter, p identity.Principal) (sessionstore.InboxEntry, bool, error) {
-		return a.AdmitInterrupt(ctx, p, req)
+	return rpcCommand{session: req.SessionID, admit: func(ctx context.Context, a Admitter, p identity.Principal) (sessionwire.CommandStatus, bool, error) {
+		entry, _, err := a.AdmitInterrupt(ctx, p, req)
+		if err != nil {
+			return sessionwire.CommandStatus{}, false, err
+		}
+		status, readable := command.StatusFor(entry)
+		return status, readable, nil
 	}}, nil
 }
 
@@ -146,8 +170,13 @@ func decodeRestore(data []byte) (rpcCommand, error) {
 	if err := json.Unmarshal(data, &req); err != nil {
 		return rpcCommand{}, err
 	}
-	return rpcCommand{session: req.SessionID, admit: func(ctx context.Context, a Admitter, p identity.Principal) (sessionstore.InboxEntry, bool, error) {
-		return a.AdmitRestore(ctx, p, req)
+	return rpcCommand{session: req.SessionID, admit: func(ctx context.Context, a Admitter, p identity.Principal) (sessionwire.CommandStatus, bool, error) {
+		entry, _, err := a.AdmitRestore(ctx, p, req)
+		if err != nil {
+			return sessionwire.CommandStatus{}, false, err
+		}
+		status, readable := command.StatusFor(entry)
+		return status, readable, nil
 	}}, nil
 }
 
@@ -156,8 +185,13 @@ func decodeGateResponse(data []byte) (rpcCommand, error) {
 	if err := json.Unmarshal(data, &req); err != nil {
 		return rpcCommand{}, err
 	}
-	return rpcCommand{session: req.SessionID, admit: func(ctx context.Context, a Admitter, p identity.Principal) (sessionstore.InboxEntry, bool, error) {
-		return a.AdmitGateResponse(ctx, p, req)
+	return rpcCommand{session: req.SessionID, admit: func(ctx context.Context, a Admitter, p identity.Principal) (sessionwire.CommandStatus, bool, error) {
+		entry, _, err := a.AdmitGateResponse(ctx, p, req)
+		if err != nil {
+			return sessionwire.CommandStatus{}, false, err
+		}
+		status, readable := command.StatusFor(entry)
+		return status, readable, nil
 	}}, nil
 }
 
@@ -247,7 +281,7 @@ func (e *Engine) Admit(ctx context.Context, principal identity.Principal, method
 	if err := e.cfg.Authorizer.AuthorizeControl(ctx, principal, decoded.session, spec.kind); err != nil {
 		return nil, err
 	}
-	entry, _, err := decoded.admit(ctx, e.cfg.Admitter, principal)
+	status, readable, err := decoded.admit(ctx, e.cfg.Admitter, principal)
 	if err != nil {
 		var refusal *admission.Error
 		if errors.As(err, &refusal) {
@@ -261,7 +295,7 @@ func (e *Engine) Admit(ctx context.Context, principal identity.Principal, method
 		// the retry contract exists for.
 		return nil, err
 	}
-	return replyFor(entry)
+	return replyFor(status, readable)
 }
 
 // replyFor projects the authoritative SessionInbox record into Core's public
@@ -292,15 +326,15 @@ func (e *Engine) Admit(ctx context.Context, principal identity.Principal, method
 // state this build does not know is a store disagreeing with this build, and
 // defaulting it to accepted would report the one case that must never be
 // reported optimistically.
-func replyFor(entry sessionstore.InboxEntry) ([]byte, error) {
-	// The PROJECTION is internal/command's, called rather than restated: A3.3
-	// gave the REST controls the same answer to build, and two projections of
-	// one five-state vocabulary is two places for one durable record to be
-	// described differently over two transports. The paragraphs above are the
-	// argument for the mapping and now live beside it, in command.StatusFor.
-	status, readable := command.StatusFor(entry)
+//
+// The PROJECTION is internal/command's, applied by the decoder rather than
+// here: A3.3 gave the REST controls the same answer to build, and two
+// projections of one five-state vocabulary is two places for one durable record
+// to be described differently over two transports. The paragraphs above are the
+// argument for the mapping and now live beside it, in command.StatusFor.
+func replyFor(status sessionwire.CommandStatus, readable bool) ([]byte, error) {
 	if !readable {
-		return nil, fmt.Errorf("%w: state %q", ErrUnreadableRecord, entry.Record.State)
+		return nil, ErrUnreadableRecord
 	}
 	body, err := status.MarshalJSON()
 	if err != nil {

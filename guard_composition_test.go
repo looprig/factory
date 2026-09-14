@@ -544,8 +544,8 @@ type refusingAdmitter struct{}
 
 var errNoAdmissionHere = errors.New("this composition admits no command")
 
-func (refusingAdmitter) AdmitCreate(context.Context, factoryidentity.Principal, sessionwire.CreateRequest) (sessionstore.InboxEntry, bool, error) {
-	return sessionstore.InboxEntry{}, false, errNoAdmissionHere
+func (refusingAdmitter) AdmitCreate(context.Context, factoryidentity.Principal, sessionwire.CreateRequest) (sessionstore.DispositionInboxEntry, bool, error) {
+	return sessionstore.DispositionInboxEntry{}, false, errNoAdmissionHere
 }
 
 func (refusingAdmitter) AdmitInput(context.Context, factoryidentity.Principal, sessionwire.InputRequest) (sessionstore.InboxEntry, bool, error) {

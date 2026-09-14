@@ -679,8 +679,14 @@ func TestTheUnimplementedMethodsAreExactlyTheOnesLaterTasksOwn(t *testing.T) {
 	if implemented == 0 {
 		t.Fatal("no method is implemented at this task, so the 501 split is vacuous")
 	}
-	if pending == 0 {
-		t.Fatal("no method is pending, so the owner column has no reader")
+	// pending == 0 is the CORRECT answer as of A3.1: the create was the last
+	// owned method. The split this test names is therefore one-sided now, and
+	// the half that still has a subject -- every served method answers
+	// something other than 501 -- is the half asserted above. The owner
+	// column's reader, for the day a task adds one back, is
+	// TestTheNotImplementedAnswerStillWorksForAFutureTask.
+	if pending != 0 {
+		t.Logf("%d methods are still pending", pending)
 	}
 }
 
@@ -705,8 +711,14 @@ func TestARouteMayBePartlyImplemented(t *testing.T) {
 			mixed++
 		}
 	}
+	// Zero as of A3.1: /v1/sessions was the mixed route -- a served GET list
+	// beside a pending POST create -- and the create is now served, so no
+	// route mixes the two. The per-METHOD owner this test argued for is still
+	// the right shape and is still what the table declares; what is gone is a
+	// live example of it. Recorded rather than asserted, because "no route is
+	// mixed" is not a property worth enforcing either way.
 	if mixed == 0 {
-		t.Fatal("no route serves an implemented method beside a pending one, so a per-route owner would still be sufficient")
+		t.Log("no route mixes a served and a pending method; the create was the last")
 	}
 }
 
@@ -825,15 +837,22 @@ func concreteTarget(pattern string) string {
 //
 // The ORDER of the search is the table's, so the answer moves when the table
 // does instead of being pinned to one route.
-func aPendingTarget() (string, string) {
+// aPendingTarget reports a method this build does not serve, if there is one.
+//
+// As of A3.1 there is NOT: the create was the last, and every route is now
+// served. The helper therefore reports absence instead of panicking. A panic
+// here would be the trap this module has already hit twice -- a fixture that
+// cannot fail taking a whole timeout or killing the run rather than naming the
+// thing that changed.
+func aPendingTarget() (method, target string, ok bool) {
 	for _, route := range routeTable() {
 		for _, rule := range route.rules {
 			if rule.owner != "" {
-				return rule.method, concreteTarget(route.pattern)
+				return rule.method, concreteTarget(route.pattern), true
 			}
 		}
 	}
-	panic("no route serves a pending method, so the not-implemented case has no subject")
+	return "", "", false
 }
 
 // TestNoPendingMethodNamesAnAcceptedTask is the guard the owner column's own
@@ -867,15 +886,79 @@ func TestNoPendingMethodNamesAnAcceptedTask(t *testing.T) {
 			}
 		}
 	}
-	if pending == 0 {
-		t.Fatal("no method is pending, so this guard has no subject")
+	// Zero is the CORRECT answer as of A3.1: the create was the last pending
+	// method and every route is now served. The guard is kept because the
+	// owner column is not deleted -- a future task may add one -- and its
+	// machinery has a positive control in
+	// TestTheNotImplementedAnswerStillWorksForAFutureTask.
+	if pending != 0 {
+		t.Logf("%d methods are still pending", pending)
+	}
+}
+
+// TestTheNotImplementedAnswerStillWorksForAFutureTask is the positive control
+// every "nothing is pending" assertion now rests on.
+//
+// With the create served there is no real pending method left, so the guards
+// that used to drive one would pass on an empty set forever and the 501 path,
+// the owner column and the reason column would rot untested until the next task
+// needed them.
+//
+// It does NOT drive a synthetic route through the router, and that is
+// deliberate: driveRule builds a request from a PATTERN and serves it through
+// the real table, so a synthetic rule would be ignored and the real, served
+// route would answer. A test constructed that way would be measuring the wrong
+// subject while looking correct. What the machinery actually is, is two pieces,
+// and each is checked where it lives.
+func TestTheNotImplementedAnswerStillWorksForAFutureTask(t *testing.T) {
+	t.Parallel()
+
+	// (1) The ANSWER. notImplemented renders a reason into the envelope a
+	// caller sees.
+	const reason = "a future task owns this one"
+	answer := notImplemented(reason)
+	if answer.status != http.StatusNotImplemented {
+		t.Errorf("status = %d, want 501", answer.status)
+	}
+	if answer.code != ErrorCodeNotImplemented {
+		t.Errorf("code = %q, want %q", answer.code, ErrorCodeNotImplemented)
+	}
+	if !strings.Contains(answer.message, reason) {
+		t.Errorf("message = %q, which does not carry the reason %q", answer.message, reason)
+	}
+	// Anti-vacuity: a different reason produces a different message, so the
+	// check above is reading the reason rather than a constant.
+	if other := notImplemented("something else"); other.message == answer.message {
+		t.Error("two different reasons render the same message; the reason is not reaching the caller")
+	}
+
+	// (2) The SELECTION. A rule answers 501 exactly when it carries no
+	// handler, and the table's own invariant is that a handler and an owner are
+	// mutually exclusive. This is what makes the owner column mean "pending"
+	// rather than being decoration.
+	for _, route := range routeTable() {
+		for _, rule := range route.rules {
+			key := rule.method + " " + route.pattern
+			if (rule.owner == "") != (rule.handle != nil) {
+				t.Errorf("%s has owner %q and handle-present %v; an owned method must have no handler and a served one must have one",
+					key, rule.owner, rule.handle != nil)
+			}
+		}
 	}
 }
 
 func TestAPendingTargetIsReallyPending(t *testing.T) {
 	t.Parallel()
 
-	method, target := aPendingTarget()
+	method, target, ok := aPendingTarget()
+	if !ok {
+		// A3.1 served the create, which was the last pending method. This is
+		// an assertion that the set is EMPTY, which is a fact about the build
+		// rather than the absence of one -- and the 501 machinery it used to
+		// drive is still exercised by
+		// TestTheNotImplementedAnswerStillWorksForAFutureTask.
+		return
+	}
 	f := newFixture(t)
 	recorder := f.serve(request(method, target, bytes.NewReader([]byte("{}"))))
 	if recorder.Code != http.StatusNotImplemented {
@@ -983,19 +1066,17 @@ func TestNoAPIFailureFallsThroughToTheSPA(t *testing.T) {
 				return r
 			},
 		},
-		{
-			name: "not implemented", status: http.StatusNotImplemented, code: ErrorCodeNotImplemented,
-			// A route a LATER task owns, DERIVED from the table rather than
-			// named. It was /v1/agents until A2.2 served one and the session
-			// status until A2.3 did; a case pinned to a route that becomes
-			// implemented does not fail, it silently stops testing the
-			// condition it names. Deriving it means the case moves itself, and
-			// the day nothing is pending it fails loudly instead.
-			build: func(*fixture) *http.Request {
-				method, target := aPendingTarget()
-				return request(method, target, bytes.NewReader([]byte("{}")))
-			},
-		},
+		// The "not implemented" row is GONE as of A3.1, and its own comment
+		// predicted the day: it derived its subject from the table so that
+		// "the day nothing is pending it fails loudly instead", and the create
+		// was the last pending method. There is no longer a request this
+		// router answers 501 to, so the row has no subject to derive.
+		//
+		// What it checked is not lost. The envelope's status, code and
+		// reason-carrying message are checked directly in
+		// TestTheNotImplementedAnswerStillWorksForAFutureTask, and the SPA
+		// fall-through it also guarded is checked by every other row here --
+		// the concern is the error writer's, not this status's.
 	}
 	for _, row := range cases {
 		t.Run(row.name, func(t *testing.T) {
@@ -2385,8 +2466,13 @@ func expectedRoutes() map[string]expectation {
 	control := func(command sessionstore.CommandKind, session bool) expectation {
 		return expectation{auth: authControl, command: command, body: bodyJSON, session: session, implemented: true}
 	}
-	pendingControl := func(command sessionstore.CommandKind, session bool) expectation {
-		return expectation{auth: authControl, command: command, body: bodyJSON, session: session}
+	// servedControl is what pendingControl became. Every control this build
+	// declares is now served, the create last, so the restatement has no
+	// pending shape left to express. The `session` argument stays because it
+	// is a property of the ROUTE rather than of its implementation status:
+	// /v1/sessions carries no {sid} and the other four do.
+	servedControl := func(command sessionstore.CommandKind, session bool) expectation {
+		return expectation{auth: authControl, command: command, body: bodyJSON, session: session, implemented: true}
 	}
 	routes := map[string]expectation{
 		// The caller's authenticated tenant identity, with no caller-selected
@@ -2416,7 +2502,7 @@ func expectedRoutes() map[string]expectation {
 		// The create is the one control that is NOT served, and the reason is
 		// the immutable session binding this composition cannot author, not an
 		// unwritten handler. See routeTable.
-		"POST /v1/sessions": pendingControl(commandCreate, false),
+		"POST /v1/sessions": servedControl(commandCreate, false),
 		// Durable reads within one session, all three served by this build.
 		// They are replay-free projections of durable state, so each remains
 		// answerable while every Host is stopped.
@@ -2518,8 +2604,8 @@ func TestTheRestatementIsIndependentOfTheTable(t *testing.T) {
 	if !base["GET /v1/sessions"].implemented {
 		t.Error("the restatement does not expect the tenant list to be served, so withdrawing its handler is unreported")
 	}
-	if base["POST /v1/sessions"].implemented {
-		t.Error("the restatement expects the session create to be served; it cannot be, for want of a session binding")
+	if !base["POST /v1/sessions"].implemented {
+		t.Error("the restatement does not expect the session create to be served, so withdrawing its handler is unreported")
 	}
 	if !base["POST /v1/sessions/{sid}/input"].implemented {
 		t.Error("the restatement does not expect input to be served, so withdrawing its handler is unreported")
@@ -2561,6 +2647,25 @@ func sanctionedImplementedMethods() map[string]string {
 	// HEAD is GET's rule exactly, so its sanction is GET's sanction. Writing
 	// it twice would be two places for one argument to be revised in one.
 	sanctioned := map[string]string{
+		// The create does NOT share controlSanction, and the difference is the
+		// whole reason this sanction is per-method. Every clause of that
+		// argument that begins "the session is the PATH's" is FALSE here:
+		// /v1/sessions names no session, because the create is where a caller
+		// chooses one.
+		"POST /v1/sessions": "admits ONE state-changing command under authControl with the " +
+			"command kind `create`, taken before the body is read -- so a caller who may not create " +
+			"in this tenant learns nothing by sending one. The SESSION IS THE BODY'S, not the " +
+			"path's, and that is the one way this route's rule differs from the other four " +
+			"controls: there is no {sid} to validate or to resolve through scope.catalogEntry, so " +
+			"AuthorizeControl is reached with the session the CALLER proposes and the tenant the " +
+			"credential established. That is adequate because the proposed session cannot yet " +
+			"belong to anyone: the identity is filed by internal/admission under the caller's own " +
+			"tenant namespace, and a proposal colliding with an existing session is refused by the " +
+			"store's create-only reservation rather than admitted into another tenant's record -- " +
+			"a cross-tenant collision is a refusal, never a write. The command identity is the " +
+			"CALLER's: a repeat of the identical request returns the original durable record, and " +
+			"a reuse of one CommandID for a different session, agent or payload is refused " +
+			"command_rejected, which is the property A3.1 step 2 exists for",
 		"GET /v1/sessions/{sid}/objects/{oid}":          "requires an object decision before catalog lookup and trusted committed-reference policy before metadata/body; frozen catalog binding selects the reader; success follows whole-object EOF and Close",
 		"GET /v1/sessions/{sid}/objects/{oid}/metadata": "requires the same object and committed-reference decisions as bytes; exposes only Core metadata, which is not current blob-presence proof",
 		"GET /v1/bootstrap": "serves the CALLER their own bounded tenant identity under " +

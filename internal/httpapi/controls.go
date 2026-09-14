@@ -39,12 +39,17 @@ import (
 // returns the authoritative SessionInbox record, so nothing about a URL, a
 // header or a path value reaches the service.
 //
-// AdmitCreate is deliberately ABSENT, and the absence is the point rather than
-// an omission: this composition cannot author the immutable SessionBinding a V1
-// create reservation carries, so there is no create handler to declare a
-// dependency for, and a seam naming a method no route calls would be a
-// deployment asked to supply something nothing uses. The day the binding exists,
-// adding the method here and clearing the create's owner are one change.
+// AdmitCreate is PRESENT as of A3.1, and it was absent for two tasks before
+// that because this composition could not author the immutable SessionBinding a
+// V1 create reservation carries. It now can: WithSessionBinding supplies the
+// two deployment members and admission derives the third from the create's own
+// identity. Adding the method here and clearing the create's owner in
+// routeTable were one change, as that absence note predicted.
+//
+// It returns a DISPOSITION entry while the other four return legacy ones, and
+// that asymmetry is the protocol rather than an inconsistency: a create chooses
+// the session's protocol mode, and disposition is the only choice a Host can
+// take residency on.
 //
 // AdmitLegacyCreate is absent for a second, independent reason: it is a create.
 //
@@ -53,6 +58,7 @@ import (
 // and the seam still declares it, because the seam's shape is the service's and
 // an adapter would be a second place for the two edges to answer differently.
 type ControlAdmitter interface {
+	AdmitCreate(ctx context.Context, principal identity.Principal, req sessionwire.CreateRequest) (sessionstore.DispositionInboxEntry, bool, error)
 	AdmitInput(ctx context.Context, principal identity.Principal, req sessionwire.InputRequest) (sessionstore.InboxEntry, bool, error)
 	AdmitInterrupt(ctx context.Context, principal identity.Principal, req sessionwire.InterruptRequest) (sessionstore.InboxEntry, bool, error)
 	AdmitRestore(ctx context.Context, principal identity.Principal, req sessionwire.RestoreRequest) (sessionstore.InboxEntry, bool, error)
@@ -97,7 +103,52 @@ type controlSpec struct {
 	// admit decodes the body and calls the one service method for this route.
 	// It returns a classified refusal or a fault exactly as the service does;
 	// nothing here reclassifies one into the other.
-	admit func(rt *Router, r *http.Request, principal identity.Principal, session sessionwire.SessionID, body []byte) (sessionstore.InboxEntry, error)
+	admit func(rt *Router, r *http.Request, principal identity.Principal, session sessionwire.SessionID, body []byte) (admitted, error)
+}
+
+// admitted is what a control spec answers: the PUBLIC projection of the
+// durable record, plus the identity a delivery attempt names.
+//
+// It exists because the two command families return different durable record
+// types -- a create is admitted into the disposition inbox and the other four
+// into the legacy one -- and this is the point at which that stops mattering.
+// The projection itself is internal/command's single authority, called by each
+// spec; nothing here re-derives a state.
+//
+// readable is "this record can be described publicly". A record whose state
+// this build does not recognise, or a rejected one carrying no error detail,
+// is a fault rather than an acceptance -- see command.StatusForDisposition for
+// why the second case exists at all.
+type admitted struct {
+	status   sessionwire.CommandStatus
+	readable bool
+	command  sessionwire.CommandID
+	// session OVERRIDES the URL's session for a delivery attempt, and it is
+	// set by exactly one spec.
+	//
+	// The four session-scoped controls leave it empty and keep using the URL
+	// value, which decodeCommand has already held equal to the body's. The
+	// CREATE names no session in its path -- /v1/sessions is where a caller
+	// CHOOSES one -- so it is the one control whose delivery target can only
+	// come from the request it just admitted.
+	session sessionwire.SessionID
+}
+
+// legacyAdmitted projects the four commands that admit into the legacy inbox.
+func legacyAdmitted(entry sessionstore.InboxEntry, err error) (admitted, error) {
+	if err != nil {
+		return admitted{}, err
+	}
+	status, readable := command.StatusFor(entry)
+	return admitted{status: status, readable: readable, command: entry.Record.CommandID}, nil
+}
+
+// dropCreated discards admission's "this call is the one that accepted it".
+// This edge deliberately does not read it -- a retry and a first acceptance get
+// the same answer -- and the seam still returns it because the seam's shape is
+// the service's. See ControlAdmitter.
+func dropCreated(entry sessionstore.InboxEntry, _ bool, err error) (sessionstore.InboxEntry, error) {
+	return entry, err
 }
 
 // controlSpecs is the table, keyed by the same command kinds the route table
@@ -107,34 +158,31 @@ type controlSpec struct {
 // reference that lets it add an operation at run time.
 func controlSpecs() map[sessionstore.CommandKind]controlSpec {
 	return map[sessionstore.CommandKind]controlSpec{
-		commandInput: {success: http.StatusOK, admit: func(rt *Router, r *http.Request, p identity.Principal, session sessionwire.SessionID, body []byte) (sessionstore.InboxEntry, error) {
+		commandInput: {success: http.StatusOK, admit: func(rt *Router, r *http.Request, p identity.Principal, session sessionwire.SessionID, body []byte) (admitted, error) {
 			var req sessionwire.InputRequest
 			if err := decodeCommand(body, &req, session); err != nil {
-				return noAdmission(), err
+				return admitted{}, err
 			}
-			entry, _, err := rt.admissions.AdmitInput(r.Context(), p, req)
-			return entry, err
+			return legacyAdmitted(dropCreated(rt.admissions.AdmitInput(r.Context(), p, req)))
 		}},
-		commandInterrupt: {success: http.StatusOK, admit: func(rt *Router, r *http.Request, p identity.Principal, session sessionwire.SessionID, body []byte) (sessionstore.InboxEntry, error) {
+		commandInterrupt: {success: http.StatusOK, admit: func(rt *Router, r *http.Request, p identity.Principal, session sessionwire.SessionID, body []byte) (admitted, error) {
 			var req sessionwire.InterruptRequest
 			if err := decodeCommand(body, &req, session); err != nil {
-				return noAdmission(), err
+				return admitted{}, err
 			}
-			entry, _, err := rt.admissions.AdmitInterrupt(r.Context(), p, req)
-			return entry, err
+			return legacyAdmitted(dropCreated(rt.admissions.AdmitInterrupt(r.Context(), p, req)))
 		}},
-		commandRestore: {success: http.StatusOK, admit: func(rt *Router, r *http.Request, p identity.Principal, session sessionwire.SessionID, body []byte) (sessionstore.InboxEntry, error) {
+		commandRestore: {success: http.StatusOK, admit: func(rt *Router, r *http.Request, p identity.Principal, session sessionwire.SessionID, body []byte) (admitted, error) {
 			var req sessionwire.RestoreRequest
 			if err := decodeCommand(body, &req, session); err != nil {
-				return noAdmission(), err
+				return admitted{}, err
 			}
-			entry, _, err := rt.admissions.AdmitRestore(r.Context(), p, req)
-			return entry, err
+			return legacyAdmitted(dropCreated(rt.admissions.AdmitRestore(r.Context(), p, req)))
 		}},
-		commandGateResponse: {success: http.StatusAccepted, admit: func(rt *Router, r *http.Request, p identity.Principal, session sessionwire.SessionID, body []byte) (sessionstore.InboxEntry, error) {
+		commandGateResponse: {success: http.StatusAccepted, admit: func(rt *Router, r *http.Request, p identity.Principal, session sessionwire.SessionID, body []byte) (admitted, error) {
 			var req sessionwire.GateResponseRequest
 			if err := decodeCommand(body, &req, session); err != nil {
-				return noAdmission(), err
+				return admitted{}, err
 			}
 			// The gate route carries a SECOND identifier, and it is compared
 			// for the session identifier's reason one line up: {gid} is in the
@@ -142,28 +190,31 @@ func controlSpecs() map[sessionstore.CommandKind]controlSpec {
 			// admit, so a handler comparing only the session would answer one
 			// gate's question with another gate's answer.
 			if gate := sessionwire.GateID(r.PathValue("gid")); req.GateID != gate {
-				return noAdmission(), mismatchedIdentifier("gate_id")
+				return admitted{}, mismatchedIdentifier("gate_id")
 			}
-			entry, _, err := rt.admissions.AdmitGateResponse(r.Context(), p, req)
-			return entry, err
+			return legacyAdmitted(dropCreated(rt.admissions.AdmitGateResponse(r.Context(), p, req)))
+		}},
+		// The CREATE, runbook A3.1. It is the one control whose session
+		// identifier comes from the BODY rather than the URL -- /v1/sessions
+		// names no session because the caller is choosing one -- so it is the
+		// one spec that passes no URL session to decodeCommand.
+		//
+		// 201 Created, unlike the four above: this is the only control that
+		// brings a resource into existence.
+		commandCreate: {success: http.StatusCreated, admit: func(rt *Router, r *http.Request, p identity.Principal, _ sessionwire.SessionID, body []byte) (admitted, error) {
+			var req sessionwire.CreateRequest
+			if err := decodeCreate(body, &req); err != nil {
+				return admitted{}, err
+			}
+			entry, _, err := rt.admissions.AdmitCreate(r.Context(), p, req)
+			if err != nil {
+				return admitted{}, err
+			}
+			status, readable := command.StatusForDisposition(entry)
+			return admitted{status: status, readable: readable,
+				command: entry.Record.Descriptor.CommandID, session: entry.Record.Descriptor.SessionID}, nil
 		}},
 	}
-}
-
-// noAdmission is the zero record a refused control returns beside its error.
-//
-// It is a declared zero value rather than a composite literal because
-// TestNoProductionFileBuildsAStoreRequestOutsideTheScope scans this package's
-// production files for sessionstore composite literals and would report these.
-// That report would be a false positive by the scan's own stated subject -- an
-// InboxEntry is a RESPONSE type and carries no tenant for a scope to supply --
-// but the scan is syntactic on purpose, and weakening it to know which
-// sessionstore types are requests would be a second authority for "what must go
-// through scope". objects.go already spells a zero store value this way, for the
-// same reason.
-func noAdmission() sessionstore.InboxEntry {
-	var zero sessionstore.InboxEntry
-	return zero
 }
 
 // decodeCommand applies Core's own strict decoder and then compares the session
@@ -216,6 +267,13 @@ func decodeCommand(body []byte, req any, path sessionwire.SessionID) error {
 		decoded = typed.SessionID
 	case *sessionwire.GateResponseRequest:
 		decoded = typed.SessionID
+	case *sessionwire.CreateRequest:
+		// A create reaching HERE would be one routed at a session-scoped path,
+		// which routeTable does not do. It is listed so that if one ever is,
+		// it is COMPARED like every other command rather than falling into the
+		// fault arm below -- the create's own route uses decodeCreate, which
+		// has no path identifier to compare against at all.
+		decoded = typed.SessionID
 	default:
 		// Unreachable through controlSpecs, which names the four types above.
 		// It fails closed rather than trusting that, because the cost of being
@@ -224,6 +282,25 @@ func decodeCommand(body []byte, req any, path sessionwire.SessionID) error {
 	}
 	if decoded != path {
 		return mismatchedIdentifier("session_id")
+	}
+	return nil
+}
+
+// decodeCreate decodes the one command whose route carries no session.
+//
+// It is separate from decodeCommand rather than a sentinel path through it,
+// because a sentinel meaning "do not compare" is a value the other four routes
+// could also pass -- by a copy-paste, or by a later refactor threading an empty
+// path value -- and it would silently disable the comparison that stops a body
+// naming another session from being admitted. There is no such value here: this
+// function has no path parameter to be given one.
+//
+// What replaces the comparison is that the body's session is the ONLY session
+// in play. /v1/sessions is where a caller chooses one, so there is nothing for
+// it to disagree with, and admission files it under the caller's own tenant.
+func decodeCreate(body []byte, req *sessionwire.CreateRequest) error {
+	if err := json.Unmarshal(body, req); err != nil {
+		return refusedRequest(err)
 	}
 	return nil
 }
@@ -303,20 +380,19 @@ func (rt *Router) serveControl(kind sessionstore.CommandKind) http.Handler {
 		}
 		session := sessionwire.SessionID(r.PathValue("sid"))
 
-		entry, err := spec.admit(rt, r, operation.Principal, session, body)
+		result, err := spec.admit(rt, r, operation.Principal, session, body)
 		if err != nil {
 			writeAPIError(w, admissionFailure(err))
 			return
 		}
-		status, readable := command.StatusFor(entry)
-		if !readable {
+		if !result.readable {
 			// A record whose state this build does not recognise is a store
 			// disagreeing with this build. Reporting it as an acceptance is the
 			// one answer that must never be produced optimistically.
 			writeAPIError(w, internalFailure())
 			return
 		}
-		payload, err := status.MarshalJSON()
+		payload, err := result.status.MarshalJSON()
 		if err != nil {
 			// Core validates on marshal, so this is a record that cannot be
 			// described publicly -- a rejected command with no rejection
@@ -325,7 +401,15 @@ func (rt *Router) serveControl(kind sessionstore.CommandKind) http.Handler {
 			writeAPIError(w, internalFailure())
 			return
 		}
-		rt.deliverAdmitted(r.Context(), operation.Principal.Tenant(), session, entry)
+		// The URL's session, except for the one route that has none. Keeping
+		// the URL authoritative where there IS one preserves the property
+		// decodeCommand establishes: the path a caller addressed and the body
+		// it sent name the same session.
+		target := session
+		if result.session != "" {
+			target = result.session
+		}
+		rt.deliverAdmitted(r.Context(), operation.Principal.Tenant(), target, result.command)
 		writeJSONBytes(w, spec.success, payload)
 	})
 }
@@ -357,7 +441,7 @@ func (rt *Router) serveControl(kind sessionstore.CommandKind) http.Handler {
 // link.
 //
 // A nil seam makes no attempt and changes no response.
-func (rt *Router) deliverAdmitted(ctx context.Context, tenant sessionwire.TenantID, session sessionwire.SessionID, entry sessionstore.InboxEntry) {
+func (rt *Router) deliverAdmitted(ctx context.Context, tenant sessionwire.TenantID, session sessionwire.SessionID, command sessionwire.CommandID) {
 	if rt.delivery == nil {
 		return
 	}
@@ -365,7 +449,7 @@ func (rt *Router) deliverAdmitted(ctx context.Context, tenant sessionwire.Tenant
 	// the HostLink agree on. The proposed runtime identity is the store's own
 	// and means nothing to a Host that did not win the admission.
 	_ = rt.delivery.Deliver(ctx, tenant, session, sessionwire.HostLinkCommandDelivery{
-		CommandID: entry.Record.CommandID,
+		CommandID: command,
 	})
 }
 

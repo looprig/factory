@@ -87,8 +87,26 @@ func (a *parityAdmitter) answer(req any) (sessionstore.InboxEntry, bool, error) 
 	return a.entry, true, nil
 }
 
-func (a *parityAdmitter) AdmitCreate(_ context.Context, _ identity.Principal, req sessionwire.CreateRequest) (sessionstore.InboxEntry, bool, error) {
-	return a.answer(req)
+// AdmitCreate answers in the DISPOSITION family, because a create is the one
+// command that chooses a session's protocol. The projection of the two families
+// is internal/command's single authority, so the two edges still compare.
+func (a *parityAdmitter) AdmitCreate(_ context.Context, _ identity.Principal, req sessionwire.CreateRequest) (sessionstore.DispositionInboxEntry, bool, error) {
+	entry, created, err := a.answer(req)
+	if err != nil {
+		return sessionstore.DispositionInboxEntry{}, created, err
+	}
+	return sessionstore.DispositionInboxEntry{
+		Record: sessionstore.DispositionInboxRecord{
+			Descriptor: sessionstore.DispositionCommandDescriptor{
+				PublicCreate: true, TenantID: entry.Record.TenantID, SessionID: entry.Record.SessionID,
+				CommandID: entry.Record.CommandID, RuntimeCommandID: entry.Record.RuntimeCommandID,
+				Kind: entry.Record.Kind,
+			},
+			AcceptedAt: entry.Record.AcceptedAt, ApplyDeadline: entry.Record.ApplyDeadline,
+			State: entry.Record.State,
+		},
+		Revision: entry.Revision, AcceptedOrder: entry.AcceptedOrder,
+	}, created, nil
 }
 
 func (a *parityAdmitter) AdmitInput(_ context.Context, _ identity.Principal, req sessionwire.InputRequest) (sessionstore.InboxEntry, bool, error) {
@@ -243,6 +261,16 @@ type parityOperation struct {
 func parityOperations() []parityOperation {
 	sid := string(paritySession)
 	return []parityOperation{
+		{
+			// The create, added by A3.1. It is the one operation whose REST
+			// path names no session -- the caller chooses one in the body --
+			// and the one that answers 201 rather than 200, because it is the
+			// only control that brings a resource into existence.
+			name: "create", method: clientlink.MethodSessionCreate,
+			path: "/v1/sessions",
+			body: fmt.Sprintf(`{"version":%d,"command_id":"command-a","session_id":%q,"agent_id":"agent-a"}`,
+				sessionwire.CurrentWireVersion, sid),
+		},
 		{
 			name: "input", method: clientlink.MethodSessionInput,
 			path: "/v1/sessions/" + sid + "/input",
@@ -446,41 +474,59 @@ func TestTheParityComparisonCanSeeADifference(t *testing.T) {
 	}
 }
 
-// TestTheCreateIsTheOneOperationWithoutParity states the exclusion as an
-// assertion rather than as a comment, in both directions.
+// TestTheCreateAnswersTheSameRefusalOverBothEdges is what
+// TestTheCreateIsTheOneOperationWithoutParity became.
 //
-// The REST create must still answer 501 naming its blocker, and the RPC create
-// must still be reachable and refused by the SERVICE -- because the two facts
-// have different owners. If the binding blocker is ever lifted, the RPC starts
-// answering an acceptance and this test fails, which is the signal to add the
-// create row to parityOperations rather than to delete this.
-func TestTheCreateIsTheOneOperationWithoutParity(t *testing.T) {
+// That test held an EXCLUSION: the REST create answered 501 while the RPC
+// create reached the service and was refused, and it said that if the binding
+// blocker were ever lifted it would fail and the signal would be "add the
+// create row to parityOperations rather than delete this". A3.1 lifted it, the
+// row is added, and every parity assertion in this file now covers the create
+// alongside the other four.
+//
+// What survives as its own test is the half the shared table cannot express.
+// The create is the one operation whose two edges disagree about the SHAPE of a
+// success -- 201 over REST, an envelope over the RPC -- so this drives the one
+// axis where they must still agree exactly: a REFUSAL. Both edges must answer
+// the same classified code for the same refused create.
+func TestTheCreateAnswersTheSameRefusalOverBothEdges(t *testing.T) {
 	t.Parallel()
 
-	admitter := newParityAdmitter()
-	admitter.refuse, admitter.refusing = sessionwire.ErrorCodeRuntimeUnavailable, true
-	create := parityOperation{
-		name: "create", method: clientlink.MethodSessionCreate, path: "/v1/sessions",
-		body: fmt.Sprintf(`{"version":%d,"command_id":"command-a","session_id":"session-new","agent_id":"agent-a"}`,
-			sessionwire.CurrentWireVersion),
+	create := parityOperations()[0]
+	if create.name != "create" {
+		t.Fatalf("the first parity operation is %q; this test drives the create", create.name)
 	}
+	for _, code := range []sessionwire.ErrorCode{
+		sessionwire.ErrorCodeRuntimeUnavailable,
+		sessionwire.ErrorCodeCommandRejected,
+		sessionwire.ErrorCodeInvalidRequest,
+	} {
+		t.Run(string(code), func(t *testing.T) {
+			admitter := newParityAdmitter()
+			admitter.refuse, admitter.refusing = code, true
 
-	recorder := create.overREST(t, parityRouter(t, admitter))
-	if recorder.Code != http.StatusNotImplemented {
-		t.Fatalf("the REST create answered %d (%s), want 501: if it is served now, add it to parityOperations",
-			recorder.Code, recorder.Body)
-	}
-	if len(admitter.asked) != 0 {
-		t.Errorf("the REST create reached the admission service: %+v", admitter.asked)
-	}
+			recorder := create.overREST(t, parityRouter(t, admitter))
+			if recorder.Code == http.StatusCreated {
+				t.Fatalf("a refused create answered 201 over REST: %s", recorder.Body)
+			}
+			var rest sessionwire.ErrorEnvelope
+			if err := json.Unmarshal(recorder.Body.Bytes(), &rest); err != nil {
+				t.Fatalf("the REST create answered %s, which is not an error envelope: %v", recorder.Body, err)
+			}
 
-	reply := create.overRPC(t, parityEngine(t, admitter))
-	var envelope sessionwire.ErrorEnvelope
-	if err := json.Unmarshal(reply, &envelope); err != nil {
-		t.Fatalf("the RPC create answered %s, which is not an error envelope: %v", reply, err)
-	}
-	if envelope.Error.Code != sessionwire.ErrorCodeRuntimeUnavailable {
-		t.Errorf("the RPC create was refused %q; the service's own refusal is what the REST 501 stands in for",
-			envelope.Error.Code)
+			reply := create.overRPC(t, parityEngine(t, admitter))
+			var rpc sessionwire.ErrorEnvelope
+			if err := json.Unmarshal(reply, &rpc); err != nil {
+				t.Fatalf("the RPC create answered %s, which is not an error envelope: %v", reply, err)
+			}
+			if rest.Error.Code != rpc.Error.Code {
+				t.Errorf("the two edges refused one create differently: REST %q, RPC %q",
+					rest.Error.Code, rpc.Error.Code)
+			}
+			if rest.Error.Code != code {
+				t.Errorf("the edges agreed on %q, which is not the service's refusal %q",
+					rest.Error.Code, code)
+			}
+		})
 	}
 }

@@ -818,14 +818,6 @@ func routeTable() []route {
 			handle: func(rt *Router) http.Handler { return rt.serveControl(kind) },
 		}}
 	}
-	// pendingControl is a command this build cannot admit, with the reason a
-	// caller is given.
-	pendingControl := func(kind sessionstore.CommandKind, owner, reason string) []methodRule {
-		return []methodRule{{
-			method: http.MethodPost, auth: authControl, command: kind, body: bodyJSON,
-			owner: owner, reason: reason,
-		}}
-	}
 	served := func(auth authRule, handle func(*Router) http.Handler) []methodRule {
 		return readRules(methodRule{auth: auth, handle: handle})
 	}
@@ -836,29 +828,24 @@ func routeTable() []route {
 		{pattern: "/v1/capabilities", rules: agents},
 		{pattern: "/v1/sessions", rules: append(
 			served(authSessionList, func(rt *Router) http.Handler { return rt.serveSessionList() }),
-			// The create is the ONE control this build does not serve, and the
-			// reason is not that nobody has written the handler.
+			// The create, served as of A3.1.
 			//
-			// A V1 create files a durable public-create reservation carrying an
-			// immutable SessionBinding, and three of that binding's four
-			// members -- StorageBindingID, BindingVersion, RuntimeSessionID --
-			// name a deployment's storage configuration and a runtime-assigned
-			// identity that this module is composed with no source for. A
-			// binding is immutable after create, so minting one would durably
-			// and irreversibly pin the session to a configuration no resolver
-			// is required to know, with no repair path. internal/admission
-			// therefore refuses with ErrCreateIdentityProtocolUnavailable, and
-			// a route wired to it would answer runtime_unavailable: a
-			// differently-spelled 501 that a client would read as a decision
-			// about its command.
+			// It answered 501 through two tasks, and the reason was never a
+			// missing handler: a V1 create files a durable public-create
+			// reservation carrying an immutable SessionBinding, and this
+			// module had no source for three of its four members. It has one
+			// now. StorageBindingID and BindingVersion are deployment
+			// configuration supplied by WithSessionBinding -- the same two
+			// members ObjectStoreResolver keys on, which is what makes them
+			// configuration rather than a guess -- RuntimeSessionID is derived
+			// from the create's own identity, and ProtocolMode is disposition
+			// because a legacy session is one no Host can take residency on.
 			//
-			// So the refusal stays 501 and names the blocker. The LEGACY create
-			// decoder (runbook A3.3 step 2) belongs with it: admission exposes
-			// exactly one legacy entry point, AdmitLegacyCreate, it is a
-			// create, and a compatibility decoder on a route that is not served
-			// would be dead code.
-			pendingControl(commandCreate, "A3.1",
-				"a V1 create needs an immutable session binding this deployment composition cannot author")...)},
+			// A composition that supplies no binding still refuses, but it now
+			// refuses in admission rather than here, so the route is served
+			// unconditionally and the refusal is a property of the deployment
+			// rather than of the build.
+			control(commandCreate)...)},
 		{pattern: "/v1/sessions/{sid}/status",
 			rules:   served(authSessionRead, func(rt *Router) http.Handler { return rt.serveSessionStatus() }),
 			session: true},

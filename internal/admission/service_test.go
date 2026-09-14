@@ -253,7 +253,47 @@ type serviceFixture struct {
 	commands  *serviceCommands
 	directory *serviceDirectory
 	ids       *serviceIDs
+	creates   *servicePublicCreates
 	principal identity.Principal
+}
+
+// configureCreates supplies the deployment-configuration half a V1 create
+// needs. It is separate from the fake so a fixture can hold the STORE without
+// the CONFIGURATION and drive the unconfigured refusal, which is a composition
+// this module supports rather than a broken one.
+func (f *serviceFixture) configureCreates(t *testing.T) {
+	t.Helper()
+	f.rebuild(t, func(cfg *Config) {
+		cfg.Binding = SessionBindingTemplate{StorageBindingID: "storage-a", BindingVersion: "v1"}
+	})
+}
+
+// rebuildConfigured is configureCreates without a *testing.T, for the helpers
+// that are not themselves tests. It cannot fail: every dependency is already
+// present on the fixture and only the binding template is added.
+func (f *serviceFixture) rebuildConfigured() {
+	cfg := Config{Authorizer: f.auth, Targets: f.targets, Catalog: f.catalog, Commands: f.commands,
+		Directory: f.directory, Clock: serviceClock{serviceNow}, IDs: f.ids, PublicCreates: f.creates,
+		Binding:       SessionBindingTemplate{StorageBindingID: "storage-a", BindingVersion: "v1"},
+		ApplyDeadline: time.Minute}
+	if svc, err := NewService(cfg); err == nil {
+		f.service = svc
+	}
+}
+
+// rebuild reconstructs the service with one field changed, so a test can vary
+// composition without restating seven dependencies.
+func (f *serviceFixture) rebuild(t *testing.T, adjust func(*Config)) {
+	t.Helper()
+	cfg := Config{Authorizer: f.auth, Targets: f.targets, Catalog: f.catalog, Commands: f.commands,
+		Directory: f.directory, Clock: serviceClock{serviceNow}, IDs: f.ids,
+		PublicCreates: f.creates, ApplyDeadline: time.Minute}
+	adjust(&cfg)
+	svc, err := NewService(cfg)
+	if err != nil {
+		t.Fatalf("NewService: %v", err)
+	}
+	f.service = svc
 }
 
 func newServiceFixture(t *testing.T) *serviceFixture {
@@ -270,12 +310,18 @@ func newServiceFixture(t *testing.T) *serviceFixture {
 	commands := &serviceCommands{records: make(map[sessionwire.CommandID]sessionstore.InboxEntry)}
 	directory := &serviceDirectory{}
 	ids := &serviceIDs{}
+	creates := newServicePublicCreates()
+	// The base fixture supplies the public-create STORE but NOT the binding
+	// configuration, so AdmitCreate refuses here and configureCreates is what
+	// turns a create on. Both halves are required and neither implies the
+	// other; see Config.createsServed.
 	svc, err := NewService(Config{Authorizer: auth, Targets: targets, Catalog: catalog, Commands: commands,
-		Directory: directory, Clock: serviceClock{serviceNow}, IDs: ids, ApplyDeadline: time.Minute})
+		Directory: directory, Clock: serviceClock{serviceNow}, IDs: ids,
+		PublicCreates: creates, ApplyDeadline: time.Minute})
 	if err != nil {
 		t.Fatalf("NewService: %v", err)
 	}
-	return &serviceFixture{svc, auth, targets, catalog, commands, directory, ids, p}
+	return &serviceFixture{svc, auth, targets, catalog, commands, directory, ids, creates, p}
 }
 
 func envelope(id string) sessionwire.CommandEnvelope {
@@ -372,17 +418,50 @@ func TestAuthorizationAndUnknownTargetPrecedeEveryWrite(t *testing.T) {
 	}
 }
 
-func TestV1CreateFailsClosedWithoutTheImmutableCreateReservation(t *testing.T) {
-	f := newServiceFixture(t)
-	req := sessionwire.CreateRequest{CommandEnvelope: envelope("create-a"), SessionID: "session-a", AgentID: "agent-a", Blocks: []byte(`[{"text":"hi"}]`)}
-	if _, _, err := f.service.AdmitCreate(context.Background(), f.principal, req); !errors.Is(err, ErrCreateIdentityProtocolUnavailable) || !IsCode(err, sessionwire.ErrorCodeRuntimeUnavailable) {
-		t.Fatalf("error = %v, want fail-closed create protocol refusal", err)
-	}
-	if f.targets.calls != 1 {
-		t.Fatalf("target checks = %d, want 1", f.targets.calls)
-	}
-	if f.catalog.createCalls != 0 || f.commands.calls != 0 {
-		t.Fatal("unsupported V1 create changed durable state")
+// TestACreateChecksAuthorizationAndTargetBeforeAnyDurableWrite is what
+// TestV1CreateFailsClosedWithoutTheImmutableCreateReservation became.
+//
+// That test asserted a create ALWAYS refused, which was the honest answer
+// while no store primitive could express a create identity. A3.1 implements
+// the create, so what survives of it is the part that is still true and still
+// load-bearing: the pre-admission order. Authorization and a known runtime are
+// checked BEFORE the reservation, so a refused create reserves no identity --
+// and a reservation is immutable, so one written for a command that was never
+// authorized could not be withdrawn.
+func TestACreateChecksAuthorizationAndTargetBeforeAnyDurableWrite(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		configure func(*serviceFixture)
+	}{
+		{"denied", func(f *serviceFixture) { f.auth.err = errors.New("denied") }},
+		{"unknown target", func(f *serviceFixture) { f.targets.known = false }},
+		{"a target for another agent", func(f *serviceFixture) { f.targets.target.Key.AgentID = "agent-b" }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			f := createFixture(t)
+			test.configure(f)
+			_, created, err := f.service.AdmitCreate(context.Background(), f.principal,
+				sessionwire.CreateRequest{CommandEnvelope: envelope("create-a"), SessionID: "session-a", AgentID: "agent-a"})
+			if err == nil {
+				t.Fatal("the create was admitted")
+			}
+			if created {
+				t.Error("a refused create reported itself the accepting call")
+			}
+			if len(f.creates.reservations) != 0 || len(f.creates.records) != 0 {
+				t.Fatal("a refused create reserved a durable identity it can never withdraw")
+			}
+			// The positive control: unconfigured, this same call IS admitted
+			// and DOES reserve, so the two assertions above can fail.
+			ok := createFixture(t)
+			if _, _, err := ok.service.AdmitCreate(context.Background(), ok.principal,
+				sessionwire.CreateRequest{CommandEnvelope: envelope("create-a"), SessionID: "session-a", AgentID: "agent-a"}); err != nil {
+				t.Fatalf("the control was refused: %v", err)
+			}
+			if len(ok.creates.reservations) == 0 {
+				t.Fatal("the control reserved nothing, so the assertions above are vacuous")
+			}
+		})
 	}
 }
 
@@ -460,18 +539,6 @@ func TestOversizedPrivatePayloadFailsClosedUntilTheStoreRetainsItsIdentity(t *te
 	}
 	if f.commands.calls != 0 {
 		t.Fatal("unsupported payload reached durable writes")
-	}
-}
-
-func TestOversizedCreateDoesNotCreateCatalogState(t *testing.T) {
-	f := newServiceFixture(t)
-	blocks := []byte(`["` + strings.Repeat("x", sessionstore.MaxInboxPayloadBytes) + `"]`)
-	_, _, err := f.service.AdmitCreate(context.Background(), f.principal, sessionwire.CreateRequest{CommandEnvelope: envelope("create-a"), SessionID: "session-a", AgentID: "agent-a", Blocks: blocks})
-	if !errors.Is(err, ErrPayloadProtocolUnavailable) {
-		t.Fatalf("error = %v", err)
-	}
-	if f.auth.calls != 0 || f.catalog.createCalls != 0 || f.commands.calls != 0 {
-		t.Fatal("unsupported create changed state")
 	}
 }
 
@@ -909,6 +976,11 @@ func unreachedDependencyMethods() map[string]string {
 // every path is reachable: the session exists, its pinned target is configured,
 // and its gate is open, resident and version-matched.
 func resolvableSession(f *serviceFixture) {
+	// A create is only reachable when this composition can author a binding,
+	// so the state where "every dependency read on every path is reachable"
+	// includes the deployment configuration. Without it AdmitCreate refuses
+	// before the public-create plane and three fault sites go undriven.
+	f.rebuildConfigured()
 	f.catalog.getErr = nil
 	f.catalog.entry.Record = sessionstore.CatalogRecord{
 		TenantID: "tenant-a", SessionID: "session-a", AgentID: "agent-a",
@@ -952,6 +1024,8 @@ func armFault(f *serviceFixture, dependency, method string) (*faultInjector, boo
 		injector = &f.directory.faultInjector
 	case "IDs":
 		injector = &f.ids.faultInjector
+	case "PublicCreates":
+		injector = &f.creates.faultInjector
 	default:
 		return nil, false
 	}
@@ -1062,8 +1136,12 @@ func admissionEntryPoints(t *testing.T) map[string]func(*serviceFixture) error {
 
 	entries := map[string]func(*serviceFixture) error{
 		"AdmitCreate": func(f *serviceFixture) error {
+			// OVERSIZED deliberately. A small create never calls
+			// PutCommandPayload, so a sweep driving only a small one would
+			// leave step 5's upload as a fault site nothing exercises -- which
+			// the anti-vacuity check below reports rather than tolerates.
 			_, _, err := f.service.AdmitCreate(context.Background(), f.principal,
-				sessionwire.CreateRequest{CommandEnvelope: envelope("create-a"), SessionID: "session-a", AgentID: "agent-a"})
+				createRequest("create-a", "session-a", oversizedBlocks()))
 			return err
 		},
 		"AdmitLegacyCreate": func(f *serviceFixture) error {
@@ -2363,63 +2441,103 @@ func bindingSites(root reflect.Type) []string {
 	return sites
 }
 
-// TestEverySessionBindingThisModuleCanReachIsTiedToASessionThatAlreadyExists is
-// the tripwire that re-opens A3.1 steps 2 and 5.
+// TestEverySessionBindingThisModuleCanReachIsAuthoredOrKeyedToAnExistingSession
+// is the tripwire that guarded A3.1 steps 2 and 5, kept and RE-RULED now that
+// they are implemented.
 //
-// It pins the EXACT set of reachable sites, in both directions, because either
-// direction changing means something different and both mean A3.1 must be
-// re-read:
+// Its instruction was "GO AND FINISH A3.1, not delete the assertion", and that
+// is what happened: this module now AUTHORS a binding, deliberately, at three
+// inbound sites. The guard is not weaker for it. What it defends has moved
+// from "this module can author nothing" to "these are the only places it
+// authors, and every one goes through one derivation":
 //
-//   - A new OUTBOUND site is a new way to OBTAIN a binding. If it is not keyed
-//     on an existing catalog record, step 2 may have become implementable: a
-//     create could then name a disposition binding it did not invent.
-//   - A new INBOUND site is a new store call this module would have to author a
-//     binding FOR, which is the blocker itself arriving somewhere new.
+//   - A new INBOUND site is a new store call this module would pin an
+//     immutable binding into. SessionBinding is immutable after create, so a
+//     site that acquired its binding from anywhere but Service.bind would
+//     durably and irreversibly pin a session to a configuration nothing
+//     verified. That is the failure this list exists to catch.
+//   - A new OUTBOUND site is a new way to READ a binding, which is harmless in
+//     itself but means a record shape changed under this module.
 //
-// Every outbound site today is a CatalogEntry for a session that already
-// exists, so none can supply the binding a session's CREATE has to choose — and StorageBindingID,
-// BindingVersion and RuntimeSessionID name a deployment's immutable storage
-// configuration and a runtime-assigned identity, which this module has no
-// input for. Minting them would durably and IRREVERSIBLY pin a session to a
-// configuration no ResolveObjectStore is required to know; SessionBinding is
-// immutable after create, so there is no repair. That is why AdmitCreate
-// refuses rather than guesses.
-//
-// If this test fails, the instruction is GO AND FINISH A3.1, not delete the
-// assertion.
-func TestEverySessionBindingThisModuleCanReachIsTiedToASessionThatAlreadyExists(t *testing.T) {
-	// Each site is RULED individually below, because listing five and saying
-	// "none of them helps" is a sentence wider than its probe.
+// The one-derivation claim is held mechanically by
+// TestEveryAuthoredBindingComesFromTheOneDerivation below; this list is what
+// makes that claim's SUBJECT complete.
+func TestEverySessionBindingThisModuleCanReachIsAuthoredOrKeyedToAnExistingSession(t *testing.T) {
+	// Each site is RULED individually, because listing eleven and saying "all
+	// fine" is a sentence wider than its probe.
 	want := []string{
-		// (1) INBOUND. The binding this module would have to AUTHOR, and the
-		// only one. admitLegacyCreate builds this request with no Binding at
-		// all, so createCatalogEntry takes its mode = ProtocolModeLegacy arm
-		// and every Factory-created session is legacy. This is the blocker.
+		// (1) INBOUND, and still never authored: admitLegacyCreate builds this
+		// request with no Binding at all, so createCatalogEntry takes its
+		// mode = ProtocolModeLegacy arm. The legacy create is a REST
+		// compatibility path and deliberately stays legacy.
 		"in:Config.Catalog.CreateCatalogEntry(arg1).Binding",
-		// (2) OUTBOUND, but it is the binding THIS CALL just supplied, echoed
-		// back on the record the store created or found. It can only ever be
-		// the zero value here, by (1). It sources nothing.
+		// (2) and (3) INBOUND and AUTHORED. These are A3.1's two writes, and
+		// both carry the SAME value: admitPublicCreate builds one identity and
+		// passes it to both calls, so a reservation and its admission cannot
+		// disagree about the binding. Service.bind is the only producer.
+		"in:Config.PublicCreates.AdmitPublicCreate(arg1).Identity.Binding",
+		"in:Config.PublicCreates.PreparePublicCreate(arg1).Identity.Binding",
+		// (4) OUTBOUND, the binding THIS CALL supplied, echoed back. Zero here
+		// by (1).
 		"out:Config.Catalog.CreateCatalogEntry(res0).Record.Binding",
-		// (3) OUTBOUND, and it is the reservation's OWN copy of (2) — present
-		// only on a version-3 catalog written by PreparePublicCreate, which
-		// this module never calls. Immutable provenance of a create that
-		// already happened.
+		// (5) OUTBOUND, the reservation's own copy of (4), on a version-3
+		// catalog. Immutable provenance of a create that already happened.
 		"out:Config.Catalog.CreateCatalogEntry(res0).Record.PublicCreate[].Identity.Binding",
-		// (4) OUTBOUND and genuinely readable: the binding of a session that
-		// ALREADY EXISTS. This is the one that matters, and it is exactly why
-		// step 5 is downstream of step 2 rather than independently blocked —
-		// a disposition-bound session's binding could be read and passed to
-		// AdmitDispositionCommand, but this module can produce no such session.
+		// (6) OUTBOUND and genuinely readable: an existing session's binding.
+		// This is what a disposition-bound session's later commands would be
+		// admitted under.
 		"out:Config.Catalog.GetCatalogEntry(res0).Record.Binding",
-		// (5) OUTBOUND, the read counterpart of (3). Same ruling.
+		// (7) OUTBOUND, the read counterpart of (5).
 		"out:Config.Catalog.GetCatalogEntry(res0).Record.PublicCreate[].Identity.Binding",
+		// (8) OUTBOUND: the admitted record's own copy of (3). It is the
+		// store's echo of the winner, which on a retry is the FIRST caller's
+		// binding rather than this one's -- which is exactly why the
+		// derivation has to be deterministic.
+		"out:Config.PublicCreates.AdmitPublicCreate(res0).Record.Descriptor.Binding",
+		// (9), (10), (11) OUTBOUND: the preparation's echoes of (2), on the
+		// reservation and on the catalog it created. Same ruling as (8).
+		"out:Config.PublicCreates.PreparePublicCreate(res0).Catalog.Record.Binding",
+		"out:Config.PublicCreates.PreparePublicCreate(res0).Catalog.Record.PublicCreate[].Identity.Binding",
+		"out:Config.PublicCreates.PreparePublicCreate(res0).Reservation.Identity.Binding",
 	}
 	got := bindingSites(reflect.TypeOf(Config{}))
 	if !slices.Equal(got, want) {
 		t.Fatalf("the SessionBinding sites reachable from admission.Config changed.\n got: %q\nwant: %q\n"+
-			"An OUTBOUND site not keyed on an existing session may mean A3.1 step 2 is now implementable; "+
-			"an INBOUND one is a new call this module must author a binding for. Re-read the runbook before touching this list.",
+			"An INBOUND site is a place this module pins an IMMUTABLE binding: it must take its value from "+
+			"Service.bind and nowhere else. An OUTBOUND one means a record shape moved. Re-read A3.1 before touching this list.",
 			got, want)
+	}
+}
+
+// TestEveryAuthoredBindingComesFromTheOneDerivation is the claim the list above
+// makes checkable.
+//
+// The two inbound authored sites are driven through a real create and their
+// bindings compared against Service.bind's own output. A second producer -- a
+// literal built at one call site, a member defaulted differently -- fails here
+// even though the site list is unchanged, which is the half a structural list
+// cannot see.
+func TestEveryAuthoredBindingComesFromTheOneDerivation(t *testing.T) {
+	f := createFixture(t)
+	req := createRequest("create-a", "session-a", smallBlocks)
+	entry, _, err := f.service.AdmitCreate(context.Background(), f.principal, req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := f.service.bind(f.principal.Tenant(), req.SessionID, req.CommandID)
+	if want == (sessionstore.SessionBinding{}) {
+		t.Fatal("the derivation produced a zero binding, so every comparison below is vacuous")
+	}
+	for _, site := range []struct {
+		name string
+		got  sessionstore.SessionBinding
+	}{
+		{"the reservation", f.creates.reservations[req.CommandID].Identity.Binding},
+		{"the admitted record", entry.Record.Descriptor.Binding},
+	} {
+		if site.got != want {
+			t.Errorf("%s carries %+v, not the one derivation's %+v", site.name, site.got, want)
+		}
 	}
 }
 

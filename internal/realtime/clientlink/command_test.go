@@ -184,8 +184,26 @@ func (a *recordingAdmitter) recorded() []admitCall {
 	return slices.Clone(a.calls)
 }
 
-func (a *recordingAdmitter) AdmitCreate(ctx context.Context, p identity.Principal, req sessionwire.CreateRequest) (sessionstore.InboxEntry, bool, error) {
-	return a.record(ctx, clientlink.MethodSessionCreate, p, req)
+// AdmitCreate answers in the DISPOSITION family; see the service's own
+// AdmitCreate for why a create cannot be a legacy record. The recorded entry is
+// projected so the existing record/reply assertions still read one shape.
+func (a *recordingAdmitter) AdmitCreate(ctx context.Context, p identity.Principal, req sessionwire.CreateRequest) (sessionstore.DispositionInboxEntry, bool, error) {
+	entry, created, err := a.record(ctx, clientlink.MethodSessionCreate, p, req)
+	if err != nil {
+		return sessionstore.DispositionInboxEntry{}, created, err
+	}
+	return sessionstore.DispositionInboxEntry{
+		Record: sessionstore.DispositionInboxRecord{
+			Descriptor: sessionstore.DispositionCommandDescriptor{
+				PublicCreate: true, TenantID: entry.Record.TenantID, SessionID: entry.Record.SessionID,
+				CommandID: entry.Record.CommandID, RuntimeCommandID: entry.Record.RuntimeCommandID,
+				Kind: entry.Record.Kind,
+			},
+			AcceptedAt: entry.Record.AcceptedAt, ApplyDeadline: entry.Record.ApplyDeadline,
+			State: entry.Record.State,
+		},
+		Revision: entry.Revision, AcceptedOrder: entry.AcceptedOrder,
+	}, created, nil
 }
 
 func (a *recordingAdmitter) AdmitInput(ctx context.Context, p identity.Principal, req sessionwire.InputRequest) (sessionstore.InboxEntry, bool, error) {
@@ -796,6 +814,12 @@ func TestTheAdmissionServiceIsExactlyTheSeamThisEdgeCalls(t *testing.T) {
 	ctxType := reflect.TypeOf((*context.Context)(nil)).Elem()
 	principalType := reflect.TypeOf(identity.Principal{})
 	entryType := reflect.TypeOf(sessionstore.InboxEntry{})
+	// A create is admitted into the DISPOSITION inbox, so "a durable command
+	// record" is now two types rather than one. Both are accepted and NOTHING
+	// ELSE is -- the WrongEntry probe below still has to be refused -- so this
+	// widens the rule by exactly one named type rather than loosening it into
+	// "any struct".
+	dispositionEntryType := reflect.TypeOf(sessionstore.DispositionInboxEntry{})
 	errorType := reflect.TypeOf((*error)(nil)).Elem()
 	isV1Admission := func(fn reflect.Type) bool {
 		// NumIn counts the receiver on a method obtained from the type.
@@ -803,7 +827,8 @@ func TestTheAdmissionServiceIsExactlyTheSeamThisEdgeCalls(t *testing.T) {
 			return false
 		}
 		return fn.In(1) == ctxType && fn.In(2) == principalType &&
-			fn.Out(0) == entryType && fn.Out(1) == reflect.TypeOf(false) && fn.Out(2) == errorType
+			(fn.Out(0) == entryType || fn.Out(0) == dispositionEntryType) &&
+			fn.Out(1) == reflect.TypeOf(false) && fn.Out(2) == errorType
 	}
 	want := map[string]bool{}
 	for i := range service.NumMethod() {
@@ -839,7 +864,11 @@ func TestTheAdmissionServiceIsExactlyTheSeamThisEdgeCalls(t *testing.T) {
 		t.Errorf("the shape rule matches %s, so it is not distinguishing a V1 admission from a legacy one", legacy)
 	}
 	for name, probe := range map[string]any{
-		"the exact V1 shape":       shapeProbeType.AdmitExact,
+		"the exact V1 shape": shapeProbeType.AdmitExact,
+		// The second accepted family, rowed rather than assumed: widening the
+		// rule by a type is only safe if the widened rule still refuses
+		// everything else, which "a catalog entry returned" below holds.
+		"the disposition family":   shapeProbeType.AdmitDisposition,
 		"one argument short":       shapeProbeType.MissingPrincipal,
 		"one argument too many":    shapeProbeType.ExtraArgument,
 		"no context":               shapeProbeType.NoContext,
@@ -850,7 +879,7 @@ func TestTheAdmissionServiceIsExactlyTheSeamThisEdgeCalls(t *testing.T) {
 		"a non-boolean second":     shapeProbeType.WrongCreated,
 		"a non-error third":        shapeProbeType.WrongError,
 	} {
-		want := name == "the exact V1 shape"
+		want := name == "the exact V1 shape" || name == "the disposition family"
 		if got := isV1Admission(reflect.TypeOf(probe)); got != want {
 			t.Errorf("isV1Admission(%s) = %t, want %t", name, got, want)
 		}
@@ -1072,6 +1101,10 @@ func TestARefusalWithNoCodeIsAFaultNotAnEmptyReply(t *testing.T) {
 // first parameter is the receiver -- the same shape reflect.Type.Method yields,
 // which is why isV1Admission counts from index 1.
 type shapeProbeType struct{}
+
+func (shapeProbeType) AdmitDisposition(context.Context, identity.Principal, sessionwire.CreateRequest) (sessionstore.DispositionInboxEntry, bool, error) {
+	return sessionstore.DispositionInboxEntry{}, false, nil
+}
 
 func (shapeProbeType) AdmitExact(context.Context, identity.Principal, sessionwire.InputRequest) (sessionstore.InboxEntry, bool, error) {
 	return sessionstore.InboxEntry{}, false, nil

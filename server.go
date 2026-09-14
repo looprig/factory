@@ -247,6 +247,24 @@ func New(opts ...Option) (*Server, error) {
 	if cfg.objectPolicy != nil && cfg.objectStores == nil {
 		return nil, ErrObjectPolicyWithoutResolver
 	}
+	// A session binding with no resolver behind it is refused for a STRONGER
+	// reason than the policy above, and the difference is worth stating: an
+	// object policy composed alone makes a read fail, which a later
+	// composition fixes. A session binding composed alone writes an immutable
+	// StorageBindingID into every session this Factory creates, and a
+	// deployment that resolves no storage at all can never read their objects
+	// back. Nothing here can verify the resolver knows this particular
+	// binding; what it can refuse is the composition that is certainly wrong.
+	if cfg.sessionBinding != (SessionBindingTemplate{}) && cfg.objectStores == nil {
+		return nil, ErrSessionBindingWithoutResolver
+	}
+	// EITHER half alone is refused, rather than silently serving a create
+	// route that can only answer runtime_unavailable. A deployment that
+	// composed one half meant to serve creates, and learning at composition
+	// that it has not is strictly better than learning it from a caller.
+	if (cfg.sessionBinding != SessionBindingTemplate{}) != (cfg.publicCreates != nil) {
+		return nil, ErrCreatePlaneIncomplete
+	}
 
 	if err := cfg.csrf.Validate(); err != nil {
 		return nil, &OptionError{Option: "WithCSRF", Err: err}

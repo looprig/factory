@@ -284,18 +284,62 @@ func SessionAbsent(err error) bool {
 // store disagreeing with this build, and defaulting it to accepted would report
 // the one case that must never be reported optimistically.
 func StatusFor(entry sessionstore.InboxEntry) (sessionwire.CommandStatus, bool) {
-	status := sessionwire.CommandStatus{
-		CommandID:     entry.Record.CommandID,
-		AcceptedOrder: entry.AcceptedOrder,
-	}
-	switch entry.Record.State {
+	return statusFor(entry.Record.CommandID, entry.AcceptedOrder, entry.Record.State, entry.Record.Rejection)
+}
+
+// StatusForDisposition is StatusFor over the DISPOSITION family.
+//
+// It is a second ENTRANCE, not a second authority: both call statusFor, so the
+// InboxState -> CommandState mapping and the five-state vocabulary exist in
+// exactly one place. Adding a family must not add a second opinion about what
+// "claimed" means publicly, which is the rule A9.1 fixed for RefusalStatus and
+// which a per-family copy of this switch would immediately reintroduce.
+//
+// # A rejected disposition command is deliberately UNREADABLE
+//
+// The one genuine asymmetry between the families is the rejection detail.
+// sessionstore's DispositionInboxRecord has NO member equivalent to the legacy
+// record's `Rejection *sessionwire.ErrorDetail` -- rejection is a state there
+// and nothing more -- while Core REQUIRES an error on a rejected status
+// (commands.go:374-377, CommandStateRejected with a nil Error is
+// missing_field). So a rejected disposition record cannot be described
+// publicly at all.
+//
+// This passes nil and lets statusFor's own readability rule refuse it, rather
+// than inventing a detail. An invented one would be a public, stable,
+// client-switchable code for a rejection whose real cause this module never
+// saw. The edge answers a fault instead, which is the same fail-closed answer
+// it already gives for an unreadable legacy record. It is recorded as owed
+// against sessionstore rather than papered over here.
+func StatusForDisposition(entry sessionstore.DispositionInboxEntry) (sessionwire.CommandStatus, bool) {
+	return statusFor(entry.Record.Descriptor.CommandID, entry.AcceptedOrder, entry.Record.State, nil)
+}
+
+// statusFor is the ONE mapping from a durable inbox state to a public command
+// state, for every family.
+//
+// rejection is the family's public detail if it has one. A rejected record with
+// none is reported UNREADABLE rather than described, because Core refuses a
+// rejected status carrying no error and a caller must not be handed a
+// fabricated one.
+func statusFor(
+	command sessionwire.CommandID,
+	acceptedOrder uint64,
+	state sessionstore.InboxState,
+	rejection *sessionwire.ErrorDetail,
+) (sessionwire.CommandStatus, bool) {
+	status := sessionwire.CommandStatus{CommandID: command, AcceptedOrder: acceptedOrder}
+	switch state {
 	case sessionstore.InboxStatePending, sessionstore.InboxStateClaimed, sessionstore.InboxStateApplying:
 		status.State = sessionwire.CommandStateAccepted
 	case sessionstore.InboxStateApplied:
 		status.State = sessionwire.CommandStateApplied
 	case sessionstore.InboxStateRejected:
+		if rejection == nil {
+			return sessionwire.CommandStatus{}, false
+		}
 		status.State = sessionwire.CommandStateRejected
-		status.Error = entry.Record.Rejection
+		status.Error = rejection
 	default:
 		return sessionwire.CommandStatus{}, false
 	}
