@@ -146,6 +146,10 @@ func TestObjectAuthPrecedesExistenceAndPolicyPrecedesMetadata(t *testing.T) {
 		}{
 			{"public sentinel", identity.ErrUnauthorized, http.StatusForbidden, ErrorCodeNotAuthorized},
 			{"wrapped public sentinel", fmt.Errorf("external object policy: %w", identity.ErrUnauthorized), http.StatusForbidden, ErrorCodeNotAuthorized},
+			// Depth 2 and a join: a classifier that unwraps exactly once
+			// passes the two rows above and fails both of these.
+			{"doubly wrapped public sentinel", fmt.Errorf("external object policy: %w", fmt.Errorf("policy engine: %w", identity.ErrUnauthorized)), http.StatusForbidden, ErrorCodeNotAuthorized},
+			{"joined public sentinel", errors.Join(errors.New("audit sink unavailable"), identity.ErrUnauthorized), http.StatusForbidden, ErrorCodeNotAuthorized},
 			{"policy dependency fault", errors.New("policy backend failed"), http.StatusInternalServerError, ErrorCodeInternal},
 		} {
 			t.Run(suffix+"/"+policy.name, func(t *testing.T) {

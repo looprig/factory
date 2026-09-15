@@ -369,6 +369,10 @@ func TestTheComposedAuthorizerDecidesTheSessionList(t *testing.T) {
 	}{
 		{"public sentinel", identity.ErrUnauthorized, http.StatusForbidden, httpapi.ErrorCodeNotAuthorized},
 		{"wrapped public sentinel", fmt.Errorf("external authorizer: %w", identity.ErrUnauthorized), http.StatusForbidden, httpapi.ErrorCodeNotAuthorized},
+		// Depth 2 and a join: a classifier that unwraps exactly once passes
+		// the two rows above and fails both of these.
+		{"doubly wrapped public sentinel", fmt.Errorf("external authorizer: %w", fmt.Errorf("policy engine: %w", identity.ErrUnauthorized)), http.StatusForbidden, httpapi.ErrorCodeNotAuthorized},
+		{"joined public sentinel", errors.Join(errors.New("audit sink unavailable"), identity.ErrUnauthorized), http.StatusForbidden, httpapi.ErrorCodeNotAuthorized},
 		{"authorization dependency fault", errors.New("authorization backend failed"), http.StatusInternalServerError, httpapi.ErrorCodeInternal},
 	} {
 		t.Run(test.name, func(t *testing.T) {

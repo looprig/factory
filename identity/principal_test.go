@@ -11,12 +11,29 @@ import (
 	"github.com/looprig/factory/identity"
 )
 
+// TestErrUnauthorizedIsAStablePublicSentinel pins the two things an external
+// Authorizer or ObjectPolicy relies on: the value survives wrapping at any
+// depth, and its text does not move. The text is part of the public contract
+// because it reaches operator logs through every wrap an implementer adds;
+// changing it is a visible change to a released value.
+//
+// This package holds no classifier, so a mutant of one of Factory's three
+// classifiers is not reachable from here; those are killed by the depth-2 and
+// join rows in the root, internal/httpapi and clientlink denial matrices.
 func TestErrUnauthorizedIsAStablePublicSentinel(t *testing.T) {
 	t.Parallel()
 
-	wrapped := fmt.Errorf("external authorizer: %w", identity.ErrUnauthorized)
-	if !errors.Is(wrapped, identity.ErrUnauthorized) {
-		t.Fatalf("errors.Is(%v, ErrUnauthorized) = false", wrapped)
+	if got, want := identity.ErrUnauthorized.Error(), "identity: unauthorized"; got != want {
+		t.Fatalf("ErrUnauthorized text = %q, want %q", got, want)
+	}
+	for _, wrapped := range []error{
+		fmt.Errorf("external authorizer: %w", identity.ErrUnauthorized),
+		fmt.Errorf("external authorizer: %w", fmt.Errorf("policy engine: %w", identity.ErrUnauthorized)),
+		errors.Join(errors.New("audit sink unavailable"), identity.ErrUnauthorized),
+	} {
+		if !errors.Is(wrapped, identity.ErrUnauthorized) {
+			t.Errorf("errors.Is(%v, ErrUnauthorized) = false", wrapped)
+		}
 	}
 }
 

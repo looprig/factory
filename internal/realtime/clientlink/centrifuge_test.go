@@ -698,6 +698,10 @@ func TestExternalSubscribeAuthorizationErrorsKeepTheirWireClass(t *testing.T) {
 	}{
 		{"public sentinel", identity.ErrUnauthorized, 103},
 		{"wrapped public sentinel", fmt.Errorf("external authorizer: %w", identity.ErrUnauthorized), 103},
+		// Depth 2 and a join: a classifier that unwraps exactly once passes
+		// the two rows above and fails both of these.
+		{"doubly wrapped public sentinel", fmt.Errorf("external authorizer: %w", fmt.Errorf("policy engine: %w", identity.ErrUnauthorized)), 103},
+		{"joined public sentinel", errors.Join(errors.New("audit sink unavailable"), identity.ErrUnauthorized), 103},
 		{"authorization dependency fault", errors.New("authorization backend failed"), 100},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -929,6 +933,10 @@ func TestARefusedCommandRPCIsDenied(t *testing.T) {
 	}{
 		{"public sentinel", identity.ErrUnauthorized, 103},
 		{"wrapped public sentinel", fmt.Errorf("external authorizer: %w", identity.ErrUnauthorized), 103},
+		// Depth 2 and a join: a classifier that unwraps exactly once passes
+		// the two rows above and fails both of these.
+		{"doubly wrapped public sentinel", fmt.Errorf("external authorizer: %w", fmt.Errorf("policy engine: %w", identity.ErrUnauthorized)), 103},
+		{"joined public sentinel", errors.Join(errors.New("audit sink unavailable"), identity.ErrUnauthorized), 103},
 		{"authorization dependency fault", errors.New("authorization backend failed"), 100},
 	} {
 		t.Run(test.name, func(t *testing.T) {
