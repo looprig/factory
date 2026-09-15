@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	sessionwire "github.com/looprig/core/sessionwire/v1"
 	"github.com/looprig/sessionstore"
@@ -185,6 +186,49 @@ func TestACreateIsAdmittedWithADispositionBindingThisModuleAuthored(t *testing.T
 	// The payload is inline, and step 5's object path was NOT taken.
 	if f.creates.uploads != 0 {
 		t.Errorf("a small create performed %d uploads, want 0", f.creates.uploads)
+	}
+}
+
+// TestACreatesAcceptedTimestampsAreUTCWhateverZoneTheClockReadsIn reads the
+// `.UTC()` in admitPublicCreate, which nothing read (quality gate F6, present
+// since A3.1). It is the create-path twin of
+// TestTheAdmittedTimestampsAreNormalisedToUTCWhateverZoneTheClockReadsIn and
+// is needed for the same reason: every other fixture reads serviceNow, which
+// is already UTC, and every other assertion compares with time.Equal, which
+// ignores the location.
+func TestACreatesAcceptedTimestampsAreUTCWhateverZoneTheClockReadsIn(t *testing.T) {
+	// A positive offset and a nonzero sub-second field, so no shared fixture
+	// constant can satisfy the assertions below.
+	skewed := time.Date(2026, 9, 5, 19, 0, 0, 123456789, time.FixedZone("plus7", 7*60*60))
+	f := createFixture(t)
+	f.rebuild(t, func(cfg *Config) {
+		cfg.Clock = serviceClock{skewed}
+		cfg.Binding = SessionBindingTemplate{StorageBindingID: "storage-a", BindingVersion: "v1"}
+	})
+	if _, created, err := f.service.AdmitCreate(context.Background(), f.principal, createRequest("create-utc", "session-utc", smallBlocks)); err != nil || !created {
+		t.Fatalf("create = (%v, %v)", created, err)
+	}
+	// The positive control: without a reservation every assertion below would
+	// read the zero time.Time, which is in UTC.
+	reservation, ok := f.creates.reservations["create-utc"]
+	if !ok {
+		t.Fatal("no reservation reached the store, so the timestamps below are the zero value")
+	}
+	for _, ts := range []struct {
+		name  string
+		value time.Time
+		want  time.Time
+	}{
+		{"AcceptedAt", reservation.AcceptedAt, skewed},
+		{"ApplyDeadline", reservation.ApplyDeadline, skewed.Add(time.Minute)},
+	} {
+		if ts.value.Location() != time.UTC {
+			t.Errorf("%s location = %v, want UTC", ts.name, ts.value.Location())
+		}
+		// Normalising the zone must not shift or truncate the instant.
+		if !ts.value.Equal(ts.want) {
+			t.Errorf("%s = %v, want the instant %v", ts.name, ts.value, ts.want)
+		}
 	}
 }
 
