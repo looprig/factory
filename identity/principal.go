@@ -32,6 +32,12 @@ var ErrInvalidPrincipal = errors.New("identity: invalid principal")
 // caller's fault and must not sign every user out.
 var ErrUnauthenticated = errors.New("identity: unauthenticated")
 
+// ErrUnauthorized is what an Authorizer or ObjectPolicy reports when an
+// authenticated principal may not perform an operation. Implementations may
+// wrap it with an operation name, but must not add resource identifiers: a
+// denial must not disclose whether a named resource exists.
+var ErrUnauthorized = errors.New("identity: unauthorized")
+
 // ErrCredentialExpired is the expiry case of ErrUnauthenticated, and it WRAPS
 // it, so a caller matching only ErrUnauthenticated needs no change.
 //

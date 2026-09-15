@@ -131,6 +131,8 @@ func (t LaunchTemplate) published() httpapi.LaunchTemplate {
 
 // ObjectPolicy authorizes one object reference using trusted committed session
 // evidence, and it is an alias for LaunchTemplate's reason.
+// A denial must wrap identity.ErrUnauthorized; any other error is a policy
+// dependency fault.
 //
 // A nil policy fails closed at the router: an object read is answered
 // "unavailable" before the catalog summary, before any authorization call and

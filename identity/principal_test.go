@@ -2,6 +2,7 @@ package identity_test
 
 import (
 	"errors"
+	"fmt"
 	"reflect"
 	"strings"
 	"testing"
@@ -9,6 +10,15 @@ import (
 	sessionwire "github.com/looprig/core/sessionwire/v1"
 	"github.com/looprig/factory/identity"
 )
+
+func TestErrUnauthorizedIsAStablePublicSentinel(t *testing.T) {
+	t.Parallel()
+
+	wrapped := fmt.Errorf("external authorizer: %w", identity.ErrUnauthorized)
+	if !errors.Is(wrapped, identity.ErrUnauthorized) {
+		t.Fatalf("errors.Is(%v, ErrUnauthorized) = false", wrapped)
+	}
+}
 
 func TestNewPrincipalValidates(t *testing.T) {
 	t.Parallel()

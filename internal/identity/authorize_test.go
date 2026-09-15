@@ -32,6 +32,14 @@ var (
 	_ admission.Authorizer  = internalidentity.Authorizer{}
 )
 
+func TestInternalUnauthorizedIsThePublicSentinel(t *testing.T) {
+	t.Parallel()
+
+	if internalidentity.ErrUnauthorized != factoryidentity.ErrUnauthorized {
+		t.Fatal("internal ErrUnauthorized is not the public identity.ErrUnauthorized value")
+	}
+}
+
 // TestAuthorizerOpaqueSeamParametersAreUnread derives both sides of the rule:
 // the public A0.2 seam supplies the parameter types, and the package directory
 // supplies every production file and concrete Authorizer method. Parameters

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -16,7 +17,6 @@ import (
 	"github.com/looprig/factory"
 	"github.com/looprig/factory/identity"
 	"github.com/looprig/factory/internal/httpapi"
-	internalidentity "github.com/looprig/factory/internal/identity"
 	"github.com/looprig/sessionstore"
 )
 
@@ -361,24 +361,39 @@ func TestTheComposedSessionReaderIsTheOneQueried(t *testing.T) {
 func TestTheComposedAuthorizerDecidesTheSessionList(t *testing.T) {
 	t.Parallel()
 
-	var queried atomic.Bool
-	server, err := factory.New(append(
-		factory.RequiredOptionsExcept("WithSessionReader", "WithAuthorizer"),
-		factory.WithSessionReader(recordingReader{queried: &queried}),
-		factory.WithAuthorizer(refusingAuthorizer{err: internalidentity.ErrUnauthorized}),
-	)...)
-	if err != nil {
-		t.Fatalf("New() = %v", err)
+	for _, test := range []struct {
+		name       string
+		err        error
+		wantStatus int
+		wantCode   sessionwire.ErrorCode
+	}{
+		{"public sentinel", identity.ErrUnauthorized, http.StatusForbidden, httpapi.ErrorCodeNotAuthorized},
+		{"wrapped public sentinel", fmt.Errorf("external authorizer: %w", identity.ErrUnauthorized), http.StatusForbidden, httpapi.ErrorCodeNotAuthorized},
+		{"authorization dependency fault", errors.New("authorization backend failed"), http.StatusInternalServerError, httpapi.ErrorCodeInternal},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			var queried atomic.Bool
+			server, err := factory.New(append(
+				factory.RequiredOptionsExcept("WithSessionReader", "WithAuthorizer"),
+				factory.WithSessionReader(recordingReader{queried: &queried}),
+				factory.WithAuthorizer(refusingAuthorizer{err: test.err}),
+			)...)
+			if err != nil {
+				t.Fatalf("New() = %v", err)
+			}
+			recorder := serveHandler(t, server.Handler(), apiRequest(t, http.MethodGet, "/v1/sessions"))
+			if recorder.Code != test.wantStatus {
+				t.Fatalf("refused session list = %d, want %d; body %q", recorder.Code, test.wantStatus, recorder.Body)
+			}
+			if code := decodeError(t, recorder); code != test.wantCode {
+				t.Errorf("error code = %q, want %q", code, test.wantCode)
+			}
+			if queried.Load() {
+				t.Error("a refused session list still reached the durable read plane")
+			}
+		})
 	}
-	recorder := serveHandler(t, server.Handler(), apiRequest(t, http.MethodGet, "/v1/sessions"))
-
-	if recorder.Code != http.StatusForbidden {
-		t.Fatalf("a refused session list = %d, want 403; body %q", recorder.Code, recorder.Body)
-	}
-	if queried.Load() {
-		t.Error("a refused session list still reached the durable read plane")
-	}
-	decodeError(t, recorder)
 }
 
 // tenantlessVerifier asserts the one credential shape WithDefaultTenant changes

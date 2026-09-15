@@ -36,22 +36,8 @@ import (
 // identity/credential.go for why the seam is the verifier.
 
 // Authorizer decides every public operation and the one service operation.
-//
-// TODO(A9.3, precondition of factory v0.1.0): a deployer implementing this
-// interface outside the module cannot NAME the refusal that produces a 403.
-// The sentinel a denial must wrap is internal/identity.ErrUnauthorized, and Go
-// forbids importing github.com/looprig/factory/internal/...; the public
-// identity package declares ErrUnauthenticated but no authorization error at
-// all. serve_test.go can only build its refusing authorizer because it is an
-// in-module test that imports the internal package directly. Anything else an
-// external implementation returns is classified by internal/httpapi's
-// authorizationFailure as a different failure. This is deliberately left open
-// here -- stage 1 publishes nothing and has no external implementer -- but it
-// must be closed BEFORE factory v0.1.0, because fixing it afterwards is a
-// breaking change to a published surface. The fix is the alias technique
-// internal/identity/http.go already uses for Credential, Claims, Source and
-// Verifier: declare the sentinel in the public identity package and forward it
-// from internal/identity, so the program keeps exactly one declaration.
+// A denial must wrap identity.ErrUnauthorized. Any other error is a fault in
+// the authorization dependency rather than a permissions decision.
 type Authorizer interface {
 	AuthorizeSessionList(ctx context.Context, principal identity.Principal) error
 	AuthorizeSessionRead(ctx context.Context, principal identity.Principal, session sessionwire.SessionID) error

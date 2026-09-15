@@ -95,6 +95,7 @@ type recordingAuthorizer struct {
 	control   []controlCall
 	// denyKind, when set, refuses exactly one command kind.
 	denyKind sessionstore.CommandKind
+	denyErr  error
 	// waitForContext makes the authorizer behave like a wedged dependency that
 	// honours its context, exactly as recordingAdmitter's flag does. A stalled
 	// AUTHORIZER produces the identical hazard to a stalled admission -- it
@@ -129,10 +130,13 @@ func (a *recordingAuthorizer) AuthorizeSubscribe(ctx context.Context, principal 
 func (a *recordingAuthorizer) AuthorizeControl(ctx context.Context, principal identity.Principal, session sessionwire.SessionID, kind sessionstore.CommandKind) error {
 	a.mu.Lock()
 	a.control = append(a.control, controlCall{tenant: principal.Tenant(), session: session, kind: kind})
-	deny, wait := a.denyKind, a.waitForContext
+	deny, denial, wait := a.denyKind, a.denyErr, a.waitForContext
 	a.mu.Unlock()
 	if deny != "" && kind == deny {
-		return fmt.Errorf("%w: refused for this case", internalidentity.ErrUnauthorized)
+		if denial != nil {
+			return denial
+		}
+		return fmt.Errorf("%w: refused for this case", identity.ErrUnauthorized)
 	}
 	if wait {
 		timer := time.NewTimer(admitterBackstop)
@@ -876,30 +880,52 @@ func TestEveryCommandRPCIsAuthorizedUnderItsOwnKind(t *testing.T) {
 func TestARefusedCommandRPCIsDenied(t *testing.T) {
 	t.Parallel()
 
-	f := newFixture(t, testLimits())
-	f.authorizer.mu.Lock()
-	f.authorizer.denyKind = command.KindInterrupt
-	f.authorizer.mu.Unlock()
+	for _, test := range []struct {
+		name     string
+		err      error
+		wantCode uint32
+	}{
+		{"public sentinel", identity.ErrUnauthorized, 103},
+		{"wrapped public sentinel", fmt.Errorf("external authorizer: %w", identity.ErrUnauthorized), 103},
+		{"authorization dependency fault", errors.New("authorization backend failed"), 100},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			f := newFixture(t, testLimits())
+			f.authorizer.mu.Lock()
+			f.authorizer.denyKind = command.KindInterrupt
+			f.authorizer.denyErr = test.err
+			f.authorizer.mu.Unlock()
 
+			client, observed := dialSupported(t, f, "token-a")
+			await(t, observed.connected, "connected event")
+			ctx, cancel := context.WithTimeout(context.Background(), waitFor)
+			defer cancel()
+
+			f.admitter.mu.Lock()
+			f.admitter.entry = acceptedEntry("session-1", "cmd-1")
+			f.admitter.mu.Unlock()
+
+			_, err := client.RPC(ctx, string(clientlink.MethodSessionInterrupt),
+				commandBody(clientlink.MethodSessionInterrupt, "session-1", "cmd-1"))
+			if got := codeOf(err); got != test.wantCode {
+				t.Errorf("refused interrupt failed with code %d (%v), want %d", got, err, test.wantCode)
+			}
+			if calls := f.admitter.recorded(); len(calls) != 0 {
+				t.Errorf("a refused interrupt reached admission %d times", len(calls))
+			}
+		})
+	}
+
+	f := newFixture(t, testLimits())
 	client, observed := dialSupported(t, f, "token-a")
 	await(t, observed.connected, "connected event")
 	ctx, cancel := context.WithTimeout(context.Background(), waitFor)
 	defer cancel()
-
+	// The sibling method, denied by nothing, must still be admitted: otherwise
+	// "denied" would be indistinguishable from "every RPC is refused".
 	f.admitter.mu.Lock()
 	f.admitter.entry = acceptedEntry("session-1", "cmd-1")
 	f.admitter.mu.Unlock()
-
-	_, err := client.RPC(ctx, string(clientlink.MethodSessionInterrupt),
-		commandBody(clientlink.MethodSessionInterrupt, "session-1", "cmd-1"))
-	if got := codeOf(err); got != 103 {
-		t.Errorf("a denied interrupt failed with code %d (%v), want 103 (permission denied)", got, err)
-	}
-	if calls := f.admitter.recorded(); len(calls) != 0 {
-		t.Errorf("a denied interrupt reached admission %d times", len(calls))
-	}
-	// The sibling method, denied by nothing, must still be admitted: otherwise
-	// "denied" would be indistinguishable from "every RPC is refused".
 	result, err := client.RPC(ctx, string(clientlink.MethodSessionInput),
 		commandBody(clientlink.MethodSessionInput, "session-1", "cmd-1"))
 	if err != nil {

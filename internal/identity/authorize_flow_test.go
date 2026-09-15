@@ -57,7 +57,7 @@ func TestAuthorizationInformationFlow(t *testing.T) {
 	t.Parallel()
 	imports := newAuditImporter()
 	public := readProductionPackage(t, filepath.Join("..", "..", "identity"), identityPath, imports, func(decl ast.Decl) bool {
-		if declarationHasName(decl, "Principal") || declarationHasName(decl, "Kind") || declarationHasName(decl, "KindService") {
+		if declarationHasName(decl, "Principal") || declarationHasName(decl, "Kind") || declarationHasName(decl, "KindService") || declarationHasName(decl, "ErrUnauthorized") {
 			return true
 		}
 		function, ok := decl.(*ast.FuncDecl)

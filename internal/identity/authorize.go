@@ -2,7 +2,6 @@ package identity
 
 import (
 	"context"
-	"errors"
 	"regexp"
 
 	sessionwire "github.com/looprig/core/sessionwire/v1"
@@ -10,11 +9,14 @@ import (
 	"github.com/looprig/sessionstore"
 )
 
-// ErrUnauthorized is the complete result of a denied authorization decision.
+// ErrUnauthorized aliases identity.ErrUnauthorized so internal callers and
+// external seam implementations classify the same error value.
+//
+// It is the complete result of a denied authorization decision.
 // It deliberately carries no tenant, session, command, object or channel value:
 // a denial must not disclose whether the named resource exists in another
 // tenant. Callers may add operation names, but must not add those identifiers.
-var ErrUnauthorized = errors.New("identity: unauthorized")
+var ErrUnauthorized = factoryidentity.ErrUnauthorized
 
 // Authorizer applies Factory's tenant boundary to its public edges.
 //

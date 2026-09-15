@@ -138,13 +138,29 @@ func TestObjectAuthPrecedesExistenceAndPolicyPrecedesMetadata(t *testing.T) {
 		if len(calls) != 0 {
 			t.Fatal("denied object reached catalog")
 		}
-		f, m, blobs := observedObjectFixture(t, "secret")
-		f.router.objectPolicy = objectPolicyFunc(func(context.Context, identity.Principal, sessionstore.CatalogEntry, sessionwire.ObjectReference) (sessionstore.ObjectKind, error) {
-			return "", internalidentity.ErrUnauthorized
-		})
-		got = f.get(objectTarget(m) + suffix)
-		if got.Code != 403 || blobs.gets != 0 {
-			t.Fatalf("policy denial: %d reads %d", got.Code, blobs.gets)
+		for _, policy := range []struct {
+			name       string
+			err        error
+			wantStatus int
+			wantCode   sessionwire.ErrorCode
+		}{
+			{"public sentinel", identity.ErrUnauthorized, http.StatusForbidden, ErrorCodeNotAuthorized},
+			{"wrapped public sentinel", fmt.Errorf("external object policy: %w", identity.ErrUnauthorized), http.StatusForbidden, ErrorCodeNotAuthorized},
+			{"policy dependency fault", errors.New("policy backend failed"), http.StatusInternalServerError, ErrorCodeInternal},
+		} {
+			t.Run(suffix+"/"+policy.name, func(t *testing.T) {
+				f, m, blobs := observedObjectFixture(t, "secret")
+				f.router.objectPolicy = objectPolicyFunc(func(context.Context, identity.Principal, sessionstore.CatalogEntry, sessionwire.ObjectReference) (sessionstore.ObjectKind, error) {
+					return "", policy.err
+				})
+				got := f.get(objectTarget(m) + suffix)
+				if got.Code != policy.wantStatus || blobs.gets != 0 {
+					t.Fatalf("policy refusal: status %d, reads %d; want status %d and no blob reads", got.Code, blobs.gets, policy.wantStatus)
+				}
+				if code := decodeEnvelope(t, got).Error.Code; code != policy.wantCode {
+					t.Errorf("error code = %q, want %q", code, policy.wantCode)
+				}
+			})
 		}
 	}
 }
