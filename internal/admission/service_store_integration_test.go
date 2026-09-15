@@ -440,7 +440,22 @@ func TestPublicCreateRetriesResolveEveryDurabilityFailureWindowThroughIdentity(t
 	}
 }
 
-func TestClaimingAFactoryAcceptedCreateDoesNotExtendItsApplyDeadline(t *testing.T) {
+// TestSessionstoreClaimKeepsTheApplyDeadlineOfAFactoryAcceptedCreate is a PIN
+// ON SESSIONSTORE BEHAVIOUR FACTORY RELIES ON, not a test of Factory code.
+// Runbook A3.2 step 4 says a claim never extends the apply deadline; Factory
+// has no claim path, so the property lives entirely in
+// sessionstore.ClaimDispositionCommand, and no mutant of Factory can reach it
+// (doubling the proposal deadline moves accepted and claimed together). It
+// stays here because it drives the released store over a record Factory
+// authored, so a sessionstore bump that broke the property fails in this
+// module rather than in a Host.
+//
+// The claim expires AFTER the apply deadline (90s against 60s). With a claim
+// shorter than the deadline, a store that extended the deadline to the claim's
+// expiry would leave it unchanged-looking only because the expiry was earlier;
+// the spec gate measured that such a mutant survives a 30s claim and dies on a
+// 90s one.
+func TestSessionstoreClaimKeepsTheApplyDeadlineOfAFactoryAcceptedCreate(t *testing.T) {
 	store := openCreateIntegrationStore(t)
 	svc, principal := newCreateIntegrationService(t, store, store, serviceNow, "runtime-command-claim")
 	accepted, created, err := svc.AdmitCreate(context.Background(), principal, createRequest("create-claim", "session-claim", smallBlocks))
@@ -460,7 +475,7 @@ func TestClaimingAFactoryAcceptedCreateDoesNotExtendItsApplyDeadline(t *testing.
 	})
 	claimed, changed, err := store.ClaimDispositionCommand(context.Background(), sessionstore.ClaimDispositionCommandRequest{
 		TenantID: principal.Tenant(), SessionID: "session-claim", CommandID: "create-claim",
-		ExpectedRevision: accepted.Revision, Residency: grant, ClaimExpiresAt: serviceNow.Add(30 * time.Second),
+		ExpectedRevision: accepted.Revision, Residency: grant, ClaimExpiresAt: serviceNow.Add(90 * time.Second),
 	})
 	if err != nil || !changed {
 		t.Fatalf("ClaimDispositionCommand = (%v, %v)", changed, err)
