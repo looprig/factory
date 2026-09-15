@@ -11,6 +11,7 @@ import (
 	sessionwire "github.com/looprig/core/sessionwire/v1"
 	"github.com/looprig/factory/identity"
 	"github.com/looprig/sessionstore"
+	"github.com/looprig/storage"
 	"github.com/looprig/storage/memstore"
 )
 
@@ -128,9 +129,30 @@ func newCreateIntegrationService(t *testing.T, store *sessionstore.Store, create
 	return svc, f.principal
 }
 
+// TestServiceRefusesLegacyCreateWithoutPersistingASession proves absence by
+// SCANNING, not by a lookup at one guessed id: a refusal that wrote a session
+// under any id would pass a probe of `generated-1`.
+//
+// Two scans, over what the store exposes:
+//   - sessionstore.Store.ListSessions for the principal's tenant, which walks
+//     the whole catalog ranking scope, so a catalog row under ANY session id
+//     is seen (a reader that skips an unreadable row still counts it in
+//     UnreadableSkipped, which is asserted too);
+//   - the backend's storage.KV.Keys("") and storage.Blobs.List("") before and
+//     after the call, so a key or object written anywhere in those two
+//     primitives is seen.
+//
+// Neither storage.Ledger nor storage.OrderedIndex can enumerate its names or
+// namespaces, so a write confined to a ledger, or to an ordered namespace other
+// than the catalog, is outside what this scan can see. Admission's only durable
+// writer for a session is the catalog, which the first scan covers.
+//
+// The minted-IDs assertion reads the Service's OWN id source; the fixture's is
+// not wired into this Service.
 func TestServiceRefusesLegacyCreateWithoutPersistingASession(t *testing.T) {
 	ctx := context.Background()
-	store, err := sessionstore.Open(ctx, memstore.New())
+	backend := memstore.New()
+	store, err := sessionstore.Open(ctx, backend, sessionstore.WithClock(serviceClock{serviceNow}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -139,11 +161,13 @@ func TestServiceRefusesLegacyCreateWithoutPersistingASession(t *testing.T) {
 			t.Errorf("Close: %v", err)
 		}
 	})
+	before := backendKeys(t, backend)
 
 	f := newServiceFixture(t)
+	ids := &serviceIDs{}
 	f.service, err = NewService(Config{
 		Authorizer: f.auth, Targets: f.targets, Catalog: store, Commands: store,
-		Directory: f.directory, Clock: serviceClock{serviceNow}, IDs: &serviceIDs{}, ApplyDeadline: time.Minute,
+		Directory: f.directory, Clock: serviceClock{serviceNow}, IDs: ids, ApplyDeadline: time.Minute,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -155,16 +179,59 @@ func TestServiceRefusesLegacyCreateWithoutPersistingASession(t *testing.T) {
 	if !errors.Is(err, ErrLegacyCreateUnsupported) || !IsCode(err, sessionwire.ErrorCodeRuntimeUnavailable) {
 		t.Fatalf("error = %v, want runtime_unavailable wrapping ErrLegacyCreateUnsupported", err)
 	}
-	if f.ids.next != 0 {
-		t.Fatalf("IDs minted = %d, want 0", f.ids.next)
+	if ids.next != 0 || len(ids.called) != 0 {
+		t.Fatalf("the Service's own id source minted %d ids (called %v), want none", ids.next, ids.called)
 	}
-	_, err = store.GetCatalogEntry(ctx, sessionstore.GetCatalogEntryRequest{TenantID: "tenant-a", SessionID: sessionwire.SessionID("generated-1")})
-	if err == nil {
-		t.Fatal("legacy create persisted generated-1 despite refusing")
+	if n, skipped := tenantSessions(t, store, f.principal.Tenant()); n != 0 || skipped != 0 {
+		t.Fatalf("ListSessions after the refusal = %d sessions, %d unreadable; want none", n, skipped)
 	}
-	if !catalogNotFound(err) {
-		t.Fatalf("GetCatalogEntry(generated-1) = %v, want session absence", err)
+	if after := backendKeys(t, backend); !reflect.DeepEqual(before, after) {
+		t.Fatalf("backend keys changed across the refusal:\nbefore %v\nafter  %v", before, after)
 	}
+
+	// The positive control, on the same store and tenant: a V1 create DOES
+	// appear in the scan. Without it an empty listing could be a scan that
+	// sees nothing at all.
+	control, _ := newCreateIntegrationService(t, store, store, serviceNow, "runtime-command-control")
+	if _, created, err := control.AdmitCreate(ctx, f.principal, createRequest("create-control", "session-control", smallBlocks)); err != nil || !created {
+		t.Fatalf("control AdmitCreate = (%v, %v)", created, err)
+	}
+	if n, _ := tenantSessions(t, store, f.principal.Tenant()); n != 1 {
+		t.Fatalf("ListSessions after a real create = %d sessions, want 1; the scan cannot see a write", n)
+	}
+}
+
+// tenantSessions walks every ListSessions page for one tenant and reports the
+// sessions listed and the rows the store could not read.
+func tenantSessions(t *testing.T, store *sessionstore.Store, tenant sessionwire.TenantID) (sessions, unreadable int) {
+	t.Helper()
+	var cursor sessionwire.Cursor
+	for {
+		page, err := store.ListSessions(context.Background(), sessionstore.ListSessionsRequest{TenantID: tenant, Cursor: cursor})
+		if err != nil {
+			t.Fatalf("ListSessions: %v", err)
+		}
+		sessions += len(page.Sessions)
+		unreadable += page.UnreadableSkipped
+		if page.NextCursor == "" {
+			return sessions, unreadable
+		}
+		cursor = page.NextCursor
+	}
+}
+
+// backendKeys is every KV key and blob name the backend holds.
+func backendKeys(t *testing.T, backend *storage.Composite) map[string][]string {
+	t.Helper()
+	kv, err := backend.KV.Keys(context.Background(), "")
+	if err != nil {
+		t.Fatalf("KV.Keys: %v", err)
+	}
+	blobs, err := backend.Blobs.List(context.Background(), "")
+	if err != nil {
+		t.Fatalf("Blobs.List: %v", err)
+	}
+	return map[string][]string{"kv": kv, "blobs": blobs}
 }
 
 func TestTwoServicesRaceOnePublicCreateAndReturnOneAuthoritativeRecord(t *testing.T) {

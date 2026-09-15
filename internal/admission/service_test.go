@@ -636,6 +636,18 @@ func TestLegacyCreateRefusesBeforeAllWork(t *testing.T) {
 		t.Errorf("dependency calls = auth %d, targets %d, catalog %d, commands %d; want all zero",
 			f.auth.calls, f.targets.calls, f.catalog.createCalls, f.commands.calls)
 	}
+	// Every method of every fake, reads included: the counters above see only
+	// the writes and a few named calls, and a refusal that first read the
+	// catalog or asked the directory would pass them.
+	for name, called := range map[string]map[string]bool{
+		"Authorizer": f.auth.called, "Targets": f.targets.called, "Catalog": f.catalog.called,
+		"Commands": f.commands.called, "Directory": f.directory.called, "IDs": f.ids.called,
+		"PublicCreates": f.creates.called,
+	} {
+		if len(called) != 0 {
+			t.Errorf("%s was called (%v) before the refusal; want no dependency reached", name, called)
+		}
+	}
 }
 
 // TestADependencyFaultIsNotADecisionAboutTheCommand is the fault/refusal split
@@ -968,7 +980,7 @@ var exercisedMu sync.Mutex
 func unreachedDependencyMethods() map[string]string {
 	return map[string]string{
 		"Authorizer.AuthorizeServiceSweep": "the cross-tenant due-work sweep is the reconciler's, never a tenant command's",
-		"Catalog.CreateCatalogEntry":       "legacy creation is refused before dependencies; disposition creation uses PublicCreates",
+		"Catalog.CreateCatalogEntry":       "legacy creation is refused before any durable write; disposition creation uses PublicCreates",
 	}
 }
 
