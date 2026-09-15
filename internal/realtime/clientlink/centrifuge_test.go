@@ -90,9 +90,10 @@ func (v *verifier) verifications() int {
 type recordingAuthorizer struct {
 	inner internalidentity.Authorizer
 
-	mu        sync.Mutex
-	subscribe []subscribeCall
-	control   []controlCall
+	mu           sync.Mutex
+	subscribe    []subscribeCall
+	subscribeErr error
+	control      []controlCall
 	// denyKind, when set, refuses exactly one command kind.
 	denyKind sessionstore.CommandKind
 	denyErr  error
@@ -123,7 +124,11 @@ type controlCall struct {
 func (a *recordingAuthorizer) AuthorizeSubscribe(ctx context.Context, principal identity.Principal, channel string) error {
 	a.mu.Lock()
 	a.subscribe = append(a.subscribe, subscribeCall{tenant: principal.Tenant(), channel: channel})
+	result := a.subscribeErr
 	a.mu.Unlock()
+	if result != nil {
+		return result
+	}
 	return a.inner.AuthorizeSubscribe(ctx, principal, channel)
 }
 
@@ -680,6 +685,43 @@ func TestASuccessfulHandshakeAuthorizesNoChannel(t *testing.T) {
 	// the refusals above about the channel rather than about the link.
 	if err := subscribe(t, client, sessionChannel(tenantA, "session-1")); err != nil {
 		t.Fatalf("subscribing to this principal's own session failed: %v", err)
+	}
+}
+
+func TestExternalSubscribeAuthorizationErrorsKeepTheirWireClass(t *testing.T) {
+	t.Parallel()
+
+	for _, test := range []struct {
+		name     string
+		err      error
+		wantCode uint32
+	}{
+		{"public sentinel", identity.ErrUnauthorized, 103},
+		{"wrapped public sentinel", fmt.Errorf("external authorizer: %w", identity.ErrUnauthorized), 103},
+		{"authorization dependency fault", errors.New("authorization backend failed"), 100},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			f := newFixture(t, testLimits())
+			f.authorizer.mu.Lock()
+			f.authorizer.subscribeErr = test.err
+			f.authorizer.mu.Unlock()
+
+			client, observed := dialSupported(t, f, "token-a")
+			await(t, observed.connected, "connected event")
+			err := subscribe(t, client, sessionChannel(tenantA, "session-1"))
+			if got := codeOf(err); got != test.wantCode {
+				t.Errorf("subscribe failed with code %d (%v), want %d", got, err, test.wantCode)
+			}
+			if calls := f.demand.acquired(); len(calls) != 0 {
+				t.Errorf("a refused subscribe reached demand %d times", len(calls))
+			}
+			if calls := f.demand.released(); len(calls) != 0 {
+				t.Errorf("a refused subscribe released demand %d times", len(calls))
+			}
+			if calls := f.admitter.recorded(); len(calls) != 0 {
+				t.Errorf("a refused subscribe reached admission %d times", len(calls))
+			}
+		})
 	}
 }
 
