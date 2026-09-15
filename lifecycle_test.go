@@ -301,3 +301,51 @@ func TestServeReportsAListenerFailure(t *testing.T) {
 		t.Errorf("Serve() = %v, want the closed listener's error (net.ErrClosed)", err)
 	}
 }
+
+// TestServeClosesTheListenerAfterARealServeError covers the cleanup on
+// net/http's non-shutdown return path. The closed-listener case above proves
+// Factory reports that error, but its listener is already closed before Serve
+// receives it and therefore cannot prove that the listener handed to Serve is
+// closed when Accept itself fails.
+func TestServeClosesTheListenerAfterARealServeError(t *testing.T) {
+	t.Parallel()
+
+	server, err := factory.New(factory.RequiredOptions()...)
+	if err != nil {
+		t.Fatalf("New() = %v", err)
+	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), serveWait)
+		defer cancel()
+		if err := server.Stop(ctx); err != nil {
+			t.Errorf("Stop() after Serve returned: %v", err)
+		}
+	})
+
+	acceptFailure := errors.New("accept failed")
+	ln := &failingListener{acceptFailure: acceptFailure}
+	err = awaitServe(t, served(t, server, ln), "report the listener's Accept failure")
+	if !errors.Is(err, acceptFailure) {
+		t.Fatalf("Serve() = %v, want the listener's Accept failure", err)
+	}
+	if !ln.closed {
+		t.Fatal("Serve() returned the listener's Accept failure without closing the supplied listener")
+	}
+}
+
+// failingListener reaches http.Server.Serve's real-error return arm without
+// beginning closed. The receive from served synchronizes inspection of closed
+// with both Accept and Close, so this fixture needs no lock of its own.
+type failingListener struct {
+	acceptFailure error
+	closed        bool
+}
+
+func (l *failingListener) Accept() (net.Conn, error) { return nil, l.acceptFailure }
+func (l *failingListener) Close() error              { l.closed = true; return nil }
+func (l *failingListener) Addr() net.Addr            { return failingListenerAddr{} }
+
+type failingListenerAddr struct{}
+
+func (failingListenerAddr) Network() string { return "test" }
+func (failingListenerAddr) String() string  { return "failing-listener" }
