@@ -328,12 +328,13 @@ func TestTwoServicesRaceDistinctPublicCreatesWithoutSharingOrderOrMappings(t *te
 
 func TestPublicCreateRetriesResolveEveryDurabilityFailureWindowThroughIdentity(t *testing.T) {
 	for _, test := range []struct {
-		name  string
-		point publicCreateFaultPoint
+		name        string
+		point       publicCreateFaultPoint
+		wantCreated bool
 	}{
-		{"failure before storage", failBeforePrepare},
-		{"reservation committed but response lost", failAfterPrepare},
-		{"accepted record committed but response lost", failAfterAdmit},
+		{"failure before storage", failBeforePrepare, true},
+		{"reservation committed but response lost", failAfterPrepare, true},
+		{"accepted record committed but response lost", failAfterAdmit, false},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			store := openCreateIntegrationStore(t)
@@ -346,12 +347,15 @@ func TestPublicCreateRetriesResolveEveryDurabilityFailureWindowThroughIdentity(t
 			if err == nil || acknowledged || !reflect.DeepEqual(lost, sessionstore.DispositionInboxEntry{}) {
 				t.Fatalf("failed call = (%+v, %v, %v), want zero/unacknowledged/error", lost, acknowledged, err)
 			}
+			if !errors.Is(err, errInjectedFault) {
+				t.Fatalf("failed call error = %v, want injected storage cause", err)
+			}
 			retry, created, err := second.AdmitCreate(context.Background(), principal, req)
 			if err != nil {
 				t.Fatalf("retry: %v", err)
 			}
-			if test.point == failAfterAdmit && created {
-				t.Fatal("retry claimed creation after the accepted record was already committed")
+			if created != test.wantCreated {
+				t.Fatalf("retry created = %v, want %v for this durability window", created, test.wantCreated)
 			}
 			wantAccepted := serviceNow.Add(time.Hour)
 			wantRuntime := sessionstore.RuntimeCommandID("runtime-command-second")
