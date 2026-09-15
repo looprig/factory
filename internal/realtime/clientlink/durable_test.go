@@ -113,7 +113,7 @@ func waitUntil(t *testing.T, done func() bool, what string) {
 // own clock and its own identifier source, over a shared store.
 type replica struct {
 	fixture  *fixture
-	service  *admission.Service
+	store    *sessionstore.Store
 	clock    replicaClock
 	shutdown func()
 }
@@ -244,7 +244,7 @@ func newReplica(t *testing.T, store *sessionstore.Store, prefix string, now time
 	t.Cleanup(stop)
 	return &replica{
 		fixture:  &fixture{handler: handler, url: "ws" + strings.TrimPrefix(server.URL, "http"), verifier: v, demand: demand, clock: clock},
-		service:  service,
+		store:    store,
 		clock:    replicaClock{now},
 		shutdown: stop,
 	}
@@ -281,21 +281,23 @@ func openStore(t *testing.T) *sessionstore.Store {
 	return store
 }
 
-// existingSession creates a durable session through the LEGACY create, and as of
-// A3.1 that is a choice rather than the only option: the V1 create is served
-// and makes a DISPOSITION session. The legacy path is kept here because this
-// file's subject is the legacy inbox -- AdmitInput and the rest admit into it --
-// and a disposition-bound session is not one those commands can be admitted to.
+// existingSession seeds a legacy-bound catalog row directly. Factory no longer
+// exposes a legacy-create path, but this file still exercises commands against
+// pre-existing legacy sessions that may remain in a released store.
 func existingSession(t *testing.T, r *replica, principal identity.Principal) sessionwire.SessionID {
 	t.Helper()
 
-	result, err := r.service.AdmitLegacyCreate(t.Context(), principal, admission.LegacyCreateRequest{
-		AgentID: "agent-a", Blocks: []byte(`[{"text":"hello"}]`),
+	const sessionID sessionwire.SessionID = "legacy-session"
+	_, _, err := r.store.CreateCatalogEntry(t.Context(), sessionstore.CreateCatalogEntryRequest{
+		TenantID: principal.Tenant(), SessionID: sessionID, AgentID: "agent-a",
+		RuntimeCompatibilityID: "runtime-v1", CreatedAt: r.clock.now, LastActiveAt: r.clock.now,
+		State: sessionwire.SessionStateIdle, Residency: sessionwire.SessionResidencyCold,
+		DesiredPlacement: sessionwire.HostPlacementPooled, IdempotencyKey: "legacy-fixture",
 	})
 	if err != nil {
-		t.Fatalf("AdmitLegacyCreate: %v", err)
+		t.Fatalf("CreateCatalogEntry: %v", err)
 	}
-	return result.SessionID
+	return sessionID
 }
 
 func testPrincipal(t *testing.T) identity.Principal {

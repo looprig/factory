@@ -54,6 +54,10 @@ const (
 // those four.
 var ErrPayloadProtocolUnavailable = errors.New("admission: oversized payload needs a disposition session binding this module cannot author")
 
+// ErrLegacyCreateUnsupported reports that Factory cannot create a session on
+// the legacy protocol. No runtime this program ships can host such a session.
+var ErrLegacyCreateUnsupported = errors.New("admission: legacy create unsupported")
+
 type Error struct {
 	Code  sessionwire.ErrorCode
 	Cause error
@@ -340,56 +344,7 @@ type LegacyCreateResult struct {
 }
 
 func (s *Service) AdmitLegacyCreate(ctx context.Context, principal identity.Principal, req LegacyCreateRequest) (LegacyCreateResult, error) {
-	sessionID, err := s.cfg.IDs.NewUUID()
-	if err != nil {
-		return LegacyCreateResult{}, err
-	}
-	commandID, err := s.cfg.IDs.NewUUID()
-	if err != nil {
-		return LegacyCreateResult{}, err
-	}
-	create := sessionwire.CreateRequest{
-		CommandEnvelope: sessionwire.CommandEnvelope{Version: sessionwire.CurrentWireVersion, CommandID: sessionwire.CommandID(commandID)},
-		SessionID:       sessionwire.SessionID(sessionID), AgentID: req.AgentID, Blocks: req.Blocks,
-	}
-	entry, err := s.admitLegacyCreate(ctx, principal, create)
-	return LegacyCreateResult{SessionID: sessionwire.SessionID(sessionID), Entry: entry}, err
-}
-
-func (s *Service) admitLegacyCreate(ctx context.Context, principal identity.Principal, req sessionwire.CreateRequest) (sessionstore.InboxEntry, error) {
-	if err := req.Validate(); err != nil {
-		return sessionstore.InboxEntry{}, refusal(sessionwire.ErrorCodeInvalidRequest, err)
-	}
-	payload, err := canonicalCommand(req)
-	if err := admissiblePayload(payload, err); err != nil {
-		return sessionstore.InboxEntry{}, err
-	}
-	if err := s.cfg.Authorizer.AuthorizeControl(ctx, principal, req.SessionID, CommandCreate); err != nil {
-		return sessionstore.InboxEntry{}, err
-	}
-	target, known, targetErr := s.cfg.Targets.ResolveAgent(ctx, req.AgentID)
-	if targetErr != nil {
-		return sessionstore.InboxEntry{}, resolveTargetFault(targetErr)
-	}
-	if !known || target.Key.AgentID != req.AgentID {
-		return sessionstore.InboxEntry{}, refusal(sessionwire.ErrorCodeRuntimeUnavailable, nil)
-	}
-	now := s.cfg.Clock.Now().UTC()
-	entry, _, err := s.cfg.Catalog.CreateCatalogEntry(ctx, sessionstore.CreateCatalogEntryRequest{
-		TenantID: principal.Tenant(), SessionID: req.SessionID, AgentID: req.AgentID,
-		RuntimeCompatibilityID: target.Key.RuntimeCompatibilityID, CreatedAt: now, LastActiveAt: now,
-		State: sessionwire.SessionStateIdle, Residency: sessionwire.SessionResidencyCold,
-		DesiredPlacement: target.Key.Placement, DesiredWorkload: target.Workload,
-		IdempotencyKey: string(req.CommandID),
-	})
-	if err != nil {
-		return sessionstore.InboxEntry{}, err
-	}
-	if entry.Record.AgentID != req.AgentID || entry.Record.DesiredIdempotencyKey != string(req.CommandID) {
-		return sessionstore.InboxEntry{}, refusal(sessionwire.ErrorCodeCommandRejected, nil)
-	}
-	admitted, _, err := s.admit(ctx, principal.Tenant(), req.SessionID, req.CommandID, CommandCreate, payload)
-	return admitted, err
+	return LegacyCreateResult{}, refusal(sessionwire.ErrorCodeRuntimeUnavailable, ErrLegacyCreateUnsupported)
 }
 
 func canonicalCommand(request any) ([]byte, error) {

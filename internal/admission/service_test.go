@@ -617,14 +617,24 @@ func TestGateResponseRetryReturnsOriginalAndDifferentAnswerConflicts(t *testing.
 	}
 }
 
-func TestLegacyCreateMintsBothIdentities(t *testing.T) {
+func TestLegacyCreateRefusesBeforeAllWork(t *testing.T) {
 	f := newServiceFixture(t)
 	result, err := f.service.AdmitLegacyCreate(context.Background(), f.principal, LegacyCreateRequest{AgentID: "agent-a"})
-	if err != nil {
-		t.Fatal(err)
+	if !reflect.DeepEqual(result, LegacyCreateResult{}) {
+		t.Fatalf("result = %+v, want zero", result)
 	}
-	if result.SessionID == "" || result.Entry.Record.CommandID == "" {
-		t.Fatalf("legacy result = %+v", result)
+	if !errors.Is(err, ErrLegacyCreateUnsupported) {
+		t.Fatalf("error = %v, want ErrLegacyCreateUnsupported", err)
+	}
+	if !IsCode(err, sessionwire.ErrorCodeRuntimeUnavailable) {
+		t.Fatalf("error = %v, want runtime_unavailable", err)
+	}
+	if f.ids.next != 0 {
+		t.Errorf("IDs minted = %d, want 0", f.ids.next)
+	}
+	if f.auth.calls != 0 || f.targets.calls != 0 || f.catalog.createCalls != 0 || f.commands.calls != 0 {
+		t.Errorf("dependency calls = auth %d, targets %d, catalog %d, commands %d; want all zero",
+			f.auth.calls, f.targets.calls, f.catalog.createCalls, f.commands.calls)
 	}
 }
 
@@ -693,17 +703,6 @@ func TestADependencyFaultIsNotADecisionAboutTheCommand(t *testing.T) {
 			call: func(f *serviceFixture) error {
 				_, _, err := f.service.AdmitCreate(context.Background(), f.principal,
 					sessionwire.CreateRequest{CommandEnvelope: envelope("create-a"), SessionID: "session-a", AgentID: "agent-a"})
-				return err
-			},
-			code: sessionwire.ErrorCodeRuntimeUnavailable,
-		},
-		{
-			name:   "resolving a legacy create's launch target",
-			fault:  func(f *serviceFixture) { f.targets.err = boom },
-			answer: func(f *serviceFixture) { f.targets.known = false },
-			call: func(f *serviceFixture) error {
-				_, err := f.service.AdmitLegacyCreate(context.Background(), f.principal,
-					LegacyCreateRequest{AgentID: "agent-a", Blocks: []byte(`[{"text":"hello"}]`)})
 				return err
 			},
 			code: sessionwire.ErrorCodeRuntimeUnavailable,
@@ -969,6 +968,7 @@ var exercisedMu sync.Mutex
 func unreachedDependencyMethods() map[string]string {
 	return map[string]string{
 		"Authorizer.AuthorizeServiceSweep": "the cross-tenant due-work sweep is the reconciler's, never a tenant command's",
+		"Catalog.CreateCatalogEntry":       "legacy creation is refused before dependencies; disposition creation uses PublicCreates",
 	}
 }
 
@@ -1953,60 +1953,6 @@ func TestAResolvedTargetForAnotherAgentIsRuntimeUnavailable(t *testing.T) {
 			t.Fatal("a mismatched target wrote durable state")
 		}
 	})
-	t.Run("legacy create", func(t *testing.T) {
-		f := newServiceFixture(t)
-		f.targets.target.Key.AgentID = "agent-b"
-		_, err := f.service.AdmitLegacyCreate(context.Background(), f.principal, LegacyCreateRequest{AgentID: "agent-a"})
-		if !IsCode(err, sessionwire.ErrorCodeRuntimeUnavailable) {
-			t.Fatalf("error = %v, want runtime_unavailable", err)
-		}
-		if f.catalog.createCalls != 0 || f.commands.calls != 0 {
-			t.Fatal("a mismatched target wrote durable state")
-		}
-		// The control: the same call with a matching target IS admitted, so
-		// the two assertions above are not trivially true.
-		ok := newServiceFixture(t)
-		if _, err := ok.service.AdmitLegacyCreate(context.Background(), ok.principal, LegacyCreateRequest{AgentID: "agent-a"}); err != nil {
-			t.Fatalf("the matching control was refused: %v", err)
-		}
-		if ok.catalog.createCalls == 0 || ok.commands.calls == 0 {
-			t.Fatal("the accepted control wrote nothing, so the refusals above assert nothing")
-		}
-	})
-}
-
-// TestLegacyCreateRefusesACatalogEntryItDidNotCreate reads the post-create
-// identity recheck, which nothing read.
-//
-// Mutant: replacing the `entry.Record.AgentID != req.AgentID ||
-// entry.Record.DesiredIdempotencyKey != string(req.CommandID)` condition with
-// a constant false left the module green. The fake echoed every create back,
-// so the case the guard exists for -- a durable entry already at that session
-// id, belonging to another agent or another create command -- could not be
-// produced at all. That is a fake looser than the dependency: the released
-// CreateCatalogEntry returns the INCUMBENT with created false.
-func TestLegacyCreateRefusesACatalogEntryItDidNotCreate(t *testing.T) {
-	for _, test := range []struct {
-		name      string
-		incumbent sessionstore.CatalogRecord
-	}{
-		{"another agent already holds the session id", sessionstore.CatalogRecord{
-			AgentID: "agent-b", DesiredIdempotencyKey: "generated-2"}},
-		{"another create command already holds the session id", sessionstore.CatalogRecord{
-			AgentID: "agent-a", DesiredIdempotencyKey: "someone-elses-command"}},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			f := newServiceFixture(t)
-			f.catalog.createReturn = &sessionstore.CatalogEntry{Record: test.incumbent, Revision: 1}
-			_, err := f.service.AdmitLegacyCreate(context.Background(), f.principal, LegacyCreateRequest{AgentID: "agent-a"})
-			if !IsCode(err, sessionwire.ErrorCodeCommandRejected) {
-				t.Fatalf("error = %v, want command_rejected", err)
-			}
-			if f.commands.calls != 0 {
-				t.Fatal("a create whose catalog entry is not its own reached the inbox")
-			}
-		})
-	}
 }
 
 // TestAnAbsentSessionIsSessionNotFoundInEitherSpelling reads BOTH arms of
@@ -2375,11 +2321,10 @@ func TestARefusedCommandStopsAtItsGuardAndTouchesNothingFurther(t *testing.T) {
 // WithSessionBinding, RuntimeSessionID is derived from the create's own
 // identity, and ProtocolMode is hardcoded to disposition.
 //
-// What is still true, and is why the walker below is kept rather than deleted:
-// AdmitLegacyCreate builds its CreateCatalogEntryRequest with no Binding at
-// all, so createCatalogEntry takes the mode = ProtocolModeLegacy arm and the
-// REST compatibility create still makes LEGACY sessions. The two tests below
-// hold the authored set exactly, in the two directions it can fail.
+// The walker remains useful after legacy creation was closed: it inventories
+// every binding-bearing dependency shape, including currently unreachable
+// methods, and distinguishes values this module would have to author from
+// values a collaborator can return.
 
 // bindingSites reports every place a sessionstore.SessionBinding is reachable
 // from a root type, and — this is the whole point of the function — which
@@ -2474,10 +2419,9 @@ func TestEverySessionBindingThisModuleCanReachIsAuthoredOrKeyedToAnExistingSessi
 	// Each site is RULED individually, because listing eleven and saying "all
 	// fine" is a sentence wider than its probe.
 	want := []string{
-		// (1) INBOUND, and still never authored: admitLegacyCreate builds this
-		// request with no Binding at all, so createCatalogEntry takes its
-		// mode = ProtocolModeLegacy arm. The legacy create is a REST
-		// compatibility path and deliberately stays legacy.
+		// (1) INBOUND and unreachable: legacy creation is refused before any
+		// dependency call. Keep the site in the structural inventory so making
+		// it reachable again cannot silently introduce a second binding source.
 		"in:Config.Catalog.CreateCatalogEntry(arg1).Binding",
 		// (2) and (3) INBOUND and AUTHORED. These are A3.1's two writes, and
 		// both carry the SAME value: admitPublicCreate builds one identity and
@@ -2648,7 +2592,7 @@ func TestTheFailClosedReasonsNameTheBlockerThatActuallyRemains(t *testing.T) {
 }
 
 // TestTheAdmittedTimestampsAreNormalisedToUTCWhateverZoneTheClockReadsIn
-// reads the `.UTC()` in admit and admitLegacyCreate, which nothing read.
+// reads the `.UTC()` in admit, which nothing read.
 //
 // THIS IS A FIXTURE-CONSTANT HOLE, not an ordinary unread line, and it is
 // recorded as one because the distinction is what makes it invisible. Every
@@ -2693,59 +2637,40 @@ func TestTheAdmittedTimestampsAreNormalisedToUTCWhateverZoneTheClockReadsIn(t *t
 		return f
 	}
 
-	for _, test := range []struct {
-		name string
-		call func(*testing.T, *serviceFixture)
-	}{
-		{"an existing session's command", func(t *testing.T, f *serviceFixture) {
-			if _, created, err := f.service.AdmitInput(context.Background(), f.principal, sessionwire.InputRequest{
-				CommandEnvelope: envelope("command-utc"), SessionID: "session-a", Blocks: []byte(`[{"text":"hi"}]`),
-			}); err != nil || !created {
-				t.Fatalf("admission = (%v, %v)", created, err)
-			}
-		}},
-		{"a legacy create", func(t *testing.T, f *serviceFixture) {
-			f.catalog.getErr = &sessionstore.CatalogError{Code: sessionstore.CatalogErrorNotFound}
-			if _, err := f.service.AdmitLegacyCreate(context.Background(), f.principal, LegacyCreateRequest{
-				AgentID: "agent-a", Blocks: []byte(`[{"text":"hi"}]`),
-			}); err != nil {
-				t.Fatalf("legacy create: %v", err)
-			}
-		}},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			f := newSkewed(t)
-			test.call(t, f)
+	f := newSkewed(t)
+	if _, created, err := f.service.AdmitInput(context.Background(), f.principal, sessionwire.InputRequest{
+		CommandEnvelope: envelope("command-utc"), SessionID: "session-a", Blocks: []byte(`[{"text":"hi"}]`),
+	}); err != nil || !created {
+		t.Fatalf("admission = (%v, %v)", created, err)
+	}
 
-			// The positive control. Without it every assertion below would be
-			// satisfied by a service that never reached the inbox at all: the
-			// zero time.Time is in UTC.
-			if f.commands.calls == 0 {
-				t.Fatal("no command reached the inbox, so the timestamps below are the zero value")
-			}
-			got := f.commands.lastAdmit
-			for _, ts := range []struct {
-				name  string
-				value time.Time
-			}{
-				{"AcceptedAt", got.AcceptedAt},
-				{"ApplyDeadline", got.ApplyDeadline},
-			} {
-				if ts.value.Location() != time.UTC {
-					t.Errorf("%s location = %v, want UTC", ts.name, ts.value.Location())
-				}
-				// And the instant must be untouched: normalising a zone must
-				// not be confused with truncating or shifting the reading.
-				// Without this a mutant that returned time.Now().UTC(), or one
-				// that truncated to the second, would pass the check above.
-				if ts.name == "AcceptedAt" && !ts.value.Equal(skewed) {
-					t.Errorf("AcceptedAt = %v, want the clock's own instant %v", ts.value, skewed)
-				}
-				if ts.name == "ApplyDeadline" && !ts.value.Equal(skewed.Add(time.Minute)) {
-					t.Errorf("ApplyDeadline = %v, want %v", ts.value, skewed.Add(time.Minute))
-				}
-			}
-		})
+	// The positive control. Without it every assertion below would be
+	// satisfied by a service that never reached the inbox at all: the zero
+	// time.Time is in UTC.
+	if f.commands.calls == 0 {
+		t.Fatal("no command reached the inbox, so the timestamps below are the zero value")
+	}
+	got := f.commands.lastAdmit
+	for _, ts := range []struct {
+		name  string
+		value time.Time
+	}{
+		{"AcceptedAt", got.AcceptedAt},
+		{"ApplyDeadline", got.ApplyDeadline},
+	} {
+		if ts.value.Location() != time.UTC {
+			t.Errorf("%s location = %v, want UTC", ts.name, ts.value.Location())
+		}
+		// And the instant must be untouched: normalising a zone must
+		// not be confused with truncating or shifting the reading.
+		// Without this a mutant that returned time.Now().UTC(), or one
+		// that truncated to the second, would pass the check above.
+		if ts.name == "AcceptedAt" && !ts.value.Equal(skewed) {
+			t.Errorf("AcceptedAt = %v, want the clock's own instant %v", ts.value, skewed)
+		}
+		if ts.name == "ApplyDeadline" && !ts.value.Equal(skewed.Add(time.Minute)) {
+			t.Errorf("ApplyDeadline = %v, want %v", ts.value, skewed.Add(time.Minute))
+		}
 	}
 }
 

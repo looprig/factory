@@ -2,15 +2,17 @@ package admission
 
 import (
 	"context"
+	"errors"
 	"reflect"
 	"testing"
 	"time"
 
+	sessionwire "github.com/looprig/core/sessionwire/v1"
 	"github.com/looprig/sessionstore"
 	"github.com/looprig/storage/memstore"
 )
 
-func TestServicePersistsOnlyLegacyCreateThroughTheReleasedStore(t *testing.T) {
+func TestServiceRefusesLegacyCreateWithoutPersistingASession(t *testing.T) {
 	ctx := context.Background()
 	store, err := sessionstore.Open(ctx, memstore.New())
 	if err != nil {
@@ -31,23 +33,20 @@ func TestServicePersistsOnlyLegacyCreateThroughTheReleasedStore(t *testing.T) {
 		t.Fatal(err)
 	}
 	result, err := f.service.AdmitLegacyCreate(ctx, f.principal, LegacyCreateRequest{AgentID: "agent-a", Blocks: []byte(`[{"text":"hello"}]`)})
-	if err != nil {
-		t.Fatal(err)
+	if !reflect.DeepEqual(result, LegacyCreateResult{}) {
+		t.Fatalf("result = %+v, want zero", result)
 	}
-	first := result.Entry
-
-	catalog, err := store.GetCatalogEntry(ctx, sessionstore.GetCatalogEntryRequest{TenantID: "tenant-a", SessionID: result.SessionID})
-	if err != nil {
-		t.Fatal(err)
+	if !errors.Is(err, ErrLegacyCreateUnsupported) || !IsCode(err, sessionwire.ErrorCodeRuntimeUnavailable) {
+		t.Fatalf("error = %v, want runtime_unavailable wrapping ErrLegacyCreateUnsupported", err)
 	}
-	if catalog.Record.AgentID != "agent-a" || catalog.Record.RuntimeCompatibilityID != "runtime-v1" || catalog.Record.DesiredIdempotencyKey != string(first.Record.CommandID) {
-		t.Fatalf("catalog binding = %+v", catalog.Record)
+	if f.ids.next != 0 {
+		t.Fatalf("IDs minted = %d, want 0", f.ids.next)
 	}
-	stored, err := store.GetCommand(ctx, sessionstore.GetCommandRequest{TenantID: "tenant-a", SessionID: result.SessionID, CommandID: first.Record.CommandID})
-	if err != nil {
-		t.Fatal(err)
+	_, err = store.GetCatalogEntry(ctx, sessionstore.GetCatalogEntryRequest{TenantID: "tenant-a", SessionID: sessionwire.SessionID("generated-1")})
+	if err == nil {
+		t.Fatal("legacy create persisted generated-1 despite refusing")
 	}
-	if !reflect.DeepEqual(stored, first) {
-		t.Fatalf("stored command = %+v, want %+v", stored, first)
+	if !catalogNotFound(err) {
+		t.Fatalf("GetCatalogEntry(generated-1) = %v, want session absence", err)
 	}
 }
