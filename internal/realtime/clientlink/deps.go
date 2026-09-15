@@ -54,9 +54,10 @@ type Authorizer interface {
 // interface that dropped the result would need an adapter, and an adapter is a
 // second place for the two edges to answer differently.
 //
-// AdmitLegacyCreate is deliberately ABSENT. It mints identities server-side and
-// keeps the legacy unknown-outcome limitation, which is exactly the property a
-// ClientLink RPC must not have; it remains a REST compatibility route.
+// AdmitLegacyCreate is deliberately ABSENT. Admission refuses every legacy
+// create with runtime_unavailable (ErrLegacyCreateUnsupported) before any
+// durable write, because no runtime this program ships can host a legacy
+// session, and no edge -- REST or ClientLink -- routes to it.
 type Admitter interface {
 	AdmitCreate(ctx context.Context, principal identity.Principal, req sessionwire.CreateRequest) (sessionstore.DispositionInboxEntry, bool, error)
 	AdmitInput(ctx context.Context, principal identity.Principal, req sessionwire.InputRequest) (sessionstore.InboxEntry, bool, error)

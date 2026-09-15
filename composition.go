@@ -25,8 +25,13 @@ import (
 // internal/httpapi's nil-Admissions rule already protects at the router.
 
 // Catalog is the durable session record: the read every decision is made
-// against, the create a legacy admission authors, and the desired state
-// placement authors.
+// against, and the desired state placement authors.
+//
+// CreateCatalogEntry is still required but no Factory path calls it: legacy
+// create is refused before any durable write, and a V1 create is authored
+// through PublicCreates. Narrowing the interface is booked for a minor release,
+// because removing a method from an exported interface breaks callers holding
+// a Catalog.
 //
 // GetCatalogEntry also appears on SessionReader. That is not a second
 // authority: it is one method on one deployer-supplied object reached through

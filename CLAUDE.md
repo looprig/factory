@@ -899,9 +899,9 @@ acceptance.
 **The seam is derived from the service, not listed.** `clientlink.Admitter` is
 audited against `*admission.Service` in both directions by reflection, so an
 admission task adding a sixth V1 command fails here instead of silently leaving
-the ClientLink unable to serve it. `AdmitLegacyCreate` is excluded BY NAME: it
-mints identities server-side and keeps the legacy unknown-outcome limitation,
-which is exactly what a ClientLink command may not have.
+the ClientLink unable to serve it. `AdmitLegacyCreate` is excluded BY NAME: admission
+refuses every legacy create with `runtime_unavailable` before any durable write,
+and no edge routes to it.
 
 **The retry contract is measured against the released store, not a fake.** Two
 admission services and two ClientLink handlers over one `sessionstore.Open` —
