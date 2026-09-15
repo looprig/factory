@@ -175,15 +175,24 @@ func TestTwoServicesRaceOnePublicCreateAndReturnOneAuthoritativeRecord(t *testin
 	req := createRequest("create-race", "session-race", smallBlocks)
 
 	type result struct {
-		entry   sessionstore.DispositionInboxEntry
-		created bool
-		err     error
+		entry          sessionstore.DispositionInboxEntry
+		created        bool
+		err            error
+		wantRuntimeID  sessionstore.RuntimeCommandID
+		wantAcceptedAt time.Time
 	}
 	results := make(chan result, 2)
-	for _, svc := range []*Service{first, second} {
+	for i, svc := range []*Service{first, second} {
+		i, svc := i, svc
 		go func() {
 			entry, created, err := svc.AdmitCreate(context.Background(), principal, req)
-			results <- result{entry: entry, created: created, err: err}
+			wantRuntimeID := sessionstore.RuntimeCommandID("runtime-command-first")
+			wantAcceptedAt := serviceNow
+			if i == 1 {
+				wantRuntimeID = "runtime-command-second"
+				wantAcceptedAt = serviceNow.Add(time.Hour)
+			}
+			results <- result{entry: entry, created: created, err: err, wantRuntimeID: wantRuntimeID, wantAcceptedAt: wantAcceptedAt}
 		}()
 	}
 	a, b := <-results, <-results
@@ -196,12 +205,40 @@ func TestTwoServicesRaceOnePublicCreateAndReturnOneAuthoritativeRecord(t *testin
 	if !reflect.DeepEqual(a.entry, b.entry) {
 		t.Fatalf("replicas returned different records:\n first %+v\nsecond %+v", a.entry, b.entry)
 	}
+	winner := a
+	if b.created {
+		winner = b
+	}
+	// PreparePublicCreate chooses the immutable proposal winner. Either caller
+	// may subsequently win AdmitPublicCreate and receive created=true, so the
+	// reservation winner and inbox writer are intentionally not conflated.
+	// The authoritative tuple must nevertheless be EXACTLY one replica's whole
+	// proposal, and both replicas must return it.
+	proposal := a
+	gotRuntime := winner.entry.Record.Descriptor.RuntimeCommandID
+	if gotRuntime == b.wantRuntimeID {
+		proposal = b
+	} else if gotRuntime != a.wantRuntimeID {
+		t.Fatalf("authoritative runtime mapping %q is neither replica's proposal", gotRuntime)
+	}
+	if !winner.entry.Record.AcceptedAt.Equal(proposal.wantAcceptedAt) {
+		t.Fatalf("authoritative AcceptedAt %v does not match proposal owner %v", winner.entry.Record.AcceptedAt, proposal.wantAcceptedAt)
+	}
+	wantDeadline := proposal.wantAcceptedAt.Add(time.Minute)
+	if !winner.entry.Record.ApplyDeadline.Equal(wantDeadline) {
+		t.Fatalf("authoritative ApplyDeadline %v, want proposal owner's exact deadline %v", winner.entry.Record.ApplyDeadline, wantDeadline)
+	}
+	stored, err := store.GetDispositionCommand(context.Background(), sessionstore.GetDispositionCommandRequest{
+		TenantID: principal.Tenant(), SessionID: req.SessionID, CommandID: req.CommandID,
+	})
+	if err != nil {
+		t.Fatalf("GetDispositionCommand: %v", err)
+	}
+	if !reflect.DeepEqual(stored, winner.entry) {
+		t.Fatalf("stored record differs from both responses:\n stored %+v\nresponse %+v", stored, winner.entry)
+	}
 	if a.entry.AcceptedOrder != 1 {
 		t.Fatalf("AcceptedOrder = %d, want the first order in this session", a.entry.AcceptedOrder)
-	}
-	winnerDeadline := a.entry.Record.AcceptedAt.Add(time.Minute)
-	if !a.entry.Record.ApplyDeadline.Equal(winnerDeadline) {
-		t.Fatalf("ApplyDeadline = %v, want winner AcceptedAt + 1m = %v", a.entry.Record.ApplyDeadline, winnerDeadline)
 	}
 }
 
@@ -241,8 +278,34 @@ func TestTwoServicesRaceDistinctPublicCreatesWithoutSharingOrderOrMappings(t *te
 	if len(bySession) != 2 {
 		t.Fatalf("persisted sessions = %v, want both distinct sessions", bySession)
 	}
+	wantTuples := map[sessionwire.SessionID]struct {
+		runtimeID  sessionstore.RuntimeCommandID
+		acceptedAt time.Time
+	}{
+		"session-a": {runtimeID: "runtime-command-a", acceptedAt: serviceNow},
+		"session-b": {runtimeID: "runtime-command-b", acceptedAt: serviceNow.Add(time.Hour)},
+	}
 	for i, req := range requests {
 		original := bySession[req.SessionID]
+		want := wantTuples[req.SessionID]
+		if got := original.Record.Descriptor.RuntimeCommandID; got != want.runtimeID {
+			t.Fatalf("%s runtime mapping = %q, want %q", req.SessionID, got, want.runtimeID)
+		}
+		if !original.Record.AcceptedAt.Equal(want.acceptedAt) {
+			t.Fatalf("%s AcceptedAt = %v, want %v", req.SessionID, original.Record.AcceptedAt, want.acceptedAt)
+		}
+		if wantDeadline := want.acceptedAt.Add(time.Minute); !original.Record.ApplyDeadline.Equal(wantDeadline) {
+			t.Fatalf("%s ApplyDeadline = %v, want %v", req.SessionID, original.Record.ApplyDeadline, wantDeadline)
+		}
+		stored, err := store.GetDispositionCommand(context.Background(), sessionstore.GetDispositionCommandRequest{
+			TenantID: principal.Tenant(), SessionID: req.SessionID, CommandID: req.CommandID,
+		})
+		if err != nil {
+			t.Fatalf("GetDispositionCommand(%s): %v", req.SessionID, err)
+		}
+		if !reflect.DeepEqual(stored, original) {
+			t.Fatalf("stored %s differs from its response:\n stored %+v\nresponse %+v", req.SessionID, stored, original)
+		}
 		retryService := second
 		if i == 1 {
 			retryService = first
