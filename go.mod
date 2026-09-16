@@ -1,6 +1,6 @@
 module github.com/looprig/factory
 
-go 1.26.6
+go 1.26.8
 
 require (
 	github.com/centrifugal/centrifuge v0.38.0
