@@ -991,11 +991,15 @@ it to SessionStore, which knows none of these keys. A consumer that read one
 would make it a live difference. The same applies one layer in, to
 `Engine.Admit`'s own parent.
 
-**One limit this task did not close.** The V1 `session.create` RPC reaches
-admission and is refused `runtime_unavailable`, because `AdmitCreate` still
-returns `ErrCreateIdentityProtocolUnavailable`; the create path is A3.1's
-remaining work, and the durable cases here use the legacy create to establish a
-session.
+**The V1 `session.create` RPC is served by composition, not by build.**
+`AdmitCreate` admits into the durable public-create plane when the composition
+supplies both `WithSessionBinding` and `WithPublicCreates`, and refuses
+`runtime_unavailable` when it does not; there is no
+`ErrCreateIdentityProtocolUnavailable` any more, and the legacy create is refused
+before any durable write and routed to by no edge. The durable cases in
+`durable_test.go` seed a pre-existing legacy-bound catalog row directly, because
+a released store may still hold such sessions and commands against them must
+still be admitted.
 
 **`A3.3-retryable` is settled, and the answer is 422.** `runtime_unavailable`
 does **not** map to 503. The set was **enumerated at the pin**: six `refusal()`
@@ -1078,7 +1082,7 @@ differently on purpose.
 **The three hand-written vocabulary lists have one tripwire.**
 `TestTheStoreErrorVocabularyHasNotGrownSinceTheAbsenceSetWasDerived` parses the
 **pinned** sessionstore's sources and counts its two error vocabularies (14 and
-10 at v0.8.0). The lists themselves are fine; what was wrong was claiming they
+10 at v0.9.0, unchanged from v0.8.0). The lists themselves are fine; what was wrong was claiming they
 were self-maintaining. A value added to a vocabulary joins those tests **on the
 day somebody lists it**, and this is what makes that day arrive loudly.
 
@@ -1322,7 +1326,7 @@ with `ErrUnknownBinding`, and `Unbind` drops an orphaned route rather than
 keeping one that would refuse every later bind as a conflict.
 
 The pool carries the **control** plane only. Session event data and the live
-tail are still absent — Core v0.7.0 defines no session-event push, so there is
+tail are still absent — Core v0.8.0 defines no session-event push, so there is
 no framing here to carry one — and the per-binding queues and backpressure
 repair now sit *above* this package, in `internal/realtime/delivery` and
 `routing.Relay`. Nothing here may be read as having solved any of the three. Choosing *which* Host a session
@@ -1795,7 +1799,7 @@ confused with an unrelated decode failure (`ErrMalformed` is the control).
 Both bounds are driven at their exact values in both directions.
 
 **`CommittedAppendSeq` is a declared gap, and the gap is narrower than it first
-reads.** Core v0.7.0 **does** define the session-channel record bodies —
+reads.** Core v0.8.0 **does** define the session-channel record bodies —
 `enduring_publication`, `ephemeral_publication`, `journal_tip`, `session.reset` —
 and `Relay.classify` dispatches on exactly that discriminator. What is missing is
 two things: any **HostLink transport framing** to carry them, which is the gap

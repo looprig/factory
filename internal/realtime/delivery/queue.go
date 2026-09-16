@@ -360,7 +360,7 @@ func (e Enduring) Record() Record {
 //     package's, and committedAppend is an INPUT rather than something derived
 //     from the record: a record cannot vouch for itself. See the note in
 //     internal/routing on where a Host declares it, and on the fact that Core
-//     v0.7.0's HostLink vocabulary has no member carrying it yet.
+//     v0.8.0's HostLink vocabulary has no member carrying it yet.
 func ParseEnduring(encoded []byte, committedAppend uint64) (Enduring, error) {
 	recordType, err := sessionwire.SessionRecordTypeOf(encoded)
 	if err != nil {

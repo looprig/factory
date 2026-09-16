@@ -2,8 +2,10 @@ package admission
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"reflect"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -142,6 +144,11 @@ func newCreateIntegrationService(t *testing.T, store *sessionstore.Store, create
 //     after the call, so a key or object written anywhere in those two
 //     primitives is seen.
 //
+// The positive control at the end moves all three: a create for the listing
+// and the KV arm, then a stored object for the Blobs arm, each asserted to
+// have grown the arm it targets. An arm no control moves is an arm whose
+// "unchanged" verdict nothing has distinguished from a reader that sees nothing.
+//
 // Neither storage.Ledger nor storage.OrderedIndex can enumerate its names or
 // namespaces, so a write confined to a ledger, or to an ordered namespace other
 // than the catalog, is outside what this scan can see. Admission's only durable
@@ -189,15 +196,41 @@ func TestServiceRefusesLegacyCreateWithoutPersistingASession(t *testing.T) {
 		t.Fatalf("backend keys changed across the refusal:\nbefore %v\nafter  %v", before, after)
 	}
 
-	// The positive control, on the same store and tenant: a V1 create DOES
-	// appear in the scan. Without it an empty listing could be a scan that
-	// sees nothing at all.
+	// The positive control, on the same store and tenant, and it has to move
+	// EVERY arm the scan reads or the arm it leaves still is unread: a V1
+	// create appears in the listing and in the KV arm, and a stored object --
+	// which nothing on the refused path could write either -- appears in the
+	// Blobs arm. Without the third write, "blobs unchanged across the refusal"
+	// would also be the output of a Blobs.List that sees nothing at all.
 	control, _ := newCreateIntegrationService(t, store, store, serviceNow, "runtime-command-control")
 	if _, created, err := control.AdmitCreate(ctx, f.principal, createRequest("create-control", "session-control", smallBlocks)); err != nil || !created {
 		t.Fatalf("control AdmitCreate = (%v, %v)", created, err)
 	}
 	if n, _ := tenantSessions(t, store, f.principal.Tenant()); n != 1 {
 		t.Fatalf("ListSessions after a real create = %d sessions, want 1; the scan cannot see a write", n)
+	}
+	afterCreate := backendKeys(t, backend)
+	if len(afterCreate["kv"]) <= len(before["kv"]) {
+		t.Fatalf("KV.Keys after a real create = %d keys, was %d; the KV arm cannot see a write", len(afterCreate["kv"]), len(before["kv"]))
+	}
+	if len(afterCreate["blobs"]) != len(before["blobs"]) {
+		t.Fatalf("Blobs.List moved on a create alone (%d -> %d), so the object write below would not be what moves it", len(before["blobs"]), len(afterCreate["blobs"]))
+	}
+	// The object write goes through the DISPOSITION family's own entry point,
+	// because the control session is a V1 create and the store refuses the
+	// legacy PutObject on a disposition-bound catalog (catalog conflict,
+	// binding.protocol_mode). It is still a store write landing in the
+	// backend's Blobs, which is what the arm reads.
+	body := "control-object-body"
+	sum := sha256.Sum256([]byte(body))
+	if _, err := store.PutCommandPayload(ctx, sessionstore.PutCommandPayloadRequest{
+		TenantID: f.principal.Tenant(), SessionID: "session-control",
+		SizeBytes: uint64(len(body)), SHA256: sum, Body: strings.NewReader(body), MediaType: "text/plain",
+	}); err != nil {
+		t.Fatalf("control PutCommandPayload: %v", err)
+	}
+	if afterObject := backendKeys(t, backend); len(afterObject["blobs"]) <= len(afterCreate["blobs"]) {
+		t.Fatalf("Blobs.List after a real object write = %d names, was %d; the Blobs arm cannot see a write", len(afterObject["blobs"]), len(afterCreate["blobs"]))
 	}
 }
 
@@ -443,7 +476,8 @@ func TestPublicCreateRetriesResolveEveryDurabilityFailureWindowThroughIdentity(t
 // TestSessionstoreClaimKeepsTheApplyDeadlineOfAFactoryAcceptedCreate is a PIN
 // ON SESSIONSTORE BEHAVIOUR FACTORY RELIES ON, not a test of Factory code.
 // Runbook A3.2 step 4 says a claim never extends the apply deadline; Factory
-// has no claim path, so the property lives entirely in
+// has no command-claim path (a Host claims a command, Factory only admits and
+// settles), so the property lives entirely in
 // sessionstore.ClaimDispositionCommand, and no mutant of Factory can reach it
 // (doubling the proposal deadline moves accepted and claimed together). It
 // stays here because it drives the released store over a record Factory

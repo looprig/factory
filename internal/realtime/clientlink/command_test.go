@@ -821,9 +821,11 @@ func TestTheAdmissionServiceIsExactlyTheSeamThisEdgeCalls(t *testing.T) {
 	// admission's own LegacyCreateRequest and returns a LegacyCreateResult, so
 	// it never matches. It is ALSO named below, because the reason it must stay
 	// off this seam is a decision rather than an accident of its signature: it
-	// mints identities server-side and keeps the legacy unknown-outcome
-	// limitation, which is the property step 3 requires a ClientLink command
-	// not to have. If a later change gave it the V1 shape, the named check is
+	// is the refused legacy entry point, answering runtime_unavailable before
+	// it mints an identity or writes anything durable, and no edge routes to
+	// it. A ClientLink command must carry a caller-supplied, retry-stable
+	// CommandID, which is the property step 3 requires and the legacy shape
+	// never had. If a later change gave it the V1 shape, the named check is
 	// what would still refuse it.
 	const legacy = "AdmitLegacyCreate"
 	ctxType := reflect.TypeOf((*context.Context)(nil)).Elem()

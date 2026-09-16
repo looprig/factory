@@ -2148,7 +2148,7 @@ type foreignModuleSeam interface {
 // TestAKeyspaceFaultIsNotAMissingSession is the other direction of the absence
 // mapping, and it is what keeps the new branch narrow.
 //
-// sessionstore's KeyspaceError carries ten codes AT v0.8.0, and exactly one of
+// sessionstore's KeyspaceError carries ten codes AT v0.9.0, and exactly one of
 // them -- binding_not_found -- means "there is no such session". The count and
 // the list below are hand-written and do not maintain themselves; what fails
 // when the vocabulary grows is internal/command's

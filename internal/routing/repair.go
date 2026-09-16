@@ -120,7 +120,7 @@ func (l RepairLimits) Validate() error {
 // watermark bound is that somebody other than the record says how far the
 // journal has been committed.
 //
-// A DECLARED GAP. Core v0.7.0's HostLink vocabulary has no member carrying it,
+// A DECLARED GAP. Core v0.8.0's HostLink vocabulary has no member carrying it,
 // and no session-event push exists there at all -- hostlink's own doc records
 // that Core defines the record bodies and no transport framing for them. So the
 // Host half that will supply this does not exist in this repository, and the

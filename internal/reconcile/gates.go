@@ -244,7 +244,7 @@ type GateSweepResult struct {
 // revision the page reported, so two replicas racing one intent produce one
 // retirement and one GateDispositionRaceLost rather than a wrong answer. The
 // claim would suppress duplicate cost, not protect a decision. Separately,
-// sessionstore v0.8.0's reconciliationClaimDue returns the zero storage.Due, so
+// sessionstore v0.9.0's reconciliationClaimDue returns the zero storage.Due, so
 // a claim taken here would sit in no deadline view at all.
 type GateSweeper struct {
 	cfg GateSweeperConfig
