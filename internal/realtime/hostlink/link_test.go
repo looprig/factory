@@ -498,6 +498,14 @@ func TestTwoTenantsMayHoldTheSameSessionIdOnDifferentHosts(t *testing.T) {
 	if got := dialer.link(hostTwo).commands(); len(got) != 1 || got[0].CommandID != "cmd-b" {
 		t.Errorf("%s received %v, want one delivery of cmd-b", hostTwo, got)
 	}
+	// And the link is told WHICH tenant's session the delivery is for, in that
+	// order: Core's framing makes the RPC method the session channel, and the
+	// pool is what hands the link the pair the channel is derived from. A pool
+	// that passed the pair swapped, or its own route key's tenant for another
+	// tenant's, would still record one delivery above.
+	if got := dialer.link(hostTwo).routes(); len(got) != 1 || got[0] != (deliveredRoute{tenant: otherTenant, session: shared}) {
+		t.Errorf("%s was handed routes %+v, want exactly {%s %s}", hostTwo, got, otherTenant, shared)
+	}
 	if got := dialer.link(hostOne).commands(); len(got) != 0 {
 		t.Errorf("%s received %v, want nothing", hostOne, got)
 	}
@@ -1108,11 +1116,13 @@ type fakeLink struct {
 	bindRecords []sessionwire.HostLinkBindRequest
 	unbindRecs  []sessionwire.HostLinkUnbindRequest
 	commandRecs []sessionwire.HostLinkCommandDelivery
-	closeCount  int
-	bindErr     error
-	unbindErr   error
-	commandErr  error
-	closeErr    error
+	// commandRoutes is index-aligned with commandRecs.
+	commandRoutes []deliveredRoute
+	closeCount    int
+	bindErr       error
+	unbindErr     error
+	commandErr    error
+	closeErr      error
 }
 
 func (l *fakeLink) Host() sessionwire.HostID { return l.host }
@@ -1137,14 +1147,29 @@ func (l *fakeLink) Unbind(_ context.Context, req sessionwire.HostLinkUnbindReque
 	return nil
 }
 
-func (l *fakeLink) DeliverCommand(_ context.Context, req sessionwire.HostLinkCommandDelivery) error {
+func (l *fakeLink) DeliverCommand(_ context.Context, tenant sessionwire.TenantID, session sessionwire.SessionID, req sessionwire.HostLinkCommandDelivery) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if l.commandErr != nil {
 		return l.commandErr
 	}
 	l.commandRecs = append(l.commandRecs, req)
+	l.commandRoutes = append(l.commandRoutes, deliveredRoute{tenant: tenant, session: session})
 	return nil
+}
+
+// deliveredRoute is the (tenant, session) a delivery named beside its record.
+// It is recorded so a case can see WHICH session the pool addressed, which the
+// record alone cannot say.
+type deliveredRoute struct {
+	tenant  sessionwire.TenantID
+	session sessionwire.SessionID
+}
+
+func (l *fakeLink) routes() []deliveredRoute {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return append([]deliveredRoute(nil), l.commandRoutes...)
 }
 
 func (l *fakeLink) Close(context.Context) error {

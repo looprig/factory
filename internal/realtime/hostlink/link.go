@@ -399,7 +399,7 @@ func (p *Pool) DeliverCommand(ctx context.Context, tenantID sessionwire.TenantID
 	link := pooled.link
 	p.mu.Unlock()
 
-	if err := link.DeliverCommand(ctx, delivery); err != nil {
+	if err := link.DeliverCommand(ctx, tenantID, sessionID, delivery); err != nil {
 		var refusal *HostRefusal
 		if errors.As(err, &refusal) {
 			return err

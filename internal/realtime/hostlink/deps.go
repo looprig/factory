@@ -15,10 +15,11 @@
 // pushes. It does NOT carry session event data. The per-binding queues and the
 // backpressure repair now live ABOVE this package, in
 // internal/realtime/delivery and internal/routing's Relay; what is still absent
-// here is the LIVE TAIL itself, because Core v0.7.0 defines the session-channel
-// record bodies but no HostLink transport framing to carry them -- the same gap
-// centrifuge.go records about the method names. Nothing here may be read as
-// having solved any of the three. It also does not decide WHICH Host a session belongs to; that is
+// here is the LIVE TAIL itself. Core v0.8.0 names the session channel a Host
+// publishes on (sessionwire.HostLinkChannel), so the framing gap this package
+// used to record is closed for the control plane, but no subscription to that
+// channel exists here yet. Nothing here may be read as having solved any of the
+// three. It also does not decide WHICH Host a session belongs to; that is
 // A7.2's demand-driven binding, which calls Bind and Unbind.
 package hostlink
 
@@ -72,8 +73,11 @@ type Link interface {
 	// Unbind releases one route.
 	Unbind(ctx context.Context, req sessionwire.HostLinkUnbindRequest) error
 	// DeliverCommand hands an already committed inbox record's public command
-	// id to the Host. See Pool.DeliverCommand for what a failure means.
-	DeliverCommand(ctx context.Context, req sessionwire.HostLinkCommandDelivery) error
+	// id to the Host. The tenant and session travel beside the record because
+	// Core's framing makes the RPC METHOD the session's channel,
+	// sessionwire.HostLinkChannel(tenant, session); the body names no session.
+	// See Pool.DeliverCommand for what a failure means.
+	DeliverCommand(ctx context.Context, tenant sessionwire.TenantID, session sessionwire.SessionID, req sessionwire.HostLinkCommandDelivery) error
 	// Close releases the connection.
 	Close(ctx context.Context) error
 }

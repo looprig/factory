@@ -57,50 +57,35 @@ func (e *HostDisconnect) Unwrap() error { return ErrDialFailed }
 // transport's own documentation asks for.
 const ClientName = "factory-hostlink"
 
-// The HostLink control vocabulary.
+// The HostLink control vocabulary is CORE'S, since core v0.8.0.
 //
-// These names, and the push envelope below, are FACTORY'S HALF of a protocol
-// whose Host half does not exist in this repository. Core v0.7.0 defines the
-// record bodies -- HostLinkBindRequest, HostLinkCapacityReport and the rest --
-// and their strict JSON, but it defines no transport framing for them: no
-// method names, no push discriminator, no channel vocabulary. That gap is real
-// and is recorded here rather than papered over. The Host writer must implement
-// the mirror of exactly this, or one of the two must move.
+// sessionwire/v1's hostlink_framing.go names the reserved RPC methods
+// (HostLinkMethodBind, HostLinkMethodUnbind, HostLinkMethodAttach and the two
+// drain methods), the channel prefix, and HostLinkChannel(tenant, session).
+// This package declares no method constant of its own any more, and the
+// reason is what the previous constants recorded as a gap: Factory sent
+// "hostlink.command" while Host reserved only bind/unbind/drain and resolved
+// EVERY other method as a channel name, so every command delivery Factory made
+// would have been refused. There is no command method. COMMAND DELIVERY'S RPC
+// METHOD IS THE SESSION'S CHANNEL, HostLinkChannel(tenant, session), and the
+// body is the HostLinkCommandDelivery -- which is why Link.DeliverCommand takes
+// the tenant and session beside the record.
 //
-// Where these strings should eventually live is UNRESOLVED, and internal/ is
-// not it: Host cannot import a Factory-internal package, so one half of a
-// two-repo contract currently sits somewhere the other half cannot see. Core's
-// sessionwire/v1 is deliberately NOT the answer either. A method name and a
-// push discriminator are transport-SHAPED -- they exist because the transport
-// is centrifuge, and they would read differently under gRPC or raw WebSocket
-// frames -- while sessionwire/v1 is today transport-neutral: it says what a
-// record is and nothing about how it travels. Putting hostlink.bind into a
-// tier-0 module would leak the transport choice downward and make a future
-// transport change a tier-0 breaking release. What this needs is a shared,
-// explicitly transport-scoped home; booking one is not this package's to
-// decide, and nothing here should be read as that decision having been taken.
+// The strings are still pinned as absolute literals by
+// TestTheWireVocabularyIsPinnedToItsLiterals, now against Core's constants and
+// Core's channel helper rather than against locals, and for the same reason:
+// a fixture built from the constant under test pins nothing.
 //
-// Because the strings are the artifact Host mirrors, they are pinned as
-// absolute literals by TestTheWireVocabularyIsPinnedToItsLiterals rather than
-// through the constants themselves. A fixture built from the constant under
-// test pins nothing: a rename would move both sides together and the suite
-// would stay green while Factory stopped speaking the protocol Host implements.
-const (
-	// MethodBind establishes one Factory-local route to a Host-owned session.
-	MethodBind = "hostlink.bind"
-	// MethodUnbind releases one.
-	MethodUnbind = "hostlink.unbind"
-	// MethodCommand hands over one committed inbox record's public command id.
-	MethodCommand = "hostlink.command"
-)
-
 // The asynchronous messages a Host pushes.
 //
-// They are async messages rather than channel publications on purpose. A
-// channel would need a namespace both ends agree on and would put control-plane
-// observations behind the subscription machinery; there is exactly one
-// connection per Host and every observation on it is for this replica, so a
-// discriminated message on that connection is the whole requirement.
+// Core's framing covers RPC methods and the session channel; it names no push
+// discriminator, so the {type, data} envelope below is still Factory's half of
+// the protocol and the stand-in node in the tests implements exactly it. They
+// are async messages rather than channel publications on purpose. A channel
+// would put control-plane observations behind the subscription machinery;
+// there is exactly one connection per Host and every observation on it is for
+// this replica, so a discriminated message on that connection is the whole
+// requirement.
 //
 // That reasoning is stronger for a REGISTRY observation than for a CAPACITY
 // report, and the difference is recorded rather than answered. A registry
@@ -110,11 +95,10 @@ const (
 // message out to every subscribed replica instead of the Host calling
 // Client.Send once per connected replica, and two replicas on one Host is
 // already a measured case rather than a hypothetical one. A Host writer has a
-// real argument here. It is not taken now because there is no agreed channel
-// namespace to take it with -- that is the same gap as the method names -- and
-// because the Observer seam absorbs the change: moving capacity to a
-// publication changes how a link is wired to the transport and nothing above
-// it.
+// real argument here. It is not taken now because Core names no channel for it
+// -- HostLinkChannel is per session -- and because the Observer seam absorbs
+// the change: moving capacity to a publication changes how a link is wired to
+// the transport and nothing above it.
 const (
 	// PushTypeCapacity carries a HostLinkCapacityReport.
 	PushTypeCapacity = "host.capacity"
@@ -300,15 +284,22 @@ type centrifugeLink struct {
 func (l *centrifugeLink) Host() sessionwire.HostID { return l.host }
 
 func (l *centrifugeLink) Bind(ctx context.Context, req sessionwire.HostLinkBindRequest) error {
-	return l.call(ctx, MethodBind, req)
+	return l.call(ctx, sessionwire.HostLinkMethodBind, req)
 }
 
 func (l *centrifugeLink) Unbind(ctx context.Context, req sessionwire.HostLinkUnbindRequest) error {
-	return l.call(ctx, MethodUnbind, req)
+	return l.call(ctx, sessionwire.HostLinkMethodUnbind, req)
 }
 
-func (l *centrifugeLink) DeliverCommand(ctx context.Context, req sessionwire.HostLinkCommandDelivery) error {
-	return l.call(ctx, MethodCommand, req)
+// DeliverCommand sends the record with the SESSION'S CHANNEL as the RPC method.
+//
+// That is Core's framing rule, not a convenience: a Host resolves any method
+// that is not one of its reserved names as a channel against the routes the
+// link holds, so the method is what names the binding the delivery is for. The
+// body carries only the command id. Neither identifier is validated here --
+// Core's helper does not, and the pool validated the route when it was bound.
+func (l *centrifugeLink) DeliverCommand(ctx context.Context, tenant sessionwire.TenantID, session sessionwire.SessionID, req sessionwire.HostLinkCommandDelivery) error {
+	return l.call(ctx, sessionwire.HostLinkChannel(tenant, session), req)
 }
 
 // Close releases the connection.

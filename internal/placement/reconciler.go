@@ -230,9 +230,17 @@ type Result struct {
 //     change the desired placement the decision branches on.
 //
 // What this does NOT do is attach the session to the pooled Host it selects.
-// OutcomeAttachPooled names a candidate for the caller; see the package's
-// README section for why the pinned Core wire version has no request that could
-// carry that attachment.
+// OutcomeAttachPooled names a candidate for the caller. The pinned Core
+// (v0.8.0) now carries the request that asks a Host to take an unowned session
+// -- sessionwire.HostLinkAttachRequest, sent as HostLinkMethodAttach, fenced by
+// the candidate's host_id and host_generation, answered with the registry
+// observation whose lease epoch a bind then names -- so the reason this method
+// stops at naming is no longer the wire. It is that a caller sending the attach
+// must be able to tell a Host that cannot answer it (a v0.1.0 Host resolves
+// the method as a channel and refuses runtime_unavailable) from one that
+// refused it, and no released record carries that capability. The caller that
+// sends it therefore lives above this package and is not built yet;
+// TestThePinnedWireCarriesAnAttachment holds the wire half of the premise.
 func (r *Reconciler) Reconcile(ctx context.Context, req Request) (Result, error) {
 	entry, err := r.cfg.Catalog.GetCatalogEntry(ctx, sessionstore.GetCatalogEntryRequest{
 		TenantID: req.TenantID, SessionID: req.SessionID,

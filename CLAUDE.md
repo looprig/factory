@@ -1241,37 +1241,40 @@ Host restarted at a version this build does not speak would otherwise be
 reconnected to indefinitely while every control record failed to decode; instead
 the link is marked terminal and stops answering.
 
-**A declared gap, not a seam.** Core v0.7.0 defines the HostLink record *bodies*
-and their strict JSON, and defines **no transport framing** for them: no method
-names, no push discriminator, no channel vocabulary. `MethodBind`,
-`MethodUnbind`, `MethodCommand` and the `{type, data}` push envelope are
-Factory's half of a protocol whose Host half does not exist in this repository.
-The Host writer must implement this mirror, or one of the two must move. Do not
-read the tests here as agreement with Host; the node they run against is a
-stand-in that implements exactly this proposal.
+**The framing is Core's since v0.8.0, and B6 is what it closed.** Core v0.7.0
+defined the HostLink record *bodies* and no transport framing, so this package
+declared `MethodBind`, `MethodUnbind` and `MethodCommand` as its own half of a
+protocol whose Host half it could not see — and the two halves disagreed. Host
+reserved only `hostlink.bind`, `hostlink.unbind` and the two drain methods and
+resolved **every other method as a channel name**, so Factory's
+`hostlink.command` would have been refused `runtime_unavailable` on every
+delivery. `sessionwire/v1/hostlink_framing.go` now names the reserved methods
+(`HostLinkMethodBind`, `Unbind`, `Attach`, `Drain`, `DrainStatus`), the
+`hostlink.v1.` prefix and `HostLinkChannel(tenant, session)`, byte-identical to
+Host's derivation, and this package declares no method constant of its own.
+**Command delivery's RPC method IS the session's channel**, which is why
+`Link.DeliverCommand` takes the tenant and session beside the record: the body
+names no session. The `{type, data}` push envelope is still Factory's half —
+Core names no push discriminator — and the stand-in node in the tests
+implements exactly it.
 
-**Where the framing should live is unresolved, and two homes are ruled out.**
-`factory/internal/` is not it — Host cannot import a Factory-internal package,
-so one half of a two-repo contract sits where the other half cannot see it. And
-Core's `sessionwire/v1` is not it either: a method name and a push discriminator
-are transport-*shaped*, they exist because the transport is centrifuge, and
-`sessionwire/v1` is transport-neutral today. Putting `hostlink.bind` into a
-tier-0 module would make a future transport change a tier-0 breaking release.
-The answer is a shared, explicitly transport-scoped home; root books it, and
-nothing in this repository should be read as that decision having been taken.
+The strings are still pinned as **absolute literals**
+(`TestTheWireVocabularyIsPinnedToItsLiterals`), now against Core's constants and
+against the spelled-out channel `hostlink.v1.dGVuYW50LWE.cy0x` for
+`("tenant-a", "s-1")`, because a test that compares a constant to itself pins
+nothing. `TestACommandDeliveryIsSentOnTheSessionsChannelAsItsMethod` measures
+the derivation over a real socket: two deliveries differing only in tenant reach
+the Host as two methods.
 
-Because those strings are the artifact Host mirrors, they are pinned as
-**absolute literals** — a test that compared `MethodBind` to itself pinned
-nothing, since a rename moves both sides together.
-
-**One decision in the proposal is contestable and is recorded as such.** Pushing
-a capacity report as an async message rather than publishing it to a channel is
-right for a *registry observation*, which is per-session and per-route, and
-weaker for a *capacity report*, which every Factory replica wants: a channel
-would let the broker fan one publication out instead of the Host calling
-`Client.Send` per connected replica, and two replicas on one Host is a measured
-case. It is not taken now because there is no agreed channel namespace — the
-same gap as the method names — and the `Observer` seam absorbs a later change.
+**One decision in the push envelope is contestable and is recorded as such.**
+Pushing a capacity report as an async message rather than publishing it to a
+channel is right for a *registry observation*, which is per-session and
+per-route, and weaker for a *capacity report*, which every Factory replica
+wants: a channel would let the broker fan one publication out instead of the
+Host calling `Client.Send` per connected replica, and two replicas on one Host
+is a measured case. It is not taken now because `HostLinkChannel` is per
+session and Core names no Host-level channel, and the `Observer` seam absorbs a
+later change.
 
 **The route table and a link's binding set are two maps, and only one of them
 was observable.** `Bindings()` counts a link's binding set; `RouteFor()` reports
@@ -1374,38 +1377,38 @@ here implements it. Reconciling the public option surface with H5 (most likely
 by deleting the option, since the adapter is internal) is A9.1/D1.1 composition
 work and is deliberately not done here.
 
-### Two gaps, declared rather than papered over
+### One gap closed by Core, one still declared
 
-**The pinned wire cannot carry an attachment.** A4.2 step 2 has the selected
-candidate asked to acquire or attach. At the pinned `core v0.7.0` there is no
-request that could. Three of its records concern one session — bind, unbind and
-drain — and only a **bind** could establish a route; it refuses a zero
-`LeaseEpoch`, so a bind names an ownership tuple that a session with no owner,
-which is the only kind that reaches placement, does not have. Unbind refuses a
-zero epoch too, and drain asks a Host to *give up* a session it already holds.
-Core's own bind decoder fails closed so that "unknown members cannot become a
-future attach/create workflow", which is the same gap seen from the other side.
-`OutcomeAttachPooled` therefore names a Host and stops; the caller performs no
-attachment because none exists to perform. The same premise records that **Core
-names no `lease_held` refusal**: step 2's `LeaseHeld` is spelled
-`HostLinkErrorEpochMismatch`, whose `CurrentLeaseEpoch` is the whole answer.
+**The pinned wire carries an attachment since `core v0.8.0`, and the caller
+that sends it is not built.** A4.2 step 2 has the selected candidate asked to
+acquire or attach. At `core v0.7.0` no request could carry that — bind and
+unbind refuse a zero `LeaseEpoch`, drain asks a Host to *give up* a session —
+and `TestThePinnedWireCannotCarryAnAttachment` held that premise by failing on
+any growth of the `HostLink*` vocabulary. Core v0.8.0 grew it by exactly the
+record that closes the gap, `HostLinkAttachRequest` (sent as
+`HostLinkMethodAttach`, carrying **no lease epoch** and a **required host fence**
+`host_id`/`host_generation`, answered with a `HostLinkRegistryObservation`
+whose `lease_epoch` a bind then names), so that test failed on the bump by
+design and `TestThePinnedWireCarriesAnAttachment` replaces it in the positive
+direction: attach validates without an epoch and refuses without the fence,
+bind still refuses a zero epoch, `epoch_mismatch` still carries the **other
+holder's** epoch and Core still names no `lease_held`, and the vocabulary list
+is the twelve names v0.8.0 declares. The scan is unchanged — parsed from the
+pinned source, refused if `go.mod` has moved off `pinnedCoreVersion`, with
+`TestTheHostLinkVocabularyScanSeesANewType` as its positive control — so the
+next growth asks a human again.
 
-**The marker is executable, and its third assertion is derived rather than
-named.** `TestThePinnedWireCannotCarryAnAttachment` fails on each of the three
-ways Core could close this: bind relaxing the zero-epoch rule, a `lease_held`
-code appearing, and — the likeliest, and the one the first version was blind to
-— a **new record type** declared beside an unchanged bind. A test cannot name a
-type that does not exist yet and no reflect call can enumerate a package, so the
-HostLink vocabulary is parsed out of the pinned `sessionwire/v1` source and
-compared against an absolute list of the ten names it holds today. The version
-is read from `go.mod` and required to be the pin before anything is parsed, so
-the premise cannot be checked against a different copy of core than the build
-resolves. The whole `HostLink` prefix is watched rather than the `*Request`
-suffix, because naming is exactly what a future Core is free to choose; the
-accepted cost is that any growth of that vocabulary fails the test and asks a
-human to recheck the premise. `TestTheHostLinkVocabularyScanSeesANewType` is the
-scan's own positive control, because against a clean pinned core the assertion
-reports the same list whether the scan works or is stuck.
+`OutcomeAttachPooled` still **names** a Host and stops, and the reason is no
+longer the wire. A caller sending `hostlink.attach` to a **v0.1.0 Host** has the
+method resolved as a channel and is answered `runtime_unavailable` from the
+not-bound branch, indistinguishable from a Host that genuinely refused; and
+**no released Core or SessionStore record carries a Host capability or version**
+the caller could gate on — the capacity report, registry observation, host
+registration and target advertisement name a runtime build, a placement and a
+generation, none of them a Host build, and the wire version is `1` on both
+sides of the bump. Until that signal exists the attach caller would be a retry
+loop against every pre-attach Host in a mixed fleet, so it lives above this
+package and is owed, not shipped.
 
 **Tenant-exclusive pooled capacity is refused, not admitted.** Section 12 makes
 Factory placement the enforcer of tenant exclusivity for a pooled Host without
@@ -1419,7 +1422,7 @@ pooled placement at all until the directory carries a tenant dimension, which is
 H8's per-tenant Department and a specification section 7 change that is not this
 repository's to book.
 
-Not built here: the attachment of A4.2 step 2,
+Not built here: the caller that sends the A4.2 step 2 attachment,
 drain-before-delete of D2.2, and the authorship of a dedicated workload's
 payload — `Desired` is an INPUT, because what a launch template should contain
 is a composition question A9.1 owns.

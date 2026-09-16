@@ -796,73 +796,110 @@ func TestTwoIntentsNeverShareADesiredKey(t *testing.T) {
 	}
 }
 
-// TestThePinnedWireCannotCarryAnAttachment is why OutcomeAttachPooled stops at
-// NAMING a Host instead of asking it to take the session.
+// TestThePinnedWireCarriesAnAttachment is the POSITIVE form of the gap-marker
+// that stood here at core v0.7.0, and it fails in the opposite direction.
 //
-// A4.2 step 2 says the selected candidate is asked to acquire or attach. At the
-// pinned core v0.7.0 there is no request that could carry that. Three requests
-// concern one session -- bind, unbind and drain -- and only a bind could
-// ESTABLISH a route; it refuses a zero lease epoch, so a bind names an
-// ownership tuple that a session with no owner, which is the only kind that
-// reaches placement, does not have. Unbind refuses a zero epoch too, and drain
-// asks a Host to give up a session it already holds. Core's own bind decoder
-// says the same from the other side, failing closed so that "unknown members
-// cannot become a future attach/create workflow".
+// A4.2 step 2 says the selected candidate is asked to acquire or attach. At
+// v0.7.0 no request could carry that: bind refused a zero lease epoch, unbind
+// refused one too, drain asked a Host to give up a session it held, and
+// TestThePinnedWireCannotCarryAnAttachment held the premise by failing on any
+// growth of Core's HostLink vocabulary. Core v0.8.0 grew it by exactly the
+// record that closes the gap, so that test failed BY DESIGN on the bump and
+// this one replaces it. What it holds now:
 //
-// This asserts a DEPENDENCY's behaviour deliberately and for one reason: it is
-// the premise of a gap this package declares, and a premise nobody rechecks is
-// how a stale citation survives a version bump.
+//   - HostLinkAttachRequest exists and carries NO lease epoch, which is what
+//     a session with no owner -- the only kind that reaches placement -- can
+//     send. It DOES carry the host fence (host_id, host_generation) and
+//     refuses a request without one, so the caller cannot attach to whatever
+//     Host happens to serve an endpoint.
+//   - bind still refuses a zero epoch. The attach is what SUPPLIES the epoch a
+//     bind then names; a bind that accepted zero would be a second way to
+//     establish residency, and Core's own decoder fails closed against that.
+//   - the stale-registry answer is still epoch_mismatch carrying the OTHER
+//     holder's epoch, and Core still names no lease_held. A caller must never
+//     bind with that epoch.
+//   - the reserved method for the record is Core's, and the record's mode set
+//     is closed to create and restore.
+//   - the pinned vocabulary is exactly the twelve names below, read from the
+//     pinned package's source, so the next growth asks a human again.
 //
-// Three ways Core could close the gap, and this test fails on each:
-//
-//   - bind stops refusing a zero epoch  -- the first assertion;
-//   - a lease_held refusal appears      -- the second;
-//   - a NEW record type is declared     -- the third, which is derived from
-//     the pinned package rather than naming a type, because a test can only
-//     name what already exists and the new type is precisely what does not.
-func TestThePinnedWireCannotCarryAnAttachment(t *testing.T) {
+// This asserts a DEPENDENCY's behaviour deliberately: it is the premise the
+// caller of Reconcile is written against, and a premise nobody rechecks is how
+// a stale citation survives a version bump.
+func TestThePinnedWireCarriesAnAttachment(t *testing.T) {
 	t.Parallel()
+
+	attach := sessionwire.HostLinkAttachRequest{
+		Version: sessionwire.CurrentWireVersion, TenantID: testTenant, SessionID: testSession,
+		HostID: "host-shared", HostGeneration: 1,
+		AgentID: testAgent, RuntimeCompatibilityID: testRuntime,
+		Mode: sessionwire.HostLinkAttachModeCreate, ActorID: "factory-service", IdempotencyKey: "attach-1",
+	}
+	if err := attach.Validate(); err != nil {
+		t.Fatalf("an attach naming no lease epoch was refused (%v); the wire cannot carry an attachment for an unowned session", err)
+	}
+	unfenced := attach
+	unfenced.HostGeneration = 0
+	if err := unfenced.Validate(); err == nil {
+		t.Error("an attach with no host generation was accepted; the host fence is not required")
+	}
+	unfenced = attach
+	unfenced.HostID = ""
+	if err := unfenced.Validate(); err == nil {
+		t.Error("an attach with no host id was accepted; the host fence is not required")
+	}
+	for _, mode := range []sessionwire.HostLinkAttachMode{"", "attach", "Create", "resume"} {
+		bad := attach
+		bad.Mode = mode
+		if err := bad.Validate(); err == nil {
+			t.Errorf("mode %q was accepted; the mode set is no longer closed to create and restore", mode)
+		}
+	}
+	restore := attach
+	restore.Mode = sessionwire.HostLinkAttachModeRestore
+	if err := restore.Validate(); err != nil {
+		t.Errorf("a restore-mode attach was refused: %v", err)
+	}
+	if sessionwire.HostLinkMethodAttach != "hostlink.attach" {
+		t.Errorf("HostLinkMethodAttach = %q, want %q", sessionwire.HostLinkMethodAttach, "hostlink.attach")
+	}
 
 	bind := sessionwire.HostLinkBindRequest{
 		Version: sessionwire.CurrentWireVersion, TenantID: testTenant, SessionID: testSession,
 		HostID: "host-shared", HostGeneration: 1, LeaseEpoch: 0,
-		RuntimeCompatibilityID: testRuntime, IdempotencyKey: "attach-1",
+		RuntimeCompatibilityID: testRuntime, IdempotencyKey: "bind-1",
 	}
 	if err := bind.Validate(); err == nil {
-		t.Fatal("a bind with no lease epoch was accepted; the pinned wire may now carry an attachment")
+		t.Fatal("a bind with no lease epoch was accepted; bind has become a second way to establish residency")
 	}
 	bind.LeaseEpoch = 1
 	if err := bind.Validate(); err != nil {
 		t.Fatalf("a bind naming a lease epoch was refused (%v), so the case above proves nothing about the epoch", err)
 	}
 
-	// Core's refusal codes carry no lease_held. A4.2 step 2's LeaseHeld is
-	// spelled epoch_mismatch here, and the current epoch is the whole answer.
 	held := sessionwire.HostLinkError{Code: "lease_held"}
 	if err := held.Validate(); err == nil {
-		t.Error("core now names a lease_held refusal; the reuse path should read it")
+		t.Error("core now names a lease_held refusal; the stale-registry path should read it")
 	}
 	mismatch := sessionwire.HostLinkError{Code: sessionwire.HostLinkErrorEpochMismatch, CurrentLeaseEpoch: 9}
 	if err := mismatch.Validate(); err != nil {
 		t.Errorf("epoch_mismatch with a current epoch was refused: %v", err)
 	}
+	if err := (sessionwire.HostLinkError{Code: sessionwire.HostLinkErrorEpochMismatch}).Validate(); err == nil {
+		t.Error("epoch_mismatch without the holder's epoch was accepted; the stale-registry signal has lost its content")
+	}
 
-	// The two assertions above are blind to the likeliest way this gap closes:
-	// Core adding a NEW record type beside an unchanged bind. Neither names a
-	// type Core does not have yet, and no reflect call can enumerate a
-	// package's declarations, so the vocabulary is derived from the pinned
-	// package's SOURCE and compared against an absolute list.
 	got := exportedHostLinkTypes(t, pinnedSessionwireDir(t))
 	if !slices.Equal(got, pinnedHostLinkTypes) {
 		t.Errorf("the pinned HostLink record vocabulary is %q, not %q.\n"+
-			"Core's HostLink surface changed under the pin. Re-read the gap: if a new record can ask a Host to "+
-			"take a session it does not own, OutcomeAttachPooled must stop naming a Host and start asking one.",
+			"Core's HostLink surface changed under the pin. Re-read what the attach caller is written against "+
+			"before updating the list.",
 			got, pinnedHostLinkTypes)
 	}
 }
 
 // pinnedHostLinkTypes is every exported HostLink* type declared by the pinned
-// core sessionwire/v1, as ABSOLUTE literals. A set built from the package
+// core sessionwire/v1 (v0.8.0), as ABSOLUTE literals. A set built from the package
 // itself would pin nothing; this list is what a reader compared against.
 //
 // The whole HostLink prefix is pinned rather than only the *Request suffix,
@@ -877,6 +914,8 @@ func TestThePinnedWireCannotCarryAnAttachment(t *testing.T) {
 // VersionNegotiation{Request,Response} are deliberately outside it: they
 // negotiate a connection, name no session, and cannot carry placement.
 var pinnedHostLinkTypes = []string{
+	"HostLinkAttachMode",
+	"HostLinkAttachRequest",
 	"HostLinkBindRequest",
 	"HostLinkCapacityReport",
 	"HostLinkCommandDelivery",
@@ -895,7 +934,7 @@ var pinnedHostLinkTypes = []string{
 // "the sessionwire on disk" and "the sessionwire this build resolves" are not
 // the same directory, and a premise checked against the wrong one is the stale
 // citation this test exists to prevent.
-const pinnedCoreVersion = "v0.7.0"
+const pinnedCoreVersion = "v0.8.0"
 
 const pinnedCoreModule = "github.com/looprig/core"
 

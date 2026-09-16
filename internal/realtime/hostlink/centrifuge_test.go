@@ -165,7 +165,7 @@ func TestEachControlRecordReachesTheHostAsItsOwnMethodAndBody(t *testing.T) {
 	if err := link.Bind(context.Background(), bind); err != nil {
 		t.Fatalf("Bind: %v", err)
 	}
-	if err := link.DeliverCommand(context.Background(), sessionwire.HostLinkCommandDelivery{CommandID: "cmd-abc"}); err != nil {
+	if err := link.DeliverCommand(context.Background(), tenant, "s-1", sessionwire.HostLinkCommandDelivery{CommandID: "cmd-abc"}); err != nil {
 		t.Fatalf("DeliverCommand: %v", err)
 	}
 	unbind := unbindRequest(hostOne, "s-1")
@@ -178,12 +178,17 @@ func TestEachControlRecordReachesTheHostAsItsOwnMethodAndBody(t *testing.T) {
 		t.Fatalf("the Host received %d rpcs, want 3", len(calls))
 	}
 	// The wanted methods are ABSOLUTE LITERALS, not the constants. Comparing
-	// what the Host recorded against hostlink.MethodBind pins nothing: a rename
-	// moves both sides together and this case stays green while Factory stops
-	// speaking the protocol the Host implements. TestTheWireVocabularyIsPinnedToItsLiterals
-	// states the same strings once more, deliberately.
+	// what the Host recorded against sessionwire.HostLinkMethodBind pins
+	// nothing: a rename moves both sides together and this case stays green
+	// while Factory stops speaking the protocol the Host implements.
+	// TestTheWireVocabularyIsPinnedToItsLiterals states the same strings once
+	// more, deliberately. The command's method is the SESSION CHANNEL --
+	// "hostlink.v1." + base64url("tenant-a") + "." + base64url("s-1"), spelled
+	// out -- because Core defines no command method: a Host resolves every
+	// unreserved method as a channel, and "hostlink.command" was exactly the
+	// string it refused.
 	if got, want := []string{calls[0].method, calls[1].method, calls[2].method},
-		[]string{"hostlink.bind", "hostlink.command", "hostlink.unbind"}; !slices.Equal(got, want) {
+		[]string{"hostlink.bind", "hostlink.v1.dGVuYW50LWE.cy0x", "hostlink.unbind"}; !slices.Equal(got, want) {
 		t.Fatalf("the Host received methods %v, want %v", got, want)
 	}
 
@@ -248,7 +253,7 @@ func TestATypedHostRefusalArrivesWithItsCodeAndDetail(t *testing.T) {
 	})
 	link := mustDial(t, host)
 
-	err := link.DeliverCommand(context.Background(), sessionwire.HostLinkCommandDelivery{CommandID: "cmd-abc"})
+	err := link.DeliverCommand(context.Background(), tenant, "s-1", sessionwire.HostLinkCommandDelivery{CommandID: "cmd-abc"})
 	var refusal *hostlink.HostRefusal
 	if !errors.As(err, &refusal) {
 		t.Fatalf("DeliverCommand = %v, want a *HostRefusal", err)
@@ -278,7 +283,7 @@ func TestAProtocolErrorIsNotAHostRefusal(t *testing.T) {
 	})
 	link := mustDial(t, host)
 
-	err := link.DeliverCommand(context.Background(), sessionwire.HostLinkCommandDelivery{CommandID: "cmd-abc"})
+	err := link.DeliverCommand(context.Background(), tenant, "s-1", sessionwire.HostLinkCommandDelivery{CommandID: "cmd-abc"})
 	if err == nil {
 		t.Fatal("DeliverCommand hid a protocol error")
 	}
@@ -390,8 +395,8 @@ func TestTheLinkReconnectsAfterAReconnectBandCloseAndKeepsWorking(t *testing.T) 
 		t.Fatal("the Host received no rpc after the reconnect")
 	}
 	for index, call := range calls {
-		if call.method != hostlink.MethodBind {
-			t.Errorf("rpc %d after the reconnect was %q, want %q", index, call.method, hostlink.MethodBind)
+		if call.method != sessionwire.HostLinkMethodBind {
+			t.Errorf("rpc %d after the reconnect was %q, want %q", index, call.method, sessionwire.HostLinkMethodBind)
 		}
 	}
 }
@@ -742,17 +747,22 @@ func (h *hostServer) pushRaw(t *testing.T, data []byte) {
 	}
 }
 
-// TestTheWireVocabularyIsPinnedToItsLiterals holds Factory's half of an
-// unwritten cross-repo contract to absolute strings.
+// TestTheWireVocabularyIsPinnedToItsLiterals holds the framing this package
+// sends to absolute strings.
 //
-// Core v0.7.0 defines the record bodies and no transport framing, so these
-// names are a PROPOSAL the Host writer must mirror exactly. Every other case in
-// this file compares what the stand-in recorded against the constant it was
-// sent with, which pins nothing at all: renaming MethodBind renames both sides
-// and the whole suite stays green. Writing the strings out is what makes a
-// rename a deliberate act rather than a silent one, for the same reason
-// limits_test.go pins the ping boundary as a literal rather than through the
-// constant it guards.
+// The method names are Core's since v0.8.0, and the push discriminators are
+// still Factory's half of the protocol; both are pinned here as literals. Every
+// other case in this file compares what the stand-in recorded against the
+// constant it was sent with, which pins nothing at all: renaming a constant
+// renames both sides and the whole suite stays green. Writing the strings out
+// is what makes a rename a deliberate act rather than a silent one, for the
+// same reason limits_test.go pins the ping boundary as a literal rather than
+// through the constant it guards.
+//
+// The command row is the one that closed B6. It pins the delivery method to
+// Core's HostLinkChannel AND to the spelled-out channel for one known pair, so
+// a Factory that went back to a command method of its own, or a Core whose
+// helper changed its encoding, both fail here rather than at the first Host.
 func TestTheWireVocabularyIsPinnedToItsLiterals(t *testing.T) {
 	t.Parallel()
 
@@ -761,16 +771,67 @@ func TestTheWireVocabularyIsPinnedToItsLiterals(t *testing.T) {
 		got  string
 		want string
 	}{
-		{"MethodBind", hostlink.MethodBind, "hostlink.bind"},
-		{"MethodUnbind", hostlink.MethodUnbind, "hostlink.unbind"},
-		{"MethodCommand", hostlink.MethodCommand, "hostlink.command"},
+		{"HostLinkMethodBind", sessionwire.HostLinkMethodBind, "hostlink.bind"},
+		{"HostLinkMethodUnbind", sessionwire.HostLinkMethodUnbind, "hostlink.unbind"},
+		{"HostLinkMethodAttach", sessionwire.HostLinkMethodAttach, "hostlink.attach"},
+		{"HostLinkChannelPrefix", sessionwire.HostLinkChannelPrefix, "hostlink.v1."},
+		{"HostLinkChannel(tenant-a, s-1)", sessionwire.HostLinkChannel("tenant-a", "s-1"), "hostlink.v1.dGVuYW50LWE.cy0x"},
 		{"PushTypeCapacity", hostlink.PushTypeCapacity, "host.capacity"},
 		{"PushTypeRegistry", hostlink.PushTypeRegistry, "host.registry"},
 	} {
 		if tc.got != tc.want {
-			t.Errorf("%s = %q, want %q -- this string is Factory's half of a protocol "+
+			t.Errorf("%s = %q, want %q -- this string is one half of a protocol "+
 				"whose Host half mirrors it; changing it is a cross-repo change", tc.name, tc.got, tc.want)
 		}
+	}
+}
+
+// TestACommandDeliveryIsSentOnTheSessionsChannelAsItsMethod is B6 measured
+// over a real socket, per session and per tenant.
+//
+// The method the stand-in records is compared against Core's helper for the
+// SAME pair, and two deliveries differing only in tenant must reach the Host
+// as two different methods -- a session id is unique only within a tenant, so
+// a channel derived from the session alone would let one tenant's binding
+// answer for another's. The sibling literal in
+// TestEachControlRecordReachesTheHostAsItsOwnMethodAndBody pins the encoding;
+// this pins the derivation.
+func TestACommandDeliveryIsSentOnTheSessionsChannelAsItsMethod(t *testing.T) {
+	t.Parallel()
+
+	host := newHostServer(t, hostOptions{})
+	link := mustDial(t, host)
+
+	deliveries := []struct {
+		tenant  sessionwire.TenantID
+		session sessionwire.SessionID
+	}{
+		{"tenant-a", "s-1"},
+		{"tenant-b", "s-1"},
+		{"tenant-a", "s.2"},
+	}
+	for _, d := range deliveries {
+		if err := link.DeliverCommand(context.Background(), d.tenant, d.session, sessionwire.HostLinkCommandDelivery{CommandID: "cmd-1"}); err != nil {
+			t.Fatalf("DeliverCommand(%s, %s): %v", d.tenant, d.session, err)
+		}
+	}
+	calls := host.calls()
+	if len(calls) != len(deliveries) {
+		t.Fatalf("the Host received %d rpcs, want %d", len(calls), len(deliveries))
+	}
+	seen := map[string]bool{}
+	for i, d := range deliveries {
+		want := sessionwire.HostLinkChannel(d.tenant, d.session)
+		if calls[i].method != want {
+			t.Errorf("delivery %d was sent as method %q, want HostLinkChannel = %q", i, calls[i].method, want)
+		}
+		if !strings.HasPrefix(calls[i].method, "hostlink.v1.") {
+			t.Errorf("delivery %d method %q does not carry the channel prefix", i, calls[i].method)
+		}
+		if seen[calls[i].method] {
+			t.Errorf("delivery %d reused method %q for a different (tenant, session)", i, calls[i].method)
+		}
+		seen[calls[i].method] = true
 	}
 }
 
@@ -824,7 +885,7 @@ func TestATerminalDisconnectOnALiveLinkStopsItAnswering(t *testing.T) {
 		t.Errorf("HostDisconnect.Host = %q, want %q", closed.Host, hostOne)
 	}
 	// Every method is refused, not just the one that discovered the state.
-	err := link.DeliverCommand(context.Background(), sessionwire.HostLinkCommandDelivery{CommandID: "cmd-abc"})
+	err := link.DeliverCommand(context.Background(), tenant, "s-1", sessionwire.HostLinkCommandDelivery{CommandID: "cmd-abc"})
 	if !errors.As(err, &closed) {
 		t.Errorf("DeliverCommand after a terminal disconnect = %v, want the HostDisconnect", err)
 	}

@@ -287,7 +287,7 @@ func TestAnUnknownDurableStateIsAFaultRatherThanAnAcceptance(t *testing.T) {
 // moves.
 const (
 	pinnedSessionstoreModule  = "github.com/looprig/sessionstore"
-	pinnedSessionstoreVersion = "v0.8.0"
+	pinnedSessionstoreVersion = "v0.9.0"
 
 	pinnedCatalogErrorCodes  = 14
 	pinnedKeyspaceErrorCodes = 10
