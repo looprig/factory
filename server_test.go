@@ -86,6 +86,10 @@ func publicSeams() map[reflect.Type][]reflect.Type {
 			iface[admission.Directory](), iface[httpapi.Directory](),
 			iface[placement.Directory](), iface[routing.Resolver](),
 		},
+		// The store surface behind the exported directory. It is paired with
+		// internal/routing's Store so the exported seam can neither be
+		// narrower than what the directory reads nor wider than it.
+		iface[factory.DirectoryStore]():      {iface[routing.Store]()},
 		iface[factory.PlacementController](): {iface[admission.PlacementController]()},
 		// internal/identity declares a Clock with only Now, because expiry is
 		// the only time it reads. Pairing it here is what keeps the union
