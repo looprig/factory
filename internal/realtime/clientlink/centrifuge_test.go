@@ -180,13 +180,14 @@ func (a *recordingAuthorizer) controlCalls() []controlCall {
 
 // fixture is one running handler behind one loopback HTTP server.
 type fixture struct {
-	handler    *clientlink.Handler
-	url        string
-	verifier   *verifier
-	authorizer *recordingAuthorizer
-	admitter   *recordingAdmitter
-	demand     *recordingDemand
-	clock      *manualClock
+	handler       *clientlink.Handler
+	authenticator *internalidentity.Authenticator
+	url           string
+	verifier      *verifier
+	authorizer    *recordingAuthorizer
+	admitter      *recordingAdmitter
+	demand        *recordingDemand
+	clock         *manualClock
 }
 
 // testLimits is the ClientLink configuration a case starts from. It is written
@@ -221,6 +222,14 @@ func tokens() map[string]identity.Claims {
 func newFixture(t *testing.T, limits clientlink.Limits) *fixture {
 	t.Helper()
 
+	return newFixtureBehind(t, limits, nil)
+}
+
+// newFixtureBehind builds the fixture with the handler served BEHIND wrap, the
+// way the composed router serves it. A nil wrap serves the handler bare.
+func newFixtureBehind(t *testing.T, limits clientlink.Limits, wrap func(*internalidentity.Authenticator, http.Handler) http.Handler) *fixture {
+	t.Helper()
+
 	v := &verifier{claims: tokens()}
 	authenticator, err := internalidentity.NewAuthenticator(internalidentity.Config{Verifier: v})
 	if err != nil {
@@ -242,7 +251,11 @@ func newFixture(t *testing.T, limits clientlink.Limits) *fixture {
 	if err != nil {
 		t.Fatalf("NewHandler: %v", err)
 	}
-	server := httptest.NewServer(handler)
+	var served http.Handler = handler
+	if wrap != nil {
+		served = wrap(authenticator, handler)
+	}
+	server := httptest.NewServer(served)
 	t.Cleanup(func() {
 		// Shutdown BEFORE Close, and the order is the same lesson the fake's
 		// backstop taught one layer in. httptest.Server.Close waits for
@@ -262,13 +275,14 @@ func newFixture(t *testing.T, limits clientlink.Limits) *fixture {
 		server.Close()
 	})
 	return &fixture{
-		handler:    handler,
-		url:        "ws" + strings.TrimPrefix(server.URL, "http"),
-		verifier:   v,
-		authorizer: authorizer,
-		admitter:   admitter,
-		demand:     demand,
-		clock:      clock,
+		handler:       handler,
+		authenticator: authenticator,
+		url:           "ws" + strings.TrimPrefix(server.URL, "http"),
+		verifier:      v,
+		authorizer:    authorizer,
+		admitter:      admitter,
+		demand:        demand,
+		clock:         clock,
 	}
 }
 
@@ -314,11 +328,19 @@ func await[T any](t *testing.T, ch <-chan T, what string) T {
 func dial(t *testing.T, f *fixture, token, protocol string) (*centrifugego.Client, *events) {
 	t.Helper()
 
+	return dialWithHeader(t, f, token, protocol, nil)
+}
+
+// dialWithHeader is dial with headers on the UPGRADE request -- the cookie a
+// browser attaches, or the bearer header a non-browser client sets.
+func dialWithHeader(t *testing.T, f *fixture, token, protocol string, header http.Header) (*centrifugego.Client, *events) {
+	t.Helper()
+
 	data, err := json.Marshal(map[string]string{"protocol_version": protocol})
 	if err != nil {
 		t.Fatalf("marshal connect data: %v", err)
 	}
-	client := centrifugego.NewJsonClient(f.url, centrifugego.Config{Token: token, Data: data})
+	client := centrifugego.NewJsonClient(f.url, centrifugego.Config{Token: token, Data: data, Header: header})
 	observed := &events{
 		connected:    make(chan centrifugego.ConnectedEvent, 32),
 		disconnected: make(chan centrifugego.DisconnectedEvent, 32),

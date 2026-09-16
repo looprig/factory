@@ -236,9 +236,27 @@ func (h *Handler) connecting(ctx context.Context, e centrifuge.ConnectEvent) (ce
 		}
 	}
 
-	principal, err := h.engine.Authenticate(ctx, ConnectRequest{Token: e.Token, ProtocolVersion: data.ProtocolVersion})
+	// The upgrade's operation context, if the router authenticated one. The
+	// transport builds the connection's context from the HTTP request's
+	// (centrifuge@v0.38.0/handler_websocket.go:218-225), so what the router
+	// recorded on the upgrade is what ctx carries here, and this is the only
+	// place it is read: the Engine decides whether it may stand in for a
+	// token; this adapter only reports that it was there.
+	upgrade, upgraded := internalidentity.OperationContextFrom(ctx)
+	principal, err := h.engine.Authenticate(ctx, ConnectRequest{
+		Token: e.Token, ProtocolVersion: data.ProtocolVersion, Upgrade: upgrade, Upgraded: upgraded,
+	})
 	if err != nil {
 		return centrifuge.ConnectReply{}, connectRefusal(err)
+	}
+	// The connection's context. A token-authenticated link records the LINK as
+	// its credential source; a link admitted on the upgrade's cookie keeps the
+	// upgrade's own operation context, which already names that principal,
+	// that source and the upgrade request's trace id -- rewriting it as a link
+	// credential would record an authentication that did not happen.
+	linkCtx := internalidentity.NewLinkOperationContext(ctx, principal)
+	if e.Token == "" && upgraded {
+		linkCtx = ctx
 	}
 
 	reply, err := json.Marshal(connectReplyData{
@@ -255,7 +273,7 @@ func (h *Handler) connecting(ctx context.Context, e centrifuge.ConnectEvent) (ce
 		// established rather than re-deriving one from something the client
 		// sends. Principal is a value with no reference members, so what the
 		// context holds cannot be widened by anything holding it.
-		Context: internalidentity.NewLinkOperationContext(ctx, principal),
+		Context: linkCtx,
 		// The subject, not the tenant. Credentials.UserID is the transport's
 		// own connection label and carries no authority here; putting a tenant
 		// in it would make a diagnostic look like a scope.

@@ -763,6 +763,40 @@ the link, so the guard is what decides. A6.1 recorded this as blocked on A9.1;
 it was not. `NewGuard`, `Wrap` and `NewHandler` are exported, and a composition
 seam is not the same thing as composition code.
 
+**A cookie-authenticated upgrade needs no connect token (B7), and the reuse is
+narrow.** The embedded WUI sends no connect token — it holds a session cookie
+the browser attaches to the `/v1/realtime` upgrade — and the handshake refused
+an empty credential before any verifier ran, so REST worked and realtime never
+did. `Engine.Authenticate` now reuses the principal the ROUTER verified at the
+upgrade when, and only when, the client presents **no token**, the upgrade was
+authenticated by a **cookie**, and the context carries a constructed principal.
+The adapter reads the upgrade's operation context off the connection context
+(centrifuge builds it from the HTTP request, `handler_websocket.go:218-225`) and
+hands it to the Engine as `ConnectRequest.Upgrade`/`Upgraded`; the Engine
+decides. A non-empty token is verified exactly as before whatever rode the
+upgrade, a **bearer** upgrade is not reused (a browser cannot set one, so it is
+not the WUI's request), and no cookie is read, no verifier called and **no
+credential minted** anywhere on the path. A cross-site page cannot reach it: the
+origin guard refuses an ambient-credential upgrade with no or another site's
+`Origin` before the handler is entered. The decision table is
+`TestACookieAuthenticatedUpgradeNeedsNoConnectToken` plus three single-clause
+readers, each asserting the exact close code 3500; a reused principal is per
+connection because the context is (`TestAnUpgradePrincipalIsNeverReusedOnAnotherConnection`).
+
+**The composed `/v1/realtime` could not upgrade at all, and the end-to-end
+cookie case is what found it.** `recordingWriter` exposed the real writer through
+`Unwrap` and its doc called that "the whole fix"; gorilla/websocket@v1.5.3's
+`Upgrader` asserts `w.(http.Hijacker)` directly (`server.go:175`) and never
+consults `http.ResponseController`, so every upgrade through the router
+answered **500 "response does not implement http.Hijacker"**. Nothing measured
+it: the composed case sent a plain GET (400 before the hijack) and the guard
+case wrapped the ClientLink handler with no router in front.
+`recordingWriter.Hijack` now delegates through the ResponseController, and
+`TestAComposedFactoryAdmitsACookieUpgradeWithNoConnectToken` in the root package
+writes the handshake and one Centrifuge connect frame by hand over the composed
+`Server.Handler()` — 101 then a connect result for the cookie, 3500 for a bogus
+token, 401 with no credential.
+
 **`internal/command` is a vocabulary, not a seam.** The five
 `sessionstore.CommandKind` values are shared by `internal/httpapi` and
 `internal/realtime/clientlink` because §8.1 makes the REST controls and the

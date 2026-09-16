@@ -1,12 +1,14 @@
 package httpapi
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"io"
 	"mime"
+	"net"
 	"net/http"
 	"path"
 	"slices"
@@ -607,12 +609,28 @@ type recordingWriter struct {
 // Embedding an http.ResponseWriter satisfies the interface and CONCEALS every
 // optional one the real writer implements: without this, no handler below can
 // reach Flusher, Hijacker or ReaderFrom, because a type assertion sees only the
-// wrapper. A6.1's WebSocket upgrade needs Hijacker, and the failure mode is a
-// nil assertion at run time in a task
-// that has no reason to suspect this type -- so it is settled here rather than
-// discovered there. Unwrap is the whole fix: http.ResponseController follows the
-// chain, which is why re-declaring each optional method would be strictly worse.
+// wrapper. http.ResponseController follows the Unwrap chain, so a handler
+// written against it reaches the real writer through any depth of wrapping.
 func (w *recordingWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
+
+// Hijack hands the connection to a handler that asserts http.Hijacker DIRECTLY
+// rather than through http.ResponseController.
+//
+// Unwrap was documented above as "the whole fix" for the WebSocket upgrade, and
+// it was not, because the library that performs the upgrade does not consult
+// it: gorilla/websocket@v1.5.3's Upgrader does `w.(http.Hijacker)` on the
+// writer it is handed (server.go:175) and answers 500 "response does not
+// implement http.Hijacker" when that fails. Every /v1/realtime upgrade through
+// the composed router answered exactly that 500, and nothing measured it,
+// because the composed case sent a plain GET (answered 400 before the hijack)
+// and the origin-guard case wrapped the ClientLink handler directly, with no
+// router in front of it. The end-to-end cookie case in the root package is what
+// found it. This method delegates through the ResponseController so the rule
+// stays "the real writer decides": a writer that cannot be hijacked reports
+// http.ErrNotSupported here rather than being misreported by the wrapper.
+func (w *recordingWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	return http.NewResponseController(w.ResponseWriter).Hijack()
+}
 
 func (w *recordingWriter) WriteHeader(status int) {
 	w.wrote = true

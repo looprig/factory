@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -11,6 +12,7 @@ import (
 	"go/token"
 	"io"
 	"maps"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -3167,6 +3169,58 @@ func TestTheWrapperDoesNotConcealTheWritersOptionalInterfaces(t *testing.T) {
 	if err := http.NewResponseController(concealingWriter{recorder}).Flush(); err == nil {
 		t.Error("a wrapper without Unwrap flushed, so this test cannot see the difference")
 	}
+}
+
+// TestTheWrapperIsAHijackerByDirectAssertion is the reader for
+// recordingWriter.Hijack, and it is a DIFFERENT property from the one above.
+//
+// Unwrap serves a handler written against http.ResponseController; the library
+// that performs the WebSocket upgrade is not one. gorilla/websocket@v1.5.3
+// asserts `w.(http.Hijacker)` on the writer it is handed (server.go:175) and
+// answers 500 when that fails, so a wrapper with Unwrap alone made every
+// /v1/realtime upgrade through the composed router a 500 -- measured end to end
+// by the root package's cookie-upgrade case, which is what found it. This
+// asserts the interface the way the library does, drives the hijack through to
+// the writer beneath, and keeps the Unwrap-only shape as the negative control.
+func TestTheWrapperIsAHijackerByDirectAssertion(t *testing.T) {
+	t.Parallel()
+
+	underlying := &hijackableWriter{ResponseWriter: httptest.NewRecorder()}
+	writer := &recordingWriter{ResponseWriter: underlying}
+	hijacker, ok := any(writer).(http.Hijacker)
+	if !ok {
+		t.Fatal("recordingWriter does not satisfy http.Hijacker by direct assertion, which is how the upgrade library asks")
+	}
+	if _, _, err := hijacker.Hijack(); err != nil {
+		t.Fatalf("Hijack through the wrapper: %v", err)
+	}
+	if !underlying.hijacked {
+		t.Error("the hijack did not reach the underlying writer")
+	}
+	if _, ok := any(concealingWriter{underlying}).(http.Hijacker); ok {
+		t.Error("a wrapper without Hijack asserted as a Hijacker, so this test cannot see the difference")
+	}
+	// A writer that cannot be hijacked is reported as such by the writer, not
+	// by the wrapper claiming a capability it does not have.
+	plain, _ := any(&recordingWriter{ResponseWriter: httptest.NewRecorder()}).(http.Hijacker)
+	if plain == nil {
+		t.Fatal("the plain wrapper does not assert as a Hijacker")
+	}
+	if _, _, err := plain.Hijack(); !errors.Is(err, http.ErrNotSupported) {
+		t.Errorf("Hijack over an unhijackable writer = %v, want http.ErrNotSupported", err)
+	}
+}
+
+// hijackableWriter records that Hijack reached it. It hands back no
+// connection, because the assertion is about the delegation and not the socket.
+type hijackableWriter struct {
+	http.ResponseWriter
+	hijacked bool
+}
+
+func (w *hijackableWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	w.hijacked = true
+	return nil, nil, nil
 }
 
 // concealingWriter is recordingWriter without Unwrap: the shape the wrapper had

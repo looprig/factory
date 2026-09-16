@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/looprig/factory/identity"
+	internalidentity "github.com/looprig/factory/internal/identity"
 )
 
 // ErrInvalidConfig is the class of every NewHandler rejection.
@@ -249,11 +250,20 @@ func (e *Engine) Version() string { return e.cfg.Version }
 // a decision is made from. Nothing else a client sends is read: a name and a
 // version are recorded by the transport for diagnostics and carry no authority.
 type ConnectRequest struct {
-	// Token is the connect credential.
+	// Token is the connect credential. It may be empty; see Upgrade.
 	Token string
 	// ProtocolVersion is the ClientLink application protocol the client
 	// speaks. An empty value means the client named none.
 	ProtocolVersion string
+	// Upgrade is the operation context the HTTP UPGRADE that carries this
+	// connection was authenticated under, and Upgraded reports whether there
+	// was one. The router authenticates /v1/realtime before the handler is
+	// entered and records the principal and the credential source on the
+	// request context; the transport hands that context to the handshake,
+	// and the adapter copies it here so the decision is the Engine's and not
+	// the adapter's. A handshake reached some other way carries none.
+	Upgrade  internalidentity.OperationContext
+	Upgraded bool
 }
 
 // Authenticate decides one handshake.
@@ -263,10 +273,45 @@ type ConnectRequest struct {
 // build does not implement cannot use a successful authentication for anything,
 // and refusing first means an unsupported bundle does not put load on the
 // credential verifier on every reconnect.
+//
+// # A connect token is not required over a cookie-authenticated upgrade
+//
+// The embedded WUI sends no connect token: it holds a session COOKIE, which
+// the browser attaches to the WebSocket upgrade and which the router already
+// verified before this handler was entered. Requiring a second credential at
+// the handshake would make realtime unreachable for exactly the client the
+// bundle is built for, and Factory mints no credential of its own that could
+// stand in for one. So when the client presents NO token and the upgrade was
+// authenticated by a COOKIE, the principal the upgrade verified is the
+// connection's principal. That is a reuse of a verification this same
+// authenticator made moments earlier on this same connection, not a new
+// authentication path: nothing here reads a cookie, calls a verifier or
+// consults anything the client sent at the handshake.
+//
+// The rule is narrower than "any authenticated upgrade", and each clause is a
+// refusal a test drives:
+//
+//   - a NON-EMPTY token is always verified as before, whatever the upgrade
+//     carried, so the bearer path is unchanged and a token that disagrees with
+//     the cookie is not silently overridden by it;
+//   - an upgrade authenticated by a BEARER header is not reused. A browser
+//     cannot set one on an upgrade, so that request is not the WUI's, and a
+//     non-browser client holds a token it can present at the handshake;
+//   - an upgrade context carrying an unconstructed principal is not reused,
+//     because a zero principal is the shape of a context no authenticated edge
+//     built.
+//
+// A cross-site page cannot reach this: the origin guard runs BEFORE the
+// upgrade and refuses an ambient-credential handshake that carries no Origin
+// or another site's, so a cookie-authenticated upgrade that arrives here was
+// sent by the deployment's own origin.
 func (e *Engine) Authenticate(ctx context.Context, req ConnectRequest) (identity.Principal, error) {
 	if req.ProtocolVersion != ProtocolVersion {
 		return identity.Principal{}, fmt.Errorf("%w: client speaks %q, this build speaks %q",
 			ErrUnsupportedProtocol, req.ProtocolVersion, ProtocolVersion)
+	}
+	if req.Token == "" && req.Upgraded && req.Upgrade.CredentialSource == internalidentity.SourceCookie && req.Upgrade.Principal.Tenant() != "" {
+		return req.Upgrade.Principal, nil
 	}
 	return e.cfg.Authenticator.AuthenticateLink(ctx, req.Token)
 }
