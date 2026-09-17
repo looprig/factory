@@ -262,12 +262,12 @@ type centrifugeLink struct {
 	// successful Core reply. Reserved calls fail locally during that window
 	// rather than using the previous connection's capability set.
 	connecting bool
-	// generationCtx is canceled when the transport enters its next generation.
+	// generation is canceled when the transport enters its next generation.
 	// Calls bind their transport context to it so an RPC queued by centrifuge-go
 	// while Connecting cannot be sent after a newer handshake changes the
-	// capability set.
-	generationCtx    context.Context
-	generationCancel context.CancelFunc
+	// capability set. It is an explicit registry rather than context.AfterFunc:
+	// cancellation must finish before centrifuge-go resolves connect futures.
+	generation *rpcGeneration
 	// terminal is set when the connection may not be used again. A link that
 	// kept answering RPCs after a terminal refusal would report every one as an
 	// undelivered command, which is a retry loop against a Host that has
@@ -324,7 +324,7 @@ func (l *centrifugeLink) call(ctx context.Context, method string, request any, r
 	defer l.rpcMu.Unlock()
 	l.mu.Lock()
 	terminal := l.terminal
-	generationCtx := l.generationCtx
+	generation := l.generation
 	if terminal != nil {
 		l.mu.Unlock()
 		return terminal
@@ -337,7 +337,7 @@ func (l *centrifugeLink) call(ctx context.Context, method string, request any, r
 	}
 	l.mu.Unlock()
 
-	rpcCtx, release, err := bindGenerationContext(ctx, generationCtx)
+	rpcCtx, release, err := bindGenerationContext(ctx, generation)
 	if err != nil {
 		return fmt.Errorf("hostlink: %s: %w", method, err)
 	}
@@ -363,29 +363,24 @@ func (l *centrifugeLink) call(ctx context.Context, method string, request any, r
 // transport invokes this callback before scheduling reconnect, and a queued
 // RPC may already be waiting for that reconnect while holding rpcMu.
 func (l *centrifugeLink) onConnecting(centrifugego.ConnectingEvent) {
-	nextCtx, nextCancel := newGenerationContext()
-	var previousCancel context.CancelFunc
+	nextGeneration := newRPCGeneration()
+	var previousGeneration *rpcGeneration
 	l.mu.Lock()
 	terminal := l.terminal != nil
 	if !terminal {
-		previousCancel = l.generationCancel
-		l.generationCtx = nextCtx
-		l.generationCancel = nextCancel
+		previousGeneration = l.generation
+		l.generation = nextGeneration
 		l.connecting = true
 		l.negotiated = sessionwire.VersionNegotiationResponse{}
 	}
 	l.mu.Unlock()
 	if terminal {
-		nextCancel()
+		nextGeneration.cancel()
 		return
 	}
-	if previousCancel != nil {
-		previousCancel()
+	if previousGeneration != nil {
+		previousGeneration.cancel()
 	}
-}
-
-func newGenerationContext() (context.Context, context.CancelFunc) {
-	return context.WithCancel(context.Background())
 }
 
 // onConnected verifies the version the Host selected.
@@ -456,31 +451,83 @@ func (l *centrifugeLink) settle(err error) {
 }
 
 func (l *centrifugeLink) fail(err error) {
-	var cancel context.CancelFunc
+	var generation *rpcGeneration
 	l.mu.Lock()
 	if l.terminal == nil {
 		l.terminal = err
-		cancel = l.generationCancel
+		generation = l.generation
 	}
 	l.mu.Unlock()
-	if cancel != nil {
+	if generation != nil {
+		generation.cancel()
+	}
+}
+
+// rpcGeneration owns the cancellation of every RPC admitted to one transport
+// generation. A reconnect cancels the old generation synchronously before
+// centrifuge-go can resolve its queued connect futures, so an old reserved
+// call cannot be emitted on a new connection with a different capability set.
+type rpcGeneration struct {
+	mu       sync.Mutex
+	nextID   uint64
+	canceled bool
+	bindings map[uint64]context.CancelFunc
+}
+
+func newRPCGeneration() *rpcGeneration {
+	return &rpcGeneration{bindings: make(map[uint64]context.CancelFunc)}
+}
+
+func (g *rpcGeneration) bind(ctx context.Context) (context.Context, func(), error) {
+	g.mu.Lock()
+	if g.canceled {
+		g.mu.Unlock()
+		return nil, nil, context.Canceled
+	}
+	g.mu.Unlock()
+
+	bound, cancel := context.WithCancel(ctx)
+	g.mu.Lock()
+	if g.canceled {
+		g.mu.Unlock()
+		cancel()
+		return nil, nil, context.Canceled
+	}
+	id := g.nextID
+	g.nextID++
+	g.bindings[id] = cancel
+	g.mu.Unlock()
+	return bound, func() {
+		g.mu.Lock()
+		delete(g.bindings, id)
+		g.mu.Unlock()
+		cancel()
+	}, nil
+}
+
+func (g *rpcGeneration) cancel() {
+	g.mu.Lock()
+	if g.canceled {
+		g.mu.Unlock()
+		return
+	}
+	g.canceled = true
+	cancels := make([]context.CancelFunc, 0, len(g.bindings))
+	for _, cancel := range g.bindings {
+		cancels = append(cancels, cancel)
+	}
+	g.bindings = nil
+	g.mu.Unlock()
+	for _, cancel := range cancels {
 		cancel()
 	}
 }
 
-func bindGenerationContext(ctx, generation context.Context) (context.Context, func(), error) {
+func bindGenerationContext(ctx context.Context, generation *rpcGeneration) (context.Context, func(), error) {
 	if generation == nil {
 		return ctx, func() {}, nil
 	}
-	if err := generation.Err(); err != nil {
-		return nil, nil, err
-	}
-	bound, cancel := context.WithCancel(ctx)
-	stop := context.AfterFunc(generation, cancel)
-	return bound, func() {
-		stop()
-		cancel()
-	}, nil
+	return generation.bind(ctx)
 }
 
 // verifyNegotiation reads the Host's selected wire version out of its connect
