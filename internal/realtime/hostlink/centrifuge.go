@@ -57,7 +57,7 @@ func (e *HostDisconnect) Unwrap() error { return ErrDialFailed }
 // transport's own documentation asks for.
 const ClientName = "factory-hostlink"
 
-// The HostLink control vocabulary is CORE'S, since core v0.8.0.
+// The HostLink control vocabulary is CORE'S, pinned here at core v0.9.1.
 //
 // sessionwire/v1's hostlink_framing.go names the reserved RPC methods
 // (HostLinkMethodBind, HostLinkMethodUnbind, HostLinkMethodAttach and the two
@@ -106,21 +106,6 @@ const (
 	PushTypeRegistry = "host.registry"
 )
 
-// connectData is what Factory states about itself at handshake.
-//
-// The only member carrying a decision is the version list. The service
-// credential travels in the transport's own token field rather than here: a
-// credential in application data would be logged by anything that logs a
-// connect payload.
-type connectData struct {
-	Negotiation sessionwire.VersionNegotiationRequest `json:"version_negotiation"`
-}
-
-// connectReplyData is the Host's selection.
-type connectReplyData struct {
-	Negotiation sessionwire.VersionNegotiationResponse `json:"version_negotiation"`
-}
-
 // pushEnvelope discriminates one asynchronous Host message.
 //
 // The body stays a RawMessage until the type is known, so a record is decoded
@@ -129,17 +114,6 @@ type connectReplyData struct {
 type pushEnvelope struct {
 	Type string          `json:"type"`
 	Data json.RawMessage `json:"data"`
-}
-
-// controlReply is what a Host answers a control RPC with.
-//
-// A refusal is a SUCCESSFUL reply carrying a typed body, not a protocol error.
-// The reason is the distinction Pool.DeliverCommand turns on: a protocol error
-// is indistinguishable from a transport failure at the client, and a Host that
-// signalled "not admitting" that way would be reported as a command that was
-// never delivered and retried forever.
-type controlReply struct {
-	Error *sessionwire.HostLinkError `json:"error,omitempty"`
 }
 
 // DialerConfig composes the real transport.
@@ -191,10 +165,8 @@ func (d *CentrifugeDialer) Dial(ctx context.Context, target Target, observer Obs
 	if observer == nil {
 		observer = discardObserver{}
 	}
-	data, err := json.Marshal(connectData{
-		Negotiation: sessionwire.VersionNegotiationRequest{
-			SupportedVersions: []sessionwire.WireVersion{sessionwire.CurrentWireVersion},
-		},
+	data, err := sessionwire.EncodeHostLinkConnectRequest(sessionwire.VersionNegotiationRequest{
+		SupportedVersions: []sessionwire.WireVersion{sessionwire.CurrentWireVersion},
 	})
 	if err != nil {
 		return nil, fmt.Errorf("%w: %s: connect data: %w", ErrDialFailed, target.Host, err)
@@ -230,6 +202,7 @@ func (d *CentrifugeDialer) Dial(ctx context.Context, target Target, observer Obs
 		LogLevel:          centrifugego.LogLevelNone,
 	})
 	link.client.OnConnected(link.onConnected)
+	link.client.OnConnecting(link.onConnecting)
 	link.client.OnDisconnected(link.onDisconnected)
 	link.client.OnMessage(link.onMessage)
 
@@ -263,7 +236,8 @@ func (d *CentrifugeDialer) Dial(ctx context.Context, target Target, observer Obs
 // connection without the pool being told. What this type adds is the two things
 // the transport cannot know -- that the version must be re-negotiated on every
 // reconnect, and that a terminal refusal must stop the link answering as though
-// it were live.
+// it were live. The negotiated capability set is replaced on every successful
+// handshake as well, so a restarted Host cannot inherit stale method support.
 type centrifugeLink struct {
 	host     sessionwire.HostID
 	observer Observer
@@ -274,6 +248,19 @@ type centrifugeLink struct {
 	once    sync.Once
 
 	mu sync.Mutex
+	// rpcMu serializes a reserved-method capability check with the RPC itself.
+	// A reconnect waits for an in-flight call before replacing the negotiated
+	// set, so a call cannot pass a stale capability check after the new reply has
+	// been accepted.
+	rpcMu sync.Mutex
+	// negotiated is the most recent successful Core connect reply. A reply with
+	// no hostlink_methods is valid and deliberately means no reserved method is
+	// advertised.
+	negotiated sessionwire.VersionNegotiationResponse
+	// connecting is true between the transport's reconnect callback and a
+	// successful Core reply. Reserved calls fail locally during that window
+	// rather than using the previous connection's capability set.
+	connecting bool
 	// terminal is set when the connection may not be used again. A link that
 	// kept answering RPCs after a terminal refusal would report every one as an
 	// undelivered command, which is a retry loop against a Host that has
@@ -284,11 +271,11 @@ type centrifugeLink struct {
 func (l *centrifugeLink) Host() sessionwire.HostID { return l.host }
 
 func (l *centrifugeLink) Bind(ctx context.Context, req sessionwire.HostLinkBindRequest) error {
-	return l.call(ctx, sessionwire.HostLinkMethodBind, req)
+	return l.call(ctx, sessionwire.HostLinkMethodBind, req, true)
 }
 
 func (l *centrifugeLink) Unbind(ctx context.Context, req sessionwire.HostLinkUnbindRequest) error {
-	return l.call(ctx, sessionwire.HostLinkMethodUnbind, req)
+	return l.call(ctx, sessionwire.HostLinkMethodUnbind, req, true)
 }
 
 // DeliverCommand sends the record with the SESSION'S CHANNEL as the RPC method.
@@ -299,7 +286,7 @@ func (l *centrifugeLink) Unbind(ctx context.Context, req sessionwire.HostLinkUnb
 // body carries only the command id. Neither identifier is validated here --
 // Core's helper does not, and the pool validated the route when it was bound.
 func (l *centrifugeLink) DeliverCommand(ctx context.Context, tenant sessionwire.TenantID, session sessionwire.SessionID, req sessionwire.HostLinkCommandDelivery) error {
-	return l.call(ctx, sessionwire.HostLinkChannel(tenant, session), req)
+	return l.call(ctx, sessionwire.HostLinkChannel(tenant, session), req, false)
 }
 
 // Close releases the connection.
@@ -312,19 +299,32 @@ func (l *centrifugeLink) Close(context.Context) error {
 	return nil
 }
 
-// call is one control RPC.
+// call is one HostLink RPC.
 //
 // The request is marshalled by CORE, whose MarshalJSON validates first, so a
 // record that would not survive the Host's strict decoder never reaches the
-// wire. The reply is read for a typed refusal before it is read for anything
-// else.
-func (l *centrifugeLink) call(ctx context.Context, method string, request any) error {
-	if err := l.terminalError(); err != nil {
-		return err
-	}
+// wire. Reserved operations are gated by the latest advertised capability set;
+// session-channel delivery is not, because it is addressed by the bound
+// channel rather than a reserved method. The reply is a bare Core
+// HostLinkError, or an empty body for success.
+func (l *centrifugeLink) call(ctx context.Context, method string, request any, requiresCapability bool) error {
 	body, err := json.Marshal(request)
 	if err != nil {
 		return fmt.Errorf("hostlink: %s: %w", method, err)
+	}
+
+	l.rpcMu.Lock()
+	defer l.rpcMu.Unlock()
+	if err := l.terminalError(); err != nil {
+		return err
+	}
+	if requiresCapability {
+		l.mu.Lock()
+		supported := !l.connecting && l.negotiated.Supports(method)
+		l.mu.Unlock()
+		if !supported {
+			return &UnsupportedMethodError{Method: method}
+		}
 	}
 	reply, err := l.client.RPC(ctx, method, body)
 	if err != nil {
@@ -333,14 +333,26 @@ func (l *centrifugeLink) call(ctx context.Context, method string, request any) e
 	if len(reply.Data) == 0 {
 		return nil
 	}
-	var control controlReply
-	if err := json.Unmarshal(reply.Data, &control); err != nil {
+	var refusal sessionwire.HostLinkError
+	if err := json.Unmarshal(reply.Data, &refusal); err != nil {
 		return fmt.Errorf("hostlink: %s: unreadable reply: %w", method, err)
 	}
-	if control.Error != nil {
-		return &HostRefusal{HostLinkError: *control.Error}
+	return &HostRefusal{HostLinkError: refusal}
+}
+
+// onConnecting clears the old capability set before a reconnect attempt can
+// send a new RPC. The transport may call this before the server has returned a
+// new reply, so retaining the old set would let a restarted Host receive a
+// reserved method it no longer advertises.
+func (l *centrifugeLink) onConnecting(centrifugego.ConnectingEvent) {
+	l.rpcMu.Lock()
+	l.mu.Lock()
+	if l.terminal == nil {
+		l.connecting = true
+		l.negotiated = sessionwire.VersionNegotiationResponse{}
 	}
-	return nil
+	l.mu.Unlock()
+	l.rpcMu.Unlock()
 }
 
 // onConnected verifies the version the Host selected.
@@ -350,12 +362,21 @@ func (l *centrifugeLink) call(ctx context.Context, method string, request any) e
 // reconnected to indefinitely and answer every control record with a decode
 // failure.
 func (l *centrifugeLink) onConnected(e centrifugego.ConnectedEvent) {
-	err := verifyNegotiation(e.Data)
+	negotiated, err := verifyNegotiation(e.Data)
 	if err != nil {
 		l.fail(err)
 		// Closing from inside a transport callback would block the callback on
 		// the client's own teardown, so it is handed to a goroutine.
 		go l.client.Close()
+	} else {
+		l.rpcMu.Lock()
+		l.mu.Lock()
+		if l.terminal == nil {
+			l.negotiated = negotiated
+			l.connecting = false
+		}
+		l.mu.Unlock()
+		l.rpcMu.Unlock()
 	}
 	l.settle(err)
 }
@@ -424,17 +445,17 @@ func (l *centrifugeLink) terminalError() error {
 // current version. Core's VersionNegotiationResponse rejects any version but
 // the one this build implements, so "did not decode" and "named another
 // version" are the same answer here and both are terminal.
-func verifyNegotiation(data []byte) error {
+func verifyNegotiation(data []byte) (sessionwire.VersionNegotiationResponse, error) {
 	if len(data) == 0 {
-		return fmt.Errorf("%w: host sent no version selection", ErrUnsupportedProtocol)
+		return sessionwire.VersionNegotiationResponse{}, fmt.Errorf("%w: host sent no version selection", ErrUnsupportedProtocol)
 	}
-	var reply connectReplyData
-	if err := json.Unmarshal(data, &reply); err != nil {
-		return fmt.Errorf("%w: %v", ErrUnsupportedProtocol, err)
+	reply, err := sessionwire.DecodeHostLinkConnectReply(data)
+	if err != nil {
+		return sessionwire.VersionNegotiationResponse{}, fmt.Errorf("%w: %v", ErrUnsupportedProtocol, err)
 	}
-	if reply.Negotiation.Version != sessionwire.CurrentWireVersion {
-		return fmt.Errorf("%w: host selected %d, this build speaks %d",
-			ErrUnsupportedProtocol, reply.Negotiation.Version, sessionwire.CurrentWireVersion)
+	if reply.Version != sessionwire.CurrentWireVersion {
+		return sessionwire.VersionNegotiationResponse{}, fmt.Errorf("%w: host selected %d, this build speaks %d",
+			ErrUnsupportedProtocol, reply.Version, sessionwire.CurrentWireVersion)
 	}
-	return nil
+	return reply, nil
 }

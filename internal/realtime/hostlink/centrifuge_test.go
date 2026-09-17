@@ -24,10 +24,10 @@ import (
 // produced was a compatibility claim filled in from go.mod rather than run.
 //
 // The node is a STAND-IN, not the Host. It implements the Factory half's
-// counterpart -- the method names, the reply shape and the push envelope -- and
-// that mirror is Factory's proposal: Core defines the record bodies and no
-// framing for them. A case here proves Factory speaks what it documents, not
-// that the real Host agrees.
+// counterpart -- the method names, the reply shape and the push envelope --
+// and that mirror uses Core's connect and RPC framing; the {type, data} push
+// envelope remains Factory's half. A case here proves Factory speaks what it
+// documents, not that the real Host agrees.
 
 // waitFor is deliberately generous. This box runs under a load that makes wall
 // times meaningless, so a timeout here is evidence of nothing except that the
@@ -78,9 +78,9 @@ func TestADialIsRefusedWhenTheHostSelectsAnotherWireVersion(t *testing.T) {
 	t.Parallel()
 
 	for name, opts := range map[string]hostOptions{
-		"a version this build does not speak": {rawNegotiation: `{"version_negotiation":{"version":2}}`},
+		"a version this build does not speak": {rawNegotiation: `{"version":2}`},
 		"no selection at all":                 {rawNegotiation: "-"},
-		"an unreadable selection":             {rawNegotiation: `{"version_negotiation":{"version":"one"}}`},
+		"an unreadable selection":             {rawNegotiation: `{"version":"one"}`},
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
@@ -243,11 +243,9 @@ func TestATypedHostRefusalArrivesWithItsCodeAndDetail(t *testing.T) {
 
 	host := newHostServer(t, hostOptions{
 		rpc: func(string, []byte) ([]byte, error) {
-			return json.Marshal(map[string]any{
-				"error": sessionwire.HostLinkError{
-					Code:              sessionwire.HostLinkErrorEpochMismatch,
-					CurrentLeaseEpoch: 11,
-				},
+			return json.Marshal(sessionwire.HostLinkError{
+				Code:              sessionwire.HostLinkErrorEpochMismatch,
+				CurrentLeaseEpoch: 11,
 			})
 		},
 	})
@@ -410,7 +408,7 @@ func TestAReconnectIntoAHostSpeakingAnotherVersionStopsTheLink(t *testing.T) {
 	host := newHostServer(t, hostOptions{})
 	link := mustDial(t, host)
 
-	host.setNegotiation(`{"version_negotiation":{"version":2}}`)
+	host.setNegotiation(`{"version":2}`)
 	host.disconnectEveryone(centrifuge.Disconnect{Code: 4000, Reason: "test reconnect"})
 	waitUntil(t, "a second handshake", func() bool { return len(host.connects()) >= 2 })
 
@@ -534,6 +532,8 @@ type connectRecord struct {
 	name    string
 	version string
 	offered []sessionwire.WireVersion
+	data    []byte
+	reply   []byte
 }
 
 type rpcCall struct {
@@ -544,6 +544,10 @@ type rpcCall struct {
 type hostOptions struct {
 	// token, when set, is the only credential the Host accepts.
 	token string
+	// methods are the reserved HostLink methods advertised in a bare reply.
+	// A nil slice takes the ordinary stand-in capabilities; an explicitly empty
+	// non-nil slice models a Host that advertises no reserved methods.
+	methods []string
 	// rawNegotiation replaces the connect reply body. "-" sends none.
 	rawNegotiation string
 	// rpc answers every control RPC. A nil value acknowledges.
@@ -561,6 +565,7 @@ type hostServer struct {
 	disconnected   int
 	clients        map[string]*centrifuge.Client
 	negotiation    string
+	methods        []string
 }
 
 func newHostServer(t *testing.T, opts hostOptions) *hostServer {
@@ -573,51 +578,72 @@ func newHostServer(t *testing.T, opts hostOptions) *hostServer {
 	if err != nil {
 		t.Fatalf("centrifuge.New: %v", err)
 	}
+	methods := opts.methods
+	if methods == nil {
+		methods = []string{sessionwire.HostLinkMethodBind, sessionwire.HostLinkMethodUnbind}
+	}
 	host := &hostServer{
 		id:          hostOne,
 		node:        node,
 		clients:     map[string]*centrifuge.Client{},
 		negotiation: opts.rawNegotiation,
+		methods:     append([]string(nil), methods...),
 	}
 
 	node.OnConnecting(func(_ context.Context, e centrifuge.ConnectEvent) (centrifuge.ConnectReply, error) {
-		record := connectRecord{token: e.Token, name: e.Name, version: e.Version}
-		var data struct {
-			Negotiation sessionwire.VersionNegotiationRequest `json:"version_negotiation"`
-		}
-		if len(e.Data) > 0 {
-			// Core's own strict decoder, so an offer that arrived malformed is
-			// recorded as an empty list rather than as something plausible.
-			if err := json.Unmarshal(e.Data, &data); err == nil {
-				record.offered = data.Negotiation.SupportedVersions
-			}
+		record := connectRecord{
+			token: e.Token, name: e.Name, version: e.Version,
+			data: append([]byte(nil), e.Data...),
 		}
 		host.mu.Lock()
-		host.connectRecords = append(host.connectRecords, record)
-		negotiation := host.negotiation
+		rawNegotiation := host.negotiation
+		methods := append([]string(nil), host.methods...)
 		host.mu.Unlock()
 
+		request, err := sessionwire.DecodeHostLinkConnectRequest(e.Data)
+		record.offered = append([]sessionwire.WireVersion(nil), request.SupportedVersions...)
+		if err != nil {
+			host.mu.Lock()
+			host.connectRecords = append(host.connectRecords, record)
+			host.mu.Unlock()
+			return centrifuge.ConnectReply{}, centrifuge.DisconnectInappropriateProtocol
+		}
+
 		if opts.token != "" && e.Token != opts.token {
+			host.mu.Lock()
+			host.connectRecords = append(host.connectRecords, record)
+			host.mu.Unlock()
 			return centrifuge.ConnectReply{}, centrifuge.DisconnectInvalidToken
 		}
 
 		reply := centrifuge.ConnectReply{Credentials: &centrifuge.Credentials{UserID: "factory"}}
-		switch negotiation {
+		switch rawNegotiation {
 		case "-":
 			// No selection at all.
 		case "":
-			selection, err := sessionwire.NegotiateVersion(data.Negotiation)
+			selection, err := sessionwire.NegotiateVersion(request)
 			if err != nil {
+				host.mu.Lock()
+				host.connectRecords = append(host.connectRecords, record)
+				host.mu.Unlock()
 				return centrifuge.ConnectReply{}, centrifuge.DisconnectInappropriateProtocol
 			}
-			body, err := json.Marshal(map[string]any{"version_negotiation": selection})
+			selection = selection.WithHostLinkMethods(methods...)
+			body, err := sessionwire.EncodeHostLinkConnectReply(selection)
 			if err != nil {
+				host.mu.Lock()
+				host.connectRecords = append(host.connectRecords, record)
+				host.mu.Unlock()
 				return centrifuge.ConnectReply{}, centrifuge.DisconnectServerError
 			}
 			reply.Data = body
 		default:
-			reply.Data = []byte(negotiation)
+			reply.Data = []byte(rawNegotiation)
 		}
+		record.reply = append([]byte(nil), reply.Data...)
+		host.mu.Lock()
+		host.connectRecords = append(host.connectRecords, record)
+		host.mu.Unlock()
 		return reply, nil
 	})
 
@@ -635,7 +661,10 @@ func newHostServer(t *testing.T, opts hostOptions) *hostServer {
 				cb(centrifuge.RPCReply{Data: data}, err)
 				return
 			}
-			cb(centrifuge.RPCReply{Data: []byte(`{}`)}, nil)
+			// An empty body is the legitimate success shape. A non-empty body
+			// must be a bare Core HostLinkError; returning {} here would make
+			// the stand-in bless a malformed reply.
+			cb(centrifuge.RPCReply{}, nil)
 		})
 		client.OnDisconnect(func(centrifuge.DisconnectEvent) {
 			host.mu.Lock()
@@ -674,7 +703,14 @@ func (h *hostServer) target() hostlink.Target {
 func (h *hostServer) connects() []connectRecord {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	return append([]connectRecord(nil), h.connectRecords...)
+	cloned := make([]connectRecord, len(h.connectRecords))
+	for index, record := range h.connectRecords {
+		cloned[index] = record
+		cloned[index].offered = append([]sessionwire.WireVersion(nil), record.offered...)
+		cloned[index].data = append([]byte(nil), record.data...)
+		cloned[index].reply = append([]byte(nil), record.reply...)
+	}
+	return cloned
 }
 
 func (h *hostServer) calls() []rpcCall {

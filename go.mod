@@ -5,7 +5,7 @@ go 1.26.8
 require (
 	github.com/centrifugal/centrifuge v0.38.0
 	github.com/centrifugal/centrifuge-go v0.12.0
-	github.com/looprig/core v0.8.0
+	github.com/looprig/core v0.9.1
 	github.com/looprig/sessionstore v0.10.0
 )
 

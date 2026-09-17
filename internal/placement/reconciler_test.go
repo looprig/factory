@@ -1121,7 +1121,7 @@ func TestThePinnedWireCarriesAnAttachment(t *testing.T) {
 }
 
 // pinnedHostLinkTypes is every exported HostLink* type declared by the pinned
-// core sessionwire/v1 (v0.8.0), as ABSOLUTE literals. A set built from the package
+// core sessionwire/v1 (v0.9.1), as ABSOLUTE literals. A set built from the package
 // itself would pin nothing; this list is what a reader compared against.
 //
 // The whole HostLink prefix is pinned rather than only the *Request suffix,
@@ -1156,7 +1156,7 @@ var pinnedHostLinkTypes = []string{
 // "the sessionwire on disk" and "the sessionwire this build resolves" are not
 // the same directory, and a premise checked against the wrong one is the stale
 // citation this test exists to prevent.
-const pinnedCoreVersion = "v0.8.0"
+const pinnedCoreVersion = "v0.9.1"
 
 const pinnedCoreModule = "github.com/looprig/core"
 

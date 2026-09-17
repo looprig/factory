@@ -29,6 +29,23 @@ var ErrBindingConflict = errors.New("hostlink: session is bound to another host"
 // ErrUnknownBinding reports work for a session this pool holds no route for.
 var ErrUnknownBinding = errors.New("hostlink: no binding for session")
 
+// ErrUnsupportedMethod reports a reserved HostLink operation the connected
+// Host did not advertise. It is a local refusal: no RPC is sent to a peer
+// that did not promise to handle the method.
+var ErrUnsupportedMethod = errors.New("hostlink: host did not advertise the requested method")
+
+// UnsupportedMethodError identifies the reserved operation refused locally
+// because the negotiated HostLink capability set did not contain it.
+type UnsupportedMethodError struct {
+	Method string
+}
+
+func (e *UnsupportedMethodError) Error() string {
+	return fmt.Sprintf("%s: %s", ErrUnsupportedMethod, e.Method)
+}
+
+func (e *UnsupportedMethodError) Unwrap() error { return ErrUnsupportedMethod }
+
 // ErrCommandUndelivered reports that a committed command was NOT handed to a
 // Host.
 //

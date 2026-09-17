@@ -13,7 +13,7 @@ import (
 // name, and the only ones remote-verified as released when the scaffold landed.
 // A Looprig module absent from this map has no version Factory may name.
 var releasedLooprigVersions = map[string]string{
-	"github.com/looprig/core":         "v0.8.0",
+	"github.com/looprig/core":         "v0.9.1",
 	"github.com/looprig/storage":      "v0.6.0",
 	"github.com/looprig/fsstore":      "v0.5.1",
 	"github.com/looprig/natsstore":    "v0.5.1",
