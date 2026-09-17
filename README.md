@@ -251,22 +251,21 @@ Several Factory replicas may hold their own connection to one Host. There is no
 broker and no leader: closing one replica's pool leaves the others' connections
 and routes untouched, measured over fakes and over real sockets.
 
-**Core defines the record bodies and no transport framing for them.** The method
-names and the `{type, data}` push envelope here are Factory's half of a protocol
-whose Host half does not exist in this repository, and the tests run against a
-stand-in node implementing exactly that proposal. It is a declared gap, not an
-agreement. The strings are pinned as absolute literals, because they are what
-Host must mirror. Where they should finally live is unresolved: `internal/` is a
-place Host cannot import, and Core's `sessionwire/v1` is transport-neutral and
-deliberately not the answer — a method name is transport-shaped, and putting one
-in a tier-0 module would make a future transport change a tier-0 breaking
-release.
+**Core owns the HostLink framing contract, not only the record bodies.** Core
+v0.9.1's `sessionwire/v1` defines the bare connect codecs, reserved method
+names, and injective `HostLinkChannel` derivation that Factory and Host must
+share. The asynchronous `{type, data}` push envelope is the only framing still
+local to Factory; it is not a Core record or a HostLink RPC method. The Host half
+does not exist in this repository, so these tests still run against a stand-in
+node implementing the proposal. They pin Factory's side, but are not proof of a
+live cross-module Host implementation.
 
 The pool carries the control plane only. A7.3 moved the per-binding queues and
 the backpressure repair *above* it, into `internal/realtime/delivery` and
-`routing.Relay`; the live tail itself is still absent, because Core defines the
-session-channel record bodies but no HostLink framing to carry them. Choosing
-which Host a session belongs to is A7.2.
+`routing.Relay`; the live publication consumer itself remains absent. Core's
+HostLink framing now defines the session channel and command-delivery shape, but
+Factory has not yet consumed the live publication stream. Choosing which Host a
+session belongs to is A7.2.
 `factory.New` composes neither the pool nor the reaper's cadence; A9.1 owns that.
 
 ## Placement
