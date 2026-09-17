@@ -5,6 +5,11 @@ SHELL := /bin/bash
 
 GOFILES = GOWORK=off go run ./internal/modfiles/cmd/modfiles -root .
 
+# GOTOOLCHAIN selects the compiler for `go` commands, not a standalone
+# `gofmt` found on PATH. Resolve the formatter from the pinned toolchain so
+# fmt and fmt-check enforce the module's Go 1.26.8 baseline.
+GOFMT := $(shell GOWORK=off GOTOOLCHAIN=go1.26.8 go env GOROOT)/bin/gofmt
+
 # PIPEFAIL is stated in each piping recipe rather than inherited from
 # .SHELLFLAGS above, and that is not belt-and-braces: .SHELLFLAGS arrived in GNU
 # make 3.82 and the make that ships with macOS is 3.81, which ignores it
@@ -30,11 +35,11 @@ test:
 	GOWORK=off go test -count=1 -race ./...
 
 fmt:
-	$(PIPEFAIL) $(GOFILES) | xargs -0 gofmt -w
+	$(PIPEFAIL) $(GOFILES) | xargs -0 $(GOFMT) -w
 
 fmt-check:
 	@$(PIPEFAIL) output="$$(mktemp)"; trap 'rm -f "$$output"' EXIT; \
-		if ! $(GOFILES) | xargs -0 gofmt -l >"$$output"; then exit 1; fi; \
+		if ! $(GOFILES) | xargs -0 $(GOFMT) -l >"$$output"; then exit 1; fi; \
 		if [[ -s "$$output" ]]; then cat "$$output"; exit 1; fi
 
 vet:
