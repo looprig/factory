@@ -299,14 +299,17 @@ replica is refused by name. Widening this exported method set is a source
 compatibility break for external implementations and must ship in the next
 major release.
 
-**Two gaps are declared rather than worked around.** The pinned `core v0.8.0`
-does carry `HostLinkAttachRequest`, but this package has no caller that sends it
-and gates the request against a Host that can answer it. `internal/placement`
-therefore names the selected Host in `OutcomeAttachPooled` and stops there; an
-older Host routes the unknown method as a channel and answers
-`runtime_unavailable`. And a `tenant_exclusive` pooled advertisement is never
-selected, because Factory cannot see which tenants a Host serves and refusing is
-the only enforcement of specification section 12 available to it.
+**Two gaps are declared rather than worked around.** The pinned `core v0.9.1`
+carries `HostLinkAttachRequest` and the negotiation reply's optional
+`hostlink_methods` capability signal, but this package has no caller that sends
+attach. `internal/placement` therefore names the selected Host in
+`OutcomeAttachPooled` and stops there; a future caller must gate attach on the
+negotiated `Supports` result because an older Host routes the unknown method as
+a channel and answers `runtime_unavailable`. The HostLink transport does use
+that signal to refuse unsupported bind and unbind operations locally. And a
+`tenant_exclusive` pooled advertisement is never selected, because Factory
+cannot see which tenants a Host serves and refusing is the only enforcement of
+specification section 12 available to it.
 
 ## Status
 

@@ -1419,10 +1419,11 @@ work and is deliberately not done here.
 
 ### One gap closed by Core, one still declared
 
-**The pinned wire carries an attachment since `core v0.8.0`, and the caller
-that sends it is not built.** A4.2 step 2 has the selected candidate asked to
-acquire or attach. At `core v0.7.0` no request could carry that — bind and
-unbind refuse a zero `LeaseEpoch`, drain asks a Host to *give up* a session —
+**The wire carries an attachment since `core v0.8.0`, and the caller that sends
+it is not built.** The current pin is `core v0.9.1`. A4.2 step 2 has the
+selected candidate asked to acquire or attach. At `core v0.7.0` no request
+could carry that — bind and unbind refuse a zero `LeaseEpoch`, drain asks a Host
+to *give up* a session —
 and `TestThePinnedWireCannotCarryAnAttachment` held that premise by failing on
 any growth of the `HostLink*` vocabulary. Core v0.8.0 grew it by exactly the
 record that closes the gap, `HostLinkAttachRequest` (sent as
@@ -1432,23 +1433,23 @@ whose `lease_epoch` a bind then names), so that test failed on the bump by
 design and `TestThePinnedWireCarriesAnAttachment` replaces it in the positive
 direction: attach validates without an epoch and refuses without the fence,
 bind still refuses a zero epoch, `epoch_mismatch` still carries the **other
-holder's** epoch and Core still names no `lease_held`, and the vocabulary list
-is the twelve names v0.8.0 declares. The scan is unchanged — parsed from the
-pinned source, refused if `go.mod` has moved off `pinnedCoreVersion`, with
+holder's** epoch and Core still names no `lease_held`, and the vocabulary remains
+the twelve names introduced by v0.8.0. Core v0.9.1 additionally puts the
+optional `hostlink_methods` capability signal on the negotiation response; the
+HostLink transport retains it and gates its reserved bind and unbind operations
+with `Supports`. The scan is unchanged — parsed from the pinned source, refused
+if `go.mod` has moved off `pinnedCoreVersion`, with
 `TestTheHostLinkVocabularyScanSeesANewType` as its positive control — so the
 next growth asks a human again.
 
-`OutcomeAttachPooled` still **names** a Host and stops, and the reason is no
-longer the wire. A caller sending `hostlink.attach` to a **v0.1.0 Host** has the
-method resolved as a channel and is answered `runtime_unavailable` from the
-not-bound branch, indistinguishable from a Host that genuinely refused; and
-**no released Core or SessionStore record carries a Host capability or version**
-the caller could gate on — the capacity report, registry observation, host
-registration and target advertisement name a runtime build, a placement and a
-generation, none of them a Host build, and the wire version is `1` on both
-sides of the bump. Until that signal exists the attach caller would be a retry
-loop against every pre-attach Host in a mixed fleet, so it lives above this
-package and is owed, not shipped.
+`OutcomeAttachPooled` still **names** a Host and stops, and the reason is now the
+caller, not the wire. A caller sending `hostlink.attach` to a **v0.1.0 Host**
+has the method resolved as a channel and is answered `runtime_unavailable` from
+the not-bound branch, indistinguishable from a Host that genuinely refused; an
+attach caller must therefore gate on the negotiated `Supports` result. The
+HostLink transport already applies that rule to bind and unbind, but no attach
+caller or driver is shipped, so it lives above this package and is owed, not
+shipped.
 
 **Tenant-exclusive pooled capacity is refused, not admitted.** Section 12 makes
 Factory placement the enforcer of tenant exclusivity for a pooled Host without
