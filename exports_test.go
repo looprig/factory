@@ -146,6 +146,14 @@ func TestNewStoreDirectoryReadsTheStoresRegistryAndTargetIndex(t *testing.T) {
 	}
 
 	key := sessionstore.HostTargetKey{AgentID: "agent-a", RuntimeCompatibilityID: "runtime-v1", Placement: sessionwire.HostPlacementPooled}
+	if _, _, err := store.CreateCatalogEntry(ctx, sessionstore.CreateCatalogEntryRequest{
+		TenantID: tenant, SessionID: session, AgentID: "agent-a", RuntimeCompatibilityID: "runtime-v1",
+		CreatedAt: clock.now, LastActiveAt: clock.now, State: sessionwire.SessionStateIdle,
+		Residency: sessionwire.SessionResidencyCold, DesiredPlacement: sessionwire.HostPlacementPooled,
+		IdempotencyKey: "create-export-owner",
+	}); err != nil {
+		t.Fatalf("CreateCatalogEntry: %v", err)
+	}
 	publish := func(host sessionwire.HostID, capacity uint64, accepting bool) {
 		t.Helper()
 		_, err := store.PublishHostTarget(ctx, sessionstore.PublishHostTargetRequest{

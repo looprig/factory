@@ -57,46 +57,6 @@ type Claims interface {
 	ReleaseReconciliationClaim(ctx context.Context, req sessionstore.ReleaseReconciliationClaimRequest) (sessionstore.ReconciliationClaimEntry, error)
 }
 
-// WorkloadController creates and updates the platform workload a dedicated
-// session needs. A4.2 step 3.
-//
-// ITS SHAPE FOLLOWS H5 (answered 2026-09-04), and each part of the answer shows
-// up here as a constraint rather than as prose:
-//
-//   - The adapter is INTERNAL to this module, at internal/placement/kubernetes,
-//     so this interface may not name a platform type. sessionstore.PlacementIntent
-//     is the whole currency: it is Factory-authored desire and nothing else --
-//     no lease epoch, no HostID, no residency -- and its opaque workload payload
-//     is a byte string this module never parses. A Kubernetes PodSpec, a Nomad
-//     job and a future platform's manifest are the same value to it.
-//   - The intent carries its GENERATION, which is what a controller records
-//     against the workload it created. A controller that reconciled generation 7
-//     and is handed 7 again has nothing to do, however many Host heartbeats have
-//     moved the record's revision in between. That is what makes calling this on
-//     every reconciliation cheap rather than wasteful. (Attribution, since it is
-//     easy to over-read: H5's recorded text contains no "records generation"
-//     clause. The requirement is A4.2 step 1's idempotent desired generation and
-//     the field is sessionstore.PlacementIntent.Generation, a member by
-//     construction. H5 decides the adapter's placement, not this.)
-//   - Multiple replicas of either binary run with NO leader election, so this
-//     is called concurrently for one session by design. Deterministic workload
-//     identity is the mechanism that makes that safe -- the claim only
-//     suppresses duplicate work -- and an implementation whose creation is not
-//     name-deterministic breaks the decision rather than this interface.
-//
-// It has exactly one method. Deletion is deliberately absent: specification
-// section 13 makes the ordering normative -- request drain, wait for an
-// epoch-fenced checkpoint and an observed cold release, THEN delete -- and none
-// of those steps exists in this module yet. A Delete declared here today would
-// be a seam with no implementation, no caller and no test, which is the shape
-// of the "guarantee" this lane has twice found inert. The operative widener is
-// D1.1 step 1, which specifies ensure, observe, request-drain and delete;
-// D2.2 supplies the drain protocol those last two depend on. A4.2 step 3 asks
-// for a NARROW interface, so one method is what was requested.
-type WorkloadController interface {
-	EnsureWorkload(ctx context.Context, intent sessionstore.PlacementIntent) error
-}
-
 // Clock is the time seam. It declares only Now: this package sets a claim
 // horizon and reads an owner's expiry, and schedules nothing.
 type Clock interface {
@@ -224,8 +184,8 @@ type Result struct {
 //     record that exists to coordinate SCALING.
 //  2. Only then is the claim taken. Losing it is not a failure: step 4 of the
 //     algorithm says a replica that observes an existing claim re-reads
-//     observed state rather than scaling again, so the deferral path re-reads
-//     the registry and reports an owner the winner has just produced.
+//     desired and observed state rather than scaling again, so the deferral path can
+//     report an owner the winner has just produced for the generation it wrote.
 //  3. Desired state is written before the decision, because the write can
 //     change the desired placement the decision branches on.
 //
@@ -262,7 +222,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req Request) (Result, error)
 		return Result{}, err
 	}
 	if !claimed {
-		return r.deferToHolder(ctx, req, entry.Record, held)
+		return r.deferToHolder(ctx, req, held)
 	}
 	// The release is best effort and its failure is deliberately not returned.
 	// A claim licenses nothing, so a claim left to lapse costs a delayed
@@ -338,21 +298,27 @@ func (r *Reconciler) claim(ctx context.Context, req Request, now time.Time) (boo
 // deferToHolder is specification section 15 step 4's "observing an existing
 // claim means re-read desired/observed state rather than scaling again".
 //
-// The re-read is the point. The winning replica may have finished placing
-// between this replica's first registry read and its refused acquisition, and a
-// caller told only "busy" would wait out the holder's horizon for a session
-// that already has a Host.
+// The re-reads are the point. The winning replica may have committed a new
+// desired generation and finished placing between this replica's first catalog
+// and registry reads and its refused acquisition. A caller told only "busy"
+// would wait out the holder's horizon for a session whose desired and observed
+// state is already settled.
 func (r *Reconciler) deferToHolder(
 	ctx context.Context,
 	req Request,
-	record sessionstore.CatalogRecord,
 	held *sessionstore.ReconcileError,
 ) (Result, error) {
+	entry, err := r.cfg.Catalog.GetCatalogEntry(ctx, sessionstore.GetCatalogEntryRequest{
+		TenantID: req.TenantID, SessionID: req.SessionID,
+	})
+	if err != nil {
+		return Result{}, err
+	}
 	owner, observed, err := r.cfg.Directory.Owner(ctx, req.TenantID, req.SessionID)
 	if err != nil {
 		return Result{}, err
 	}
-	if decision := Decide(record, owner, observed, nil, r.cfg.Clock.Now()); decision.Outcome == OutcomeReuseOwner {
+	if decision := Decide(entry.Record, owner, observed, nil, r.cfg.Clock.Now()); decision.Outcome == OutcomeReuseOwner {
 		return Result{Decision: decision}, nil
 	}
 	return Result{Deferred: true, ClaimExpiresAt: held.ExpiresAt}, nil

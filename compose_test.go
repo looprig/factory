@@ -743,6 +743,9 @@ func TestADedicatedTemplateNeedsAWorkloadAndAPooledOneMustNotHaveOne(t *testing.
 		{"a pooled target with no workload", factory.LaunchTemplate{
 			Key: sessionstore.HostTargetKey{AgentID: "a", RuntimeCompatibilityID: "r", Placement: sessionwire.HostPlacementPooled},
 		}, true},
+		{"an omitted placement defaults to pooled", factory.LaunchTemplate{
+			Key: sessionstore.HostTargetKey{AgentID: "a", RuntimeCompatibilityID: "r"},
+		}, true},
 		{"a pooled target with a workload", factory.LaunchTemplate{
 			Key:      sessionstore.HostTargetKey{AgentID: "a", RuntimeCompatibilityID: "r", Placement: sessionwire.HostPlacementPooled},
 			Workload: workload,

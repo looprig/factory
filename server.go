@@ -85,8 +85,7 @@ type PlacementController interface {
 	ReleasePlacement(ctx context.Context, tenant sessionwire.TenantID, session sessionwire.SessionID) error
 }
 
-// WorkloadController creates and updates the platform workload a dedicated
-// session needs.
+// WorkloadController owns the lifecycle of a dedicated session's workload.
 //
 // It is OPTIONAL and only the controller binary supplies it. H5 (answered
 // 2026-09-04) puts the platform adapter in a separate controller, so
@@ -94,12 +93,14 @@ type PlacementController interface {
 // refusal rather than silently doing nothing.
 //
 // The intent is the whole currency: Factory-authored desire, carrying its own
-// generation and an opaque workload payload this module never parses. A
-// Kubernetes PodSpec, a Nomad job and a future platform's manifest are the
-// same value to it, which is what keeps the platform out of this module's
-// import graph.
+// generation and an opaque workload payload this module never parses. The
+// lifecycle observations are Core records, so a Kubernetes PodSpec, a Nomad
+// job and a future platform's manifest remain behind the adapter boundary.
 type WorkloadController interface {
 	EnsureWorkload(ctx context.Context, intent sessionstore.PlacementIntent) error
+	ObserveWorkload(ctx context.Context, intent sessionstore.PlacementIntent) (sessionwire.HostLinkRegistryObservation, bool, error)
+	RequestDrain(ctx context.Context, intent sessionstore.PlacementIntent) (sessionwire.HostLinkDrainObservation, error)
+	DeleteWorkload(ctx context.Context, intent sessionstore.PlacementIntent) error
 }
 
 // Clock is the time seam.

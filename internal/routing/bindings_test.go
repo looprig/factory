@@ -868,6 +868,14 @@ func TestTheDirectoryIsTheResolver(t *testing.T) {
 	}
 	binder := &recordingBinder{}
 	bindings := newBindings(t, directory, binder)
+	if _, _, err := store.CreateCatalogEntry(ctx, sessionstore.CreateCatalogEntryRequest{
+		TenantID: bindTenant, SessionID: bindSession, AgentID: bindAgent, RuntimeCompatibilityID: bindRuntime,
+		CreatedAt: clock.now, LastActiveAt: clock.now, State: sessionwire.SessionStateIdle,
+		Residency: sessionwire.SessionResidencyCold, DesiredPlacement: sessionwire.HostPlacementPooled,
+		IdempotencyKey: "create-directory-resolver",
+	}); err != nil {
+		t.Fatalf("CreateCatalogEntry: %v", err)
+	}
 
 	if _, err := bindings.Acquire(ctx, bindTenant, bindSession); !errors.Is(err, ErrNoOwner) {
 		t.Fatalf("Acquire with no registration = %v, want ErrNoOwner", err)

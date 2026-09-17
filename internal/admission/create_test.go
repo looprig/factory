@@ -14,7 +14,9 @@ import (
 	"time"
 
 	sessionwire "github.com/looprig/core/sessionwire/v1"
+	"github.com/looprig/factory/identity"
 	"github.com/looprig/sessionstore"
+	"github.com/looprig/storage/memstore"
 )
 
 // servicePublicCreates models the released public-create plane.
@@ -186,6 +188,66 @@ func TestACreateIsAdmittedWithADispositionBindingThisModuleAuthored(t *testing.T
 	// The payload is inline, and step 5's object path was NOT taken.
 	if f.creates.uploads != 0 {
 		t.Errorf("a small create performed %d uploads, want 0", f.creates.uploads)
+	}
+}
+
+// TestPublicCreatePersistsTheResolvedPlacementAndWorkload uses the real
+// SessionStore public-create path. The resolver chooses the immutable target;
+// PreparePublicCreate and AdmitPublicCreate must carry that choice into the
+// catalog atomically rather than leaving placement as an in-memory hint.
+func TestPublicCreatePersistsTheResolvedPlacementAndWorkload(t *testing.T) {
+	workload := sessionstore.DesiredWorkload{PayloadVersion: "workload/v1", Payload: []byte(`{"resources":{"cpu":"2"}}`)}
+	for _, test := range []struct {
+		name      string
+		placement sessionwire.HostPlacement
+		workload  sessionstore.DesiredWorkload
+	}{
+		{name: "pooled", placement: sessionwire.HostPlacementPooled},
+		{name: "dedicated", placement: sessionwire.HostPlacementDedicated, workload: workload},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			backend := memstore.New()
+			store, err := sessionstore.Open(context.Background(), backend, sessionstore.WithClock(serviceClock{serviceNow}))
+			if err != nil {
+				t.Fatalf("Open: %v", err)
+			}
+			t.Cleanup(func() { _ = store.Close(context.Background()) })
+			principal, err := identity.NewPrincipal("tenant-a", "actor-a", identity.KindActor)
+			if err != nil {
+				t.Fatalf("NewPrincipal: %v", err)
+			}
+			auth := &serviceAuthorizer{}
+			targets := &serviceTargets{known: true, target: Target{
+				Key:      sessionstore.HostTargetKey{AgentID: "agent-a", RuntimeCompatibilityID: "runtime-v1", Placement: test.placement},
+				Workload: test.workload,
+			}}
+			svc, err := NewService(Config{
+				Authorizer: auth, Targets: targets, Catalog: store, Commands: store,
+				Directory: &serviceDirectory{}, Clock: serviceClock{serviceNow}, IDs: &serviceIDs{},
+				PublicCreates: store, Binding: SessionBindingTemplate{StorageBindingID: "storage-a", BindingVersion: "v1"},
+				ApplyDeadline: time.Minute,
+			})
+			if err != nil {
+				t.Fatalf("NewService: %v", err)
+			}
+			req := createRequest("create-"+test.name, "session-"+test.name, smallBlocks)
+			if _, created, err := svc.AdmitCreate(context.Background(), principal, req); err != nil || !created {
+				t.Fatalf("AdmitCreate = created %t, err %v", created, err)
+			}
+			entry, err := store.GetCatalogEntry(context.Background(), sessionstore.GetCatalogEntryRequest{TenantID: principal.Tenant(), SessionID: req.SessionID})
+			if err != nil {
+				t.Fatalf("GetCatalogEntry: %v", err)
+			}
+			if entry.Record.DesiredPlacement != test.placement {
+				t.Fatalf("DesiredPlacement = %q, want %q", entry.Record.DesiredPlacement, test.placement)
+			}
+			if entry.Record.AgentID != "agent-a" || entry.Record.RuntimeCompatibilityID != "runtime-v1" {
+				t.Fatalf("target identity = %q/%q, want agent-a/runtime-v1", entry.Record.AgentID, entry.Record.RuntimeCompatibilityID)
+			}
+			if entry.Record.DesiredWorkload.PayloadVersion != test.workload.PayloadVersion || !bytes.Equal(entry.Record.DesiredWorkload.Payload, test.workload.Payload) {
+				t.Fatalf("DesiredWorkload = %+v, want %+v", entry.Record.DesiredWorkload, test.workload)
+			}
+		})
 	}
 }
 

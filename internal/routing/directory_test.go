@@ -204,6 +204,14 @@ func TestOwnerComesOnlyFromTheLiveSessionRegistry(t *testing.T) {
 	store, clock := openDirectoryStore(t)
 	directory := mustDirectory(t, store, DefaultLimits())
 	tenant, session := sessionwire.TenantID("tenant-a"), sessionwire.SessionID("session-a")
+	if _, _, err := store.CreateCatalogEntry(context.Background(), sessionstore.CreateCatalogEntryRequest{
+		TenantID: tenant, SessionID: session, AgentID: "agent-a", RuntimeCompatibilityID: "runtime-v1",
+		CreatedAt: clock.now, LastActiveAt: clock.now, State: sessionwire.SessionStateIdle,
+		Residency: sessionwire.SessionResidencyCold, DesiredPlacement: sessionwire.HostPlacementPooled,
+		IdempotencyKey: "create-directory-owner",
+	}); err != nil {
+		t.Fatalf("CreateCatalogEntry: %v", err)
+	}
 	_, err := store.PutHostRegistration(context.Background(), sessionstore.PutHostRegistrationRequest{
 		TenantID: tenant, SessionID: session, LeaseEpoch: 7, ObservedAt: clock.now, ExpiresAt: clock.now.Add(time.Minute),
 		Route: sessionstore.HostRoute{HostID: "host-owner", HostGeneration: 9, AgentID: "agent-a", RuntimeCompatibilityID: "runtime-v1",

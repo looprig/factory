@@ -3,6 +3,8 @@ package placement
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"go/ast"
 	"go/parser"
@@ -46,6 +48,18 @@ type recordingController struct {
 func (c *recordingController) EnsureWorkload(_ context.Context, intent sessionstore.PlacementIntent) error {
 	c.intents = append(c.intents, intent)
 	return c.err
+}
+
+func (c *recordingController) ObserveWorkload(context.Context, sessionstore.PlacementIntent) (sessionwire.HostLinkRegistryObservation, bool, error) {
+	return sessionwire.HostLinkRegistryObservation{}, false, nil
+}
+
+func (c *recordingController) RequestDrain(context.Context, sessionstore.PlacementIntent) (sessionwire.HostLinkDrainObservation, error) {
+	return sessionwire.HostLinkDrainObservation{}, nil
+}
+
+func (c *recordingController) DeleteWorkload(context.Context, sessionstore.PlacementIntent) error {
+	return nil
 }
 
 type fixture struct {
@@ -324,6 +338,78 @@ func TestADeferringFactoryStillReportsAnOwnerThatAppeared(t *testing.T) {
 	}
 }
 
+// desiredAfterFirstRead changes the catalog only after the first snapshot. A
+// loser must use the second snapshot together with the second registry read;
+// returning the first record would report Deferred for an owner that is already
+// compatible with the desired state the winner committed.
+type desiredAfterFirstRead struct {
+	*sessionstore.Store
+	reads int
+}
+
+func (c *desiredAfterFirstRead) GetCatalogEntry(ctx context.Context, req sessionstore.GetCatalogEntryRequest) (sessionstore.CatalogEntry, error) {
+	c.reads++
+	entry, err := c.Store.GetCatalogEntry(ctx, req)
+	if err != nil || c.reads != 1 {
+		return entry, err
+	}
+	_, err = c.Store.UpdateCatalogDesiredState(ctx, sessionstore.UpdateCatalogDesiredStateRequest{
+		TenantID: req.TenantID, SessionID: req.SessionID,
+		ExpectedRevision: entry.Revision, IdempotencyKey: "winner-dedicated-intent",
+		DesiredPlacement: sessionwire.HostPlacementDedicated, RuntimeCompatibilityID: testRuntime,
+		DesiredWorkload: sessionstore.DesiredWorkload{PayloadVersion: "v1", Payload: []byte(`{"cpu":"2"}`)},
+	})
+	if err != nil {
+		return sessionstore.CatalogEntry{}, err
+	}
+	return entry, nil
+}
+
+// TestAClaimLoserRereadsDesiredAndObservedState is the discriminating form of
+// the claim race. The first snapshot says pooled while the winner's update and
+// owner appear before the loser can reread. Only the fresh desired record lets
+// the loser return the compatible owner instead of a generic Deferred body.
+func TestAClaimLoserRereadsDesiredAndObservedState(t *testing.T) {
+	t.Parallel()
+
+	f := newFixture(t, sessionwire.HostPlacementPooled, "factory-2")
+	if _, err := f.store.AcquireReconciliationClaim(context.Background(), sessionstore.AcquireReconciliationClaimRequest{
+		TenantID: testTenant, SessionID: testSession, HolderID: "factory-1", ExpiresAt: f.clock.now.Add(time.Minute),
+	}); err != nil {
+		t.Fatalf("AcquireReconciliationClaim: %v", err)
+	}
+	f.putOwner(t, sessionwire.HostPlacementDedicated)
+	catalog := &desiredAfterFirstRead{Store: f.store}
+	directory := &lateOwnerDirectory{Directory: mustDirectory(t, f.store)}
+	reconciler, err := NewReconciler(Config{
+		Directory: directory, Catalog: catalog, Claims: f.store, Workloads: f.controller,
+		Clock: f.clock, HolderID: "factory-2", ClaimTTL: time.Minute, CandidateLimit: 8,
+	})
+	if err != nil {
+		t.Fatalf("NewReconciler: %v", err)
+	}
+
+	result, err := reconciler.Reconcile(context.Background(), Request{TenantID: testTenant, SessionID: testSession})
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if catalog.reads != 2 {
+		t.Fatalf("catalog reads = %d, want initial and loser reread", catalog.reads)
+	}
+	if directory.reads != 2 {
+		t.Fatalf("registry reads = %d, want initial and loser reread", directory.reads)
+	}
+	if result.Deferred {
+		t.Fatalf("result = %+v, want the fresh owner returned", result)
+	}
+	if result.Decision.Outcome != OutcomeReuseOwner || result.Decision.Owner.HostID != "host-owner" {
+		t.Fatalf("decision = %+v, want the dedicated owner from fresh state", result.Decision)
+	}
+	if len(f.controller.intents) != 0 {
+		t.Fatalf("controller intents = %+v, want no Ensure after losing the claim", f.controller.intents)
+	}
+}
+
 // TestALapsedClaimIsTakenOverByTheNextFactory is what recovers a crashed
 // replica: the claim's expiry is the whole recovery mechanism, so a lapsed one
 // must not keep a session unplaced.
@@ -401,6 +487,142 @@ func TestOneDesiredIntentIsWrittenOnceHoweverOftenItIsReconciled(t *testing.T) {
 	}
 	if result := f.reconcile(t, desired); result.Intent.Generation != afterFirst || result.Intent.Placement != sessionwire.HostPlacementDedicated {
 		t.Errorf("Result.Intent = %+v, want the stored intent at generation %d", result.Intent, afterFirst)
+	}
+}
+
+// TestARealDispositionCreateDrivesDedicatedEnsureAfterRestart keeps the
+// reconciler's most important composition edge on the real path. Public
+// creation writes a disposition-bound catalog record and its initial desired
+// workload atomically; Reconcile must then read that durable record and hand
+// the exact intent to the consumer-owned controller. Re-opening the same
+// backend proves the placement identity is not process-local and that a
+// restarted Factory can safely drive the same desired generation again.
+func TestARealDispositionCreateDrivesDedicatedEnsureAfterRestart(t *testing.T) {
+	backend := memstore.New()
+	clock := &movableClock{now: reconcileNow}
+	store, err := sessionstore.Open(context.Background(), backend, sessionstore.WithClock(clock))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	closeStore := func() {
+		if err := store.Close(context.Background()); err != nil {
+			t.Errorf("Close: %v", err)
+		}
+	}
+	t.Cleanup(closeStore)
+
+	payload := []byte(`{"blocks":[{"kind":"text","text":"dedicated"}]}`)
+	digest := sha256.Sum256(payload)
+	identity := sessionstore.PublicCreateIdentity{
+		TenantID:  testTenant,
+		SessionID: testSession,
+		CommandID: "create-dedicated",
+		Target: sessionstore.HostTargetKey{
+			AgentID: testAgent, RuntimeCompatibilityID: testRuntime,
+			Placement: sessionwire.HostPlacementDedicated,
+		},
+		Binding: sessionstore.SessionBinding{
+			StorageBindingID: "storage-a", BindingVersion: "v1",
+			RuntimeSessionID: "runtime-session-dedicated",
+			ProtocolMode:     sessionstore.ProtocolModeDisposition,
+		},
+		Kind:          sessionstore.CommandKind("create"),
+		PayloadDigest: hex.EncodeToString(digest[:]),
+		PayloadSize:   uint64(len(payload)),
+	}
+	workload := sessionstore.DesiredWorkload{
+		PayloadVersion: "workload/v1",
+		Payload:        []byte(`{"resources":{"cpu":"2"}}`),
+	}
+	prepared, err := store.PreparePublicCreate(context.Background(), sessionstore.PreparePublicCreateRequest{
+		Identity:                 identity,
+		ProposedRuntimeCommandID: sessionstore.RuntimeCommandID("runtime-command-dedicated"),
+		AcceptedAt:               clock.now,
+		ApplyDeadline:            clock.now.Add(time.Minute),
+		InitialWorkload:          workload,
+	})
+	if err != nil {
+		t.Fatalf("PreparePublicCreate: %v", err)
+	}
+	if prepared.Catalog.Record.Binding.ProtocolMode != sessionstore.ProtocolModeDisposition {
+		t.Fatalf("prepared catalog protocol = %q, want disposition", prepared.Catalog.Record.Binding.ProtocolMode)
+	}
+	if _, created, err := store.AdmitPublicCreate(context.Background(), sessionstore.AdmitPublicCreateRequest{
+		Identity: identity, Payload: payload,
+	}); err != nil || !created {
+		t.Fatalf("AdmitPublicCreate = created %t, err %v", created, err)
+	}
+
+	entry, err := store.GetCatalogEntry(context.Background(), sessionstore.GetCatalogEntryRequest{
+		TenantID: testTenant, SessionID: testSession,
+	})
+	if err != nil {
+		t.Fatalf("GetCatalogEntry after create: %v", err)
+	}
+	if entry.Record.Binding.ProtocolMode != sessionstore.ProtocolModeDisposition {
+		t.Fatalf("stored catalog protocol = %q, want disposition", entry.Record.Binding.ProtocolMode)
+	}
+	if entry.Record.DesiredPlacement != sessionwire.HostPlacementDedicated || entry.Record.DesiredGeneration != 1 {
+		t.Fatalf("stored desired placement/generation = %q/%d, want dedicated/1", entry.Record.DesiredPlacement, entry.Record.DesiredGeneration)
+	}
+	if entry.Record.DesiredWorkload.PayloadVersion != workload.PayloadVersion || !bytes.Equal(entry.Record.DesiredWorkload.Payload, workload.Payload) {
+		t.Fatalf("stored workload = %+v, want %+v", entry.Record.DesiredWorkload, workload)
+	}
+
+	controller := &recordingController{}
+	reconciler, err := NewReconciler(Config{
+		Directory: mustDirectory(t, store), Catalog: store, Claims: store, Workloads: controller,
+		Clock: clock, HolderID: "factory-1", ClaimTTL: time.Minute, CandidateLimit: 8,
+	})
+	if err != nil {
+		t.Fatalf("NewReconciler: %v", err)
+	}
+	first, err := reconciler.Reconcile(context.Background(), Request{TenantID: testTenant, SessionID: testSession})
+	if err != nil {
+		t.Fatalf("first Reconcile: %v", err)
+	}
+	if first.Decision.Outcome != OutcomeReconcileDedicated {
+		t.Fatalf("first decision = %+v, want %v", first.Decision, OutcomeReconcileDedicated)
+	}
+	if first.DesiredWrites != 0 {
+		t.Fatalf("first DesiredWrites = %d, want zero for create-persisted intent", first.DesiredWrites)
+	}
+	if len(controller.intents) != 1 || controller.intents[0].Generation != 1 {
+		t.Fatalf("first controller intents = %+v, want one generation-1 intent", controller.intents)
+	}
+	if controller.intents[0].Placement != sessionwire.HostPlacementDedicated || !bytes.Equal(controller.intents[0].Workload.Payload, workload.Payload) {
+		t.Fatalf("first controller intent = %+v, want the durable dedicated workload", controller.intents[0])
+	}
+
+	if err := store.Close(context.Background()); err != nil {
+		t.Fatalf("close before restart: %v", err)
+	}
+	store, err = sessionstore.Open(context.Background(), backend, sessionstore.WithClock(clock))
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	controllerAfterRestart := &recordingController{}
+	reconcilerAfterRestart, err := NewReconciler(Config{
+		Directory: mustDirectory(t, store), Catalog: store, Claims: store, Workloads: controllerAfterRestart,
+		Clock: clock, HolderID: "factory-2", ClaimTTL: time.Minute, CandidateLimit: 8,
+	})
+	if err != nil {
+		t.Fatalf("NewReconciler after restart: %v", err)
+	}
+	second, err := reconcilerAfterRestart.Reconcile(context.Background(), Request{TenantID: testTenant, SessionID: testSession})
+	if err != nil {
+		t.Fatalf("restarted Reconcile: %v", err)
+	}
+	if second.Decision.Outcome != OutcomeReconcileDedicated {
+		t.Fatalf("restarted decision = %+v, want %v", second.Decision, OutcomeReconcileDedicated)
+	}
+	if second.DesiredWrites != 0 || len(controllerAfterRestart.intents) != 1 {
+		t.Fatalf("restarted writes/intents = %d/%+v, want 0/one", second.DesiredWrites, controllerAfterRestart.intents)
+	}
+	if controllerAfterRestart.intents[0].Generation != first.Intent.Generation ||
+		controllerAfterRestart.intents[0].Placement != first.Intent.Placement ||
+		!bytes.Equal(controllerAfterRestart.intents[0].Workload.Payload, first.Intent.Workload.Payload) {
+		t.Fatalf("restarted intent = %+v, want the same durable identity as %+v", controllerAfterRestart.intents[0], first.Intent)
 	}
 }
 

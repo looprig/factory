@@ -113,6 +113,7 @@ type LaunchTemplate struct {
 // so the two cannot drift, and adds only the rule that belongs to the member
 // the published type does not have.
 func (t LaunchTemplate) Validate() error {
+	t = t.normalized()
 	if err := t.published().Validate(); err != nil {
 		return err
 	}
@@ -127,6 +128,18 @@ func (t LaunchTemplate) Validate() error {
 		}
 	}
 	return nil
+}
+
+// normalized applies the only implicit placement policy: an omitted placement
+// is pooled. Dedicated placement is never inferred from a capability or from
+// the presence of a workload; it must be named by the launch template. The
+// workload itself remains the explicit resource/isolation/workspace policy
+// input that is persisted with a dedicated public create.
+func (t LaunchTemplate) normalized() LaunchTemplate {
+	if t.Key.Placement == "" {
+		t.Key.Placement = sessionwire.HostPlacementPooled
+	}
+	return t
 }
 
 // published projects the half /v1/agents may show.
@@ -411,7 +424,7 @@ const DefaultVersion = "factory"
 func cloneTemplates(templates []LaunchTemplate) []LaunchTemplate {
 	copied := make([]LaunchTemplate, len(templates))
 	for i, template := range templates {
-		copied[i] = template
+		copied[i] = template.normalized()
 		copied[i].Workload.Payload = append([]byte(nil), template.Workload.Payload...)
 	}
 	return copied
