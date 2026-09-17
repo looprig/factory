@@ -1393,12 +1393,14 @@ The Kubernetes adapter is **internal**, built as **two binaries from the one
   is **not** an H5 clause: H5's recorded text says nothing about a generation.
   The requirement is A4.2 step 1's idempotent desired generation, and
   `sessionstore` supplies the field.
-- It has **exactly one method**. Section 13's deletion ordering — request drain,
-  wait for an epoch-fenced checkpoint and an observed `cold` release, then
-  delete — has none of its steps in this module, and a `Delete` declared today
-  would be a seam with no implementation, no caller and no test. **D1.1 step 1**
-  is the widener — it specifies ensure, observe, request-drain and delete — and
-  D2.2 supplies the drain protocol those depend on.
+- It exposes the four domain lifecycle operations `EnsureWorkload`,
+  `ObserveWorkload`, `RequestDrain`, and `DeleteWorkload`. Section 13's deletion
+  ordering — request drain, wait for an epoch-fenced checkpoint and an observed
+  `cold` release, then delete — stays in the caller's ordering; no platform type
+  crosses this seam. This module is seam-only and has no scheduled reconciliation
+  driver. Widening the exported method set is a source-compatibility break for
+  external implementations and must ship in the next major release; D2.2 supplies
+  the drain protocol those operations depend on.
 - A **nil controller is a valid configuration**, because `cmd/factory` holds no
   workload create/delete RBAC and composes none. A dedicated session reaching
   that replica is refused by name with `ErrNoWorkloadController`; reporting it as

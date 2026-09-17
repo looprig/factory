@@ -288,15 +288,23 @@ generation still, and a key derived from the intent keeps a second replica from
 applying it again — two Factories deriving one intent derive one key, and
 SessionStore checks the key before the revision.
 
-`WorkloadController` names no platform type and has one method. H5 puts the
-Kubernetes adapter inside this module and links it into `cmd/controller` alone,
-so a nil controller is a supported configuration and a dedicated session
-reaching the tenant-facing replica is refused by name.
+`WorkloadController` names no platform type and exposes the four domain
+lifecycle operations `EnsureWorkload`, `ObserveWorkload`, `RequestDrain`, and
+`DeleteWorkload`, all over Core and SessionStore records. The seam is
+composition-only here: no scheduled reconciliation driver is built in this
+module. H5 keeps the Kubernetes adapter internal to `cmd/controller` alone;
+`cmd/factory` supplies no workload create/delete RBAC, so a nil controller is a
+supported configuration and a dedicated session reaching the tenant-facing
+replica is refused by name. Widening this exported method set is a source
+compatibility break for external implementations and must ship in the next
+major release.
 
-**Two gaps are declared rather than worked around.** The pinned `core v0.7.0`
-has no request that can ask a Host to take an unowned session —
-`HostLinkBindRequest` refuses a zero lease epoch — so a pooled decision names a
-Host and stops there. And a `tenant_exclusive` pooled advertisement is never
+**Two gaps are declared rather than worked around.** The pinned `core v0.8.0`
+does carry `HostLinkAttachRequest`, but this package has no caller that sends it
+and gates the request against a Host that can answer it. `internal/placement`
+therefore names the selected Host in `OutcomeAttachPooled` and stops there; an
+older Host routes the unknown method as a channel and answers
+`runtime_unavailable`. And a `tenant_exclusive` pooled advertisement is never
 selected, because Factory cannot see which tenants a Host serves and refusing is
 the only enforcement of specification section 12 available to it.
 
