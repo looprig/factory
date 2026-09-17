@@ -577,11 +577,11 @@ func TestAProviderFaultKeepsThePositionTheSweepHadReached(t *testing.T) {
 			// reply checks). Distinct values also mean no two of the six can
 			// be substituted for each other.
 			return sessionstore.HostTargetReconcileResult{
-					Scanned: 15, Withdrawn: 1, StillLive: 2, Contended: 3,
-					Unreadable: 4, Unverified: 5, NextCursor: "continue-2",
-				}, &sessionstore.HostTargetError{
-					Code: sessionstore.HostTargetErrorBackend, Field: "list_due",
-				}
+				Scanned: 15, Withdrawn: 1, StillLive: 2, Contended: 3,
+				Unreadable: 4, Unverified: 5, NextCursor: "continue-2",
+			}, &sessionstore.HostTargetError{
+				Code: sessionstore.HostTargetErrorBackend, Field: "list_due",
+			}
 		},
 	}}
 	sweeper := scriptedSweeper(t, targets)
