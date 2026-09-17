@@ -1802,15 +1802,16 @@ confused with an unrelated decode failure (`ErrMalformed` is the control).
 Both bounds are driven at their exact values in both directions.
 
 **`CommittedAppendSeq` is a declared gap, and the gap is narrower than it first
-reads.** Core v0.8.0 **does** define the session-channel record bodies —
+reads.** Core v0.9.1 **does** define the session-channel record bodies and the
+HostLink framing for their per-session channel —
 `enduring_publication`, `ephemeral_publication`, `journal_tip`, `session.reset` —
-and `Relay.classify` dispatches on exactly that discriminator. What is missing is
-two things: any **HostLink transport framing** to carry them, which is the gap
-`internal/realtime/hostlink` already records about the method names, and any
-**member on any record** from which a Host's committed append sequence could be
-read. It is the second that makes the upper watermark bound unimplementable from
-the wire. The field is the seam the Host half will fill; until it exists the
-honest reading is "what the producer declares", and the relay fences against it.
+and `Relay.classify` dispatches on exactly that discriminator. The transport
+framing gap is closed for control-plane RPCs, but this module still has no
+subscription to the session channel or live event stream, and no **member on
+any record** from which a Host's committed append sequence could be read. The
+latter makes the upper watermark bound unimplementable from the wire. The field
+is the seam the Host half will fill; until it exists the honest reading is "what
+the producer declares", and the relay fences against it.
 **For the same reason there is no ephemeral producer in this module**, so the
 ephemeral policy is driven at `Receive` and at the queue's own contract rather
 than through a stream that carries nothing. The dispatch is on Core's own

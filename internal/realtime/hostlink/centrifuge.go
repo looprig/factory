@@ -248,10 +248,11 @@ type centrifugeLink struct {
 	once    sync.Once
 
 	mu sync.Mutex
-	// rpcMu serializes a reserved-method capability check with the RPC itself.
-	// A reconnect waits for an in-flight call before replacing the negotiated
-	// set, so a call cannot pass a stale capability check after the new reply has
-	// been accepted.
+	// rpcMu serializes calls so that a capability check and its RPC are one
+	// local admission operation. Reconnect callbacks deliberately do not wait
+	// for this mutex: centrifuge-go invokes OnConnecting before scheduling its
+	// reconnect, and a call that is waiting for that reconnect must not hold the
+	// callback hostage.
 	rpcMu sync.Mutex
 	// negotiated is the most recent successful Core connect reply. A reply with
 	// no hostlink_methods is valid and deliberately means no reserved method is
@@ -261,6 +262,12 @@ type centrifugeLink struct {
 	// successful Core reply. Reserved calls fail locally during that window
 	// rather than using the previous connection's capability set.
 	connecting bool
+	// generationCtx is canceled when the transport enters its next generation.
+	// Calls bind their transport context to it so an RPC queued by centrifuge-go
+	// while Connecting cannot be sent after a newer handshake changes the
+	// capability set.
+	generationCtx    context.Context
+	generationCancel context.CancelFunc
 	// terminal is set when the connection may not be used again. A link that
 	// kept answering RPCs after a terminal refusal would report every one as an
 	// undelivered command, which is a retry loop against a Host that has
@@ -315,18 +322,27 @@ func (l *centrifugeLink) call(ctx context.Context, method string, request any, r
 
 	l.rpcMu.Lock()
 	defer l.rpcMu.Unlock()
-	if err := l.terminalError(); err != nil {
-		return err
+	l.mu.Lock()
+	terminal := l.terminal
+	generationCtx := l.generationCtx
+	if terminal != nil {
+		l.mu.Unlock()
+		return terminal
 	}
 	if requiresCapability {
-		l.mu.Lock()
-		supported := !l.connecting && l.negotiated.Supports(method)
-		l.mu.Unlock()
-		if !supported {
+		if l.connecting || !l.negotiated.Supports(method) {
+			l.mu.Unlock()
 			return &UnsupportedMethodError{Method: method}
 		}
 	}
-	reply, err := l.client.RPC(ctx, method, body)
+	l.mu.Unlock()
+
+	rpcCtx, release, err := bindGenerationContext(ctx, generationCtx)
+	if err != nil {
+		return fmt.Errorf("hostlink: %s: %w", method, err)
+	}
+	defer release()
+	reply, err := l.client.RPC(rpcCtx, method, body)
 	if err != nil {
 		return fmt.Errorf("hostlink: %s: %w", method, err)
 	}
@@ -343,16 +359,33 @@ func (l *centrifugeLink) call(ctx context.Context, method string, request any, r
 // onConnecting clears the old capability set before a reconnect attempt can
 // send a new RPC. The transport may call this before the server has returned a
 // new reply, so retaining the old set would let a restarted Host receive a
-// reserved method it no longer advertises.
+// reserved method it no longer advertises. It does not take rpcMu: the
+// transport invokes this callback before scheduling reconnect, and a queued
+// RPC may already be waiting for that reconnect while holding rpcMu.
 func (l *centrifugeLink) onConnecting(centrifugego.ConnectingEvent) {
-	l.rpcMu.Lock()
+	nextCtx, nextCancel := newGenerationContext()
+	var previousCancel context.CancelFunc
 	l.mu.Lock()
-	if l.terminal == nil {
+	terminal := l.terminal != nil
+	if !terminal {
+		previousCancel = l.generationCancel
+		l.generationCtx = nextCtx
+		l.generationCancel = nextCancel
 		l.connecting = true
 		l.negotiated = sessionwire.VersionNegotiationResponse{}
 	}
 	l.mu.Unlock()
-	l.rpcMu.Unlock()
+	if terminal {
+		nextCancel()
+		return
+	}
+	if previousCancel != nil {
+		previousCancel()
+	}
+}
+
+func newGenerationContext() (context.Context, context.CancelFunc) {
+	return context.WithCancel(context.Background())
 }
 
 // onConnected verifies the version the Host selected.
@@ -369,14 +402,12 @@ func (l *centrifugeLink) onConnected(e centrifugego.ConnectedEvent) {
 		// the client's own teardown, so it is handed to a goroutine.
 		go l.client.Close()
 	} else {
-		l.rpcMu.Lock()
 		l.mu.Lock()
 		if l.terminal == nil {
 			l.negotiated = negotiated
 			l.connecting = false
 		}
 		l.mu.Unlock()
-		l.rpcMu.Unlock()
 	}
 	l.settle(err)
 }
@@ -425,17 +456,31 @@ func (l *centrifugeLink) settle(err error) {
 }
 
 func (l *centrifugeLink) fail(err error) {
+	var cancel context.CancelFunc
 	l.mu.Lock()
-	defer l.mu.Unlock()
 	if l.terminal == nil {
 		l.terminal = err
+		cancel = l.generationCancel
+	}
+	l.mu.Unlock()
+	if cancel != nil {
+		cancel()
 	}
 }
 
-func (l *centrifugeLink) terminalError() error {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	return l.terminal
+func bindGenerationContext(ctx, generation context.Context) (context.Context, func(), error) {
+	if generation == nil {
+		return ctx, func() {}, nil
+	}
+	if err := generation.Err(); err != nil {
+		return nil, nil, err
+	}
+	bound, cancel := context.WithCancel(ctx)
+	stop := context.AfterFunc(generation, cancel)
+	return bound, func() {
+		stop()
+		cancel()
+	}, nil
 }
 
 // verifyNegotiation reads the Host's selected wire version out of its connect
