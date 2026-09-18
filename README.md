@@ -260,7 +260,7 @@ does not exist in this repository, so these tests still run against a stand-in
 node implementing the proposal. They pin Factory's side, but are not proof of a
 live cross-module Host implementation.
 
-**Three defects kept every Factory before v0.2.0 from ever holding a link to a
+**Three defects kept every Factory before the v0.2.0 release from ever holding a link to a
 Host, and the stand-ins hid all three.** Host decoded the connect Data as a
 bare `VersionNegotiationRequest` while Factory wrapped it (B8; Core v0.9.0 now
 owns the connect codecs); a Host's bare refusal body was decoded through a
@@ -322,7 +322,7 @@ replica is refused by name. Widening this exported method set is a source
 compatibility break for external implementations. **While this module is pre-1.0
 (owner ruling 2026-09-18), such a widening ships as a MINOR bump** — the `v0.x`
 contract every module in this workspace is released under — and the widening that
-added `EnsureWorkload`/`ObserveWorkload`/`RequestDrain`/`DeleteWorkload`'s
+added `ObserveWorkload`, `RequestDrain`, and `DeleteWorkload` as `EnsureWorkload`'s
 companions rides `v0.2.0`. Once `v1.0.0` is cut, widening it becomes a major
 release.
 

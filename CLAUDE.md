@@ -1296,7 +1296,7 @@ names no session. The `{type, data}` push envelope is still Factory's half —
 Core names no push discriminator — and the stand-in node in the tests
 implements exactly it.
 
-**B8 was three defects, not one, and no Factory before v0.2.0 ever held a link
+**B8 was three defects, not one, and no Factory before the v0.2.0 release ever held a link
 to any Host.** Each was invisible to this suite for the same reason: a stand-in
 that accepted what a Host refuses. Read them together.
 
