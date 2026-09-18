@@ -1119,10 +1119,14 @@ type fakeLink struct {
 	// commandRoutes is index-aligned with commandRecs.
 	commandRoutes []deliveredRoute
 	closeCount    int
-	bindErr       error
-	unbindErr     error
-	commandErr    error
-	closeErr      error
+	attachRecs    []sessionwire.HostLinkAttachRequest
+	// attachReply answers an Attach; nil answers the observation the request
+	// asked for, at attachEpoch.
+	attachReply func(sessionwire.HostLinkAttachRequest) (sessionwire.HostLinkRegistryObservation, error)
+	bindErr     error
+	unbindErr   error
+	commandErr  error
+	closeErr    error
 }
 
 func (l *fakeLink) Host() sessionwire.HostID { return l.host }
@@ -1145,6 +1149,28 @@ func (l *fakeLink) Unbind(_ context.Context, req sessionwire.HostLinkUnbindReque
 	}
 	l.unbindRecs = append(l.unbindRecs, req)
 	return nil
+}
+
+func (l *fakeLink) Attach(_ context.Context, req sessionwire.HostLinkAttachRequest) (sessionwire.HostLinkRegistryObservation, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.attachRecs = append(l.attachRecs, req)
+	if l.attachReply != nil {
+		return l.attachReply(req)
+	}
+	return observationFor(req, 7), nil
+}
+
+func (l *fakeLink) attaches() []sessionwire.HostLinkAttachRequest {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return append([]sessionwire.HostLinkAttachRequest(nil), l.attachRecs...)
+}
+
+func (l *fakeLink) answerAttach(reply func(sessionwire.HostLinkAttachRequest) (sessionwire.HostLinkRegistryObservation, error)) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.attachReply = reply
 }
 
 func (l *fakeLink) DeliverCommand(_ context.Context, tenant sessionwire.TenantID, session sessionwire.SessionID, req sessionwire.HostLinkCommandDelivery) error {

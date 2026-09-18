@@ -56,6 +56,20 @@ func (e *UnsupportedMethodError) Error() string {
 
 func (e *UnsupportedMethodError) Unwrap() error { return ErrUnsupportedMethod }
 
+// ErrMalformedAttachReply reports an attach reply that is neither of the two
+// records Core allows: an observation or a HostLinkError. An EMPTY reply is one
+// of these -- an accepted attach must say at which lease epoch the session is
+// now resident, and a caller told nothing has no epoch it may bind with.
+var ErrMalformedAttachReply = errors.New("hostlink: attach reply is not a Core record")
+
+// ErrAttachMismatch reports an accepted attach whose observation does not name
+// the session, the Host or the Host incarnation the request did. The pool
+// refuses to hand it to a caller, because the caller's next act is to bind
+// with its epoch, and a bind built from an observation of something else is a
+// route to nowhere that the Host will refuse for a reason reading as a lease
+// problem.
+var ErrAttachMismatch = errors.New("hostlink: attach observation does not match the request")
+
 // ErrCommandUndelivered reports that a committed command was NOT handed to a
 // Host.
 //
@@ -357,6 +371,89 @@ func (p *Pool) Bind(ctx context.Context, target Target, req sessionwire.HostLink
 	// reset on bind is unreachable -- a mutation that deleted it survived every
 	// case, which is how it was found rather than argued.
 	p.routes[key] = target.Host
+	return nil
+}
+
+// Attach asks target to make one session resident and returns the Host's
+// observation of the residency it now holds.
+//
+// The request must name the Host the link goes to, for Bind's reason, and it
+// is validated before anything is dialled. The link is acquired under the
+// pool's lock -- so a burst of attaches to one Host opens one connection, as a
+// burst of binds does -- but the RPC is made OUTSIDE it, and that is the one
+// way this differs from Bind. An attach can launch a runtime, which takes as
+// long as a runtime takes to start; holding the pool across it would stall
+// every bind, unbind and delivery on every Host for that long. Nothing here
+// needs the ordering the lock gives Bind: an attach records no route, so there
+// is no route table entry for a concurrent operation to race.
+//
+// What that costs is stated: a link that the reaper collects between the
+// acquisition and the RPC fails the RPC as a transport error, which the caller
+// sees as an attempt that did not complete and retries under the same
+// idempotency key. A freshly dialled link is never reapable, because its idle
+// window starts at the dial.
+//
+// An accepted observation is checked against the request before it is
+// returned. The Host is required to answer for the session and incarnation it
+// was asked about, and a caller is about to bind with the observation's epoch,
+// so an answer about anything else is refused with ErrAttachMismatch rather
+// than trusted.
+func (p *Pool) Attach(ctx context.Context, target Target, req sessionwire.HostLinkAttachRequest) (sessionwire.HostLinkRegistryObservation, error) {
+	if err := target.Validate(); err != nil {
+		return sessionwire.HostLinkRegistryObservation{}, err
+	}
+	if req.HostID != target.Host {
+		return sessionwire.HostLinkRegistryObservation{}, fmt.Errorf("%w: request names %q, link goes to %q", ErrTargetMismatch, req.HostID, target.Host)
+	}
+	if err := req.Validate(); err != nil {
+		return sessionwire.HostLinkRegistryObservation{}, err
+	}
+
+	p.mu.Lock()
+	if p.closed {
+		p.mu.Unlock()
+		return sessionwire.HostLinkRegistryObservation{}, ErrPoolClosed
+	}
+	pooled, err := p.acquireLocked(ctx, target)
+	if err != nil {
+		p.mu.Unlock()
+		return sessionwire.HostLinkRegistryObservation{}, err
+	}
+	link := pooled.link
+	p.mu.Unlock()
+
+	observation, err := link.Attach(ctx, req)
+	if err != nil {
+		return sessionwire.HostLinkRegistryObservation{}, err
+	}
+	if err := attachAnswers(req, observation); err != nil {
+		return sessionwire.HostLinkRegistryObservation{}, err
+	}
+	return observation, nil
+}
+
+// attachAnswers reports whether an accepted observation is about what the
+// attach asked for: the same session, on the same Host incarnation, for the
+// same agent and runtime.
+//
+// The incarnation is compared as well as the Host, and that is the fence doing
+// its second job. Core requires a Host that is not the incarnation named to
+// refuse BEFORE taking the lease; a Host that answered for a different
+// generation anyway has told the caller a lease epoch from an incarnation the
+// caller did not place on, and binding with it is exactly the stranded route
+// the fence exists to prevent.
+func attachAnswers(req sessionwire.HostLinkAttachRequest, observation sessionwire.HostLinkRegistryObservation) error {
+	switch {
+	case observation.TenantID != req.TenantID || observation.SessionID != req.SessionID:
+		return fmt.Errorf("%w: observation is for session %q/%q, attach asked for %q/%q",
+			ErrAttachMismatch, observation.TenantID, observation.SessionID, req.TenantID, req.SessionID)
+	case observation.HostID != req.HostID || observation.HostGeneration != req.HostGeneration:
+		return fmt.Errorf("%w: observation names host %q generation %d, attach fenced %q generation %d",
+			ErrAttachMismatch, observation.HostID, observation.HostGeneration, req.HostID, req.HostGeneration)
+	case observation.AgentID != req.AgentID || observation.RuntimeCompatibilityID != req.RuntimeCompatibilityID:
+		return fmt.Errorf("%w: observation names agent %q runtime %q, attach asked for %q runtime %q",
+			ErrAttachMismatch, observation.AgentID, observation.RuntimeCompatibilityID, req.AgentID, req.RuntimeCompatibilityID)
+	}
 	return nil
 }
 

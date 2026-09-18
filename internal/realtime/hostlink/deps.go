@@ -72,6 +72,12 @@ type Link interface {
 	Bind(ctx context.Context, req sessionwire.HostLinkBindRequest) error
 	// Unbind releases one route.
 	Unbind(ctx context.Context, req sessionwire.HostLinkUnbindRequest) error
+	// Attach asks the Host to make one session resident and returns the
+	// registry observation it answered with, whose lease epoch is the one a
+	// following Bind names. A Host that did not advertise hostlink.attach is
+	// refused locally with *UnsupportedMethodError and is never sent one; a
+	// Host's own refusal arrives as *HostRefusal.
+	Attach(ctx context.Context, req sessionwire.HostLinkAttachRequest) (sessionwire.HostLinkRegistryObservation, error)
 	// DeliverCommand hands an already committed inbox record's public command
 	// id to the Host. The tenant and session travel beside the record because
 	// Core's framing makes the RPC METHOD the session's channel,

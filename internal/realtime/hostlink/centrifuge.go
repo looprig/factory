@@ -313,6 +313,60 @@ func (l *centrifugeLink) Unbind(ctx context.Context, req sessionwire.HostLinkUnb
 	return l.call(ctx, sessionwire.HostLinkMethodUnbind, req, true)
 }
 
+// Attach asks the Host to make one session resident and returns the
+// observation it answered with.
+//
+// It is a RESERVED method and is gated like bind and unbind: a Host whose
+// connect reply did not advertise hostlink.attach is never sent one, and the
+// refusal is the local *UnsupportedMethodError rather than whatever the Host
+// would have said. That is the whole reason the capability signal exists. A
+// Host that predates attach resolves the method as a CHANNEL and answers
+// runtime_unavailable from its not-bound branch, which is byte-identical to a
+// Host that genuinely refused -- so the only way a caller can tell "cannot"
+// from "will not" is to never ask the first kind.
+//
+// The reply is read by decodeAttachReply, which is where the one shape
+// difference from bind lives: an accepted attach carries a body.
+func (l *centrifugeLink) Attach(ctx context.Context, req sessionwire.HostLinkAttachRequest) (sessionwire.HostLinkRegistryObservation, error) {
+	data, err := l.exchange(ctx, sessionwire.HostLinkMethodAttach, req, true)
+	if err != nil {
+		return sessionwire.HostLinkRegistryObservation{}, err
+	}
+	return decodeAttachReply(data)
+}
+
+// decodeAttachReply reads an attach reply body as exactly one of Core's two
+// records.
+//
+// ATTACH IS THE EXCEPTION TO THE EMPTY ACCEPTED BODY. Core requires a Host to
+// answer an accepted attach with the HostLinkRegistryObservation whose
+// host_id, host_generation and lease_epoch the following bind names, so an
+// empty body is not success here as it is for bind: it is a Host that
+// attached and did not say at which epoch, and a caller holding no epoch has
+// nothing it may bind with. It is refused as ErrMalformedAttachReply.
+//
+// The two records are told apart by Core's STRICT decoders and not by
+// sniffing a member: a refusal requires "code", which the observation's
+// decoder refuses as unknown, and an observation carries "version",
+// "tenant_id" and the rest, which HostLinkError's decoder refuses as unknown.
+// So at most one decode can succeed, and a body neither accepts is refused
+// rather than guessed at. The refusal is tried first only because it is the
+// shorter record; the order cannot change the answer.
+func decodeAttachReply(data []byte) (sessionwire.HostLinkRegistryObservation, error) {
+	if len(data) == 0 {
+		return sessionwire.HostLinkRegistryObservation{}, fmt.Errorf("%w: the accepted reply carried no observation", ErrMalformedAttachReply)
+	}
+	var refusal sessionwire.HostLinkError
+	if err := json.Unmarshal(data, &refusal); err == nil {
+		return sessionwire.HostLinkRegistryObservation{}, &HostRefusal{HostLinkError: refusal}
+	}
+	var observation sessionwire.HostLinkRegistryObservation
+	if err := json.Unmarshal(data, &observation); err != nil {
+		return sessionwire.HostLinkRegistryObservation{}, fmt.Errorf("%w: %v", ErrMalformedAttachReply, err)
+	}
+	return observation, nil
+}
+
 // DeliverCommand sends the record with the SESSION'S CHANNEL as the RPC method.
 //
 // That is Core's framing rule, not a convenience: a Host resolves any method
@@ -365,9 +419,30 @@ func (l *centrifugeLink) Close(context.Context) error {
 // leaked goroutine rather than a caller, and the caller is released by the
 // generation cancel that the same reconnect performs.
 func (l *centrifugeLink) call(ctx context.Context, method string, request any, requiresCapability bool) error {
+	data, err := l.exchange(ctx, method, request, requiresCapability)
+	if err != nil {
+		return err
+	}
+	if len(data) == 0 {
+		return nil
+	}
+	var refusal sessionwire.HostLinkError
+	if err := json.Unmarshal(data, &refusal); err != nil {
+		return fmt.Errorf("hostlink: %s: unreadable reply: %w", method, err)
+	}
+	return &HostRefusal{HostLinkError: refusal}
+}
+
+// exchange is the part of one HostLink RPC every method shares: marshal by
+// Core, admit against the negotiated capability set, bind the transport
+// context to the current generation, and return the reply body UNREAD. The
+// body's meaning is the method's: bind and unbind accept with an empty body,
+// while attach accepts with an observation, so reading it here would be a
+// second authority for a shape only the caller knows.
+func (l *centrifugeLink) exchange(ctx context.Context, method string, request any, requiresCapability bool) ([]byte, error) {
 	body, err := json.Marshal(request)
 	if err != nil {
-		return fmt.Errorf("hostlink: %s: %w", method, err)
+		return nil, fmt.Errorf("hostlink: %s: %w", method, err)
 	}
 
 	l.mu.Lock()
@@ -377,34 +452,27 @@ func (l *centrifugeLink) call(ctx context.Context, method string, request any, r
 	supported := l.negotiated.Supports(method)
 	l.mu.Unlock()
 	if terminal != nil {
-		return terminal
+		return nil, terminal
 	}
 	if requiresCapability {
 		if connecting {
-			return fmt.Errorf("hostlink: %s: %w", method, ErrLinkReconnecting)
+			return nil, fmt.Errorf("hostlink: %s: %w", method, ErrLinkReconnecting)
 		}
 		if !supported {
-			return &UnsupportedMethodError{Method: method}
+			return nil, &UnsupportedMethodError{Method: method}
 		}
 	}
 
 	rpcCtx, release, err := bindGenerationContext(ctx, generation)
 	if err != nil {
-		return fmt.Errorf("hostlink: %s: %w", method, err)
+		return nil, fmt.Errorf("hostlink: %s: %w", method, err)
 	}
 	defer release()
 	reply, err := l.rpc(rpcCtx, method, body)
 	if err != nil {
-		return fmt.Errorf("hostlink: %s: %w", method, err)
+		return nil, fmt.Errorf("hostlink: %s: %w", method, err)
 	}
-	if len(reply.Data) == 0 {
-		return nil
-	}
-	var refusal sessionwire.HostLinkError
-	if err := json.Unmarshal(reply.Data, &refusal); err != nil {
-		return fmt.Errorf("hostlink: %s: unreadable reply: %w", method, err)
-	}
-	return &HostRefusal{HostLinkError: refusal}
+	return reply.Data, nil
 }
 
 // rpcOutcome is one client.RPC result, carried off the goroutine that ran it.
