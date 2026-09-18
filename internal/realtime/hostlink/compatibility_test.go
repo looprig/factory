@@ -116,7 +116,7 @@ func TestReconnectRenegotiatesAndDropsReservedCapabilities(t *testing.T) {
 	var bindErr error
 	waitUntil(t, "the unadvertised bind refusal", func() bool {
 		bindErr = link.Bind(context.Background(), bindRequest(hostOne, "s-after-reconnect"))
-		return bindErr != nil
+		return bindErr != nil && !errors.Is(bindErr, hostlink.ErrLinkReconnecting)
 	})
 	if got := len(host.calls()); got != before {
 		t.Fatalf("Host received %d RPCs after capability removal, want %d", got, before)

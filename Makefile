@@ -1,7 +1,7 @@
 SHELL := /bin/bash
 .SHELLFLAGS := -eu -o pipefail -c
 
-.PHONY: test fuzz fmt fmt-check vet staticcheck gosec vuln secure check build
+.PHONY: test fuzz stress fmt fmt-check vet staticcheck gosec vuln secure check build
 
 GOFILES = GOWORK=off go run ./internal/modfiles/cmd/modfiles -root .
 
@@ -33,6 +33,19 @@ PIPEFAIL := set -o pipefail;
 # depends on the clock or the machine are all invisible to a cache.
 test:
 	GOWORK=off go test -count=1 -race ./...
+
+# TestReconnectStressNeverWedgesACaller skips itself under -race (see
+# race_enabled_test.go): it trips a confirmed third-party data race inside
+# centrifuge-go v0.12.0 (client.go:2187 vs :457/:533), and that report says
+# nothing about this module. `test` above runs -race exclusively, so without
+# this target the stress case -- the one reader of the wedge-confinement fix
+# in internal/realtime/hostlink -- never executes in any automated lane. This
+# runs it without the detector, which is the lane the test itself documents
+# as where the wedge was originally reproduced. The HOSTLINK_STRESS_UNDER_RACE
+# opt-in stays available for a developer who wants the -race run anyway; this
+# target intentionally does not set it.
+stress:
+	GOWORK=off go test -count=1 -run '^TestReconnectStressNeverWedgesACaller$$' -v ./internal/realtime/hostlink/...
 
 fmt:
 	$(PIPEFAIL) $(GOFILES) | xargs -0 $(GOFMT) -w
@@ -219,4 +232,4 @@ secure: fmt-check vet staticcheck gosec vuln
 build:
 	GOWORK=off go build ./...
 
-check: fmt-check vet staticcheck gosec vuln test fuzz build
+check: fmt-check vet staticcheck gosec vuln test stress fuzz build
