@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strconv"
 	"time"
 
@@ -87,6 +88,36 @@ type Config struct {
 
 	// CandidateLimit bounds one capacity page.
 	CandidateLimit int
+
+	// Links is OPTIONAL. With it, a pooled session with no live owner is
+	// ATTACHED to the first ranked admissible candidate that accepts it and
+	// bound with the epoch that Host answered (B5). Without it, the reconciler
+	// only NAMES the candidate in Result.Decision, which is what it did before
+	// any caller existed; a composition with no HostLink pool uses that.
+	Links HostLinks
+
+	// ActorID is the requesting SERVICE identity an attach carries. Required
+	// when Links is set. It names who asked for residency, never whose
+	// authority a later command carries: placement runs from a sweeper with no
+	// live user behind it.
+	ActorID string
+
+	// ReplaceAttempts bounds how many times one call re-runs placement after an
+	// epoch_mismatch, counting the first attempt. Zero takes a small default.
+	ReplaceAttempts int
+
+	// ReplaceBackoff is the wait before the first re-placement, doubled for
+	// each further one. Zero takes a small default.
+	ReplaceBackoff time.Duration
+
+	// Wait sleeps for a backoff or until the context ends. Nil uses a timer. It
+	// is a seam so a re-placement's backoff is measured rather than waited for.
+	Wait func(context.Context, time.Duration) error
+
+	// Logger receives the one diagnostic this package emits: a pooled
+	// candidate excluded because it does not advertise hostlink.attach, named
+	// by Host, so a mixed fleet is diagnosable. Nil discards.
+	Logger *slog.Logger
 }
 
 // Reconciler places one session at a time.
@@ -114,6 +145,9 @@ func NewReconciler(cfg Config) (*Reconciler, error) {
 	case cfg.CandidateLimit < 1 || cfg.CandidateLimit > storage.MaxOrderedPageLimit:
 		return nil, fmt.Errorf("%w: CandidateLimit must be between 1 and %d", ErrInvalidConfig, storage.MaxOrderedPageLimit)
 	}
+	if err := cfg.attachConfigError(); err != nil {
+		return nil, err
+	}
 	return &Reconciler{cfg: cfg}, nil
 }
 
@@ -140,6 +174,13 @@ type Request struct {
 	TenantID  sessionwire.TenantID
 	SessionID sessionwire.SessionID
 	Desired   *Desired
+
+	// Wake is the already accepted commands to deliver once the session has a
+	// route: after an attach this call made, or to a live owner it found. It
+	// is a HINT -- delivery wakes a Host's consumption of its durable inbox and
+	// carries only the retry-stable public CommandID -- so an empty Wake still
+	// places, and a failed delivery is counted, not returned.
+	Wake []sessionwire.CommandID
 }
 
 // Result is what one reconciliation did.
@@ -171,6 +212,29 @@ type Result struct {
 	// Intent is the stored desired state handed to the controller, populated
 	// only for OutcomeReconcileDedicated.
 	Intent sessionstore.PlacementIntent
+
+	// Attached is the Host's observation of the residency an attach made by
+	// THIS call produced. Its lease epoch is the one the bind named. Zero when
+	// this call attached nothing.
+	Attached sessionwire.HostLinkRegistryObservation
+
+	// Bound reports that this call bound a route: to the Host it attached, or
+	// to a live owner it woke.
+	Bound bool
+
+	// Delivered and DeliveryFailures count the Wake deliveries.
+	Delivered        int
+	DeliveryFailures int
+
+	// Excluded names the admissible candidates skipped because they do not
+	// advertise hostlink.attach; Unreachable those this replica could not ask;
+	// Refused those that answered with a HostLinkError, in the order asked.
+	Excluded    []sessionwire.HostID
+	Unreachable []sessionwire.HostID
+	Refused     []CandidateRefusal
+
+	// Replacements counts the times placement re-ran after an epoch_mismatch.
+	Replacements int
 }
 
 // Reconcile routes or places one session.
@@ -189,18 +253,12 @@ type Result struct {
 //  3. Desired state is written before the decision, because the write can
 //     change the desired placement the decision branches on.
 //
-// What this does NOT do is attach the session to the pooled Host it selects.
-// OutcomeAttachPooled names a candidate for the caller. The pinned Core
-// (v0.8.0) now carries the request that asks a Host to take an unowned session
-// -- sessionwire.HostLinkAttachRequest, sent as HostLinkMethodAttach, fenced by
-// the candidate's host_id and host_generation, answered with the registry
-// observation whose lease epoch a bind then names -- so the reason this method
-// stops at naming is no longer the wire. It is that a caller sending the attach
-// must be able to tell a Host that cannot answer it (a v0.1.0 Host resolves
-// the method as a channel and refuses runtime_unavailable) from one that
-// refused it, and no released record carries that capability. The caller that
-// sends it therefore lives above this package and is not built yet;
-// TestThePinnedWireCarriesAnAttachment holds the wire half of the premise.
+// With Links composed, the pooled arm ATTACHES (B5): see placePooled for the
+// sequence and attachAnswer for what each Host answer means. The attach is
+// gated on the candidate having advertised hostlink.attach, which the HostLink
+// transport enforces locally, so a Host that predates the method is excluded
+// rather than asked. Without Links, OutcomeAttachPooled only names the
+// candidate for the caller, as it did before any caller existed.
 func (r *Reconciler) Reconcile(ctx context.Context, req Request) (Result, error) {
 	entry, err := r.cfg.Catalog.GetCatalogEntry(ctx, sessionstore.GetCatalogEntryRequest{
 		TenantID: req.TenantID, SessionID: req.SessionID,
@@ -214,7 +272,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req Request) (Result, error)
 	}
 	now := r.cfg.Clock.Now()
 	if decision := Decide(entry.Record, owner, observed, nil, now); decision.Outcome == OutcomeReuseOwner {
-		return Result{Decision: decision}, nil
+		return r.wake(ctx, req, owner, Result{Decision: decision})
 	}
 
 	claimed, held, err := r.claim(ctx, req, now)
@@ -246,6 +304,9 @@ func (r *Reconciler) Reconcile(ctx context.Context, req Request) (Result, error)
 	decision := Decision{Outcome: OutcomeUndecided}
 	switch entry.Record.DesiredPlacement {
 	case sessionwire.HostPlacementPooled:
+		if r.cfg.Links != nil {
+			return r.placePooled(ctx, req, writes)
+		}
 		page, err := r.cfg.Directory.Candidates(ctx, sessionstore.ListCompatibleHostsRequest{
 			Key:   targetKey(entry.Record),
 			Limit: r.cfg.CandidateLimit,
