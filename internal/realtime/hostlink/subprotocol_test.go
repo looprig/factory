@@ -2,7 +2,6 @@ package hostlink_test
 
 import (
 	"context"
-	"errors"
 	"net/http"
 	"strings"
 	"testing"
@@ -80,8 +79,5 @@ func TestTheStandInRefusesAnUpgradeThatDoesNotNameTheJSONProtocol(t *testing.T) 
 	}
 	if got := len(host.upgrades()); got != 1 {
 		t.Fatalf("%d upgrade requests passed the gate, want only the one that named the JSON protocol", got)
-	}
-	if errors.Is(nil, hostlink.ErrDialFailed) {
-		t.Fatal("unreachable: keeps the sentinel import honest")
 	}
 }

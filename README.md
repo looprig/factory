@@ -260,6 +260,30 @@ does not exist in this repository, so these tests still run against a stand-in
 node implementing the proposal. They pin Factory's side, but are not proof of a
 live cross-module Host implementation.
 
+**Three defects kept every Factory before v0.2.0 from ever holding a link to a
+Host, and the stand-ins hid all three.** Host decoded the connect Data as a
+bare `VersionNegotiationRequest` while Factory wrapped it (B8; Core v0.9.0 now
+owns the connect codecs); a Host's bare refusal body was decoded through a
+wrapped `{"error":…}` shape, so it decoded to `Error == nil` and a genuine
+refusal was returned as **success** — fixed silently in `563f15e` and recorded
+here; and the WebSocket upgrade named no subprotocol, which a Host answers HTTP
+400 before reading a frame (`Sec-WebSocket-Protocol: centrifuge-json` is the
+only route open, since Core's `InternalEndpoint` refuses the `?format=json`
+query). Every stand-in now gates the upgrade as a Host does, and the dialer was
+driven against the released `host v0.2.1` — dial, Bind and DeliverCommand
+round-trip — in a gate-side harness that cannot live in this suite because
+`host` may not be a Factory dependency.
+
+Bind and unbind are gated by the capability set the Host advertised in its
+connect reply and refused locally with `*UnsupportedMethodError` otherwise;
+during a reconnect, before the new reply has landed, they are refused with the
+distinct transient `ErrLinkReconnecting` instead. Command delivery is not gated
+and is queued by the transport across a reconnect — and emitted before the new
+reply is verified, because centrifuge-go resolves connect futures before it runs
+`OnConnected`. RPCs on a link are concurrent: nothing is held across the RPC,
+which runs on its own goroutine so that a centrifuge-go v0.12.0 double-callback
+wedge costs one leaked goroutine rather than a caller.
+
 The pool carries the control plane only. A7.3 moved the per-binding queues and
 the backpressure repair *above* it, into `internal/realtime/delivery` and
 `routing.Relay`; the live publication consumer itself remains absent. Core's

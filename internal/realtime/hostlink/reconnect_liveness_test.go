@@ -28,9 +28,15 @@ import (
 // centrifuge-go runs OnConnecting synchronously inside moveToConnecting and
 // only then schedules the reconnect (client.go:592-617), so any lock a call
 // holds across the RPC and a callback waits for is a deadlock of the link.
-// call holds none now; this test is what turns red if one comes back. The slow
-// reply guarantees the RPC is in flight at the disconnect, so the case does not
-// depend on a scheduler race.
+// call holds none now. Read what this case does and does not kill: it is a
+// liveness pin, and a lock re-added across the RPC AND taken in onConnecting
+// survives it, because moveToConnecting fails every pending request
+// (clearConnectedState, client.go:540) BEFORE it runs the callback, so the
+// in-flight call returns and releases such a lock in time. The mutant that
+// does turn red is the head-of-line case below; what this one adds is that
+// the caller is released and the lost reply is not reported as success. The
+// slow reply guarantees the RPC is in flight at the disconnect, so the case
+// does not depend on a scheduler race.
 func TestReconnectDoesNotWaitForAnRPCInFlight(t *testing.T) {
 	t.Parallel()
 

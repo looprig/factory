@@ -199,6 +199,21 @@ type Pool struct {
 	// The cost is that a slow dial to one Host delays a bind to another; that
 	// is bounded by DialTimeout, which the dialer applies, and it is the
 	// cheaper of the two failures.
+	//
+	// It is ALSO held across the link's Bind and Unbind RPCs (not across
+	// DeliverCommand), and that is deliberate rather than an oversight, though
+	// it has the same cost: one slow Host stalls every pool operation for as
+	// long as the caller's context allows. It is not narrowed here because the
+	// lock is what orders two operations on ONE session: released, a Bind to
+	// Host B and an Unbind from Host A for the same session could pass the
+	// conflict check together and reach the two Hosts in either order, leaving
+	// A holding a route this pool no longer tracks and can never unbind --
+	// the exact state the conflict refusal exists to prevent. Narrowing it
+	// needs a per-session in-flight marker plus a re-check for close and reap
+	// after the RPC, which is a design change, not a lock move. What made the
+	// width dangerous rather than slow -- a link wedged forever inside an RPC
+	// pinning this lock -- is gone: the link never blocks a caller past its
+	// context or the next reconnect, so this lock is held for a bounded time.
 	mu     sync.Mutex
 	closed bool
 	links  map[sessionwire.HostID]*pooledLink

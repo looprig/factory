@@ -1296,6 +1296,99 @@ names no session. The `{type, data}` push envelope is still Factory's half —
 Core names no push discriminator — and the stand-in node in the tests
 implements exactly it.
 
+**B8 was three defects, not one, and no Factory before v0.2.0 ever held a link
+to any Host.** Each was invisible to this suite for the same reason: a stand-in
+that accepted what a Host refuses. Read them together.
+
+- **Connect framing.** Host decoded the connect Data as a bare
+  `VersionNegotiationRequest`; Factory sent `{"version_negotiation":{…}}`, and
+  Host's strict decoder disconnected **4501**. Core v0.9.0 owns the codecs now
+  (`EncodeHostLinkConnectRequest`/`DecodeHostLinkConnectReply`, which refuse the
+  wrapped shape), and `563f15e` adopted them. The former wrapped request is
+  still refused 4501 by `host v0.2.1`, measured, so the fix is not vacuous.
+- **Refusal decode — a defect `563f15e` fixed silently, recorded here.** Before
+  it, an RPC reply was decoded into `controlReply{Error *HostLinkError}`
+  expecting `{"error":{…}}`. Host v0.1.0 and v0.2.1 both send the **bare**
+  `HostLinkError`, so a genuine refusal decoded to `Error == nil` and was
+  **returned as success**: an `epoch_mismatch` read as a delivered command. The
+  reply is now decoded bare, `{}` and any unknown body fail closed, and
+  `TestBareHostRefusalJSONIsValidatedByCore` is the fixture control.
+- **The upgrade itself.** A Host's HTTP handler answers **400** unless the
+  client names the JSON protocol (`selectsJSONProtocol`, unchanged since Host
+  v0.1.0). centrifuge-go's JSON client sends no `Sec-WebSocket-Protocol`, and
+  the other route Host accepts — `?format=json` — is closed by Core's
+  `InternalEndpoint.Validate`. So with framing and refusals both right, the
+  dialer still could not connect. `Dial` now sends
+  `Sec-WebSocket-Protocol: centrifuge-json`; driven against the released
+  `host v0.2.1` (`host.Compose` over memstore, no shim), the dial gets 101, the
+  link retains `[bind unbind attach drain drain_status]`, and Bind and
+  DeliverCommand round-trip to Core-valid refusals. That harness cannot live
+  here — `host` is forbidden everywhere in this module — and is booked for
+  `tests/internal/orchestrationtest`.
+
+**The rule those three teach: a stand-in must refuse what the real peer
+refuses.** Every stand-in now sits behind `RequireJSONSubprotocol`, a copy of
+Host's gate; with the header absent every dial in the package fails, and
+`TestTheStandInRefusesAnUpgradeThatDoesNotNameTheJSONProtocol` pins the gate so
+it cannot be quietly weakened.
+
+**The capability gate, and the one transient it must not misreport.** Bind and
+unbind are admitted against the `hostlink_methods` the Host advertised in its
+connect reply, snapshotted under `mu`, and refused locally with
+`*UnsupportedMethodError` otherwise. Between a dropped connection and the next
+reply there is no set to admit against, and that window is refused with
+**`ErrLinkReconnecting`**, a distinct sentinel: the earlier answer was
+`UnsupportedMethodError` — "host did not advertise bind" — during a 250ms
+reconnect, reaching `routing/bindings.go` undifferentiated from a genuine
+capability refusal. A stale bind must not be queued against the old set either;
+`TestABindInTheConnectingWindowIsRefusedAsReconnectingNotUnsupported` drives a
+bind 20ms into a 300ms reconnect toward a Host that will advertise nothing and
+requires zero RPCs to arrive. Delivery is not gated and IS queued by the
+transport — and is **emitted before the new reply is verified**, because
+centrifuge-go resolves connect futures (`client.go:1346`) before it runs
+`OnConnected` (`:1354`). That does not matter for delivery and a version
+mismatch marks the link terminal anyway, but the gate is a snapshot, not a
+promise that every emitted RPC sits behind the latest reply.
+
+**Nothing is held across `client.RPC`, and the numbers say why.** `563f15e`
+added a second mutex held across the RPC so "check then send" was one
+operation. Measured: a 100ms-deadline delivery for one session waited **702ms**
+behind another session's slow reply, because a caller deadline cannot preempt a
+mutex wait. Worse, centrifuge-go v0.12.0 can run an RPC's completion callback
+**twice** — `clearConnectedState` fails every pending request on a new goroutine
+(`client.go:745`) while the caller's own send has already registered the request
+and then fails (`:2187`, `:443`) — and the second callback blocks forever on
+`RPC`'s capacity-1 result channel (`:373`). Landing on the caller's goroutine,
+that wedges the caller before it reaches `RPC`'s `select`, and no context frees
+a channel send. With the lock, one wedge froze every later call on the link, and
+through `Pool.Bind`'s `p.mu` the whole pool; reproduced 1 in 4 reconnect stress
+runs. The lock is gone — the snapshot under `mu` plus the generation binding
+already give the atomicity it claimed, and the mutant that dropped it survived
+the whole suite — and `client.RPC` runs on its own goroutine with the caller
+selecting against the bound context, so a wedge costs one leaked goroutine and
+the caller is released by the same reconnect's generation cancel. The 60-round,
+4-sender stress (`TestReconnectStressNeverWedgesACaller`) is opt-in under
+`-race` because it trips centrifuge-go's **own** data race (`client.go:2187`
+reads `c.transport` without `c.mu`), a third-party report that says nothing
+about this module. `Pool.Bind`/`Unbind` still hold `p.mu` across the link call,
+deliberately: that lock is what orders a Bind and an Unbind for one session
+across two Hosts, and narrowing it is a per-session design change, booked.
+
+**What the generation registry is and is not proven to do.** The registry
+cancels a superseded generation's bound contexts **synchronously** — when
+`onConnecting` returns, every bound context is done, and
+`TestRPCGenerationCancelIsSynchronous` pins that at the unit against a
+`context.AfterFunc` bridge, which cancels on a new goroutine. Whether the
+transport could ever emit a stale RPC through that goroutine-wide window is
+**reasoned, not measured**: the former bridge passes every transport-level test,
+including the queued-bind case, because a reconnect delay is milliseconds and
+the asynchronous cancel lands in microseconds. What the queued-bind case does
+pin is `bind`'s re-check after `context.WithCancel`; dropping it lets a stale
+bind reach the Host (assertion kill). Its fixture is bounded everywhere and
+releases its gate by `defer`, because an earlier version could not fail, only
+hang: a `Bind` that returned before consulting its context parked the package
+on an unbounded receive, and a `Bind` parked inside the gate pinned `Cleanup`.
+
 The strings are still pinned as **absolute literals**
 (`TestTheWireVocabularyIsPinnedToItsLiterals`), now against Core's constants and
 against the spelled-out channel `hostlink.v1.dGVuYW50LWE.cy0x` for
