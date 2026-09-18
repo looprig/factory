@@ -315,7 +315,10 @@ SessionStore checks the key before the revision.
 lifecycle operations `EnsureWorkload`, `ObserveWorkload`, `RequestDrain`, and
 `DeleteWorkload`, all over Core and SessionStore records. The seam is
 composition-only here: no scheduled reconciliation driver is built in this
-module. H5 keeps the Kubernetes adapter internal to `cmd/controller` alone;
+module. H5 keeps the Kubernetes adapter out of this module entirely: it lives in
+the separate repository `looprig/controller` (owner ruling 2026-09-18), which
+consumes Factory only as a published module, so no Factory consumer inherits the
+Kubernetes client graph;
 `cmd/factory` supplies no workload create/delete RBAC, so a nil controller is a
 supported configuration and a dedicated session reaching the tenant-facing
 replica is refused by name. Widening this exported method set is a source

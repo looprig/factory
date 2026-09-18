@@ -44,8 +44,13 @@ test:
 # as where the wedge was originally reproduced. The HOSTLINK_STRESS_UNDER_RACE
 # opt-in stays available for a developer who wants the -race run anyway; this
 # target intentionally does not set it.
+STRESS_TEST := TestReconnectStressNeverWedgesACaller
 stress:
-	GOWORK=off go test -count=1 -run '^TestReconnectStressNeverWedgesACaller$$' -v ./internal/realtime/hostlink/...
+	@$(PIPEFAIL) output="$$(mktemp)"; trap 'rm -f "$$output"' EXIT; \
+	GOWORK=off go test -race=false -count=1 -run '^$(STRESS_TEST)$$' -v ./internal/realtime/hostlink 2>&1 | tee "$$output"; \
+	if ! grep -q -- '^--- PASS: $(STRESS_TEST) ' "$$output"; then \
+		echo "--- stress: $(STRESS_TEST) did not PASS (skipped, renamed, or matched nothing)"; exit 1; \
+	fi
 
 fmt:
 	$(PIPEFAIL) $(GOFILES) | xargs -0 $(GOFMT) -w
