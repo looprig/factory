@@ -2896,7 +2896,7 @@ func TestEveryDispositionRendersDistinctly(t *testing.T) {
 	t.Parallel()
 
 	seen := map[string]Disposition{}
-	for d := DispositionSettleable; d <= DispositionDeferred; d++ {
+	for d := DispositionSettleable; d <= DispositionUnrecognized; d++ {
 		name := d.String()
 		if name == "" || name == "unrecognized" {
 			t.Errorf("Disposition(%d) renders as %q", d, name)

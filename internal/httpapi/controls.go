@@ -46,10 +46,10 @@ import (
 // identity. Adding the method here and clearing the create's owner in
 // routeTable were one change, as that absence note predicted.
 //
-// It returns a DISPOSITION entry while the other four return legacy ones, and
-// that asymmetry is the protocol rather than an inconsistency: a create chooses
-// the session's protocol mode, and disposition is the only choice a Host can
-// take residency on.
+// Every method returns a DISPOSITION entry. A create chooses the session's
+// protocol mode, disposition is the only choice a Host can take residency on,
+// and every later command is admitted into the same family -- a command in the
+// legacy inbox of a disposition session is one no Host can ever apply.
 //
 // AdmitLegacyCreate is absent for a second, independent reason: it is a create.
 //
@@ -59,10 +59,10 @@ import (
 // an adapter would be a second place for the two edges to answer differently.
 type ControlAdmitter interface {
 	AdmitCreate(ctx context.Context, principal identity.Principal, req sessionwire.CreateRequest) (sessionstore.DispositionInboxEntry, bool, error)
-	AdmitInput(ctx context.Context, principal identity.Principal, req sessionwire.InputRequest) (sessionstore.InboxEntry, bool, error)
-	AdmitInterrupt(ctx context.Context, principal identity.Principal, req sessionwire.InterruptRequest) (sessionstore.InboxEntry, bool, error)
-	AdmitRestore(ctx context.Context, principal identity.Principal, req sessionwire.RestoreRequest) (sessionstore.InboxEntry, bool, error)
-	AdmitGateResponse(ctx context.Context, principal identity.Principal, req sessionwire.GateResponseRequest) (sessionstore.InboxEntry, bool, error)
+	AdmitInput(ctx context.Context, principal identity.Principal, req sessionwire.InputRequest) (sessionstore.DispositionInboxEntry, bool, error)
+	AdmitInterrupt(ctx context.Context, principal identity.Principal, req sessionwire.InterruptRequest) (sessionstore.DispositionInboxEntry, bool, error)
+	AdmitRestore(ctx context.Context, principal identity.Principal, req sessionwire.RestoreRequest) (sessionstore.DispositionInboxEntry, bool, error)
+	AdmitGateResponse(ctx context.Context, principal identity.Principal, req sessionwire.GateResponseRequest) (sessionstore.DispositionInboxEntry, bool, error)
 }
 
 // CommandDelivery wakes consumption of an already admitted command on whatever
@@ -109,9 +109,6 @@ type controlSpec struct {
 // admitted is what a control spec answers: the PUBLIC projection of the
 // durable record, plus the identity a delivery attempt names.
 //
-// It exists because the two command families return different durable record
-// types -- a create is admitted into the disposition inbox and the other four
-// into the legacy one -- and this is the point at which that stops mattering.
 // The projection itself is internal/command's single authority, called by each
 // spec; nothing here re-derives a state.
 //
@@ -134,20 +131,21 @@ type admitted struct {
 	session sessionwire.SessionID
 }
 
-// legacyAdmitted projects the four commands that admit into the legacy inbox.
-func legacyAdmitted(entry sessionstore.InboxEntry, err error) (admitted, error) {
+// dispositionAdmitted projects every admitted command. The create's spec
+// calls it too, and adds the one member only a create sets.
+func dispositionAdmitted(entry sessionstore.DispositionInboxEntry, err error) (admitted, error) {
 	if err != nil {
 		return admitted{}, err
 	}
-	status, readable := command.StatusFor(entry)
-	return admitted{status: status, readable: readable, command: entry.Record.CommandID}, nil
+	status, readable := command.StatusForDisposition(entry)
+	return admitted{status: status, readable: readable, command: entry.Record.Descriptor.CommandID}, nil
 }
 
 // dropCreated discards admission's "this call is the one that accepted it".
 // This edge deliberately does not read it -- a retry and a first acceptance get
 // the same answer -- and the seam still returns it because the seam's shape is
 // the service's. See ControlAdmitter.
-func dropCreated(entry sessionstore.InboxEntry, _ bool, err error) (sessionstore.InboxEntry, error) {
+func dropCreated(entry sessionstore.DispositionInboxEntry, _ bool, err error) (sessionstore.DispositionInboxEntry, error) {
 	return entry, err
 }
 
@@ -163,21 +161,21 @@ func controlSpecs() map[sessionstore.CommandKind]controlSpec {
 			if err := decodeCommand(body, &req, session); err != nil {
 				return admitted{}, err
 			}
-			return legacyAdmitted(dropCreated(rt.admissions.AdmitInput(r.Context(), p, req)))
+			return dispositionAdmitted(dropCreated(rt.admissions.AdmitInput(r.Context(), p, req)))
 		}},
 		commandInterrupt: {success: http.StatusOK, admit: func(rt *Router, r *http.Request, p identity.Principal, session sessionwire.SessionID, body []byte) (admitted, error) {
 			var req sessionwire.InterruptRequest
 			if err := decodeCommand(body, &req, session); err != nil {
 				return admitted{}, err
 			}
-			return legacyAdmitted(dropCreated(rt.admissions.AdmitInterrupt(r.Context(), p, req)))
+			return dispositionAdmitted(dropCreated(rt.admissions.AdmitInterrupt(r.Context(), p, req)))
 		}},
 		commandRestore: {success: http.StatusOK, admit: func(rt *Router, r *http.Request, p identity.Principal, session sessionwire.SessionID, body []byte) (admitted, error) {
 			var req sessionwire.RestoreRequest
 			if err := decodeCommand(body, &req, session); err != nil {
 				return admitted{}, err
 			}
-			return legacyAdmitted(dropCreated(rt.admissions.AdmitRestore(r.Context(), p, req)))
+			return dispositionAdmitted(dropCreated(rt.admissions.AdmitRestore(r.Context(), p, req)))
 		}},
 		commandGateResponse: {success: http.StatusAccepted, admit: func(rt *Router, r *http.Request, p identity.Principal, session sessionwire.SessionID, body []byte) (admitted, error) {
 			var req sessionwire.GateResponseRequest
@@ -192,7 +190,7 @@ func controlSpecs() map[sessionstore.CommandKind]controlSpec {
 			if gate := sessionwire.GateID(r.PathValue("gid")); req.GateID != gate {
 				return admitted{}, mismatchedIdentifier("gate_id")
 			}
-			return legacyAdmitted(dropCreated(rt.admissions.AdmitGateResponse(r.Context(), p, req)))
+			return dispositionAdmitted(dropCreated(rt.admissions.AdmitGateResponse(r.Context(), p, req)))
 		}},
 		// The CREATE, runbook A3.1. It is the one control whose session
 		// identifier comes from the BODY rather than the URL -- /v1/sessions
@@ -206,13 +204,10 @@ func controlSpecs() map[sessionstore.CommandKind]controlSpec {
 			if err := decodeCreate(body, &req); err != nil {
 				return admitted{}, err
 			}
-			entry, _, err := rt.admissions.AdmitCreate(r.Context(), p, req)
-			if err != nil {
-				return admitted{}, err
-			}
-			status, readable := command.StatusForDisposition(entry)
-			return admitted{status: status, readable: readable,
-				command: entry.Record.Descriptor.CommandID, session: entry.Record.Descriptor.SessionID}, nil
+			entry, err := dropCreated(rt.admissions.AdmitCreate(r.Context(), p, req))
+			result, err := dispositionAdmitted(entry, err)
+			result.session = entry.Record.Descriptor.SessionID
+			return result, err
 		}},
 	}
 }

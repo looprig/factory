@@ -24,9 +24,15 @@ import (
 type pendingProbe struct {
 	*probe
 
-	mu        sync.Mutex
-	pages     int
-	candidate sessionwire.InternalEndpoint
+	mu sync.Mutex
+	// pages counts the PLACEMENT sweep's reads and expiryReads the
+	// disposition DEADLINE sweep's. Both page the same view through the same
+	// object, so they are told apart by their bound: placement reads ahead to
+	// now + the apply deadline, while the deadline sweep reads only what is
+	// already due, bounded at now.
+	pages       int
+	expiryReads int
+	candidate   sessionwire.InternalEndpoint
 }
 
 func (p *pendingProbe) ListDueDispositionCommands(ctx context.Context, req sessionstore.ListDueDispositionCommandsRequest) (sessionstore.DispositionDueCommandPage, error) {
@@ -34,7 +40,11 @@ func (p *pendingProbe) ListDueDispositionCommands(ctx context.Context, req sessi
 		return sessionstore.DispositionDueCommandPage{}, err
 	}
 	p.mu.Lock()
-	p.pages++
+	if req.Cursor == "" && !req.DueAtOrBefore.After(time.Now()) {
+		p.expiryReads++
+	} else {
+		p.pages++
+	}
 	p.mu.Unlock()
 	return sessionstore.DispositionDueCommandPage{
 		Commands: []sessionstore.DispositionInboxEntry{{Record: sessionstore.DispositionInboxRecord{
@@ -70,6 +80,12 @@ func (p *pendingProbe) pageReads() int {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.pages
+}
+
+func (p *pendingProbe) deadlineReads() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.expiryReads
 }
 
 func composedWithPlacement(t *testing.T, p *pendingProbe, pending bool) *factory.Server {
@@ -132,7 +148,24 @@ func TestThePlacementSweepIsDrivenOnlyWhenItsQueryIsComposed(t *testing.T) {
 		return commands >= 3 && gates >= 3 && targets >= 3
 	})
 	if got := without.pageReads(); got != 0 {
-		t.Fatalf("a composition without WithPendingCommands read the due view %d times", got)
+		t.Fatalf("a composition without WithPendingCommands read the due view ahead of now %d times", got)
+	}
+}
+
+// TestTheDispositionDeadlineSweepIsDrivenInEveryComposition is the half of
+// Gap 2 the composition owns: the sweep that rejects an expired disposition
+// command runs whether or not the placement trigger is composed, because every
+// command this replica admits is a disposition command and a Host leaves the
+// deadline to Factory.
+func TestTheDispositionDeadlineSweepIsDrivenInEveryComposition(t *testing.T) {
+	t.Parallel()
+
+	for _, pending := range []bool{false, true} {
+		p := &pendingProbe{probe: &probe{}}
+		if err := composedWithPlacement(t, p, pending).Start(context.Background()); err != nil {
+			t.Fatalf("Start: %v", err)
+		}
+		eventually(t, "the deadline sweep read the disposition due view", func() bool { return p.deadlineReads() >= 3 })
 	}
 }
 

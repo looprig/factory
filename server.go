@@ -57,16 +57,28 @@ type SessionReader interface {
 	GetObjectMetadata(ctx context.Context, req sessionstore.GetObjectMetadataRequest) (sessionwire.ObjectMetadata, error)
 }
 
-// Commands is the durable command plane.
+// Commands is the durable command plane. A *sessionstore.Store satisfies it.
 //
 // ControlShards is on it because the periodic sweeps ask the store how many
 // service-control shards it persisted, on every pass rather than once: the
 // count is a decision of the backend and not a setting of this replica, and a
 // replica caching it would keep sweeping a shard space that had changed.
+//
+// Every command is admitted into the DISPOSITION family -- the only one a Host
+// can take residency on -- through AdmitDispositionCommand, with
+// GetDispositionCommand as the retry read and PutCommandPayload for a payload
+// too large to store inline. RejectDispositionCommand and
+// ListDueDispositionCommands are the disposition deadline sweep, which rejects
+// a command no Host applied before its apply deadline. RejectCommand and
+// ListDueCommands remain for the LEGACY deadline sweep only, which settles
+// legacy rows a store may already hold; nothing admits into that family.
 type Commands interface {
 	ControlShards() int
-	AdmitCommand(ctx context.Context, req sessionstore.AdmitCommandRequest) (sessionstore.InboxEntry, bool, error)
-	GetCommand(ctx context.Context, req sessionstore.GetCommandRequest) (sessionstore.InboxEntry, error)
+	AdmitDispositionCommand(ctx context.Context, req sessionstore.AdmitDispositionCommandRequest) (sessionstore.DispositionInboxEntry, bool, error)
+	GetDispositionCommand(ctx context.Context, req sessionstore.GetDispositionCommandRequest) (sessionstore.DispositionInboxEntry, error)
+	PutCommandPayload(ctx context.Context, req sessionstore.PutCommandPayloadRequest) (sessionwire.ObjectMetadata, error)
+	RejectDispositionCommand(ctx context.Context, req sessionstore.RejectDispositionCommandRequest) (sessionstore.DispositionInboxEntry, bool, error)
+	ListDueDispositionCommands(ctx context.Context, req sessionstore.ListDueDispositionCommandsRequest) (sessionstore.DispositionDueCommandPage, error)
 	RejectCommand(ctx context.Context, req sessionstore.RejectCommandRequest) (sessionstore.InboxEntry, error)
 	ListDueCommands(ctx context.Context, req sessionstore.ListDueCommandsRequest) (sessionstore.DueCommandPage, error)
 	AcquireReconciliationClaim(ctx context.Context, req sessionstore.AcquireReconciliationClaimRequest) (sessionstore.ReconciliationClaimEntry, error)

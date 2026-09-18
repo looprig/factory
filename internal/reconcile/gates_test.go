@@ -1778,16 +1778,23 @@ func TestAStillOpenGateDoesNotStarveTheRecordsBehindIt(t *testing.T) {
 // step 3 names. A seam that named one of them would have the capability
 // whatever its methods were called.
 var forbiddenResolutionTypes = map[string]bool{
-	"github.com/looprig/sessionstore.ResolveGateRequest":            true,
-	"github.com/looprig/sessionstore.OpenGateRequest":               true,
-	"github.com/looprig/sessionstore.AdmitCommandRequest":           true,
-	"github.com/looprig/sessionstore.RejectCommandRequest":          true,
-	"github.com/looprig/sessionstore.ClaimCommandRequest":           true,
-	"github.com/looprig/sessionstore.CompleteCommandRequest":        true,
-	"github.com/looprig/sessionstore.InboxEntry":                    true,
-	"github.com/looprig/sessionstore.CatalogEntry":                  true,
-	"github.com/looprig/sessionstore.UpdateCatalogHostStateRequest": true,
-	"github.com/looprig/core/sessionwire/v1.GateResponseRequest":    true,
+	"github.com/looprig/sessionstore.ResolveGateRequest":     true,
+	"github.com/looprig/sessionstore.OpenGateRequest":        true,
+	"github.com/looprig/sessionstore.AdmitCommandRequest":    true,
+	"github.com/looprig/sessionstore.RejectCommandRequest":   true,
+	"github.com/looprig/sessionstore.ClaimCommandRequest":    true,
+	"github.com/looprig/sessionstore.CompleteCommandRequest": true,
+	"github.com/looprig/sessionstore.InboxEntry":             true,
+	// The disposition family's counterparts. A gate response is admitted
+	// there now, so a seam naming one of these could answer a gate as surely
+	// as the legacy shapes above could.
+	"github.com/looprig/sessionstore.AdmitDispositionCommandRequest":  true,
+	"github.com/looprig/sessionstore.RejectDispositionCommandRequest": true,
+	"github.com/looprig/sessionstore.ClaimDispositionCommandRequest":  true,
+	"github.com/looprig/sessionstore.DispositionInboxEntry":           true,
+	"github.com/looprig/sessionstore.CatalogEntry":                    true,
+	"github.com/looprig/sessionstore.UpdateCatalogHostStateRequest":   true,
+	"github.com/looprig/core/sessionwire/v1.GateResponseRequest":      true,
 }
 
 // forbiddenResolutionWords are the verbs step 3 forbids, matched as WHOLE

@@ -92,12 +92,24 @@ func (FakeSeams) ReconcileHostTargets(context.Context, sessionstore.ReconcileHos
 // reached a real Host is not something any test here does.
 func (FakeSeams) ServiceToken(context.Context) (string, error) { return "service-token", nil }
 
-func (FakeSeams) AdmitCommand(context.Context, sessionstore.AdmitCommandRequest) (sessionstore.InboxEntry, bool, error) {
-	return sessionstore.InboxEntry{}, false, nil
+func (FakeSeams) AdmitDispositionCommand(context.Context, sessionstore.AdmitDispositionCommandRequest) (sessionstore.DispositionInboxEntry, bool, error) {
+	return sessionstore.DispositionInboxEntry{}, false, nil
 }
 
-func (FakeSeams) GetCommand(context.Context, sessionstore.GetCommandRequest) (sessionstore.InboxEntry, error) {
-	return sessionstore.InboxEntry{}, nil
+func (FakeSeams) GetDispositionCommand(context.Context, sessionstore.GetDispositionCommandRequest) (sessionstore.DispositionInboxEntry, error) {
+	return sessionstore.DispositionInboxEntry{}, nil
+}
+
+func (FakeSeams) PutCommandPayload(context.Context, sessionstore.PutCommandPayloadRequest) (sessionwire.ObjectMetadata, error) {
+	return sessionwire.ObjectMetadata{}, nil
+}
+
+func (FakeSeams) RejectDispositionCommand(context.Context, sessionstore.RejectDispositionCommandRequest) (sessionstore.DispositionInboxEntry, bool, error) {
+	return sessionstore.DispositionInboxEntry{}, false, nil
+}
+
+func (FakeSeams) ListDueDispositionCommands(context.Context, sessionstore.ListDueDispositionCommandsRequest) (sessionstore.DispositionDueCommandPage, error) {
+	return sessionstore.DispositionDueCommandPage{}, nil
 }
 
 func (FakeSeams) RejectCommand(context.Context, sessionstore.RejectCommandRequest) (sessionstore.InboxEntry, error) {

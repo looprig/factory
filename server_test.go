@@ -58,15 +58,18 @@ func publicSeams() map[reflect.Type][]reflect.Type {
 		// for one method would be a second answer to which store a replica
 		// reads.
 		iface[factory.SessionReader](): {iface[httpapi.SessionReader](), iface[routing.TipReader]()},
-		// Commands is paired with FOUR consumers, not one, and each names a
-		// different half of the durable command plane: the admission service
-		// writes and reads a command, the reconciler pages the due view and
-		// settles, and BOTH reconcilers claim. The union is what a deployer
+		// Commands is paired with every consumer, and each names a different
+		// part of the durable command plane: the admission service writes and
+		// reads a DISPOSITION command (CommandStore), each deadline sweep --
+		// legacy and disposition -- pages its own due view and settles, and
+		// every reconciler claims. The union is what a deployer
 		// supplies as one store, and pairing all four is what stops a later
 		// task widening one of them without widening the seam.
 		iface[factory.Commands](): {
 			iface[admission.Commands](), iface[admission.DueCommands](),
 			iface[admission.Settlement](), iface[admission.Claims](),
+			iface[admission.CommandStore](),
+			iface[admission.DispositionDue](), iface[admission.DispositionSettlement](),
 			iface[placement.Claims](),
 		},
 		// The durable session record. GetCatalogEntry also appears on

@@ -39,9 +39,14 @@ type components struct {
 	realtime   *clientlink.Handler
 
 	commandSweeper *admission.Reconciler
-	gateSweeper    *reconcile.GateSweeper
-	placement      *placement.Reconciler
-	records        *placement.RecordSweeper
+	// dispositionSweeper rejects the disposition commands no Host applied
+	// before their apply deadline. It is composed unconditionally: every
+	// command this replica admits is a disposition command, and a Host leaves
+	// the deadline to Factory.
+	dispositionSweeper *admission.DispositionReconciler
+	gateSweeper        *reconcile.GateSweeper
+	placement          *placement.Reconciler
+	records            *placement.RecordSweeper
 	// pending is nil unless WithPendingCommands supplied the durable query
 	// that triggers placement; see sweeps.
 	pending *placement.PendingSweeper
@@ -112,6 +117,20 @@ func composeComponents(cfg config, credentials *internalidentity.Authenticator) 
 	}
 
 	commandSweeper, err := admission.NewReconciler(admission.ReconcilerConfig{
+		Authorizer: cfg.authorizer,
+		Due:        cfg.commands,
+		Settlement: cfg.commands,
+		Claims:     cfg.commands,
+		Clock:      cfg.clock,
+		HolderID:   cfg.replicaID,
+		ClaimTTL:   cfg.reconcile.ClaimTTL,
+		PageLimit:  cfg.reconcile.MaxDuePerSweep,
+		MaxPages:   cfg.reconcile.MaxConcurrent,
+	})
+	if err != nil {
+		return nil, &OptionError{Option: "WithReconcileLimits", Err: err}
+	}
+	dispositionSweeper, err := admission.NewDispositionReconciler(admission.DispositionReconcilerConfig{
 		Authorizer: cfg.authorizer,
 		Due:        cfg.commands,
 		Settlement: cfg.commands,
@@ -198,15 +217,16 @@ func composeComponents(cfg config, credentials *internalidentity.Authenticator) 
 	}
 
 	return &components{
-		admissions:     service,
-		pool:           pool,
-		bindings:       bindings,
-		demand:         demand,
-		commandSweeper: commandSweeper,
-		gateSweeper:    gateSweeper,
-		placement:      placer,
-		records:        records,
-		pending:        pending,
+		admissions:         service,
+		pool:               pool,
+		bindings:           bindings,
+		demand:             demand,
+		commandSweeper:     commandSweeper,
+		dispositionSweeper: dispositionSweeper,
+		gateSweeper:        gateSweeper,
+		placement:          placer,
+		records:            records,
+		pending:            pending,
 	}, nil
 }
 
@@ -424,6 +444,13 @@ func (c *components) sweeps(cfg config) []sweep {
 	passes := []sweep{
 		{name: "commands", run: func(ctx context.Context) error {
 			_, err := c.commandSweeper.Sweep(ctx, cfg.service)
+			return err
+		}},
+		// The disposition deadline sweep. Unconditional, unlike "placement":
+		// it needs nothing beyond the required Commands seam, and without it a
+		// command no Host applied would stay open forever.
+		{name: "dispositions", run: func(ctx context.Context) error {
+			_, err := c.dispositionSweeper.Sweep(ctx, cfg.service)
 			return err
 		}},
 		{name: "gates", run: func(ctx context.Context) error {

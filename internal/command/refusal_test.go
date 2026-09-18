@@ -259,6 +259,42 @@ func TestEveryDurableInboxStateProjectsToOnePublicState(t *testing.T) {
 	}
 }
 
+// TestADispositionRejectionIsDescribedOnlyWhenNoAttemptExists holds the two
+// rejections apart. An attemptless one is the disposition deadline sweep's,
+// the only producer of one in this fleet, and it is described as the legacy
+// sweep described its own: rejected, runtime_unavailable. One carrying an
+// attempt is the store's not_applied settlement, whose cause this module never
+// saw, and it stays unreadable rather than being handed an invented code.
+func TestADispositionRejectionIsDescribedOnlyWhenNoAttemptExists(t *testing.T) {
+	t.Parallel()
+
+	entry := func(state sessionstore.InboxState, attempt *sessionstore.DispositionAttempt) sessionstore.DispositionInboxEntry {
+		return sessionstore.DispositionInboxEntry{Record: sessionstore.DispositionInboxRecord{
+			Descriptor: sessionstore.DispositionCommandDescriptor{CommandID: "command-a"},
+			State:      state, Attempt: attempt,
+		}, AcceptedOrder: 7}
+	}
+	status, ok := command.StatusForDisposition(entry(sessionstore.InboxStateRejected, nil))
+	if !ok || status.State != sessionwire.CommandStateRejected || status.Error == nil ||
+		status.Error.Code != sessionwire.ErrorCodeRuntimeUnavailable || status.Error.Message != "" || status.Error.Retryable {
+		t.Fatalf("an attemptless rejection projects to (%+v, %v), want rejected/runtime_unavailable with no message", status, ok)
+	}
+	if _, err := status.MarshalJSON(); err != nil {
+		t.Fatalf("Core refuses the described rejection: %v", err)
+	}
+	attempt := &sessionstore.DispositionAttempt{AttemptID: "attempt-1", JournalEpoch: 1, ResidencyEpoch: 1}
+	if status, ok := command.StatusForDisposition(entry(sessionstore.InboxStateRejected, attempt)); ok {
+		t.Fatalf("a store-settled rejection was described as %+v", status)
+	}
+	// And no other state gains a detail from the rule.
+	for _, state := range []sessionstore.InboxState{sessionstore.InboxStatePending, sessionstore.InboxStateClaimed, sessionstore.InboxStateApplying, sessionstore.InboxStateApplied} {
+		status, ok := command.StatusForDisposition(entry(state, nil))
+		if !ok || status.Error != nil {
+			t.Errorf("%q projects to (%+v, %v), want a readable status carrying no error", state, status, ok)
+		}
+	}
+}
+
 // TestAnUnknownDurableStateIsAFaultRatherThanAnAcceptance is the one case that
 // must never be reported optimistically: a record whose state this build does
 // not know is a store disagreeing with this build.

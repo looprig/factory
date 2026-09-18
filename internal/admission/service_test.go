@@ -1,8 +1,9 @@
 package admission
 
 import (
-	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -10,6 +11,7 @@ import (
 	"go/build"
 	"go/parser"
 	"go/token"
+	"io"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -151,52 +153,135 @@ func (c *serviceCatalog) CreateCatalogEntry(_ context.Context, req sessionstore.
 	return c.entry, true, nil
 }
 
+// existingBinding is the immutable disposition binding every existing session
+// in these fixtures is pinned to. The store requires an admission to name it
+// exactly, and serviceCommands enforces that, so a command admitted under any
+// other binding fails here as it would against the released store.
+var existingBinding = sessionstore.SessionBinding{
+	StorageBindingID: "storage-a", BindingVersion: "v1",
+	RuntimeSessionID: "0190a3c4-0000-8000-8000-000000000001", ProtocolMode: sessionstore.ProtocolModeDisposition,
+}
+
+// errLegacyProtocol is the store's refusal of a disposition operation on a
+// session that is not bound to the disposition protocol, spelled as the
+// released store spells it (catalogInvalid("binding.protocol_mode")).
+var errLegacyProtocol = &sessionstore.CatalogError{Code: sessionstore.CatalogErrorInvalid, Field: "binding.protocol_mode"}
+
+// serviceCommands is the disposition command plane, as faithful to the
+// released store as a fake can be on the axes admission depends on: it reads
+// the session's binding from the catalog fake and refuses an admission naming
+// another one, refuses a legacy-bound session in the store's own spelling,
+// compares a retry on kind, digest and size (never on the object reference),
+// and refuses a CommandID the session's create already holds.
 type serviceCommands struct {
 	faultInjector
-	records map[sessionwire.CommandID]sessionstore.InboxEntry
+	catalog *serviceCatalog
+	records map[sessionwire.CommandID]sessionstore.DispositionInboxEntry
 	calls   int
 	// lastAdmit and lastGet retain the REQUESTS for the same reason the
 	// catalog fake does: tenant scoping lives in the request.
-	lastAdmit sessionstore.AdmitCommandRequest
-	lastGet   sessionstore.GetCommandRequest
+	lastAdmit sessionstore.AdmitDispositionCommandRequest
+	lastGet   sessionstore.GetDispositionCommandRequest
+	// uploads is every oversized payload stored by reference.
+	uploads []sessionstore.PutCommandPayloadRequest
 	// notFound, when set, is the error a miss answers with. The released
-	// store has TWO not-found spellings -- an InboxError and the keyspace's
-	// binding-not-found -- and a fake that could only produce one would leave
-	// the other arm of commandNotFound unreadable.
+	// store has several not-found spellings -- the inbox's own and every
+	// session-absence code the catalog read ahead of it can answer -- and a
+	// fake that could only produce one would leave commandNotFound's other
+	// arms unreadable.
 	notFound error
 }
 
-func (c *serviceCommands) GetCommand(_ context.Context, req sessionstore.GetCommandRequest) (sessionstore.InboxEntry, error) {
+// sessionBinding is the store's catalog read ahead of every disposition
+// operation.
+func (c *serviceCommands) sessionBinding() (sessionstore.SessionBinding, error) {
+	if c.catalog.getErr != nil {
+		return sessionstore.SessionBinding{}, c.catalog.getErr
+	}
+	binding := c.catalog.entry.Record.Binding
+	if binding.ProtocolMode != sessionstore.ProtocolModeDisposition {
+		return sessionstore.SessionBinding{}, errLegacyProtocol
+	}
+	return binding, nil
+}
+
+func (c *serviceCommands) GetDispositionCommand(_ context.Context, req sessionstore.GetDispositionCommandRequest) (sessionstore.DispositionInboxEntry, error) {
 	c.lastGet = req
-	if err := c.enter("GetCommand"); err != nil {
-		return sessionstore.InboxEntry{}, err
+	if err := c.enter("GetDispositionCommand"); err != nil {
+		return sessionstore.DispositionInboxEntry{}, err
 	}
 	entry, ok := c.records[req.CommandID]
 	if !ok {
 		if c.notFound != nil {
-			return sessionstore.InboxEntry{}, c.notFound
+			return sessionstore.DispositionInboxEntry{}, c.notFound
 		}
-		return sessionstore.InboxEntry{}, &sessionstore.InboxError{Code: sessionstore.InboxErrorNotFound}
+		if _, err := c.sessionBinding(); err != nil {
+			return sessionstore.DispositionInboxEntry{}, err
+		}
+		return sessionstore.DispositionInboxEntry{}, &sessionstore.InboxError{Code: sessionstore.InboxErrorNotFound}
+	}
+	if _, err := c.sessionBinding(); err != nil {
+		return sessionstore.DispositionInboxEntry{}, err
 	}
 	return entry, nil
 }
 
-func (c *serviceCommands) AdmitCommand(_ context.Context, req sessionstore.AdmitCommandRequest) (sessionstore.InboxEntry, bool, error) {
+func (c *serviceCommands) PutCommandPayload(_ context.Context, req sessionstore.PutCommandPayloadRequest) (sessionwire.ObjectMetadata, error) {
+	if err := c.enter("PutCommandPayload"); err != nil {
+		return sessionwire.ObjectMetadata{}, err
+	}
+	if _, err := c.sessionBinding(); err != nil {
+		return sessionwire.ObjectMetadata{}, err
+	}
+	body, err := io.ReadAll(req.Body)
+	if err != nil {
+		return sessionwire.ObjectMetadata{}, err
+	}
+	if uint64(len(body)) != req.SizeBytes || sha256.Sum256(body) != req.SHA256 {
+		return sessionwire.ObjectMetadata{}, &sessionstore.ObjectError{Code: sessionstore.ObjectErrorIntegrity, Field: "body"}
+	}
+	c.uploads = append(c.uploads, req)
+	// A fresh generation every time, as the released store does.
+	return sessionwire.ObjectMetadata{
+		Reference: sessionwire.ObjectReference{ObjectID: "command-object-" + strconv.Itoa(len(c.uploads))},
+		SizeBytes: req.SizeBytes, Digest: hex.EncodeToString(req.SHA256[:]), MediaType: req.MediaType,
+	}, nil
+}
+
+func (c *serviceCommands) AdmitDispositionCommand(_ context.Context, req sessionstore.AdmitDispositionCommandRequest) (sessionstore.DispositionInboxEntry, bool, error) {
 	c.calls++
 	c.lastAdmit = req
-	if err := c.enter("AdmitCommand"); err != nil {
-		return sessionstore.InboxEntry{}, false, err
+	if err := c.enter("AdmitDispositionCommand"); err != nil {
+		return sessionstore.DispositionInboxEntry{}, false, err
+	}
+	binding, err := c.sessionBinding()
+	if err != nil {
+		return sessionstore.DispositionInboxEntry{}, false, err
+	}
+	if create := c.catalog.entry.Record.PublicCreate; create != nil && create.Identity.CommandID == req.CommandID {
+		return sessionstore.DispositionInboxEntry{}, false, &sessionstore.InboxError{Code: sessionstore.InboxErrorCommandMismatch, Field: "public_create"}
+	}
+	if req.Binding != binding {
+		return sessionstore.DispositionInboxEntry{}, false, &sessionstore.InboxError{Code: sessionstore.InboxErrorCommandMismatch, Field: "binding"}
+	}
+	digest, size := payloadIdentity(req.Payload)
+	if req.PayloadObject != nil {
+		digest, size = req.PayloadObject.Digest, req.PayloadObject.SizeBytes
 	}
 	if prior, ok := c.records[req.CommandID]; ok {
-		if prior.Record.Kind != req.Kind || !bytes.Equal(prior.Record.Payload, req.Payload) || prior.Record.PayloadRef != req.PayloadRef {
-			return sessionstore.InboxEntry{}, false, &sessionstore.InboxError{Code: sessionstore.InboxErrorCommandMismatch}
+		winner := prior.Record.Descriptor
+		if winner.Kind != req.Kind || winner.PayloadDigest != digest || winner.PayloadSize != size {
+			return sessionstore.DispositionInboxEntry{}, false, &sessionstore.InboxError{Code: sessionstore.InboxErrorCommandMismatch, Field: "command"}
 		}
 		return prior, false, nil
 	}
-	entry := sessionstore.InboxEntry{Record: sessionstore.InboxRecord{
-		TenantID: req.TenantID, SessionID: req.SessionID, CommandID: req.CommandID,
-		RuntimeCommandID: req.ProposedRuntimeCommandID, Kind: req.Kind,
-		Payload: append([]byte(nil), req.Payload...), PayloadRef: req.PayloadRef,
+	entry := sessionstore.DispositionInboxEntry{Record: sessionstore.DispositionInboxRecord{
+		Descriptor: sessionstore.DispositionCommandDescriptor{
+			TenantID: req.TenantID, SessionID: req.SessionID, CommandID: req.CommandID, Binding: binding,
+			RuntimeCommandID: req.ProposedRuntimeCommandID, Kind: req.Kind,
+			PayloadDigest: digest, PayloadSize: size,
+			Payload: append([]byte(nil), req.Payload...), PayloadObject: req.PayloadObject,
+		},
 		AcceptedAt: req.AcceptedAt, ApplyDeadline: req.ApplyDeadline, State: sessionstore.InboxStatePending,
 	}, Revision: 1, AcceptedOrder: uint64(len(c.records) + 1)}
 	c.records[req.CommandID] = entry
@@ -307,7 +392,7 @@ func newServiceFixture(t *testing.T) *serviceFixture {
 		AgentID: "agent-a", RuntimeCompatibilityID: "runtime-v1", Placement: sessionwire.HostPlacementPooled,
 	}}}
 	catalog := &serviceCatalog{getErr: &sessionstore.CatalogError{Code: sessionstore.CatalogErrorNotFound}}
-	commands := &serviceCommands{records: make(map[sessionwire.CommandID]sessionstore.InboxEntry)}
+	commands := &serviceCommands{catalog: catalog, records: make(map[sessionwire.CommandID]sessionstore.DispositionInboxEntry)}
 	directory := &serviceDirectory{}
 	ids := &serviceIDs{}
 	creates := newServicePublicCreates()
@@ -468,15 +553,15 @@ func TestACreateChecksAuthorizationAndTargetBeforeAnyDurableWrite(t *testing.T) 
 func TestExistingCommandsReturnTheOriginalAndConflictingReuseFails(t *testing.T) {
 	tests := []struct {
 		name string
-		call func(*serviceFixture, sessionwire.CommandID) (sessionstore.InboxEntry, bool, error)
+		call func(*serviceFixture, sessionwire.CommandID) (sessionstore.DispositionInboxEntry, bool, error)
 	}{
-		{"input", func(f *serviceFixture, id sessionwire.CommandID) (sessionstore.InboxEntry, bool, error) {
+		{"input", func(f *serviceFixture, id sessionwire.CommandID) (sessionstore.DispositionInboxEntry, bool, error) {
 			return f.service.AdmitInput(context.Background(), f.principal, sessionwire.InputRequest{CommandEnvelope: envelope(string(id)), SessionID: "session-a", Blocks: []byte(`[{"text":"hi"}]`)})
 		}},
-		{"interrupt", func(f *serviceFixture, id sessionwire.CommandID) (sessionstore.InboxEntry, bool, error) {
+		{"interrupt", func(f *serviceFixture, id sessionwire.CommandID) (sessionstore.DispositionInboxEntry, bool, error) {
 			return f.service.AdmitInterrupt(context.Background(), f.principal, sessionwire.InterruptRequest{CommandEnvelope: envelope(string(id)), SessionID: "session-a"})
 		}},
-		{"restore", func(f *serviceFixture, id sessionwire.CommandID) (sessionstore.InboxEntry, bool, error) {
+		{"restore", func(f *serviceFixture, id sessionwire.CommandID) (sessionstore.DispositionInboxEntry, bool, error) {
 			return f.service.AdmitRestore(context.Background(), f.principal, sessionwire.RestoreRequest{CommandEnvelope: envelope(string(id)), SessionID: "session-a"})
 		}},
 	}
@@ -484,7 +569,7 @@ func TestExistingCommandsReturnTheOriginalAndConflictingReuseFails(t *testing.T)
 		t.Run(test.name, func(t *testing.T) {
 			f := newServiceFixture(t)
 			f.catalog.getErr = nil
-			f.catalog.entry.Record = sessionstore.CatalogRecord{TenantID: "tenant-a", SessionID: "session-a", AgentID: "agent-a", RuntimeCompatibilityID: "runtime-v1", DesiredPlacement: sessionwire.HostPlacementPooled}
+			f.catalog.entry.Record = sessionstore.CatalogRecord{TenantID: "tenant-a", SessionID: "session-a", AgentID: "agent-a", RuntimeCompatibilityID: "runtime-v1", DesiredPlacement: sessionwire.HostPlacementPooled, Binding: existingBinding}
 			first, created, err := test.call(f, "command-a")
 			if err != nil || !created {
 				t.Fatalf("first = (%+v, %v, %v)", first, created, err)
@@ -503,7 +588,7 @@ func TestExistingCommandsReturnTheOriginalAndConflictingReuseFails(t *testing.T)
 func TestInputReuseWithDifferentPayloadFails(t *testing.T) {
 	f := newServiceFixture(t)
 	f.catalog.getErr = nil
-	f.catalog.entry.Record = sessionstore.CatalogRecord{TenantID: "tenant-a", SessionID: "session-a", AgentID: "agent-a", RuntimeCompatibilityID: "runtime-v1", DesiredPlacement: sessionwire.HostPlacementPooled}
+	f.catalog.entry.Record = sessionstore.CatalogRecord{TenantID: "tenant-a", SessionID: "session-a", AgentID: "agent-a", RuntimeCompatibilityID: "runtime-v1", DesiredPlacement: sessionwire.HostPlacementPooled, Binding: existingBinding}
 	first := sessionwire.InputRequest{CommandEnvelope: envelope("input-a"), SessionID: "session-a", Blocks: []byte(`[{"text":"first"}]`)}
 	if _, _, err := f.service.AdmitInput(context.Background(), f.principal, first); err != nil {
 		t.Fatal(err)
@@ -517,7 +602,7 @@ func TestInputReuseWithDifferentPayloadFails(t *testing.T) {
 func TestUnknownPinnedRuntimePrecedesInboxAdmission(t *testing.T) {
 	f := newServiceFixture(t)
 	f.catalog.getErr = nil
-	f.catalog.entry.Record = sessionstore.CatalogRecord{TenantID: "tenant-a", SessionID: "session-a", AgentID: "agent-a", RuntimeCompatibilityID: "runtime-old", DesiredPlacement: sessionwire.HostPlacementPooled}
+	f.catalog.entry.Record = sessionstore.CatalogRecord{TenantID: "tenant-a", SessionID: "session-a", AgentID: "agent-a", RuntimeCompatibilityID: "runtime-old", DesiredPlacement: sessionwire.HostPlacementPooled, Binding: existingBinding}
 	f.targets.known = false
 	_, _, err := f.service.AdmitInterrupt(context.Background(), f.principal, sessionwire.InterruptRequest{CommandEnvelope: envelope("interrupt-a"), SessionID: "session-a"})
 	if !IsCode(err, sessionwire.ErrorCodeRuntimeUnavailable) {
@@ -528,24 +613,60 @@ func TestUnknownPinnedRuntimePrecedesInboxAdmission(t *testing.T) {
 	}
 }
 
-func TestOversizedPrivatePayloadFailsClosedUntilTheStoreRetainsItsIdentity(t *testing.T) {
-	f := newServiceFixture(t)
-	f.catalog.getErr = nil
-	f.catalog.entry.Record = sessionstore.CatalogRecord{TenantID: "tenant-a", SessionID: "session-a", AgentID: "agent-a", RuntimeCompatibilityID: "runtime-v1", DesiredPlacement: sessionwire.HostPlacementPooled}
-	blocks := []byte(`["` + strings.Repeat("x", sessionstore.MaxInboxPayloadBytes) + `"]`)
-	_, _, err := f.service.AdmitInput(context.Background(), f.principal, sessionwire.InputRequest{CommandEnvelope: envelope("input-a"), SessionID: "session-a", Blocks: blocks})
-	if !errors.Is(err, ErrPayloadProtocolUnavailable) {
-		t.Fatalf("error = %v, want ErrPayloadProtocolUnavailable", err)
+// TestAnOversizedPayloadIsStoredByReferenceForEveryKind is runbook A3.1 step
+// 5 for the four kinds that are not a create. They used to be REFUSED past
+// MaxInboxPayloadBytes, because the legacy inbox compared a retry on the object
+// reference and every upload minted a fresh one. The disposition inbox compares
+// digest and size, so the rule is now the create's: upload, then admit by
+// reference -- and a retry that uploads again still matches.
+func TestAnOversizedPayloadIsStoredByReferenceForEveryKind(t *testing.T) {
+	big := strings.Repeat("x", sessionstore.MaxInboxPayloadBytes)
+	for _, test := range []struct {
+		name  string
+		admit func(*serviceFixture) (sessionstore.DispositionInboxEntry, bool, error)
+	}{
+		{"input", func(f *serviceFixture) (sessionstore.DispositionInboxEntry, bool, error) {
+			return f.service.AdmitInput(context.Background(), f.principal, sessionwire.InputRequest{CommandEnvelope: envelope("big-a"), SessionID: "session-a", Blocks: []byte(`["` + big + `"]`)})
+		}},
+		{"gate response", func(f *serviceFixture) (sessionstore.DispositionInboxEntry, bool, error) {
+			return f.service.AdmitGateResponse(context.Background(), f.principal, sessionwire.GateResponseRequest{CommandEnvelope: envelope("big-a"), SessionID: "session-a", GateID: "gate-a", Action: "submit",
+				Values: map[string]json.RawMessage{"answer": json.RawMessage(`"` + big + `"`)}, ExpectedOpenEventID: "event-a"})
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			f := newServiceFixture(t)
+			resolvableSession(f)
+			first, created, err := test.admit(f)
+			if err != nil || !created {
+				t.Fatalf("first = (%v, %v)", created, err)
+			}
+			if len(f.commands.uploads) != 1 || first.Record.Descriptor.PayloadObject == nil || len(first.Record.Descriptor.Payload) != 0 {
+				t.Fatalf("uploads = %d, object = %v, inline = %d bytes; want one upload admitted by reference",
+					len(f.commands.uploads), first.Record.Descriptor.PayloadObject, len(first.Record.Descriptor.Payload))
+			}
+			if first.Record.Descriptor.PayloadSize <= sessionstore.MaxInboxPayloadBytes {
+				t.Fatalf("admitted size %d is not past the inline ceiling", first.Record.Descriptor.PayloadSize)
+			}
+			retry, created, err := test.admit(f)
+			if err != nil || created || !reflect.DeepEqual(retry, first) {
+				t.Fatalf("retry = (%+v, %v, %v), want the original", retry, created, err)
+			}
+		})
 	}
-	if f.commands.calls != 0 {
-		t.Fatal("unsupported payload reached durable writes")
-	}
+	t.Run("an inline payload is not uploaded", func(t *testing.T) {
+		f := newServiceFixture(t)
+		resolvableSession(f)
+		entry, _, err := f.service.AdmitInput(context.Background(), f.principal, sessionwire.InputRequest{CommandEnvelope: envelope("small-a"), SessionID: "session-a", Blocks: []byte(`["x"]`)})
+		if err != nil || len(f.commands.uploads) != 0 || entry.Record.Descriptor.PayloadObject != nil || len(entry.Record.Descriptor.Payload) == 0 {
+			t.Fatalf("inline admission = (%+v, %v) with %d uploads", entry.Record.Descriptor, err, len(f.commands.uploads))
+		}
+	})
 }
 
 func TestGateResponseRequiresMatchingProjectionAndFreshResidentOwner(t *testing.T) {
 	base := func(f *serviceFixture) sessionwire.GateResponseRequest {
 		f.catalog.getErr = nil
-		f.catalog.entry.Record = sessionstore.CatalogRecord{TenantID: "tenant-a", SessionID: "session-a", AgentID: "agent-a", RuntimeCompatibilityID: "runtime-v1", DesiredPlacement: sessionwire.HostPlacementPooled,
+		f.catalog.entry.Record = sessionstore.CatalogRecord{TenantID: "tenant-a", SessionID: "session-a", AgentID: "agent-a", RuntimeCompatibilityID: "runtime-v1", DesiredPlacement: sessionwire.HostPlacementPooled, Binding: existingBinding,
 			OpenGates: []sessionwire.GateProjection{{GateID: "gate-a", OpenedEventID: "event-a", OpenedJournalSeq: 7, Deadline: serviceNow.Add(time.Hour), Answerability: sessionwire.GateAnswerabilityResident}}}
 		f.directory.ok = true
 		f.directory.owner = sessionwire.HostLinkRegistryObservation{TenantID: "tenant-a", SessionID: "session-a", AgentID: "agent-a", RuntimeCompatibilityID: "runtime-v1", Placement: sessionwire.HostPlacementPooled, Residency: sessionwire.SessionResidencyResident, Accepting: true, ExpiresAt: serviceNow.Add(time.Minute)}
@@ -591,7 +712,7 @@ func TestGateResponseRequiresMatchingProjectionAndFreshResidentOwner(t *testing.
 func TestGateResponseRetryReturnsOriginalAndDifferentAnswerConflicts(t *testing.T) {
 	f := newServiceFixture(t)
 	f.catalog.getErr = nil
-	f.catalog.entry.Record = sessionstore.CatalogRecord{TenantID: "tenant-a", SessionID: "session-a", AgentID: "agent-a", RuntimeCompatibilityID: "runtime-v1", DesiredPlacement: sessionwire.HostPlacementPooled,
+	f.catalog.entry.Record = sessionstore.CatalogRecord{TenantID: "tenant-a", SessionID: "session-a", AgentID: "agent-a", RuntimeCompatibilityID: "runtime-v1", DesiredPlacement: sessionwire.HostPlacementPooled, Binding: existingBinding,
 		OpenGates: []sessionwire.GateProjection{{GateID: "gate-a", OpenedEventID: "event-a", OpenedJournalSeq: 7, Deadline: serviceNow.Add(time.Hour), Answerability: sessionwire.GateAnswerabilityResident}}}
 	f.directory.ok = true
 	f.directory.owner = sessionwire.HostLinkRegistryObservation{TenantID: "tenant-a", SessionID: "session-a", AgentID: "agent-a", RuntimeCompatibilityID: "runtime-v1", Placement: sessionwire.HostPlacementPooled, Residency: sessionwire.SessionResidencyResident, Accepting: true, ExpiresAt: serviceNow.Add(time.Minute)}
@@ -690,7 +811,7 @@ func TestADependencyFaultIsNotADecisionAboutTheCommand(t *testing.T) {
 		f.catalog.getErr = nil
 		f.catalog.entry.Record = sessionstore.CatalogRecord{
 			TenantID: "tenant-a", SessionID: "session-a", AgentID: "agent-a",
-			RuntimeCompatibilityID: "runtime-v1", DesiredPlacement: sessionwire.HostPlacementPooled,
+			RuntimeCompatibilityID: "runtime-v1", DesiredPlacement: sessionwire.HostPlacementPooled, Binding: existingBinding,
 			OpenGates: []sessionwire.GateProjection{{
 				GateID: "gate-a", OpenedEventID: "event-a", Deadline: serviceNow.Add(time.Hour),
 				Answerability: sessionwire.GateAnswerabilityResident,
@@ -723,10 +844,12 @@ func TestADependencyFaultIsNotADecisionAboutTheCommand(t *testing.T) {
 			name: "checking an existing session's pinned runtime",
 			fault: func(f *serviceFixture) {
 				f.catalog.getErr = nil
+				f.catalog.entry.Record.Binding = existingBinding
 				f.targets.err = boom
 			},
 			answer: func(f *serviceFixture) {
 				f.catalog.getErr = nil
+				f.catalog.entry.Record.Binding = existingBinding
 				f.targets.known = false
 			},
 			call: func(f *serviceFixture) error {
@@ -996,7 +1119,7 @@ func resolvableSession(f *serviceFixture) {
 	f.catalog.getErr = nil
 	f.catalog.entry.Record = sessionstore.CatalogRecord{
 		TenantID: "tenant-a", SessionID: "session-a", AgentID: "agent-a",
-		RuntimeCompatibilityID: "runtime-v1", DesiredPlacement: sessionwire.HostPlacementPooled,
+		RuntimeCompatibilityID: "runtime-v1", DesiredPlacement: sessionwire.HostPlacementPooled, Binding: existingBinding,
 		OpenGates: []sessionwire.GateProjection{{
 			GateID: "gate-a", OpenedEventID: "event-a", OpenedJournalSeq: 7,
 			Deadline: serviceNow.Add(time.Hour), Answerability: sessionwire.GateAnswerabilityResident,
@@ -1162,8 +1285,10 @@ func admissionEntryPoints(t *testing.T) map[string]func(*serviceFixture) error {
 			return err
 		},
 		"AdmitInput": func(f *serviceFixture) error {
+			// OVERSIZED for AdmitCreate's reason: a small input never calls
+			// Commands.PutCommandPayload, and the sweep must drive it.
 			_, _, err := f.service.AdmitInput(context.Background(), f.principal,
-				sessionwire.InputRequest{CommandEnvelope: envelope("input-a"), SessionID: "session-a", Blocks: []byte(`[{"text":"hello"}]`)})
+				sessionwire.InputRequest{CommandEnvelope: envelope("input-a"), SessionID: "session-a", Blocks: []byte(oversizedBlocks())})
 			return err
 		},
 		"AdmitInterrupt": func(f *serviceFixture) error {
@@ -2233,7 +2358,7 @@ func TestARefusedCommandStopsAtItsGuardAndTouchesNothingFurther(t *testing.T) {
 					Values: map[string]json.RawMessage{"answer": json.RawMessage(`"yes"`)}, ExpectedOpenEventID: "event-a"})
 				return err
 			},
-			want: []string{"AdmitCommand", "AuthorizeControl", "GetCatalogEntry", "GetCommand", "IsKnown", "NewUUID", "Owner"},
+			want: []string{"AdmitDispositionCommand", "AuthorizeControl", "GetCatalogEntry", "GetDispositionCommand", "IsKnown", "NewUUID", "Owner"},
 		},
 		{
 			name:      "an unknown runtime stops before the inbox",
@@ -2243,7 +2368,7 @@ func TestARefusedCommandStopsAtItsGuardAndTouchesNothingFurther(t *testing.T) {
 					CommandEnvelope: envelope("command-a"), SessionID: "session-a"})
 				return err
 			},
-			want: []string{"AuthorizeControl", "GetCatalogEntry", "GetCommand", "IsKnown"},
+			want: []string{"AuthorizeControl", "GetCatalogEntry", "GetDispositionCommand", "IsKnown"},
 		},
 		{
 			name:      "a cold owner stops before the inbox and drives no placement",
@@ -2254,7 +2379,7 @@ func TestARefusedCommandStopsAtItsGuardAndTouchesNothingFurther(t *testing.T) {
 					Values: map[string]json.RawMessage{"answer": json.RawMessage(`"yes"`)}, ExpectedOpenEventID: "event-a"})
 				return err
 			},
-			want: []string{"AuthorizeControl", "GetCatalogEntry", "GetCommand", "IsKnown", "Owner"},
+			want: []string{"AuthorizeControl", "GetCatalogEntry", "GetDispositionCommand", "IsKnown", "Owner"},
 		},
 		{
 			name:      "a resolved gate stops before the inbox and drives no placement",
@@ -2265,7 +2390,7 @@ func TestARefusedCommandStopsAtItsGuardAndTouchesNothingFurther(t *testing.T) {
 					Values: map[string]json.RawMessage{"answer": json.RawMessage(`"yes"`)}, ExpectedOpenEventID: "event-a"})
 				return err
 			},
-			want: []string{"AuthorizeControl", "GetCatalogEntry", "GetCommand", "IsKnown"},
+			want: []string{"AuthorizeControl", "GetCatalogEntry", "GetDispositionCommand", "IsKnown"},
 		},
 		{
 			name:      "a denied principal stops at the authorizer",
@@ -2290,7 +2415,7 @@ func TestARefusedCommandStopsAtItsGuardAndTouchesNothingFurther(t *testing.T) {
 			if got := trace(f); !slices.Equal(got, test.want) {
 				t.Fatalf("call trace = %v, want %v", got, test.want)
 			}
-			if accepted != slices.Contains(test.want, "AdmitCommand") {
+			if accepted != slices.Contains(test.want, "AdmitDispositionCommand") {
 				t.Fatal("the control's expectation disagrees with its outcome")
 			}
 		})
@@ -2435,6 +2560,13 @@ func TestEverySessionBindingThisModuleCanReachIsAuthoredOrKeyedToAnExistingSessi
 		// dependency call. Keep the site in the structural inventory so making
 		// it reachable again cannot silently introduce a second binding source.
 		"in:Config.Catalog.CreateCatalogEntry(arg1).Binding",
+		// (12) INBOUND and KEYED TO AN EXISTING SESSION, not authored. Every
+		// command but a create is admitted into the disposition inbox, whose
+		// request must EQUAL the session's immutable pin: the value is the
+		// catalog entry's own (6), or on a retry the winner's own (14), and
+		// nothing here constructs one.
+		// TestACommandIsAdmittedUnderTheSessionsOwnBinding is its reader.
+		"in:Config.Commands.AdmitDispositionCommand(arg1).Binding",
 		// (2) and (3) INBOUND and AUTHORED. These are A3.1's two writes, and
 		// both carry the SAME value: admitPublicCreate builds one identity and
 		// passes it to both calls, so a reservation and its admission cannot
@@ -2453,6 +2585,10 @@ func TestEverySessionBindingThisModuleCanReachIsAuthoredOrKeyedToAnExistingSessi
 		"out:Config.Catalog.GetCatalogEntry(res0).Record.Binding",
 		// (7) OUTBOUND, the read counterpart of (5).
 		"out:Config.Catalog.GetCatalogEntry(res0).Record.PublicCreate[].Identity.Binding",
+		// (13) and (14) OUTBOUND: an admitted command's own copy of its
+		// session's pin, as the admission and the retry read return it.
+		"out:Config.Commands.AdmitDispositionCommand(res0).Record.Descriptor.Binding",
+		"out:Config.Commands.GetDispositionCommand(res0).Record.Descriptor.Binding",
 		// (8) OUTBOUND: the admitted record's own copy of (3). It is the
 		// store's echo of the winner, which on a retry is the FIRST caller's
 		// binding rather than this one's -- which is exactly why the
@@ -2583,7 +2719,6 @@ func TestTheFailClosedReasonsNameTheBlockerThatActuallyRemains(t *testing.T) {
 		name string
 		err  error
 	}{
-		{"oversized payload", ErrPayloadProtocolUnavailable},
 		{"V1 create binding", ErrCreateBindingUnconfigured},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -2874,4 +3009,79 @@ func mintedRefusalCodes(t *testing.T, root string) []string {
 	}
 	sort.Strings(names)
 	return names
+}
+
+// TestALegacyBoundSessionIsRuntimeUnavailableOnEveryKind is the legacy mapping
+// at the service. Every kind reaches the retry read first, and the store's
+// refusal there is what must become the classified answer.
+func TestALegacyBoundSessionIsRuntimeUnavailableOnEveryKind(t *testing.T) {
+	for name, admit := range map[string]func(*serviceFixture) error{
+		"input": func(f *serviceFixture) error {
+			_, _, err := f.service.AdmitInput(context.Background(), f.principal, sessionwire.InputRequest{CommandEnvelope: envelope("legacy-a"), SessionID: "session-a", Blocks: []byte(`["x"]`)})
+			return err
+		},
+		"interrupt": func(f *serviceFixture) error {
+			_, _, err := f.service.AdmitInterrupt(context.Background(), f.principal, sessionwire.InterruptRequest{CommandEnvelope: envelope("legacy-a"), SessionID: "session-a"})
+			return err
+		},
+		"restore": func(f *serviceFixture) error {
+			_, _, err := f.service.AdmitRestore(context.Background(), f.principal, sessionwire.RestoreRequest{CommandEnvelope: envelope("legacy-a"), SessionID: "session-a"})
+			return err
+		},
+		"gate response": func(f *serviceFixture) error {
+			_, _, err := f.service.AdmitGateResponse(context.Background(), f.principal, sessionwire.GateResponseRequest{CommandEnvelope: envelope("legacy-a"), SessionID: "session-a", GateID: "gate-a", Action: "submit", Values: map[string]json.RawMessage{}, ExpectedOpenEventID: "event-a"})
+			return err
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := newServiceFixture(t)
+			resolvableSession(f)
+			f.catalog.entry.Record.Binding = sessionstore.SessionBinding{}
+			err := admit(f)
+			if !IsCode(err, sessionwire.ErrorCodeRuntimeUnavailable) || !errors.Is(err, ErrLegacySessionUnsupported) {
+				t.Fatalf("error = %v, want runtime_unavailable wrapping ErrLegacySessionUnsupported", err)
+			}
+			if f.commands.calls != 0 || len(f.commands.uploads) != 0 {
+				t.Fatalf("a legacy-bound session reached a write: %d admissions, %d uploads", f.commands.calls, len(f.commands.uploads))
+			}
+		})
+	}
+}
+
+// TestTheStoresAnswerToACommandHasOneClassification reads commandRefusal arm by
+// arm, including the two near misses that must stay faults: the store's
+// BACKEND code on the protocol field is an outage, and an invalid code on
+// another field is not a legacy session.
+func TestTheStoresAnswerToACommandHasOneClassification(t *testing.T) {
+	t.Parallel()
+
+	for _, test := range []struct {
+		name string
+		err  error
+		code sessionwire.ErrorCode
+	}{
+		{"legacy, as the disposition read spells it", &sessionstore.CatalogError{Code: sessionstore.CatalogErrorInvalid, Field: "binding.protocol_mode"}, sessionwire.ErrorCodeRuntimeUnavailable},
+		{"legacy, as the mode witness spells it", &sessionstore.CatalogError{Code: sessionstore.CatalogErrorConflict, Field: "binding.protocol_mode"}, sessionwire.ErrorCodeRuntimeUnavailable},
+		{"a content mismatch", &sessionstore.InboxError{Code: sessionstore.InboxErrorCommandMismatch}, sessionwire.ErrorCodeCommandRejected},
+		{"an outage on the protocol field", &sessionstore.CatalogError{Code: sessionstore.CatalogErrorBackend, Field: "binding.protocol_mode"}, ""},
+		{"an invalid catalog on another field", &sessionstore.CatalogError{Code: sessionstore.CatalogErrorInvalid, Field: "binding"}, ""},
+		{"a provider outage", &sessionstore.InboxError{Code: sessionstore.InboxErrorBackend}, ""},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			got := commandRefusal(fmt.Errorf("wrapped: %w", test.err))
+			var classified *Error
+			if test.code == "" {
+				if errors.As(got, &classified) {
+					t.Fatalf("a fault was classified %q", classified.Code)
+				}
+				if !errors.Is(got, test.err) {
+					t.Fatalf("the fault %v lost its cause", got)
+				}
+				return
+			}
+			if !IsCode(got, test.code) || !errors.Is(got, test.err) {
+				t.Fatalf("commandRefusal = %v, want %q wrapping the store's answer", got, test.code)
+			}
+		})
+	}
 }

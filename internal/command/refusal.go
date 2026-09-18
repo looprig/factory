@@ -49,7 +49,12 @@ import (
 //	:186        the V1 create reservation this composition cannot author
 //	:272        an EXISTING session's own pinned target is no longer a
 //	            configured one
-//	:279, :391  the payload is past sessionstore.MaxInboxPayloadBytes
+//	existingCompatible, commandRefusal
+//	            the session is bound to the LEGACY protocol, which no Host can
+//	            take residency on (ErrLegacySessionUnsupported). This replaced
+//	            "the payload is past MaxInboxPayloadBytes" when every command
+//	            moved into the disposition family, which stores an oversized
+//	            payload by reference instead of refusing it.
 //
 // :184 and :272 are kept apart rather than counted as one "unresolvable
 // target": the first is a fact about the AgentID in the REQUEST and is fixed by
@@ -89,7 +94,10 @@ import (
 // coherent -- one is "this deployment will not accept your command", the other
 // is "your accepted command was settled because no runtime applied it" -- and
 // is stated here so the enumeration above is not read as every producer in the
-// module.
+// module. StatusForDisposition is its disposition-family counterpart: the
+// disposition record carries no detail, so an ATTEMPTLESS rejection -- which
+// only the disposition deadline sweep writes -- is described with the same code
+// at the edge rather than stored.
 //
 // The four state-conflict codes are 409, which is also what the legacy surface
 // answered for its nearest equivalent (`gate_not_ready`). A transient condition
@@ -295,24 +303,36 @@ func StatusFor(entry sessionstore.InboxEntry) (sessionwire.CommandStatus, bool) 
 // "claimed" means publicly, which is the rule A9.1 fixed for RefusalStatus and
 // which a per-family copy of this switch would immediately reintroduce.
 //
-// # A rejected disposition command is deliberately UNREADABLE
+// # Two rejections, and only one of them is describable
 //
 // The one genuine asymmetry between the families is the rejection detail.
 // sessionstore's DispositionInboxRecord has NO member equivalent to the legacy
 // record's `Rejection *sessionwire.ErrorDetail` -- rejection is a state there
 // and nothing more -- while Core REQUIRES an error on a rejected status
-// (commands.go:374-377, CommandStateRejected with a nil Error is
-// missing_field). So a rejected disposition record cannot be described
-// publicly at all.
+// (CommandStateRejected with a nil Error is missing_field). So the detail has
+// to come from WHO can have written the rejection, and the record says that
+// much:
 //
-// This passes nil and lets statusFor's own readability rule refuse it, rather
-// than inventing a detail. An invented one would be a public, stable,
-// client-switchable code for a rejection whose real cause this module never
-// saw. The edge answers a fault instead, which is the same fail-closed answer
-// it already gives for an unreadable legacy record. It is recorded as owed
-// against sessionstore rather than papered over here.
+//   - An ATTEMPTLESS rejection is a refusal before any dispatch. Its only
+//     producer in this fleet is Factory's own disposition deadline sweep
+//     (internal/admission DispositionReconciler): a Host declares no seam for
+//     RejectDispositionCommand at all and leaves the deadline to Factory. So
+//     it is described exactly as the legacy sweep described its own:
+//     runtime_unavailable -- accepted, and no runtime applied it before its
+//     deadline. This is what keeps a retry of an expired input answering
+//     "rejected, runtime_unavailable" now that inputs are disposition
+//     commands, as they did as legacy ones.
+//   - A rejection carrying an ATTEMPT is the store's not_applied settlement,
+//     decided from a runtime's evidence this module never saw. It stays
+//     UNREADABLE: an invented code would be a public, stable, client-switchable
+//     answer for a cause nobody here observed, and the edge answers a fault
+//     instead, which is recorded as owed against sessionstore.
 func StatusForDisposition(entry sessionstore.DispositionInboxEntry) (sessionwire.CommandStatus, bool) {
-	return statusFor(entry.Record.Descriptor.CommandID, entry.AcceptedOrder, entry.Record.State, nil)
+	var rejection *sessionwire.ErrorDetail
+	if entry.Record.State == sessionstore.InboxStateRejected && entry.Record.Attempt == nil {
+		rejection = &sessionwire.ErrorDetail{Code: sessionwire.ErrorCodeRuntimeUnavailable}
+	}
+	return statusFor(entry.Record.Descriptor.CommandID, entry.AcceptedOrder, entry.Record.State, rejection)
 }
 
 // statusFor is the ONE mapping from a durable inbox state to a public command

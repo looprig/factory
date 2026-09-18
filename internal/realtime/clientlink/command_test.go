@@ -103,8 +103,9 @@ func (c admitCall) deadline() (time.Time, bool) {
 
 type recordingAdmitter struct {
 	mu sync.Mutex
-	// entry is returned for every accepted command.
-	entry sessionstore.InboxEntry
+	// entry is returned for every accepted command. Every kind answers in the
+	// DISPOSITION family, the only one admission writes.
+	entry sessionstore.DispositionInboxEntry
 	// created is admission's "this call accepted it" answer.
 	created bool
 	// err, when set, is returned instead of entry.
@@ -144,7 +145,7 @@ type recordingAdmitter struct {
 // wait out.
 const admitterBackstop = 5 * time.Second
 
-func (a *recordingAdmitter) record(ctx context.Context, method clientlink.Method, principal identity.Principal, request any) (sessionstore.InboxEntry, bool, error) {
+func (a *recordingAdmitter) record(ctx context.Context, method clientlink.Method, principal identity.Principal, request any) (sessionstore.DispositionInboxEntry, bool, error) {
 	a.mu.Lock()
 	a.calls = append(a.calls, admitCall{method: method, principal: principal, request: request, ctx: ctx})
 	gate, wait, entry, created, err := a.gate, a.waitForContext, a.entry, a.created, a.err
@@ -157,12 +158,12 @@ func (a *recordingAdmitter) record(ctx context.Context, method clientlink.Method
 		defer timer.Stop()
 		select {
 		case <-ctx.Done():
-			return sessionstore.InboxEntry{}, false, ctx.Err()
+			return sessionstore.DispositionInboxEntry{}, false, ctx.Err()
 		case <-timer.C:
 			a.mu.Lock()
 			a.selfReleased = true
 			a.mu.Unlock()
-			return sessionstore.InboxEntry{}, false, errAdmissionUnbounded
+			return sessionstore.DispositionInboxEntry{}, false, errAdmissionUnbounded
 		}
 	}
 	return entry, created, err
@@ -184,51 +185,42 @@ func (a *recordingAdmitter) recorded() []admitCall {
 	return slices.Clone(a.calls)
 }
 
-// AdmitCreate answers in the DISPOSITION family; see the service's own
-// AdmitCreate for why a create cannot be a legacy record. The recorded entry is
-// projected so the existing record/reply assertions still read one shape.
+// AdmitCreate answers in the DISPOSITION family, as every kind does, and
+// marks the record as the public create it is.
 func (a *recordingAdmitter) AdmitCreate(ctx context.Context, p identity.Principal, req sessionwire.CreateRequest) (sessionstore.DispositionInboxEntry, bool, error) {
 	entry, created, err := a.record(ctx, clientlink.MethodSessionCreate, p, req)
 	if err != nil {
 		return sessionstore.DispositionInboxEntry{}, created, err
 	}
-	return sessionstore.DispositionInboxEntry{
-		Record: sessionstore.DispositionInboxRecord{
-			Descriptor: sessionstore.DispositionCommandDescriptor{
-				PublicCreate: true, TenantID: entry.Record.TenantID, SessionID: entry.Record.SessionID,
-				CommandID: entry.Record.CommandID, RuntimeCommandID: entry.Record.RuntimeCommandID,
-				Kind: entry.Record.Kind,
-			},
-			AcceptedAt: entry.Record.AcceptedAt, ApplyDeadline: entry.Record.ApplyDeadline,
-			State: entry.Record.State,
-		},
-		Revision: entry.Revision, AcceptedOrder: entry.AcceptedOrder,
-	}, created, nil
+	entry.Record.Descriptor.PublicCreate = true
+	return entry, created, nil
 }
 
-func (a *recordingAdmitter) AdmitInput(ctx context.Context, p identity.Principal, req sessionwire.InputRequest) (sessionstore.InboxEntry, bool, error) {
+func (a *recordingAdmitter) AdmitInput(ctx context.Context, p identity.Principal, req sessionwire.InputRequest) (sessionstore.DispositionInboxEntry, bool, error) {
 	return a.record(ctx, clientlink.MethodSessionInput, p, req)
 }
 
-func (a *recordingAdmitter) AdmitInterrupt(ctx context.Context, p identity.Principal, req sessionwire.InterruptRequest) (sessionstore.InboxEntry, bool, error) {
+func (a *recordingAdmitter) AdmitInterrupt(ctx context.Context, p identity.Principal, req sessionwire.InterruptRequest) (sessionstore.DispositionInboxEntry, bool, error) {
 	return a.record(ctx, clientlink.MethodSessionInterrupt, p, req)
 }
 
-func (a *recordingAdmitter) AdmitRestore(ctx context.Context, p identity.Principal, req sessionwire.RestoreRequest) (sessionstore.InboxEntry, bool, error) {
+func (a *recordingAdmitter) AdmitRestore(ctx context.Context, p identity.Principal, req sessionwire.RestoreRequest) (sessionstore.DispositionInboxEntry, bool, error) {
 	return a.record(ctx, clientlink.MethodSessionRestore, p, req)
 }
 
-func (a *recordingAdmitter) AdmitGateResponse(ctx context.Context, p identity.Principal, req sessionwire.GateResponseRequest) (sessionstore.InboxEntry, bool, error) {
+func (a *recordingAdmitter) AdmitGateResponse(ctx context.Context, p identity.Principal, req sessionwire.GateResponseRequest) (sessionstore.DispositionInboxEntry, bool, error) {
 	return a.record(ctx, clientlink.MethodGateRespond, p, req)
 }
 
 // acceptedEntry is one durable record, with every member an absolute literal
 // different from every other, so a projection that read the wrong one fails.
-func acceptedEntry(session sessionwire.SessionID, id sessionwire.CommandID) sessionstore.InboxEntry {
-	return sessionstore.InboxEntry{
-		Record: sessionstore.InboxRecord{
-			TenantID: tenantA, SessionID: session, CommandID: id,
-			RuntimeCommandID: "runtime-77", Kind: command.KindInput,
+func acceptedEntry(session sessionwire.SessionID, id sessionwire.CommandID) sessionstore.DispositionInboxEntry {
+	return sessionstore.DispositionInboxEntry{
+		Record: sessionstore.DispositionInboxRecord{
+			Descriptor: sessionstore.DispositionCommandDescriptor{
+				TenantID: tenantA, SessionID: session, CommandID: id,
+				RuntimeCommandID: "runtime-77", Kind: command.KindInput,
+			},
 			State: sessionstore.InboxStatePending,
 		},
 		Revision:      41,
@@ -682,11 +674,16 @@ func TestADeniedCommandNeverReachesAdmission(t *testing.T) {
 func TestTheReplyDescribesTheDurableRecord(t *testing.T) {
 	t.Parallel()
 
-	rejection := &sessionwire.ErrorDetail{Code: sessionwire.ErrorCodeCommandRejected, Message: "the command cannot be applied"}
+	// An attemptless disposition rejection is the deadline sweep's, described
+	// as runtime_unavailable; one carrying an attempt is the store's
+	// not_applied settlement, which has no public description.
+	rejection := &sessionwire.ErrorDetail{Code: sessionwire.ErrorCodeRuntimeUnavailable}
+	settled := &sessionstore.DispositionAttempt{AttemptID: "attempt-1", JournalEpoch: 1, ResidencyEpoch: 1}
 	for _, tt := range []struct {
 		name    string
 		state   sessionstore.InboxState
 		detail  *sessionwire.ErrorDetail
+		attempt *sessionstore.DispositionAttempt
 		want    sessionwire.CommandState
 		wantErr bool
 	}{
@@ -697,7 +694,7 @@ func TestTheReplyDescribesTheDurableRecord(t *testing.T) {
 		{name: "rejected", state: sessionstore.InboxStateRejected, detail: rejection, want: sessionwire.CommandStateRejected},
 		// A rejected record with no detail cannot be described publicly, and a
 		// state this build does not know must not be reported optimistically.
-		{name: "rejected with no detail", state: sessionstore.InboxStateRejected, wantErr: true},
+		{name: "rejected by the store's settlement", state: sessionstore.InboxStateRejected, attempt: settled, wantErr: true},
 		{name: "a state this build does not know", state: sessionstore.InboxState("quarantined"), wantErr: true},
 		{name: "no state at all", state: "", wantErr: true},
 	} {
@@ -707,7 +704,7 @@ func TestTheReplyDescribesTheDurableRecord(t *testing.T) {
 			f := newEngineFixture(t)
 			entry := acceptedEntry("session-1", "cmd-77")
 			entry.Record.State = tt.state
-			entry.Record.Rejection = tt.detail
+			entry.Record.Attempt = tt.attempt
 			f.admitter.entry = entry
 
 			reply, err := f.admit(t, clientlink.MethodSessionInput, commandBody(clientlink.MethodSessionInput, "session-1", "cmd-77"))
@@ -814,8 +811,8 @@ func TestTheAdmissionServiceIsExactlyTheSeamThisEdgeCalls(t *testing.T) {
 	// that is the gate's finding: a prefix rule cannot require a future V1
 	// command method that happens not to be called Admit*, which is the same
 	// class-6 hole this test closes everywhere else. A V1 admission is exactly
-	// "(context, Principal, <one Core request type>) -> (InboxEntry, bool,
-	// error)", and nothing else on the service has that shape.
+	// "(context, Principal, <one Core request type>) -> (DispositionInboxEntry,
+	// bool, error)", and nothing else on the service has that shape.
 	//
 	// AdmitLegacyCreate is excluded by shape rather than by name -- it takes
 	// admission's own LegacyCreateRequest and returns a LegacyCreateResult, so
@@ -830,12 +827,10 @@ func TestTheAdmissionServiceIsExactlyTheSeamThisEdgeCalls(t *testing.T) {
 	const legacy = "AdmitLegacyCreate"
 	ctxType := reflect.TypeOf((*context.Context)(nil)).Elem()
 	principalType := reflect.TypeOf(identity.Principal{})
-	entryType := reflect.TypeOf(sessionstore.InboxEntry{})
-	// A create is admitted into the DISPOSITION inbox, so "a durable command
-	// record" is now two types rather than one. Both are accepted and NOTHING
-	// ELSE is -- the WrongEntry probe below still has to be refused -- so this
-	// widens the rule by exactly one named type rather than loosening it into
-	// "any struct".
+	// EVERY command is admitted into the DISPOSITION inbox, so "a durable
+	// command record" is exactly one type. A legacy InboxEntry is refused by
+	// name (the LegacyEntry probe): a seam method answering from the legacy
+	// inbox would be a mixed-family admission, which no longer exists.
 	dispositionEntryType := reflect.TypeOf(sessionstore.DispositionInboxEntry{})
 	errorType := reflect.TypeOf((*error)(nil)).Elem()
 	isV1Admission := func(fn reflect.Type) bool {
@@ -844,7 +839,7 @@ func TestTheAdmissionServiceIsExactlyTheSeamThisEdgeCalls(t *testing.T) {
 			return false
 		}
 		return fn.In(1) == ctxType && fn.In(2) == principalType &&
-			(fn.Out(0) == entryType || fn.Out(0) == dispositionEntryType) &&
+			fn.Out(0) == dispositionEntryType &&
 			fn.Out(1) == reflect.TypeOf(false) && fn.Out(2) == errorType
 	}
 	want := map[string]bool{}
@@ -881,22 +876,19 @@ func TestTheAdmissionServiceIsExactlyTheSeamThisEdgeCalls(t *testing.T) {
 		t.Errorf("the shape rule matches %s, so it is not distinguishing a V1 admission from a legacy one", legacy)
 	}
 	for name, probe := range map[string]any{
-		"the exact V1 shape": shapeProbeType.AdmitExact,
-		// The second accepted family, rowed rather than assumed: widening the
-		// rule by a type is only safe if the widened rule still refuses
-		// everything else, which "a catalog entry returned" below holds.
-		"the disposition family":   shapeProbeType.AdmitDisposition,
-		"one argument short":       shapeProbeType.MissingPrincipal,
-		"one argument too many":    shapeProbeType.ExtraArgument,
-		"no context":               shapeProbeType.NoContext,
-		"a principal by pointer":   shapeProbeType.PointerPrincipal,
-		"one result short":         shapeProbeType.MissingCreated,
-		"one result too many":      shapeProbeType.ExtraResult,
-		"a catalog entry returned": shapeProbeType.WrongEntry,
-		"a non-boolean second":     shapeProbeType.WrongCreated,
-		"a non-error third":        shapeProbeType.WrongError,
+		"the exact V1 shape":            shapeProbeType.AdmitExact,
+		"a legacy inbox entry returned": shapeProbeType.LegacyEntry,
+		"one argument short":            shapeProbeType.MissingPrincipal,
+		"one argument too many":         shapeProbeType.ExtraArgument,
+		"no context":                    shapeProbeType.NoContext,
+		"a principal by pointer":        shapeProbeType.PointerPrincipal,
+		"one result short":              shapeProbeType.MissingCreated,
+		"one result too many":           shapeProbeType.ExtraResult,
+		"a catalog entry returned":      shapeProbeType.WrongEntry,
+		"a non-boolean second":          shapeProbeType.WrongCreated,
+		"a non-error third":             shapeProbeType.WrongError,
 	} {
-		want := name == "the exact V1 shape" || name == "the disposition family"
+		want := name == "the exact V1 shape"
 		if got := isV1Admission(reflect.TypeOf(probe)); got != want {
 			t.Errorf("isV1Admission(%s) = %t, want %t", name, got, want)
 		}
@@ -1119,32 +1111,35 @@ func TestARefusalWithNoCodeIsAFaultNotAnEmptyReply(t *testing.T) {
 // which is why isV1Admission counts from index 1.
 type shapeProbeType struct{}
 
-func (shapeProbeType) AdmitDisposition(context.Context, identity.Principal, sessionwire.CreateRequest) (sessionstore.DispositionInboxEntry, bool, error) {
+// LegacyEntry is the V1 shape answering from the LEGACY inbox. Admission
+// writes only the disposition family, so a seam method returning a legacy
+// record would be a mixed-family admission, and the rule must refuse it.
+func (shapeProbeType) LegacyEntry(context.Context, identity.Principal, sessionwire.CreateRequest) (sessionstore.InboxEntry, bool, error) {
+	return sessionstore.InboxEntry{}, false, nil
+}
+
+func (shapeProbeType) AdmitExact(context.Context, identity.Principal, sessionwire.InputRequest) (sessionstore.DispositionInboxEntry, bool, error) {
 	return sessionstore.DispositionInboxEntry{}, false, nil
 }
 
-func (shapeProbeType) AdmitExact(context.Context, identity.Principal, sessionwire.InputRequest) (sessionstore.InboxEntry, bool, error) {
-	return sessionstore.InboxEntry{}, false, nil
+func (shapeProbeType) MissingPrincipal(context.Context, sessionwire.InputRequest) (sessionstore.DispositionInboxEntry, bool, error) {
+	return sessionstore.DispositionInboxEntry{}, false, nil
 }
 
-func (shapeProbeType) MissingPrincipal(context.Context, sessionwire.InputRequest) (sessionstore.InboxEntry, bool, error) {
-	return sessionstore.InboxEntry{}, false, nil
+func (shapeProbeType) ExtraArgument(context.Context, identity.Principal, sessionwire.InputRequest, string) (sessionstore.DispositionInboxEntry, bool, error) {
+	return sessionstore.DispositionInboxEntry{}, false, nil
 }
 
-func (shapeProbeType) ExtraArgument(context.Context, identity.Principal, sessionwire.InputRequest, string) (sessionstore.InboxEntry, bool, error) {
-	return sessionstore.InboxEntry{}, false, nil
+func (shapeProbeType) NoContext(string, identity.Principal, sessionwire.InputRequest) (sessionstore.DispositionInboxEntry, bool, error) {
+	return sessionstore.DispositionInboxEntry{}, false, nil
 }
 
-func (shapeProbeType) NoContext(string, identity.Principal, sessionwire.InputRequest) (sessionstore.InboxEntry, bool, error) {
-	return sessionstore.InboxEntry{}, false, nil
+func (shapeProbeType) PointerPrincipal(context.Context, *identity.Principal, sessionwire.InputRequest) (sessionstore.DispositionInboxEntry, bool, error) {
+	return sessionstore.DispositionInboxEntry{}, false, nil
 }
 
-func (shapeProbeType) PointerPrincipal(context.Context, *identity.Principal, sessionwire.InputRequest) (sessionstore.InboxEntry, bool, error) {
-	return sessionstore.InboxEntry{}, false, nil
-}
-
-func (shapeProbeType) MissingCreated(context.Context, identity.Principal, sessionwire.InputRequest) (sessionstore.InboxEntry, error) {
-	return sessionstore.InboxEntry{}, nil
+func (shapeProbeType) MissingCreated(context.Context, identity.Principal, sessionwire.InputRequest) (sessionstore.DispositionInboxEntry, error) {
+	return sessionstore.DispositionInboxEntry{}, nil
 }
 
 // ExtraResult is the row the first version of this table did not have, and its
@@ -1170,18 +1165,18 @@ func (shapeProbeType) MissingCreated(context.Context, identity.Principal, sessio
 // a reason the rule may go unread.
 //
 //lint:ignore ST1008 this probe exists to be an ill-formed signature the shape rule must reject
-func (shapeProbeType) ExtraResult(context.Context, identity.Principal, sessionwire.InputRequest) (sessionstore.InboxEntry, bool, error, string) {
-	return sessionstore.InboxEntry{}, false, nil, ""
+func (shapeProbeType) ExtraResult(context.Context, identity.Principal, sessionwire.InputRequest) (sessionstore.DispositionInboxEntry, bool, error, string) {
+	return sessionstore.DispositionInboxEntry{}, false, nil, ""
 }
 
 func (shapeProbeType) WrongEntry(context.Context, identity.Principal, sessionwire.InputRequest) (sessionstore.CatalogEntry, bool, error) {
 	return sessionstore.CatalogEntry{}, false, nil
 }
 
-func (shapeProbeType) WrongCreated(context.Context, identity.Principal, sessionwire.InputRequest) (sessionstore.InboxEntry, string, error) {
-	return sessionstore.InboxEntry{}, "", nil
+func (shapeProbeType) WrongCreated(context.Context, identity.Principal, sessionwire.InputRequest) (sessionstore.DispositionInboxEntry, string, error) {
+	return sessionstore.DispositionInboxEntry{}, "", nil
 }
 
-func (shapeProbeType) WrongError(context.Context, identity.Principal, sessionwire.InputRequest) (sessionstore.InboxEntry, bool, string) {
-	return sessionstore.InboxEntry{}, false, ""
+func (shapeProbeType) WrongError(context.Context, identity.Principal, sessionwire.InputRequest) (sessionstore.DispositionInboxEntry, bool, string) {
+	return sessionstore.DispositionInboxEntry{}, false, ""
 }

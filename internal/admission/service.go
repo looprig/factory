@@ -30,29 +30,19 @@ const (
 	CommandGateResponse = command.KindGateResponse
 )
 
-// ErrPayloadProtocolUnavailable reports an input whose payload is too large
-// for the inbox this module can write to.
+// ErrLegacySessionUnsupported reports a command for a session whose immutable
+// binding names the LEGACY protocol.
 //
-// THE MISSING PIECE IS NOT A STORE PRIMITIVE, and the earlier wording of this
-// comment said it was, which was true at sessionstore v0.4.0 and is false at
-// the pinned version. The disposition inbox admits an oversized body by
-// reference and compares a retry on PayloadDigest and PayloadSize rather than
-// on the object reference, so re-PUTting under a fresh generation is no longer
-// a mismatch: the hazard that made this unimplementable is gone.
-//
-// What is missing is the SESSION BINDING that reaches it. Every disposition
-// entry point requires a complete immutable binding whose ProtocolMode is
-// disposition, and the four commands this error governs are admitted into the
-// LEGACY inbox, so there is no disposition record for such a reference to sit
-// on. A3.1 changed which commands that covers but not the rule: a CREATE now
-// takes the disposition path and stores an oversized payload by reference,
-// while input, interrupt, restore and gate response remain legacy. On the
-// legacy inbox the original hazard stands unchanged at this pin — the retry
-// comparison still includes the object reference, and PutObject still mints a
-// fresh generation per call — so admitting the reference there would make every
-// legitimate retry a permanent CommandMismatch. Refusing is still correct for
-// those four.
-var ErrPayloadProtocolUnavailable = errors.New("admission: oversized payload needs a disposition session binding this module cannot author")
+// Every command this service admits is admitted into the DISPOSITION family,
+// because that is the only family a Host can reach: a Host takes residency
+// through AcquireResidency, which pins ProtocolModeDisposition, so a command
+// admitted into the legacy inbox is one no Host will ever apply. A
+// legacy-bound session cannot be created by this module at all
+// (ErrLegacyCreateUnsupported), so the refusal is reached only for a session
+// some other writer created. It is runtime_unavailable for the reason every
+// other "no runtime this deployment runs can serve this" is: nothing about the
+// request can change the answer.
+var ErrLegacySessionUnsupported = errors.New("admission: the session is bound to the legacy protocol, which no Host can take residency on")
 
 // ErrLegacyCreateUnsupported reports that Factory cannot create a session on
 // the legacy protocol. No runtime this program ships can host such a session.
@@ -111,9 +101,19 @@ type Catalog interface {
 	CreateCatalogEntry(context.Context, sessionstore.CreateCatalogEntryRequest) (sessionstore.CatalogEntry, bool, error)
 }
 
+// CommandStore is the durable command plane every command but a create is
+// admitted into. It is the DISPOSITION family and only that family: see
+// ErrLegacySessionUnsupported for why a legacy inbox write would be a command
+// no Host could ever apply.
+//
+// PutCommandPayload is here, and not borrowed from PublicCreateStore, because
+// an oversized input is stored by reference exactly as an oversized create is
+// (runbook A3.1 step 5), and PublicCreates is an OPTIONAL seam: a composition
+// serving no creates must still be able to admit a large input.
 type CommandStore interface {
-	AdmitCommand(context.Context, sessionstore.AdmitCommandRequest) (sessionstore.InboxEntry, bool, error)
-	GetCommand(context.Context, sessionstore.GetCommandRequest) (sessionstore.InboxEntry, error)
+	AdmitDispositionCommand(context.Context, sessionstore.AdmitDispositionCommandRequest) (sessionstore.DispositionInboxEntry, bool, error)
+	GetDispositionCommand(context.Context, sessionstore.GetDispositionCommandRequest) (sessionstore.DispositionInboxEntry, error)
+	PutCommandPayload(context.Context, sessionstore.PutCommandPayloadRequest) (sessionwire.ObjectMetadata, error)
 }
 
 type OwnerDirectory interface {
@@ -174,15 +174,15 @@ func NewService(cfg Config) (*Service, error) {
 
 // AdmitCreate admits a V1 create: runbook A3.1 steps 2 and 5.
 //
-// It returns a DISPOSITION entry, not a legacy InboxEntry, and the difference
-// is the whole point rather than a type detail. A create is the one command
-// that CHOOSES a session's protocol, and the only choice that produces a
-// session a Host can ever take residency on is disposition.
+// It returns a DISPOSITION entry, and the difference from the legacy inbox is
+// the whole point rather than a type detail. A create is the one command that
+// CHOOSES a session's protocol, and the only choice that produces a session a
+// Host can ever take residency on is disposition. Every other command is then
+// admitted into the same family (see admit), so there is no mixed-family
+// session.
 //
-// The payload ceiling is deliberately NOT checked here the way it is for the
-// four existing commands. admissiblePayload refuses an oversized body because
-// the legacy inbox cannot retain its identity; this path can, so an oversized
-// create is stored by reference instead of refused. That is step 5.
+// An oversized create is stored by reference instead of refused. That is step
+// 5, and admit applies the same rule to the other four kinds.
 func (s *Service) AdmitCreate(ctx context.Context, principal identity.Principal, req sessionwire.CreateRequest) (sessionstore.DispositionInboxEntry, bool, error) {
 	if err := req.Validate(); err != nil {
 		return sessionstore.DispositionInboxEntry{}, false, refusal(sessionwire.ErrorCodeInvalidRequest, err)
@@ -207,76 +207,89 @@ func (s *Service) AdmitCreate(ctx context.Context, principal identity.Principal,
 	return s.admitPublicCreate(ctx, principal.Tenant(), req, target, payload)
 }
 
-func (s *Service) AdmitInput(ctx context.Context, principal identity.Principal, req sessionwire.InputRequest) (sessionstore.InboxEntry, bool, error) {
+func (s *Service) AdmitInput(ctx context.Context, principal identity.Principal, req sessionwire.InputRequest) (sessionstore.DispositionInboxEntry, bool, error) {
 	if err := req.Validate(); err != nil {
-		return sessionstore.InboxEntry{}, false, refusal(sessionwire.ErrorCodeInvalidRequest, err)
+		return sessionstore.DispositionInboxEntry{}, false, refusal(sessionwire.ErrorCodeInvalidRequest, err)
 	}
 	return s.admitExisting(ctx, principal, req.SessionID, req.CommandID, CommandInput, req)
 }
 
-func (s *Service) AdmitInterrupt(ctx context.Context, principal identity.Principal, req sessionwire.InterruptRequest) (sessionstore.InboxEntry, bool, error) {
+func (s *Service) AdmitInterrupt(ctx context.Context, principal identity.Principal, req sessionwire.InterruptRequest) (sessionstore.DispositionInboxEntry, bool, error) {
 	if err := req.Validate(); err != nil {
-		return sessionstore.InboxEntry{}, false, refusal(sessionwire.ErrorCodeInvalidRequest, err)
+		return sessionstore.DispositionInboxEntry{}, false, refusal(sessionwire.ErrorCodeInvalidRequest, err)
 	}
 	return s.admitExisting(ctx, principal, req.SessionID, req.CommandID, CommandInterrupt, req)
 }
 
-func (s *Service) AdmitRestore(ctx context.Context, principal identity.Principal, req sessionwire.RestoreRequest) (sessionstore.InboxEntry, bool, error) {
+func (s *Service) AdmitRestore(ctx context.Context, principal identity.Principal, req sessionwire.RestoreRequest) (sessionstore.DispositionInboxEntry, bool, error) {
 	if err := req.Validate(); err != nil {
-		return sessionstore.InboxEntry{}, false, refusal(sessionwire.ErrorCodeInvalidRequest, err)
+		return sessionstore.DispositionInboxEntry{}, false, refusal(sessionwire.ErrorCodeInvalidRequest, err)
 	}
 	return s.admitExisting(ctx, principal, req.SessionID, req.CommandID, CommandRestore, req)
 }
 
-func (s *Service) AdmitGateResponse(ctx context.Context, principal identity.Principal, req sessionwire.GateResponseRequest) (sessionstore.InboxEntry, bool, error) {
+// AdmitGateResponse is runbook A3.1 step 4: a gate response needs the matching
+// durable gate projection AND a fresh resident, accepting owner, or it is
+// gate_not_resumable before anything is written. Moving the command into the
+// disposition family changed where it is written and nothing about that rule.
+func (s *Service) AdmitGateResponse(ctx context.Context, principal identity.Principal, req sessionwire.GateResponseRequest) (sessionstore.DispositionInboxEntry, bool, error) {
 	if err := req.Validate(); err != nil {
-		return sessionstore.InboxEntry{}, false, refusal(sessionwire.ErrorCodeInvalidRequest, err)
+		return sessionstore.DispositionInboxEntry{}, false, refusal(sessionwire.ErrorCodeInvalidRequest, err)
 	}
 	payload, err := canonicalCommand(req)
-	if err := admissiblePayload(payload, err); err != nil {
-		return sessionstore.InboxEntry{}, false, err
+	if err != nil {
+		return sessionstore.DispositionInboxEntry{}, false, refusal(sessionwire.ErrorCodeInvalidRequest, err)
 	}
 	if err := s.cfg.Authorizer.AuthorizeControl(ctx, principal, req.SessionID, CommandGateResponse); err != nil {
-		return sessionstore.InboxEntry{}, false, err
+		return sessionstore.DispositionInboxEntry{}, false, err
 	}
 	if retry, handled, err := s.retry(ctx, principal.Tenant(), req.SessionID, req.CommandID, CommandGateResponse, payload); handled || err != nil {
 		return retry, false, err
 	}
 	entry, err := s.existingCompatible(ctx, principal.Tenant(), req.SessionID)
 	if err != nil {
-		return sessionstore.InboxEntry{}, false, err
+		return sessionstore.DispositionInboxEntry{}, false, err
 	}
 	now := s.cfg.Clock.Now()
 	if err := gateAdmission(entry.Record.OpenGates, req, now); err != nil {
-		return sessionstore.InboxEntry{}, false, err
+		return sessionstore.DispositionInboxEntry{}, false, err
 	}
 	owner, ok, err := s.cfg.Directory.Owner(ctx, principal.Tenant(), req.SessionID)
 	if err != nil {
-		return sessionstore.InboxEntry{}, false, fmt.Errorf("admission: observe the session's owner: %w", err)
+		return sessionstore.DispositionInboxEntry{}, false, fmt.Errorf("admission: observe the session's owner: %w", err)
 	}
 	if !ok || !freshMatchingOwner(owner, entry.Record, now) {
-		return sessionstore.InboxEntry{}, false, refusal(sessionwire.ErrorCodeGateNotResumable, nil)
+		return sessionstore.DispositionInboxEntry{}, false, refusal(sessionwire.ErrorCodeGateNotResumable, nil)
 	}
-	return s.admit(ctx, principal.Tenant(), req.SessionID, req.CommandID, CommandGateResponse, payload)
+	return s.admit(ctx, principal.Tenant(), req.SessionID, req.CommandID, CommandGateResponse, entry.Record.Binding, payload)
 }
 
-func (s *Service) admitExisting(ctx context.Context, principal identity.Principal, session sessionwire.SessionID, command sessionwire.CommandID, kind sessionstore.CommandKind, request any) (sessionstore.InboxEntry, bool, error) {
+func (s *Service) admitExisting(ctx context.Context, principal identity.Principal, session sessionwire.SessionID, command sessionwire.CommandID, kind sessionstore.CommandKind, request any) (sessionstore.DispositionInboxEntry, bool, error) {
 	payload, err := canonicalCommand(request)
-	if err := admissiblePayload(payload, err); err != nil {
-		return sessionstore.InboxEntry{}, false, err
+	if err != nil {
+		return sessionstore.DispositionInboxEntry{}, false, refusal(sessionwire.ErrorCodeInvalidRequest, err)
 	}
 	if err := s.cfg.Authorizer.AuthorizeControl(ctx, principal, session, kind); err != nil {
-		return sessionstore.InboxEntry{}, false, err
+		return sessionstore.DispositionInboxEntry{}, false, err
 	}
 	if retry, handled, err := s.retry(ctx, principal.Tenant(), session, command, kind, payload); handled || err != nil {
 		return retry, false, err
 	}
-	if _, err := s.existingCompatible(ctx, principal.Tenant(), session); err != nil {
-		return sessionstore.InboxEntry{}, false, err
+	entry, err := s.existingCompatible(ctx, principal.Tenant(), session)
+	if err != nil {
+		return sessionstore.DispositionInboxEntry{}, false, err
 	}
-	return s.admit(ctx, principal.Tenant(), session, command, kind, payload)
+	return s.admit(ctx, principal.Tenant(), session, command, kind, entry.Record.Binding, payload)
 }
 
+// existingCompatible reads the session a command is addressed to and refuses
+// one this deployment cannot serve.
+//
+// It does NOT restate the legacy-session refusal. Every path reaches the retry
+// read first, and GetDispositionCommand refuses a legacy-bound session in the
+// store's own words before this function runs; commandRefusal is the one place
+// that answer is classified. A second check here would be a second authority
+// that no path could reach.
 func (s *Service) existingCompatible(ctx context.Context, tenant sessionwire.TenantID, session sessionwire.SessionID) (sessionstore.CatalogEntry, error) {
 	entry, err := s.cfg.Catalog.GetCatalogEntry(ctx, sessionstore.GetCatalogEntryRequest{TenantID: tenant, SessionID: session})
 	if catalogNotFound(err) {
@@ -295,42 +308,100 @@ func (s *Service) existingCompatible(ctx context.Context, tenant sessionwire.Ten
 	return entry, nil
 }
 
-func (s *Service) admit(ctx context.Context, tenant sessionwire.TenantID, session sessionwire.SessionID, command sessionwire.CommandID, kind sessionstore.CommandKind, payload []byte) (sessionstore.InboxEntry, bool, error) {
-	if len(payload) > sessionstore.MaxInboxPayloadBytes {
-		return sessionstore.InboxEntry{}, false, refusal(sessionwire.ErrorCodeRuntimeUnavailable, ErrPayloadProtocolUnavailable)
-	}
+// admit writes one command into the session's disposition inbox.
+//
+// THE BINDING IS THE CATALOG'S, passed in rather than configured. The store
+// requires AdmitDispositionCommandRequest.Binding to EQUAL the session's
+// immutable pin and refuses anything else as a command mismatch, and the only
+// value that can equal it is the one the store holds: the entry
+// existingCompatible read, or on a retry the winner's own descriptor, which
+// the store verified against the same pin when it read it back.
+//
+// An oversized payload is uploaded first and admitted by reference (runbook
+// A3.1 step 5). The store compares a retry on PayloadDigest and PayloadSize
+// and deliberately not on the object reference, so a retry that uploads again
+// under a fresh generation still matches; the losing upload may stay orphaned,
+// which the store documents.
+func (s *Service) admit(ctx context.Context, tenant sessionwire.TenantID, session sessionwire.SessionID, command sessionwire.CommandID, kind sessionstore.CommandKind, binding sessionstore.SessionBinding, payload []byte) (sessionstore.DispositionInboxEntry, bool, error) {
 	runtimeID, err := s.cfg.IDs.NewUUID()
 	if err != nil {
-		return sessionstore.InboxEntry{}, false, err
+		return sessionstore.DispositionInboxEntry{}, false, err
 	}
 	now := s.cfg.Clock.Now().UTC()
-	entry, created, err := s.cfg.Commands.AdmitCommand(ctx, sessionstore.AdmitCommandRequest{
-		TenantID: tenant, SessionID: session, CommandID: command,
+	req := sessionstore.AdmitDispositionCommandRequest{
+		TenantID: tenant, SessionID: session, CommandID: command, Binding: binding,
 		ProposedRuntimeCommandID: sessionstore.RuntimeCommandID(runtimeID), Kind: kind,
-		Payload: payload, AcceptedAt: now, ApplyDeadline: now.Add(s.cfg.ApplyDeadline),
-	})
-	var inbox *sessionstore.InboxError
-	if errors.As(err, &inbox) && inbox.Code == sessionstore.InboxErrorCommandMismatch {
-		return sessionstore.InboxEntry{}, false, refusal(sessionwire.ErrorCodeCommandRejected, err)
+		AcceptedAt: now, ApplyDeadline: now.Add(s.cfg.ApplyDeadline),
 	}
-	return entry, created, err
+	if len(payload) > sessionstore.MaxInboxPayloadBytes {
+		object, err := putCommandPayload(ctx, s.cfg.Commands, tenant, session, payload)
+		if err != nil {
+			return sessionstore.DispositionInboxEntry{}, false, commandRefusal(err)
+		}
+		req.PayloadObject = &object
+	} else {
+		req.Payload = payload
+	}
+	entry, created, err := s.cfg.Commands.AdmitDispositionCommand(ctx, req)
+	if err != nil {
+		return sessionstore.DispositionInboxEntry{}, false, commandRefusal(err)
+	}
+	return entry, created, nil
 }
 
 // retry resolves an already durable command before consulting mutable target,
 // gate, or owner state. A retry asks what happened at the original acceptance
 // instant; a gate closing or a configured default changing afterwards cannot
-// turn that answer into a new pre-admission refusal. AdmitCommand performs the
-// immutable payload comparison and returns the winner's runtime mapping.
-func (s *Service) retry(ctx context.Context, tenant sessionwire.TenantID, session sessionwire.SessionID, command sessionwire.CommandID, kind sessionstore.CommandKind, payload []byte) (sessionstore.InboxEntry, bool, error) {
-	_, err := s.cfg.Commands.GetCommand(ctx, sessionstore.GetCommandRequest{TenantID: tenant, SessionID: session, CommandID: command})
+// turn that answer into a new pre-admission refusal. AdmitDispositionCommand
+// performs the immutable content comparison -- kind, digest and size -- and
+// returns the winner's runtime mapping, so the retry is re-admitted under the
+// winner's own binding rather than answered from this read.
+func (s *Service) retry(ctx context.Context, tenant sessionwire.TenantID, session sessionwire.SessionID, command sessionwire.CommandID, kind sessionstore.CommandKind, payload []byte) (sessionstore.DispositionInboxEntry, bool, error) {
+	found, err := s.cfg.Commands.GetDispositionCommand(ctx, sessionstore.GetDispositionCommandRequest{TenantID: tenant, SessionID: session, CommandID: command})
 	if commandNotFound(err) {
-		return sessionstore.InboxEntry{}, false, nil
+		return sessionstore.DispositionInboxEntry{}, false, nil
 	}
 	if err != nil {
-		return sessionstore.InboxEntry{}, false, err
+		return sessionstore.DispositionInboxEntry{}, false, commandRefusal(err)
 	}
-	entry, _, err := s.admit(ctx, tenant, session, command, kind, payload)
+	entry, _, err := s.admit(ctx, tenant, session, command, kind, found.Record.Descriptor.Binding, payload)
 	return entry, true, err
+}
+
+// commandRefusal classifies the store's answer to a command admission.
+//
+// Two answers are decisions about the caller's command and everything else is
+// a fault, returned as itself for the reason resolveTargetFault gives:
+//
+//   - a command MISMATCH is the caller reusing a CommandID for different
+//     content, a different kind, or the session's own create: command_rejected.
+//   - a PROTOCOL-MODE refusal is a legacy-bound session, which the store
+//     reports as a catalog invalid or conflict on binding.protocol_mode:
+//     runtime_unavailable, for ErrLegacySessionUnsupported's reason. The
+//     store's BACKEND code on the same field is an outage and stays a fault.
+func commandRefusal(err error) error {
+	if legacyProtocol(err) {
+		return refusal(sessionwire.ErrorCodeRuntimeUnavailable, fmt.Errorf("%w: %w", ErrLegacySessionUnsupported, err))
+	}
+	var inbox *sessionstore.InboxError
+	if errors.As(err, &inbox) && inbox.Code == sessionstore.InboxErrorCommandMismatch {
+		return refusal(sessionwire.ErrorCodeCommandRejected, err)
+	}
+	return err
+}
+
+// legacyProtocolField is the store's name for the member a legacy-bound
+// session disagrees on.
+const legacyProtocolField = "binding.protocol_mode"
+
+// legacyProtocol reports the store refusing a disposition operation because
+// the session is not bound to the disposition protocol.
+func legacyProtocol(err error) bool {
+	var catalog *sessionstore.CatalogError
+	if !errors.As(err, &catalog) || catalog.Field != legacyProtocolField {
+		return false
+	}
+	return catalog.Code == sessionstore.CatalogErrorInvalid || catalog.Code == sessionstore.CatalogErrorConflict
 }
 
 type LegacyCreateRequest struct {
@@ -355,16 +426,6 @@ func canonicalCommand(request any) ([]byte, error) {
 	return payload, nil
 }
 
-func admissiblePayload(payload []byte, encodeErr error) error {
-	if encodeErr != nil {
-		return refusal(sessionwire.ErrorCodeInvalidRequest, encodeErr)
-	}
-	if len(payload) > sessionstore.MaxInboxPayloadBytes {
-		return refusal(sessionwire.ErrorCodeRuntimeUnavailable, ErrPayloadProtocolUnavailable)
-	}
-	return nil
-}
-
 func catalogTarget(record sessionstore.CatalogRecord) sessionstore.HostTargetKey {
 	return sessionstore.HostTargetKey{AgentID: record.AgentID, RuntimeCompatibilityID: record.RuntimeCompatibilityID, Placement: record.DesiredPlacement}
 }
@@ -385,13 +446,21 @@ func catalogNotFound(err error) bool {
 	return command.SessionAbsent(err)
 }
 
+// commandNotFound reports that the retry read found no command to resolve, in
+// which case admission continues and the catalog read that follows answers for
+// the SESSION.
+//
+// GetDispositionCommand reads the session's catalog before the inbox row, so
+// an absent session arrives in every spelling command.SessionAbsent knows as
+// well as the inbox's own not-found. All of them mean "no durable command";
+// existingCompatible is what then turns an absent session into
+// session_not_found, so this function does not need to decide that.
 func commandNotFound(err error) bool {
 	var target *sessionstore.InboxError
 	if errors.As(err, &target) && target.Code == sessionstore.InboxErrorNotFound {
 		return true
 	}
-	var keyspace *sessionstore.KeyspaceError
-	return errors.As(err, &keyspace) && keyspace.Code == sessionstore.KeyspaceBindingNotFound
+	return command.SessionAbsent(err)
 }
 
 func gateAdmission(gates []sessionwire.GateProjection, request sessionwire.GateResponseRequest, now time.Time) error {

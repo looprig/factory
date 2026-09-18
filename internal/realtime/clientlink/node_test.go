@@ -769,20 +769,20 @@ func (stubAdmitter) AdmitCreate(context.Context, identity.Principal, sessionwire
 	return sessionstore.DispositionInboxEntry{}, false, errStubAdmitter
 }
 
-func (stubAdmitter) AdmitInput(context.Context, identity.Principal, sessionwire.InputRequest) (sessionstore.InboxEntry, bool, error) {
-	return sessionstore.InboxEntry{}, false, errStubAdmitter
+func (stubAdmitter) AdmitInput(context.Context, identity.Principal, sessionwire.InputRequest) (sessionstore.DispositionInboxEntry, bool, error) {
+	return sessionstore.DispositionInboxEntry{}, false, errStubAdmitter
 }
 
-func (stubAdmitter) AdmitInterrupt(context.Context, identity.Principal, sessionwire.InterruptRequest) (sessionstore.InboxEntry, bool, error) {
-	return sessionstore.InboxEntry{}, false, errStubAdmitter
+func (stubAdmitter) AdmitInterrupt(context.Context, identity.Principal, sessionwire.InterruptRequest) (sessionstore.DispositionInboxEntry, bool, error) {
+	return sessionstore.DispositionInboxEntry{}, false, errStubAdmitter
 }
 
-func (stubAdmitter) AdmitRestore(context.Context, identity.Principal, sessionwire.RestoreRequest) (sessionstore.InboxEntry, bool, error) {
-	return sessionstore.InboxEntry{}, false, errStubAdmitter
+func (stubAdmitter) AdmitRestore(context.Context, identity.Principal, sessionwire.RestoreRequest) (sessionstore.DispositionInboxEntry, bool, error) {
+	return sessionstore.DispositionInboxEntry{}, false, errStubAdmitter
 }
 
-func (stubAdmitter) AdmitGateResponse(context.Context, identity.Principal, sessionwire.GateResponseRequest) (sessionstore.InboxEntry, bool, error) {
-	return sessionstore.InboxEntry{}, false, errStubAdmitter
+func (stubAdmitter) AdmitGateResponse(context.Context, identity.Principal, sessionwire.GateResponseRequest) (sessionstore.DispositionInboxEntry, bool, error) {
+	return sessionstore.DispositionInboxEntry{}, false, errStubAdmitter
 }
 
 // stubDemand is the demand plane for the cases that are about the TRANSPORT.

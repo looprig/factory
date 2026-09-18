@@ -548,18 +548,18 @@ func (refusingAdmitter) AdmitCreate(context.Context, factoryidentity.Principal, 
 	return sessionstore.DispositionInboxEntry{}, false, errNoAdmissionHere
 }
 
-func (refusingAdmitter) AdmitInput(context.Context, factoryidentity.Principal, sessionwire.InputRequest) (sessionstore.InboxEntry, bool, error) {
-	return sessionstore.InboxEntry{}, false, errNoAdmissionHere
+func (refusingAdmitter) AdmitInput(context.Context, factoryidentity.Principal, sessionwire.InputRequest) (sessionstore.DispositionInboxEntry, bool, error) {
+	return sessionstore.DispositionInboxEntry{}, false, errNoAdmissionHere
 }
 
-func (refusingAdmitter) AdmitInterrupt(context.Context, factoryidentity.Principal, sessionwire.InterruptRequest) (sessionstore.InboxEntry, bool, error) {
-	return sessionstore.InboxEntry{}, false, errNoAdmissionHere
+func (refusingAdmitter) AdmitInterrupt(context.Context, factoryidentity.Principal, sessionwire.InterruptRequest) (sessionstore.DispositionInboxEntry, bool, error) {
+	return sessionstore.DispositionInboxEntry{}, false, errNoAdmissionHere
 }
 
-func (refusingAdmitter) AdmitRestore(context.Context, factoryidentity.Principal, sessionwire.RestoreRequest) (sessionstore.InboxEntry, bool, error) {
-	return sessionstore.InboxEntry{}, false, errNoAdmissionHere
+func (refusingAdmitter) AdmitRestore(context.Context, factoryidentity.Principal, sessionwire.RestoreRequest) (sessionstore.DispositionInboxEntry, bool, error) {
+	return sessionstore.DispositionInboxEntry{}, false, errNoAdmissionHere
 }
 
-func (refusingAdmitter) AdmitGateResponse(context.Context, factoryidentity.Principal, sessionwire.GateResponseRequest) (sessionstore.InboxEntry, bool, error) {
-	return sessionstore.InboxEntry{}, false, errNoAdmissionHere
+func (refusingAdmitter) AdmitGateResponse(context.Context, factoryidentity.Principal, sessionwire.GateResponseRequest) (sessionstore.DispositionInboxEntry, bool, error) {
+	return sessionstore.DispositionInboxEntry{}, false, errNoAdmissionHere
 }

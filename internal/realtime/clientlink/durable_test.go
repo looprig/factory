@@ -2,6 +2,8 @@ package clientlink_test
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"strings"
@@ -281,21 +283,34 @@ func openStore(t *testing.T) *sessionstore.Store {
 	return store
 }
 
-// existingSession seeds a legacy-bound catalog row directly. Factory no longer
-// exposes a legacy-create path, but this file still exercises commands against
-// pre-existing legacy sessions that may remain in a released store.
+// existingSession seeds a DISPOSITION-bound session through the store's own
+// public-create plane, which is the only kind of session a Host can take
+// residency on and therefore the only kind a command is admitted for. It is
+// seeded directly rather than through a replica's create, because a case about
+// a command's durable identity must not also depend on the create path.
 func existingSession(t *testing.T, r *replica, principal identity.Principal) sessionwire.SessionID {
 	t.Helper()
 
-	const sessionID sessionwire.SessionID = "legacy-session"
-	_, _, err := r.store.CreateCatalogEntry(t.Context(), sessionstore.CreateCatalogEntryRequest{
-		TenantID: principal.Tenant(), SessionID: sessionID, AgentID: "agent-a",
-		RuntimeCompatibilityID: "runtime-v1", CreatedAt: r.clock.now, LastActiveAt: r.clock.now,
-		State: sessionwire.SessionStateIdle, Residency: sessionwire.SessionResidencyCold,
-		DesiredPlacement: sessionwire.HostPlacementPooled, IdempotencyKey: "legacy-fixture",
-	})
-	if err != nil {
-		t.Fatalf("CreateCatalogEntry: %v", err)
+	const sessionID sessionwire.SessionID = "existing-session"
+	payload := []byte(`{"blocks":[{"text":"hello"}]}`)
+	digest := sha256.Sum256(payload)
+	createIdentity := sessionstore.PublicCreateIdentity{
+		TenantID: principal.Tenant(), SessionID: sessionID, CommandID: "existing-session-create",
+		Target: replicaTargetKey(),
+		Binding: sessionstore.SessionBinding{
+			StorageBindingID: "storage-a", BindingVersion: "v1",
+			RuntimeSessionID: "0190a3c4-0000-8000-8000-00000000000e", ProtocolMode: sessionstore.ProtocolModeDisposition,
+		},
+		Kind: "create", PayloadDigest: hex.EncodeToString(digest[:]), PayloadSize: uint64(len(payload)),
+	}
+	if _, err := r.store.PreparePublicCreate(t.Context(), sessionstore.PreparePublicCreateRequest{
+		Identity: createIdentity, ProposedRuntimeCommandID: "runtime-create",
+		AcceptedAt: r.clock.now, ApplyDeadline: r.clock.now.Add(replicaApplyDeadline),
+	}); err != nil {
+		t.Fatalf("PreparePublicCreate: %v", err)
+	}
+	if _, _, err := r.store.AdmitPublicCreate(t.Context(), sessionstore.AdmitPublicCreateRequest{Identity: createIdentity, Payload: payload}); err != nil {
+		t.Fatalf("AdmitPublicCreate: %v", err)
 	}
 	return sessionID
 }
@@ -310,15 +325,16 @@ func testPrincipal(t *testing.T) identity.Principal {
 	return principal
 }
 
-// storedCommand reads one durable record back, out of band of both replicas.
-func storedCommand(t *testing.T, store *sessionstore.Store, session sessionwire.SessionID, id sessionwire.CommandID) sessionstore.InboxEntry {
+// storedCommand reads one durable record back, out of band of both replicas,
+// from the DISPOSITION inbox -- the only family admission writes.
+func storedCommand(t *testing.T, store *sessionstore.Store, session sessionwire.SessionID, id sessionwire.CommandID) sessionstore.DispositionInboxEntry {
 	t.Helper()
 
-	entry, err := store.GetCommand(t.Context(), sessionstore.GetCommandRequest{
+	entry, err := store.GetDispositionCommand(t.Context(), sessionstore.GetDispositionCommandRequest{
 		TenantID: tenantA, SessionID: session, CommandID: id,
 	})
 	if err != nil {
-		t.Fatalf("GetCommand(%q): %v", id, err)
+		t.Fatalf("GetDispositionCommand(%q): %v", id, err)
 	}
 	return entry
 }
@@ -367,8 +383,8 @@ func TestAnUnknownOutcomeRetriedOnANewFactoryReturnsTheOriginal(t *testing.T) {
 	if got, want := stored.Record.ApplyDeadline.UTC(), accepted.Add(replicaApplyDeadline); !got.Equal(want) {
 		t.Errorf("the durable apply deadline is %v, want %v", got, want)
 	}
-	if !strings.HasPrefix(string(stored.Record.RuntimeCommandID), "runtime-first") {
-		t.Errorf("the winning runtime mapping is %q, want the first replica's", stored.Record.RuntimeCommandID)
+	if !strings.HasPrefix(string(stored.Record.Descriptor.RuntimeCommandID), "runtime-first") {
+		t.Errorf("the winning runtime mapping is %q, want the first replica's", stored.Record.Descriptor.RuntimeCommandID)
 	}
 
 	// The outcome becomes unknown: the replica that accepted it is gone.
@@ -437,8 +453,8 @@ func TestAnUnknownOutcomeRetriedOnANewFactoryReturnsTheOriginal(t *testing.T) {
 	if after.AcceptedOrder != stored.AcceptedOrder {
 		t.Errorf("the acceptance order moved from %d to %d", stored.AcceptedOrder, after.AcceptedOrder)
 	}
-	if after.Record.RuntimeCommandID != stored.Record.RuntimeCommandID {
-		t.Errorf("the runtime mapping moved from %q to %q", stored.Record.RuntimeCommandID, after.Record.RuntimeCommandID)
+	if after.Record.Descriptor.RuntimeCommandID != stored.Record.Descriptor.RuntimeCommandID {
+		t.Errorf("the runtime mapping moved from %q to %q", stored.Record.Descriptor.RuntimeCommandID, after.Record.Descriptor.RuntimeCommandID)
 	}
 	if !after.Record.ApplyDeadline.Equal(stored.Record.ApplyDeadline) {
 		t.Errorf("the apply deadline moved from %v to %v; a retry may not extend it", stored.Record.ApplyDeadline, after.Record.ApplyDeadline)
@@ -464,8 +480,8 @@ func TestAnUnknownOutcomeRetriedOnANewFactoryReturnsTheOriginal(t *testing.T) {
 		t.Errorf("the new command's order %d is not above the original's %d", freshStatus.AcceptedOrder, originalStatus.AcceptedOrder)
 	}
 	freshRecord := storedCommand(t, store, session, "cmd-second")
-	if !strings.HasPrefix(string(freshRecord.Record.RuntimeCommandID), "runtime-second") {
-		t.Errorf("the new command's runtime mapping is %q, want the second replica's", freshRecord.Record.RuntimeCommandID)
+	if !strings.HasPrefix(string(freshRecord.Record.Descriptor.RuntimeCommandID), "runtime-second") {
+		t.Errorf("the new command's runtime mapping is %q, want the second replica's", freshRecord.Record.Descriptor.RuntimeCommandID)
 	}
 	if got, want := freshRecord.Record.ApplyDeadline.UTC(), accepted.Add(time.Hour).Add(replicaApplyDeadline); !got.Equal(want) {
 		t.Errorf("the new command's deadline is %v, want %v", got, want)
@@ -518,7 +534,7 @@ func TestTwoFactoriesRacingOneCommandIdentityAgreeOnOneRecord(t *testing.T) {
 	}
 	// The winner is one of the two proposals, never a blend, and never the
 	// loser's own.
-	runtime := string(stored.Record.RuntimeCommandID)
+	runtime := string(stored.Record.Descriptor.RuntimeCommandID)
 	if !strings.HasPrefix(runtime, "runtime-left") && !strings.HasPrefix(runtime, "runtime-right") {
 		t.Errorf("the stored runtime mapping %q is neither replica's proposal", runtime)
 	}
@@ -552,8 +568,8 @@ func TestTheAcceptedRecordIsTheStoresOwn(t *testing.T) {
 		status := statusOf(t, reply)
 		record := storedCommand(t, store, session, id)
 
-		if status.CommandID != record.Record.CommandID {
-			t.Errorf("%s replied with command %q, want the stored %q", method, status.CommandID, record.Record.CommandID)
+		if status.CommandID != record.Record.Descriptor.CommandID {
+			t.Errorf("%s replied with command %q, want the stored %q", method, status.CommandID, record.Record.Descriptor.CommandID)
 		}
 		if status.AcceptedOrder != record.AcceptedOrder {
 			t.Errorf("%s replied with order %d, want the stored %d", method, status.AcceptedOrder, record.AcceptedOrder)
@@ -562,13 +578,13 @@ func TestTheAcceptedRecordIsTheStoresOwn(t *testing.T) {
 			t.Errorf("%s replied %q, want accepted", method, status.State)
 		}
 		kind, _ := clientlink.CommandKindFor(method)
-		if record.Record.Kind != kind {
-			t.Errorf("%s stored kind %q, want %q", method, record.Record.Kind, kind)
+		if record.Record.Descriptor.Kind != kind {
+			t.Errorf("%s stored kind %q, want %q", method, record.Record.Descriptor.Kind, kind)
 		}
 		// The stored payload is the canonical V1 command, which is what makes
 		// a retry's payload comparison the same comparison on either edge.
 		var stored map[string]json.RawMessage
-		if err := json.Unmarshal(record.Record.Payload, &stored); err != nil {
+		if err := json.Unmarshal(record.Record.Descriptor.Payload, &stored); err != nil {
 			t.Fatalf("%s stored a payload that is not JSON: %v", method, err)
 		}
 		if got := string(stored["command_id"]); got != `"`+string(id)+`"` {

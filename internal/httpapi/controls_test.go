@@ -41,66 +41,66 @@ type admittedCommand struct {
 
 type fakeAdmitter struct {
 	calls []admittedCommand
-	// entry is what a successful admission returns.
-	entry sessionstore.InboxEntry
+	// entry is what a successful admission returns. Every kind answers in the
+	// DISPOSITION family, the only one admission writes.
+	entry sessionstore.DispositionInboxEntry
 	// err, when set, is returned INSTEAD of entry, after recording the call.
 	err error
 }
 
 func newFakeAdmitter() *fakeAdmitter {
-	return &fakeAdmitter{entry: sessionstore.InboxEntry{
-		Record:        sessionstore.InboxRecord{CommandID: "command-a", State: sessionstore.InboxStatePending},
+	return &fakeAdmitter{entry: sessionstore.DispositionInboxEntry{
+		Record: sessionstore.DispositionInboxRecord{
+			Descriptor: sessionstore.DispositionCommandDescriptor{CommandID: "command-a"},
+			State:      sessionstore.InboxStatePending,
+		},
 		AcceptedOrder: 3,
 	}}
 }
 
-func (f *fakeAdmitter) record(call admittedCommand) (sessionstore.InboxEntry, bool, error) {
+func (f *fakeAdmitter) record(call admittedCommand) (sessionstore.DispositionInboxEntry, bool, error) {
 	f.calls = append(f.calls, call)
 	if f.err != nil {
-		return sessionstore.InboxEntry{}, false, f.err
+		return sessionstore.DispositionInboxEntry{}, false, f.err
 	}
-	return f.entry, true, nil
+	entry := f.entry
+	entry.Record.Descriptor.Kind = call.kind
+	return entry, true, nil
 }
 
-// AdmitCreate answers in the DISPOSITION family. The projection of the two
-// families onto one public status is internal/command's, so the recorded entry
-// is built from the same fields the legacy one carries and the existing
-// assertions about the response body read one shape.
+// AdmitCreate answers with the request's own session, as the store does: a
+// create names a session that does not exist yet, so the record can only carry
+// the one the caller proposed.
 func (f *fakeAdmitter) AdmitCreate(_ context.Context, p identity.Principal, req sessionwire.CreateRequest) (sessionstore.DispositionInboxEntry, bool, error) {
 	entry, created, err := f.record(admittedCommand{principal: p, create: req, kind: commandCreate})
 	if err != nil {
 		return sessionstore.DispositionInboxEntry{}, created, err
 	}
-	return sessionstore.DispositionInboxEntry{
-		Record: sessionstore.DispositionInboxRecord{
-			Descriptor: sessionstore.DispositionCommandDescriptor{
-				PublicCreate: true, CommandID: entry.Record.CommandID,
-				// The session is the REQUEST's, as the store's is: a create
-				// names a session that does not exist yet, so the record can
-				// only carry the one the caller proposed.
-				SessionID: req.SessionID, Kind: commandCreate,
-			},
-			State: entry.Record.State,
-		},
-		Revision: entry.Revision, AcceptedOrder: entry.AcceptedOrder,
-	}, created, nil
+	entry.Record.Descriptor.PublicCreate = true
+	entry.Record.Descriptor.SessionID = req.SessionID
+	return entry, created, nil
 }
 
-func (f *fakeAdmitter) AdmitInput(_ context.Context, p identity.Principal, req sessionwire.InputRequest) (sessionstore.InboxEntry, bool, error) {
+func (f *fakeAdmitter) AdmitInput(_ context.Context, p identity.Principal, req sessionwire.InputRequest) (sessionstore.DispositionInboxEntry, bool, error) {
 	return f.record(admittedCommand{principal: p, input: req, kind: commandInput})
 }
 
-func (f *fakeAdmitter) AdmitInterrupt(_ context.Context, p identity.Principal, req sessionwire.InterruptRequest) (sessionstore.InboxEntry, bool, error) {
+func (f *fakeAdmitter) AdmitInterrupt(_ context.Context, p identity.Principal, req sessionwire.InterruptRequest) (sessionstore.DispositionInboxEntry, bool, error) {
 	return f.record(admittedCommand{principal: p, interrupt: req, kind: commandInterrupt})
 }
 
-func (f *fakeAdmitter) AdmitRestore(_ context.Context, p identity.Principal, req sessionwire.RestoreRequest) (sessionstore.InboxEntry, bool, error) {
+func (f *fakeAdmitter) AdmitRestore(_ context.Context, p identity.Principal, req sessionwire.RestoreRequest) (sessionstore.DispositionInboxEntry, bool, error) {
 	return f.record(admittedCommand{principal: p, restore: req, kind: commandRestore})
 }
 
-func (f *fakeAdmitter) AdmitGateResponse(_ context.Context, p identity.Principal, req sessionwire.GateResponseRequest) (sessionstore.InboxEntry, bool, error) {
+func (f *fakeAdmitter) AdmitGateResponse(_ context.Context, p identity.Principal, req sessionwire.GateResponseRequest) (sessionstore.DispositionInboxEntry, bool, error) {
 	return f.record(admittedCommand{principal: p, gate: req, kind: commandGateResponse})
 }
+
+// storeSettledAttempt is the attempt a store-settled rejection (not_applied)
+// carries. Its presence is what makes a rejected disposition record
+// undescribable at the edge.
+var storeSettledAttempt = &sessionstore.DispositionAttempt{AttemptID: "attempt-1", JournalEpoch: 1, ResidencyEpoch: 1}
 
 type deliveredCommand struct {
 	// The context is read AT THE CALL, not retained, because what the seam's
@@ -368,10 +368,6 @@ func TestEveryDurableStateIsAnsweredUnderTheSameSuccessStatus(t *testing.T) {
 		t.Run(string(durable.state), func(t *testing.T) {
 			admitter := newFakeAdmitter()
 			admitter.entry.Record.State = durable.state
-			if durable.state == sessionstore.InboxStateRejected {
-				admitter.entry.Record.Rejection = &sessionwire.ErrorDetail{
-					Code: sessionwire.ErrorCodeCommandRejected, Message: "the host refused it"}
-			}
 			f := newFixture(t, withAdmitter(admitter))
 
 			recorder := postJSON(f, probe.target, probe.body)
@@ -971,7 +967,7 @@ func TestARecordCoreWillNotMarshalIsAFault(t *testing.T) {
 
 	admitter := newFakeAdmitter()
 	admitter.entry.Record.State = sessionstore.InboxStateRejected
-	admitter.entry.Record.Rejection = nil
+	admitter.entry.Record.Attempt = storeSettledAttempt
 	f := newFixture(t, withAdmitter(admitter))
 	probe := controlProbes(fixtureSession)[0]
 

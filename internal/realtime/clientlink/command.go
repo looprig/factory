@@ -145,7 +145,7 @@ func decodeInput(data []byte) (rpcCommand, error) {
 		if err != nil {
 			return sessionwire.CommandStatus{}, false, "", err
 		}
-		status, readable := command.StatusFor(entry)
+		status, readable := command.StatusForDisposition(entry)
 		return status, readable, entry.Record.State, nil
 	}}, nil
 }
@@ -160,7 +160,7 @@ func decodeInterrupt(data []byte) (rpcCommand, error) {
 		if err != nil {
 			return sessionwire.CommandStatus{}, false, "", err
 		}
-		status, readable := command.StatusFor(entry)
+		status, readable := command.StatusForDisposition(entry)
 		return status, readable, entry.Record.State, nil
 	}}, nil
 }
@@ -175,7 +175,7 @@ func decodeRestore(data []byte) (rpcCommand, error) {
 		if err != nil {
 			return sessionwire.CommandStatus{}, false, "", err
 		}
-		status, readable := command.StatusFor(entry)
+		status, readable := command.StatusForDisposition(entry)
 		return status, readable, entry.Record.State, nil
 	}}, nil
 }
@@ -190,7 +190,7 @@ func decodeGateResponse(data []byte) (rpcCommand, error) {
 		if err != nil {
 			return sessionwire.CommandStatus{}, false, "", err
 		}
-		status, readable := command.StatusFor(entry)
+		status, readable := command.StatusForDisposition(entry)
 		return status, readable, entry.Record.State, nil
 	}}, nil
 }

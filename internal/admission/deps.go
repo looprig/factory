@@ -30,9 +30,17 @@ type Authorizer interface {
 }
 
 // Commands is the durable command plane admission uses.
+//
+// Admission writes and reads the DISPOSITION family only. The two legacy
+// methods left here, RejectCommand and ListDueCommands, belong to the legacy
+// deadline sweep (Reconciler), which still settles legacy rows a store may
+// already hold; nothing in this package admits into that family any more.
 type Commands interface {
-	AdmitCommand(ctx context.Context, req sessionstore.AdmitCommandRequest) (sessionstore.InboxEntry, bool, error)
-	GetCommand(ctx context.Context, req sessionstore.GetCommandRequest) (sessionstore.InboxEntry, error)
+	AdmitDispositionCommand(ctx context.Context, req sessionstore.AdmitDispositionCommandRequest) (sessionstore.DispositionInboxEntry, bool, error)
+	GetDispositionCommand(ctx context.Context, req sessionstore.GetDispositionCommandRequest) (sessionstore.DispositionInboxEntry, error)
+	PutCommandPayload(ctx context.Context, req sessionstore.PutCommandPayloadRequest) (sessionwire.ObjectMetadata, error)
+	RejectDispositionCommand(ctx context.Context, req sessionstore.RejectDispositionCommandRequest) (sessionstore.DispositionInboxEntry, bool, error)
+	ListDueDispositionCommands(ctx context.Context, req sessionstore.ListDueDispositionCommandsRequest) (sessionstore.DispositionDueCommandPage, error)
 	RejectCommand(ctx context.Context, req sessionstore.RejectCommandRequest) (sessionstore.InboxEntry, error)
 	ListDueCommands(ctx context.Context, req sessionstore.ListDueCommandsRequest) (sessionstore.DueCommandPage, error)
 	AcquireReconciliationClaim(ctx context.Context, req sessionstore.AcquireReconciliationClaimRequest) (sessionstore.ReconciliationClaimEntry, error)

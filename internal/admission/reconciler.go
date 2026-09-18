@@ -98,10 +98,27 @@ type ReconcilerConfig struct {
 // rather than position: a restarted replica resumes at shard zero and
 // re-derives everything else from the store within the call.
 type Reconciler struct {
-	cfg ReconcilerConfig
+	cfg   ReconcilerConfig
+	rotor rotor
+}
 
+// rotor is the round-robin shard position, shared by both deadline sweeps.
+type rotor struct {
 	mu   sync.Mutex
 	next int
+}
+
+// claimant takes and gives back one replica's reconciliation claims. It is the
+// half both deadline sweeps share, so the legacy and the disposition sweep
+// cannot come to disagree about what a held, lost or contended claim means.
+type claimant struct {
+	claims Claims
+	holder string
+	ttl    time.Duration
+}
+
+func (r *Reconciler) claimant() claimant {
+	return claimant{claims: r.cfg.Claims, holder: r.cfg.HolderID, ttl: r.cfg.ClaimTTL}
 }
 
 // NewReconciler validates a configuration before it can reach a store.
@@ -178,6 +195,12 @@ const (
 	// DispositionDeferred means another replica holds this session's
 	// reconciliation claim, so this one did nothing about the row.
 	DispositionDeferred
+
+	// DispositionUnrecognized means the record is in a state this build does
+	// not know. It is refused rather than guessed at, so a newer store's state
+	// cannot be rejected by an older sweeper. Only the disposition sweep
+	// reports it: the legacy predicate's arms are total over its own states.
+	DispositionUnrecognized
 )
 
 func (d Disposition) String() string {
@@ -200,6 +223,8 @@ func (d Disposition) String() string {
 		return "race_lost"
 	case DispositionDeferred:
 		return "deferred"
+	case DispositionUnrecognized:
+		return "unrecognized_state"
 	default:
 		return "unrecognized"
 	}
@@ -282,7 +307,7 @@ func (r *Reconciler) Sweep(ctx context.Context, principal identity.Principal) (S
 	// The release runs on EVERY path, including the failing one. A sweep that
 	// gave up halfway still holds the claims it took, and leaving them to lapse
 	// would keep every other replica off those sessions for the whole TTL.
-	r.release(ctx, held, &result)
+	r.claimant().release(ctx, held, &result)
 	return result, sweepErr
 }
 
@@ -297,7 +322,10 @@ func (r *Reconciler) Sweep(ctx context.Context, principal identity.Principal) (S
 // is a persisted decision of the backend rather than a setting of this replica:
 // a sweeper holding its own count would silently never visit some shards.
 func (r *Reconciler) rotate() (int, error) {
-	shards := r.cfg.Due.ControlShards()
+	return r.rotor.rotate(r.cfg.Due.ControlShards())
+}
+
+func (r *rotor) rotate(shards int) (int, error) {
 	if shards < sessionstore.MinControlShards {
 		return 0, fmt.Errorf("admission: the store reports %d control shards, so no shard can be swept", shards)
 	}
@@ -393,7 +421,7 @@ func (r *Reconciler) settle(
 		result.Dispositions[disposition]++
 		return nil
 	}
-	claimed, err := r.claim(ctx, entry.Record.TenantID, entry.Record.SessionID, now, result, held)
+	claimed, err := r.claimant().claim(ctx, entry.Record.TenantID, entry.Record.SessionID, now, result, held)
 	if err != nil {
 		return err
 	}
@@ -451,7 +479,7 @@ func expiredCommandRejection() sessionwire.ErrorDetail {
 // The memo holds BOTH answers. A page carrying four commands of one session
 // costs one acquisition whether this replica won the claim or lost it, and a
 // loser that re-asked per row would pay the deferral several times over.
-func (r *Reconciler) claim(
+func (c claimant) claim(
 	ctx context.Context,
 	tenant sessionwire.TenantID,
 	session sessionwire.SessionID,
@@ -477,9 +505,9 @@ func (r *Reconciler) claim(
 	var err error
 	for range attempts {
 		result.Queries++
-		_, err = r.cfg.Claims.AcquireReconciliationClaim(ctx, sessionstore.AcquireReconciliationClaimRequest{
+		_, err = c.claims.AcquireReconciliationClaim(ctx, sessionstore.AcquireReconciliationClaimRequest{
 			TenantID: tenant, SessionID: session,
-			HolderID: r.cfg.HolderID, ExpiresAt: now.Add(r.cfg.ClaimTTL),
+			HolderID: c.holder, ExpiresAt: now.Add(c.ttl),
 		})
 		if err == nil {
 			held[key] = true
@@ -518,14 +546,14 @@ func (r *Reconciler) claim(
 // It walks the memo rather than the page, so a session this sweep DEFERRED --
 // recorded false -- is not released: releasing another replica's live claim is
 // the one way this record could take work away from the replica doing it.
-func (r *Reconciler) release(ctx context.Context, held map[sessionKey]bool, result *SweepResult) {
+func (c claimant) release(ctx context.Context, held map[sessionKey]bool, result *SweepResult) {
 	for key, taken := range held {
 		if !taken {
 			continue
 		}
 		result.Queries++
-		if _, err := r.cfg.Claims.ReleaseReconciliationClaim(ctx, sessionstore.ReleaseReconciliationClaimRequest{
-			TenantID: key.tenant, SessionID: key.session, HolderID: r.cfg.HolderID,
+		if _, err := c.claims.ReleaseReconciliationClaim(ctx, sessionstore.ReleaseReconciliationClaimRequest{
+			TenantID: key.tenant, SessionID: key.session, HolderID: c.holder,
 		}); err != nil {
 			result.ReleaseFailures++
 			continue

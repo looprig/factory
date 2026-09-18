@@ -46,7 +46,7 @@ type probe struct {
 	dueCommands  int
 	dueGates     int
 	targetSweeps int
-	admitted     []sessionstore.AdmitCommandRequest
+	admitted     []sessionstore.AdmitDispositionCommandRequest
 	sweepHolders []string
 
 	// duePage makes the due command view answer ONE settleable row, which is
@@ -218,25 +218,25 @@ func (p *probe) GetCatalogEntry(_ context.Context, req sessionstore.GetCatalogEn
 	}}, nil
 }
 
-// GetCommand answers NOT FOUND rather than a zero record.
+// GetDispositionCommand answers NOT FOUND rather than a zero record.
 //
 // The difference decides the whole path: admission treats a found record as a
 // retry of a command it already accepted and answers from it, so a probe
 // returning a zero entry with a nil error would make every control request
 // short-circuit before the durable write -- and a case asserting the write was
 // reached would fail for a reason that has nothing to do with the composition.
-func (p *probe) GetCommand(context.Context, sessionstore.GetCommandRequest) (sessionstore.InboxEntry, error) {
-	return sessionstore.InboxEntry{}, &sessionstore.InboxError{Code: sessionstore.InboxErrorNotFound}
+func (p *probe) GetDispositionCommand(context.Context, sessionstore.GetDispositionCommandRequest) (sessionstore.DispositionInboxEntry, error) {
+	return sessionstore.DispositionInboxEntry{}, &sessionstore.InboxError{Code: sessionstore.InboxErrorNotFound}
 }
 
-func (p *probe) AdmitCommand(_ context.Context, req sessionstore.AdmitCommandRequest) (sessionstore.InboxEntry, bool, error) {
-	if p.panicOn == "AdmitCommand" {
+func (p *probe) AdmitDispositionCommand(_ context.Context, req sessionstore.AdmitDispositionCommandRequest) (sessionstore.DispositionInboxEntry, bool, error) {
+	if p.panicOn == "AdmitDispositionCommand" {
 		panic("a control route reached the composed durable command plane")
 	}
 	p.mu.Lock()
 	p.admitted = append(p.admitted, req)
 	p.mu.Unlock()
-	return sessionstore.InboxEntry{}, true, nil
+	return sessionstore.DispositionInboxEntry{}, true, nil
 }
 
 func (p *probe) AcquireReconciliationClaim(_ context.Context, req sessionstore.AcquireReconciliationClaimRequest) (sessionstore.ReconciliationClaimEntry, error) {
@@ -394,7 +394,7 @@ func TestTheSweepsClaimUnderTheComposedReplicaIdentifier(t *testing.T) {
 // TestAControlRouteAdmitsIntoTheComposedDurablePlane is A3.3's routes
 // answering for real.
 //
-// The probe does not merely count: it keeps the AdmitCommand REQUEST, and the
+// The probe does not merely count: it keeps the AdmitDispositionCommand REQUEST, and the
 // case asserts the CommandID and SessionID carried in the HTTP body arrive in
 // it. That identity is what makes this a probe of this request rather than of
 // the composition in general -- a background sweep cannot produce it, and a

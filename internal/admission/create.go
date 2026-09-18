@@ -161,7 +161,7 @@ func (s *Service) admitPublicCreate(ctx context.Context, tenant sessionwire.Tena
 	}
 	admit := sessionstore.AdmitPublicCreateRequest{Identity: identity}
 	if identity.PayloadSize > sessionstore.MaxInboxPayloadBytes {
-		object, err := s.putCommandPayload(ctx, tenant, req.SessionID, payload)
+		object, err := putCommandPayload(ctx, s.cfg.PublicCreates, tenant, req.SessionID, payload)
 		if err != nil {
 			return sessionstore.DispositionInboxEntry{}, false, err
 		}
@@ -176,17 +176,24 @@ func (s *Service) admitPublicCreate(ctx context.Context, tenant sessionwire.Tena
 	return entry, created, nil
 }
 
+// payloadStore is the one write both admission paths make before an oversized
+// command: the create through PublicCreates, every other kind through
+// Commands.
+type payloadStore interface {
+	PutCommandPayload(context.Context, sessionstore.PutCommandPayloadRequest) (sessionwire.ObjectMetadata, error)
+}
+
 // putCommandPayload is step 5's upload. The digest and size it declares are the
 // SAME pair the identity carries, so the store's exactness check and this
 // module's retry comparison cannot disagree about what was uploaded.
-func (s *Service) putCommandPayload(ctx context.Context, tenant sessionwire.TenantID, session sessionwire.SessionID, payload []byte) (sessionwire.ObjectMetadata, error) {
-	object, err := s.cfg.PublicCreates.PutCommandPayload(ctx, sessionstore.PutCommandPayloadRequest{
+func putCommandPayload(ctx context.Context, store payloadStore, tenant sessionwire.TenantID, session sessionwire.SessionID, payload []byte) (sessionwire.ObjectMetadata, error) {
+	object, err := store.PutCommandPayload(ctx, sessionstore.PutCommandPayloadRequest{
 		TenantID: tenant, SessionID: session,
 		SizeBytes: uint64(len(payload)), SHA256: sha256.Sum256(payload),
 		MediaType: canonicalCommandMediaType, Body: bytesReader(payload),
 	})
 	if err != nil {
-		return sessionwire.ObjectMetadata{}, fmt.Errorf("admission: store the oversized create payload: %w", err)
+		return sessionwire.ObjectMetadata{}, fmt.Errorf("admission: store the oversized command payload: %w", err)
 	}
 	return object, nil
 }

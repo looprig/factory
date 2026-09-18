@@ -74,59 +74,51 @@ type parityAdmitter struct {
 	// refusing reports whether refuse is armed, so the zero ErrorCode can be
 	// armed too.
 	refusing bool
-	entry    sessionstore.InboxEntry
+	entry    sessionstore.DispositionInboxEntry
 }
 
 func newParityAdmitter() *parityAdmitter {
-	return &parityAdmitter{entry: sessionstore.InboxEntry{
-		Record:        sessionstore.InboxRecord{CommandID: "command-a", State: sessionstore.InboxStatePending},
+	return &parityAdmitter{entry: sessionstore.DispositionInboxEntry{
+		Record: sessionstore.DispositionInboxRecord{
+			Descriptor: sessionstore.DispositionCommandDescriptor{CommandID: "command-a"},
+			State:      sessionstore.InboxStatePending,
+		},
 		AcceptedOrder: 11,
 	}}
 }
 
-func (a *parityAdmitter) answer(req any) (sessionstore.InboxEntry, bool, error) {
+func (a *parityAdmitter) answer(req any) (sessionstore.DispositionInboxEntry, bool, error) {
 	a.asked = append(a.asked, req)
 	if a.refusing {
-		return sessionstore.InboxEntry{}, false, &admission.Error{Code: a.refuse}
+		return sessionstore.DispositionInboxEntry{}, false, &admission.Error{Code: a.refuse}
 	}
 	return a.entry, true, nil
 }
 
-// AdmitCreate answers in the DISPOSITION family, because a create is the one
-// command that chooses a session's protocol. The projection of the two families
-// is internal/command's single authority, so the two edges still compare.
+// AdmitCreate answers in the DISPOSITION family, as every kind does, and marks
+// the record as the public create it is.
 func (a *parityAdmitter) AdmitCreate(_ context.Context, _ identity.Principal, req sessionwire.CreateRequest) (sessionstore.DispositionInboxEntry, bool, error) {
 	entry, created, err := a.answer(req)
 	if err != nil {
 		return sessionstore.DispositionInboxEntry{}, created, err
 	}
-	return sessionstore.DispositionInboxEntry{
-		Record: sessionstore.DispositionInboxRecord{
-			Descriptor: sessionstore.DispositionCommandDescriptor{
-				PublicCreate: true, TenantID: entry.Record.TenantID, SessionID: entry.Record.SessionID,
-				CommandID: entry.Record.CommandID, RuntimeCommandID: entry.Record.RuntimeCommandID,
-				Kind: entry.Record.Kind,
-			},
-			AcceptedAt: entry.Record.AcceptedAt, ApplyDeadline: entry.Record.ApplyDeadline,
-			State: entry.Record.State,
-		},
-		Revision: entry.Revision, AcceptedOrder: entry.AcceptedOrder,
-	}, created, nil
+	entry.Record.Descriptor.PublicCreate = true
+	return entry, created, nil
 }
 
-func (a *parityAdmitter) AdmitInput(_ context.Context, _ identity.Principal, req sessionwire.InputRequest) (sessionstore.InboxEntry, bool, error) {
+func (a *parityAdmitter) AdmitInput(_ context.Context, _ identity.Principal, req sessionwire.InputRequest) (sessionstore.DispositionInboxEntry, bool, error) {
 	return a.answer(req)
 }
 
-func (a *parityAdmitter) AdmitInterrupt(_ context.Context, _ identity.Principal, req sessionwire.InterruptRequest) (sessionstore.InboxEntry, bool, error) {
+func (a *parityAdmitter) AdmitInterrupt(_ context.Context, _ identity.Principal, req sessionwire.InterruptRequest) (sessionstore.DispositionInboxEntry, bool, error) {
 	return a.answer(req)
 }
 
-func (a *parityAdmitter) AdmitRestore(_ context.Context, _ identity.Principal, req sessionwire.RestoreRequest) (sessionstore.InboxEntry, bool, error) {
+func (a *parityAdmitter) AdmitRestore(_ context.Context, _ identity.Principal, req sessionwire.RestoreRequest) (sessionstore.DispositionInboxEntry, bool, error) {
 	return a.answer(req)
 }
 
-func (a *parityAdmitter) AdmitGateResponse(_ context.Context, _ identity.Principal, req sessionwire.GateResponseRequest) (sessionstore.InboxEntry, bool, error) {
+func (a *parityAdmitter) AdmitGateResponse(_ context.Context, _ identity.Principal, req sessionwire.GateResponseRequest) (sessionstore.DispositionInboxEntry, bool, error) {
 	return a.answer(req)
 }
 
