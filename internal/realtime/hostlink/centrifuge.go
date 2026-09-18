@@ -258,26 +258,43 @@ type centrifugeLink struct {
 	settled chan error
 	once    sync.Once
 
+	// mu guards the admission snapshot below and NOTHING is held across
+	// client.RPC. There was a second mutex here, held across the RPC so that
+	// "capability check then send" was one operation, and it was removed for
+	// three measured reasons. It serialised every session on the Host behind
+	// the slowest reply -- a 100ms-deadline delivery waited 702ms, because a
+	// caller deadline cannot preempt a mutex wait. Reconnect callbacks must
+	// never wait for anything a call holds, since centrifuge-go runs
+	// OnConnecting synchronously before scheduling the reconnect. And it
+	// widened a centrifuge-go v0.12.0 wedge (see call) from one lost caller
+	// into a permanently frozen link. The atomicity the lock claimed is
+	// already provided by the snapshot under mu plus the generation binding:
+	// a reconnect replaces the generation under mu and cancels the old one,
+	// so a call admitted against the old snapshot cannot be sent on the new
+	// connection. The mutant that dropped the lock survived the whole suite.
 	mu sync.Mutex
-	// rpcMu serializes calls so that a capability check and its RPC are one
-	// local admission operation. Reconnect callbacks deliberately do not wait
-	// for this mutex: centrifuge-go invokes OnConnecting before scheduling its
-	// reconnect, and a call that is waiting for that reconnect must not hold the
-	// callback hostage.
-	rpcMu sync.Mutex
 	// negotiated is the most recent successful Core connect reply. A reply with
 	// no hostlink_methods is valid and deliberately means no reserved method is
 	// advertised.
 	negotiated sessionwire.VersionNegotiationResponse
 	// connecting is true between the transport's reconnect callback and a
 	// successful Core reply. Reserved calls fail locally during that window
-	// rather than using the previous connection's capability set.
+	// with ErrLinkReconnecting rather than being queued against the previous
+	// connection's capability set. negotiated is zeroed at the same moment;
+	// the flag is what chooses the transient answer over the capability one,
+	// and the zeroing is what stops any reader of negotiated seeing a stale set.
 	connecting bool
 	// generation is canceled when the transport enters its next generation.
 	// Calls bind their transport context to it so an RPC queued by centrifuge-go
 	// while Connecting cannot be sent after a newer handshake changes the
-	// capability set. It is an explicit registry rather than context.AfterFunc:
-	// cancellation must finish before centrifuge-go resolves connect futures.
+	// capability set. It is an explicit registry rather than context.AfterFunc
+	// so that cancellation is SYNCHRONOUS: when onConnecting returns, every
+	// bound context is already done (TestRPCGenerationCancelIsSynchronous).
+	// That is a determinism hardening, not a measured bug fix -- the AfterFunc
+	// bridge lost by microseconds against a reconnect delay of milliseconds,
+	// and no test demonstrates a stale RPC escaping through that window. What
+	// IS pinned by a failing test is bind's re-check after context.WithCancel
+	// (TestQueuedBoundBindCannotCrossIntoANewerCapabilityGeneration).
 	generation *rpcGeneration
 	// terminal is set when the connection may not be used again. A link that
 	// kept answering RPCs after a terminal refusal would report every one as an
@@ -321,39 +338,62 @@ func (l *centrifugeLink) Close(context.Context) error {
 //
 // The request is marshalled by CORE, whose MarshalJSON validates first, so a
 // record that would not survive the Host's strict decoder never reaches the
-// wire. Reserved operations are gated by the latest advertised capability set;
-// session-channel delivery is not, because it is addressed by the bound
+// wire. Reserved operations are gated by the latest advertised capability set,
+// and refused with ErrLinkReconnecting while there is none to gate against;
+// session-channel delivery is not gated, because it is addressed by the bound
 // channel rather than a reserved method. The reply is a bare Core
 // HostLinkError, or an empty body for success.
+//
+// A delivery admitted while Connecting is QUEUED by centrifuge-go and emitted
+// on the next connection before this link has verified its reply:
+// centrifuge-go resolves connect futures before it runs OnConnected
+// (client.go:1346 against :1354). It does not matter for delivery, which no
+// capability gates, and a version mismatch marks the link terminal anyway;
+// but it is why the gate above is a snapshot and not a promise that every
+// emitted RPC sits behind the latest reply.
+//
+// RPCs on a link are CONCURRENT and nothing is held across client.RPC. The
+// RPC runs on its own goroutine and the caller selects against the bound
+// context, for a reason beyond head-of-line blocking: centrifuge-go v0.12.0
+// can run an RPC's completion callback twice -- clearConnectedState fails every
+// pending request on a new goroutine (client.go:745) while the caller's own
+// send has already registered the request and then fails (client.go:2187,
+// :443) -- and the second callback blocks forever on RPC's capacity-1 result
+// channel (client.go:373). When that lands on the caller's goroutine the
+// caller never reaches RPC's select, and no context frees a channel send.
+// Reproduced 1 in 4 reconnect stress runs. Confined here, a wedge costs one
+// leaked goroutine rather than a caller, and the caller is released by the
+// generation cancel that the same reconnect performs.
 func (l *centrifugeLink) call(ctx context.Context, method string, request any, requiresCapability bool) error {
 	body, err := json.Marshal(request)
 	if err != nil {
 		return fmt.Errorf("hostlink: %s: %w", method, err)
 	}
 
-	l.rpcMu.Lock()
-	defer l.rpcMu.Unlock()
 	l.mu.Lock()
 	terminal := l.terminal
 	generation := l.generation
+	connecting := l.connecting
+	supported := l.negotiated.Supports(method)
+	l.mu.Unlock()
 	if terminal != nil {
-		l.mu.Unlock()
 		return terminal
 	}
 	if requiresCapability {
-		if l.connecting || !l.negotiated.Supports(method) {
-			l.mu.Unlock()
+		if connecting {
+			return fmt.Errorf("hostlink: %s: %w", method, ErrLinkReconnecting)
+		}
+		if !supported {
 			return &UnsupportedMethodError{Method: method}
 		}
 	}
-	l.mu.Unlock()
 
 	rpcCtx, release, err := bindGenerationContext(ctx, generation)
 	if err != nil {
 		return fmt.Errorf("hostlink: %s: %w", method, err)
 	}
 	defer release()
-	reply, err := l.client.RPC(rpcCtx, method, body)
+	reply, err := l.rpc(rpcCtx, method, body)
 	if err != nil {
 		return fmt.Errorf("hostlink: %s: %w", method, err)
 	}
@@ -367,12 +407,38 @@ func (l *centrifugeLink) call(ctx context.Context, method string, request any, r
 	return &HostRefusal{HostLinkError: refusal}
 }
 
+// rpcOutcome is one client.RPC result, carried off the goroutine that ran it.
+type rpcOutcome struct {
+	reply centrifugego.RPCResult
+	err   error
+}
+
+// rpc runs client.RPC on its own goroutine and waits for whichever comes
+// first, its result or the bound context. The result channel is buffered so
+// the goroutine can always finish once the caller has left; a goroutine
+// wedged INSIDE client.RPC (see call) is the one this cannot collect, by
+// design.
+func (l *centrifugeLink) rpc(ctx context.Context, method string, body []byte) (centrifugego.RPCResult, error) {
+	outcome := make(chan rpcOutcome, 1)
+	go func() {
+		reply, err := l.client.RPC(ctx, method, body)
+		outcome <- rpcOutcome{reply: reply, err: err}
+	}()
+	select {
+	case out := <-outcome:
+		return out.reply, out.err
+	case <-ctx.Done():
+		return centrifugego.RPCResult{}, ctx.Err()
+	}
+}
+
 // onConnecting clears the old capability set before a reconnect attempt can
 // send a new RPC. The transport may call this before the server has returned a
 // new reply, so retaining the old set would let a restarted Host receive a
-// reserved method it no longer advertises. It does not take rpcMu: the
-// transport invokes this callback before scheduling reconnect, and a queued
-// RPC may already be waiting for that reconnect while holding rpcMu.
+// reserved method it no longer advertises. It takes only mu, briefly: the
+// transport invokes this callback before scheduling the reconnect, so a
+// callback that waited for anything a call holds would be a deadlock of the
+// link (TestReconnectDoesNotWaitForAnRPCInFlight).
 func (l *centrifugeLink) onConnecting(centrifugego.ConnectingEvent) {
 	nextGeneration := newRPCGeneration()
 	var previousGeneration *rpcGeneration

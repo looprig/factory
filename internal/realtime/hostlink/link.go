@@ -34,6 +34,16 @@ var ErrUnknownBinding = errors.New("hostlink: no binding for session")
 // that did not promise to handle the method.
 var ErrUnsupportedMethod = errors.New("hostlink: host did not advertise the requested method")
 
+// ErrLinkReconnecting reports a reserved HostLink operation refused locally
+// because the link is between a dropped connection and the next Host reply,
+// so there is no capability set to admit it against. It is a TRANSIENT,
+// deliberately distinct from ErrUnsupportedMethod: the Host may well advertise
+// the method, and a caller that read "did not advertise" during a 250ms
+// reconnect would remake a placement decision over a perfectly good Host.
+// Retry after the reconnect settles; session-channel delivery is not gated
+// and is queued by the transport instead.
+var ErrLinkReconnecting = errors.New("hostlink: link is reconnecting")
+
 // UnsupportedMethodError identifies the reserved operation refused locally
 // because the negotiated HostLink capability set did not contain it.
 type UnsupportedMethodError struct {
