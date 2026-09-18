@@ -102,7 +102,8 @@ type Reconciler struct {
 	rotor rotor
 }
 
-// rotor is the round-robin shard position, shared by both deadline sweeps.
+// rotor is the legacy sweep's round-robin shard position. The disposition sweep
+// keeps a position per shard as well; see DispositionReconciler.
 type rotor struct {
 	mu   sync.Mutex
 	next int
@@ -280,6 +281,12 @@ type SweepResult struct {
 	// outstanding. The remaining rows are still due and are met by the next
 	// pass over this shard.
 	Truncated bool
+
+	// Resumed reports that this pass continued from the position an earlier
+	// truncated pass over the same shard kept, rather than from the head.
+	// Only the disposition sweep keeps positions; the legacy one always reads
+	// from the head.
+	Resumed bool
 }
 
 // Sweep reconciles the next control shard, round-robin.

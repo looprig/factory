@@ -16,6 +16,7 @@ import (
 type fakeDispositionDue struct {
 	faultInjector
 	shards int
+	refuse bool
 	pages  []sessionstore.DispositionDueCommandPage
 	served int
 	reqs   []sessionstore.ListDueDispositionCommandsRequest
@@ -27,6 +28,9 @@ func (d *fakeDispositionDue) ListDueDispositionCommands(_ context.Context, req s
 	d.reqs = append(d.reqs, req)
 	if err := d.enter("ListDueDispositionCommands"); err != nil {
 		return sessionstore.DispositionDueCommandPage{}, err
+	}
+	if d.refuse {
+		return sessionstore.DispositionDueCommandPage{}, &sessionstore.InboxError{Code: sessionstore.InboxErrorCursor}
 	}
 	if d.served >= len(d.pages) {
 		return sessionstore.DispositionDueCommandPage{Limit: req.Limit}, nil
@@ -397,5 +401,68 @@ func unclassifiedDispositionCodes() map[sessionstore.InboxErrorCode]string {
 		sessionstore.InboxErrorMalformed:       "a row this store cannot decode needs an operator",
 		sessionstore.InboxErrorVersion:         "a record version this build does not understand needs an operator",
 		sessionstore.InboxErrorTooLarge:        "a rejection shrinks no record",
+	}
+}
+
+// TestADispositionShardsPositionIsKeptOnlyWhileItsPassIsTruncated is the
+// cursor lifecycle, the placement sweep's rule on this sweep's view.
+func TestADispositionShardsPositionIsKeptOnlyWhileItsPassIsTruncated(t *testing.T) {
+	f := newDispositionFixture(t, func(cfg *DispositionReconcilerConfig) { cfg.MaxPages = 2 })
+	f.due.shards = 1
+	f.due.pages = []sessionstore.DispositionDueCommandPage{
+		dispositionPage("cursor-1"), dispositionPage("cursor-2"), // pass 1: truncated
+		dispositionPage(""),                                      // pass 2: resumed, reaches the end
+		dispositionPage("cursor-3"), dispositionPage("cursor-4"), // pass 3: fresh, truncated
+	}
+	sweep := func() SweepResult {
+		t.Helper()
+		result, err := f.rec.Sweep(context.Background(), f.principal)
+		if err != nil {
+			t.Fatalf("Sweep: %v", err)
+		}
+		return result
+	}
+	if r := sweep(); !r.Truncated || r.Resumed {
+		t.Fatalf("pass 1 = %+v, want a fresh truncated pass", r)
+	}
+	f.clock.Set(sweepBase.Add(time.Minute))
+	if r := sweep(); r.Truncated || !r.Resumed {
+		t.Fatalf("pass 2 = %+v, want a resumed pass that reaches the end", r)
+	}
+	if r := sweep(); !r.Truncated || r.Resumed {
+		t.Fatalf("pass 3 = %+v, want a fresh truncated pass", r)
+	}
+	want := []sessionstore.ListDueDispositionCommandsRequest{
+		{Shard: 0, DueAtOrBefore: sweepBase, Limit: 2},
+		{Shard: 0, Limit: 2, Cursor: "cursor-1"},
+		{Shard: 0, Limit: 2, Cursor: "cursor-2"},
+		{Shard: 0, DueAtOrBefore: sweepBase.Add(time.Minute), Limit: 2},
+		{Shard: 0, Limit: 2, Cursor: "cursor-3"},
+	}
+	if len(f.due.reqs) != len(want) {
+		t.Fatalf("requests = %+v\nwant %+v", f.due.reqs, want)
+	}
+	for i := range want {
+		got := f.due.reqs[i]
+		if got.Shard != want[i].Shard || got.Limit != want[i].Limit || got.Cursor != want[i].Cursor || !got.DueAtOrBefore.Equal(want[i].DueAtOrBefore) {
+			t.Fatalf("request %d = %+v, want %+v", i, got, want[i])
+		}
+	}
+	// A transient fault keeps the position; a refused one drops it.
+	f.due.reqs = nil
+	f.due.failing = "ListDueDispositionCommands"
+	if _, err := f.rec.Sweep(context.Background(), f.principal); err == nil {
+		t.Fatal("a failed page was not reported")
+	}
+	f.due.failing = ""
+	f.due.refuse = true
+	if _, err := f.rec.Sweep(context.Background(), f.principal); err == nil {
+		t.Fatal("a refused continuation was not reported")
+	}
+	f.due.refuse = false
+	sweep()
+	if len(f.due.reqs) != 3 || f.due.reqs[0].Cursor != "cursor-4" || f.due.reqs[1].Cursor != "cursor-4" ||
+		f.due.reqs[2].Cursor != "" || f.due.reqs[2].DueAtOrBefore.IsZero() {
+		t.Fatalf("after a transient fault and a refusal, requests = %+v; want cursor-4 twice, then a fresh head read", f.due.reqs)
 	}
 }

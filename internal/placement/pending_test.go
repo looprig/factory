@@ -409,3 +409,121 @@ func TestNewPendingSweeperRefusesAnIncompleteConfiguration(t *testing.T) {
 		t.Errorf("control: %v", err)
 	}
 }
+
+// TestALiveCreateBehindMoreThanAPassOfExpiredRowsIsStillPlaced is the B5 spec
+// gate's F3 probe, committed: one shard, two rows per pass, and more expired
+// rows at the head of the deadline-ordered view than one pass reads. Nothing
+// retires them here -- the disposition deadline sweep is not composed -- so
+// this is the placement sweep's OWN progress guarantee, independent of
+// retirement. Before per-shard positions, every pass re-read the same two
+// expired rows from the head and the live create was never attached.
+func TestALiveCreateBehindMoreThanAPassOfExpiredRowsIsStillPlaced(t *testing.T) {
+	t.Parallel()
+
+	clock := &movableClock{now: reconcileNow}
+	store, err := sessionstore.Open(context.Background(), memstore.New(), sessionstore.WithClock(clock), sessionstore.WithControlShards(1))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close(context.Background()) })
+	// Five creates that will be expired, filed ahead of the live one.
+	for i := range 5 {
+		admitPooledCreate(t, store, clock, sessionwire.SessionID(fmt.Sprintf("session-expired-%d", i)), sessionwire.CommandID(fmt.Sprintf("create-expired-%d", i)), time.Minute)
+	}
+	clock.now = clock.now.Add(2 * time.Minute)
+	admitPooledCreate(t, store, clock, "session-live", "create-live", time.Hour)
+
+	placer := &recordingPlacer{}
+	sweeper, err := NewPendingSweeper(PendingSweeperConfig{
+		Authorizer: &allowSweeps{}, Pending: store, Placer: placer, Clock: clock,
+		Horizon: 2 * time.Hour, PageLimit: 2, MaxPages: 1,
+	})
+	if err != nil {
+		t.Fatalf("NewPendingSweeper: %v", err)
+	}
+	var resumed int
+	for pass := range 5 {
+		result, err := sweeper.Sweep(context.Background(), servicePrincipal(t))
+		if err != nil {
+			t.Fatalf("pass %d: %v", pass, err)
+		}
+		if result.Resumed {
+			resumed++
+		}
+		for _, req := range placer.requests {
+			if req.SessionID == "session-live" {
+				if resumed == 0 {
+					t.Fatalf("the live create was placed without a resumed pass; the probe did not put it behind the head")
+				}
+				if len(req.Wake) != 1 || req.Wake[0] != "create-live" {
+					t.Fatalf("the live session was woken with %v, want its create", req.Wake)
+				}
+				return
+			}
+		}
+	}
+	t.Fatalf("the live create was never placed across 5 passes (%d resumed); reconciled %+v", resumed, placer.requests)
+}
+
+// TestAShardsPositionIsKeptOnlyWhileItsPassIsTruncated is the cursor
+// lifecycle: a truncated pass keeps its continuation and the next pass over
+// that shard presents it with no second bound; a pass that reaches the end
+// forgets it and the next re-arms at the head against a fresh bound; a
+// continuation the store REFUSES is dropped rather than presented forever; and
+// a transient fault keeps it.
+func TestAShardsPositionIsKeptOnlyWhileItsPassIsTruncated(t *testing.T) {
+	t.Parallel()
+
+	clock := &movableClock{now: reconcileNow}
+	pending := &fakePending{shards: 1, pages: []sessionstore.DispositionDueCommandPage{
+		{NextCursor: "cursor-1"}, {NextCursor: "cursor-2"}, // pass 1: truncated at cursor-2
+		{},                                                 // pass 2: resumes and reaches the end
+		{NextCursor: "cursor-3"}, {NextCursor: "cursor-4"}, // pass 3: fresh, truncated at cursor-4
+	}}
+	sweeper := newFakeSweeper(t, pending, &recordingPlacer{}, clock, &allowSweeps{})
+	sweep := func() PendingSweepResult {
+		t.Helper()
+		result, err := sweeper.Sweep(context.Background(), servicePrincipal(t))
+		if err != nil {
+			t.Fatalf("Sweep: %v", err)
+		}
+		return result
+	}
+	if r := sweep(); !r.Truncated || r.Resumed {
+		t.Fatalf("pass 1 = %+v, want a fresh truncated pass", r)
+	}
+	clock.now = clock.now.Add(time.Minute)
+	if r := sweep(); r.Truncated || !r.Resumed {
+		t.Fatalf("pass 2 = %+v, want a resumed pass that reaches the end", r)
+	}
+	if r := sweep(); !r.Truncated || r.Resumed {
+		t.Fatalf("pass 3 = %+v, want a fresh truncated pass", r)
+	}
+	want := []sessionstore.ListDueDispositionCommandsRequest{
+		{Shard: 0, DueAtOrBefore: reconcileNow.Add(5 * time.Minute), Limit: 7},
+		{Shard: 0, Limit: 7, Cursor: "cursor-1"},
+		{Shard: 0, Limit: 7, Cursor: "cursor-2"},
+		{Shard: 0, DueAtOrBefore: reconcileNow.Add(time.Minute + 5*time.Minute), Limit: 7},
+		{Shard: 0, Limit: 7, Cursor: "cursor-3"},
+	}
+	if !slices.Equal(pending.requests, want) {
+		t.Fatalf("requests = %+v\nwant %+v", pending.requests, want)
+	}
+
+	// A transient fault keeps the position; a refused one drops it.
+	pending.requests = nil
+	pending.err = errors.New("the provider could not be reached")
+	if _, err := sweeper.Sweep(context.Background(), servicePrincipal(t)); err == nil {
+		t.Fatal("a failed page was not reported")
+	}
+	pending.err = &sessionstore.InboxError{Code: sessionstore.InboxErrorCursor}
+	if _, err := sweeper.Sweep(context.Background(), servicePrincipal(t)); err == nil {
+		t.Fatal("a refused continuation was not reported")
+	}
+	pending.err = nil
+	sweep()
+	if len(pending.requests) != 3 || pending.requests[0].Cursor != "cursor-4" || pending.requests[1].Cursor != "cursor-4" ||
+		pending.requests[2].Cursor != "" || pending.requests[2].DueAtOrBefore.IsZero() {
+		t.Fatalf("after a transient fault and a refusal, requests = %+v; want cursor-4 twice, then a fresh head read", pending.requests)
+	}
+}

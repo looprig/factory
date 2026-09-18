@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 
 	sessionwire "github.com/looprig/core/sessionwire/v1"
@@ -78,9 +79,24 @@ type DispositionReconcilerConfig struct {
 
 // DispositionReconciler sweeps expired disposition commands in fixed control
 // shards, round-robin, one shard per pass and at most MaxPages*PageLimit rows.
+//
+// It REMEMBERS WHERE EACH SHARD'S PASS STOPPED, and that is what keeps it from
+// starving. The due view is deadline-ordered from the head, and the head is
+// exactly where the rows this sweep may NOT reject accumulate: applying
+// commands (a successor's business) and claimed ones whose claim is still
+// live, each filed at its long-past deadline. A sweep that re-read from the
+// head every pass would, once a shard held more than MaxPages*PageLimit of
+// those, never again reach a rejectable row behind them. So a truncated pass
+// keeps the store's continuation for its shard and the next pass over that
+// shard resumes from it; only a pass that reaches the end re-arms at the head
+// against a fresh bound. The position is advice, like the rotor: a restarted
+// replica starts every shard at the head and loses nothing but time.
 type DispositionReconciler struct {
-	cfg   DispositionReconcilerConfig
-	rotor rotor
+	cfg DispositionReconcilerConfig
+
+	mu      sync.Mutex
+	next    int
+	cursors map[int]sessionwire.Cursor
 }
 
 // NewDispositionReconciler validates a configuration before it can reach a
@@ -108,7 +124,7 @@ func NewDispositionReconciler(cfg DispositionReconcilerConfig) (*DispositionReco
 	case cfg.MaxPages < 1:
 		return nil, fmt.Errorf("%w: MaxPages must be positive", ErrInvalidReconcilerConfig)
 	}
-	return &DispositionReconciler{cfg: cfg}, nil
+	return &DispositionReconciler{cfg: cfg, cursors: map[int]sessionwire.Cursor{}}, nil
 }
 
 func (r *DispositionReconciler) claimant() claimant {
@@ -123,27 +139,67 @@ func (r *DispositionReconciler) Sweep(ctx context.Context, principal identity.Pr
 	if err := r.cfg.Authorizer.AuthorizeServiceSweep(ctx, principal); err != nil {
 		return SweepResult{}, err
 	}
-	shard, err := r.rotor.rotate(r.cfg.Due.ControlShards())
+	shard, cursor, err := r.begin()
 	if err != nil {
 		return SweepResult{}, err
 	}
-	result := SweepResult{Shard: shard, Dispositions: map[Disposition]int{}}
+	result := SweepResult{Shard: shard, Resumed: cursor != "", Dispositions: map[Disposition]int{}}
 	held := map[sessionKey]bool{}
-	sweepErr := r.page(ctx, shard, &result, held)
+	next, sweepErr := r.page(ctx, shard, cursor, &result, held)
+	r.commit(shard, next)
 	r.claimant().release(ctx, held, &result)
 	return result, sweepErr
 }
 
-// page reads one shard's due disposition rows, bounded by MaxPages.
+// begin advances the rotor and hands back the shard to sweep with the position
+// this sweep last reached in it. It follows the gate sweeper's begin exactly:
+// the rotor advances before the work, the count is read from the store every
+// pass, and a position for a shard that no longer exists is dropped.
+func (r *DispositionReconciler) begin() (int, sessionwire.Cursor, error) {
+	shards := r.cfg.Due.ControlShards()
+	if shards < sessionstore.MinControlShards {
+		return 0, "", fmt.Errorf("admission: the store reports %d control shards, so no shard can be swept", shards)
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.next >= shards {
+		r.next = 0
+	}
+	for shard := range r.cursors {
+		if shard >= shards {
+			delete(r.cursors, shard)
+		}
+	}
+	shard := r.next
+	r.next = (shard + 1) % shards
+	return shard, r.cursors[shard], nil
+}
+
+// commit keeps the position a pass reached for its shard. An empty position is
+// removed, so the next pass over that shard re-arms at the head.
+func (r *DispositionReconciler) commit(shard int, cursor sessionwire.Cursor) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if cursor == "" {
+		delete(r.cursors, shard)
+		return
+	}
+	r.cursors[shard] = cursor
+}
+
+// page reads one shard's due disposition rows from cursor, bounded by
+// MaxPages, and returns the position to keep.
 //
-// The bound is NOW. The disposition index files every open command at its
-// apply deadline and nowhere else (sessionstore disposition_inbox.go
-// dispositionInboxDue), so a page bounded at now holds exactly the commands
-// whose deadline has passed -- to the store's millisecond, which is why the
-// predicate compares the deadline again at full precision.
-func (r *DispositionReconciler) page(ctx context.Context, shard int, result *SweepResult, held map[sessionKey]bool) error {
+// A FRESH pass is bounded at NOW. The disposition index files every open
+// command at its apply deadline and nowhere else (sessionstore
+// disposition_inbox.go dispositionInboxDue), so a page bounded at now holds
+// exactly the commands whose deadline has passed -- to the store's
+// millisecond, which is why the predicate compares the deadline again at full
+// precision. A RESUMED pass carries the bound its cycle started with, which is
+// the store's rule for a continuation; a row that expired since is met on the
+// next cycle.
+func (r *DispositionReconciler) page(ctx context.Context, shard int, cursor sessionwire.Cursor, result *SweepResult, held map[sessionKey]bool) (sessionwire.Cursor, error) {
 	now := r.cfg.Clock.Now()
-	var cursor sessionwire.Cursor
 	for range r.cfg.MaxPages {
 		req := sessionstore.ListDueDispositionCommandsRequest{Shard: shard, Limit: r.cfg.PageLimit, Cursor: cursor}
 		if cursor == "" {
@@ -152,7 +208,12 @@ func (r *DispositionReconciler) page(ctx context.Context, shard int, result *Swe
 		result.Queries++
 		page, err := r.cfg.Due.ListDueDispositionCommands(ctx, req)
 		if err != nil {
-			return fmt.Errorf("admission: page control shard %d for due disposition commands: %w", shard, err)
+			if refusedDispositionCursor(err) {
+				// The position is what was refused; keeping it would present it
+				// forever and the shard would silently stop being swept.
+				return "", fmt.Errorf("admission: resume disposition shard %d: %w", shard, err)
+			}
+			return cursor, fmt.Errorf("admission: page control shard %d for due disposition commands: %w", shard, err)
 		}
 		result.Pages++
 		result.Examined += page.Examined
@@ -160,16 +221,24 @@ func (r *DispositionReconciler) page(ctx context.Context, shard int, result *Swe
 		result.Due += len(page.Commands)
 		for _, due := range page.Commands {
 			if err := r.settle(ctx, due, now, result, held); err != nil {
-				return err
+				// The position this page was read FROM: the rows after the
+				// failure were not dealt with.
+				return cursor, err
 			}
 		}
 		cursor = page.NextCursor
 		if cursor == "" {
-			return nil
+			return "", nil
 		}
 	}
 	result.Truncated = true
-	return nil
+	return cursor, nil
+}
+
+// refusedDispositionCursor reports the store refusing a continuation itself.
+func refusedDispositionCursor(err error) bool {
+	var inbox *sessionstore.InboxError
+	return errors.As(err, &inbox) && inbox.Code == sessionstore.InboxErrorCursor
 }
 
 // settle decides one due row and, if it may, rejects it.

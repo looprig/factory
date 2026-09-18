@@ -66,10 +66,10 @@ type commandLane struct {
 	principal identity.Principal
 }
 
-func newCommandLane(t *testing.T) *commandLane {
+func newCommandLane(t *testing.T, options ...sessionstore.Option) *commandLane {
 	t.Helper()
 	clock := &movableClock{now: serviceNow}
-	store, err := sessionstore.Open(context.Background(), memstore.New(), sessionstore.WithClock(clock))
+	store, err := sessionstore.Open(context.Background(), memstore.New(), append([]sessionstore.Option{sessionstore.WithClock(clock)}, options...)...)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -405,4 +405,76 @@ func TestTheDispositionSweepRejectsOnlyExpiredUnattemptedCommands(t *testing.T) 
 	if err != nil || retry.Record.State != sessionstore.InboxStateRejected {
 		t.Fatalf("retry after rejection = (%q, %v), want the rejected record", retry.Record.State, err)
 	}
+}
+
+// TestARejectableCommandBehindMoreThanAPassOfApplyingOnesIsStillRejected is
+// the deadline sweep's own progress guarantee. The rows it may never reject --
+// applying commands, filed at their long-past deadlines -- sit at the HEAD of
+// the deadline-ordered view, and with more of them than one pass reads, a
+// sweep that restarted at the head every pass would never reach the expired
+// pending command behind them. One shard, one row per pass.
+func TestARejectableCommandBehindMoreThanAPassOfApplyingOnesIsStillRejected(t *testing.T) {
+	lane := newCommandLane(t, sessionstore.WithControlShards(1))
+	ctx := context.Background()
+	tenant := lane.principal.Tenant()
+	var applying []sessionwire.SessionID
+	for _, session := range []sessionwire.SessionID{"session-stuck-1", "session-stuck-2", "session-stuck-3"} {
+		created := lane.create(t, session)
+		grant, err := lane.store.AcquireResidency(ctx, sessionstore.AcquireResidencyRequest{TenantID: tenant, SessionID: session})
+		if err != nil {
+			t.Fatalf("AcquireResidency: %v", err)
+		}
+		t.Cleanup(func() { _ = grant.Release(context.Background()) })
+		claimed, _, err := lane.store.ClaimDispositionCommand(ctx, sessionstore.ClaimDispositionCommandRequest{
+			TenantID: tenant, SessionID: session, CommandID: created.Record.Descriptor.CommandID,
+			ExpectedRevision: created.Revision, Residency: grant, ClaimExpiresAt: serviceNow.Add(30 * time.Second),
+		})
+		if err != nil {
+			t.Fatalf("ClaimDispositionCommand: %v", err)
+		}
+		if _, err := lane.store.BeginDispositionAttempt(ctx, sessionstore.BeginDispositionAttemptRequest{
+			TenantID: tenant, SessionID: session, CommandID: created.Record.Descriptor.CommandID,
+			ExpectedRevision: claimed.Revision, AttemptID: "attempt-1", JournalEpoch: 1,
+			ResidencyEpoch: claimed.Record.Claim.ResidencyEpoch, StartedAt: serviceNow,
+		}); err != nil {
+			t.Fatalf("BeginDispositionAttempt: %v", err)
+		}
+		applying = append(applying, session)
+	}
+	// The rejectable command is filed BEHIND them: admitted later, so its
+	// deadline is later.
+	lane.clock.set(serviceNow.Add(10 * time.Second))
+	behind := lane.create(t, "session-behind")
+	lane.clock.set(serviceNow.Add(2 * time.Minute))
+
+	sweeper, err := NewDispositionReconciler(DispositionReconcilerConfig{
+		Authorizer: &serviceAuthorizer{}, Due: lane.store, Settlement: lane.store, Claims: lane.store,
+		Clock: lane.clock, HolderID: "replica-a", ClaimTTL: 30 * time.Second, PageLimit: 1, MaxPages: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for pass := range 6 {
+		result, err := sweeper.Sweep(ctx, sweepPrincipal(t))
+		if err != nil {
+			t.Fatalf("pass %d: %v", pass, err)
+		}
+		if result.Rejected == 1 {
+			if !result.Resumed {
+				t.Fatalf("the rejection came from a pass that did not resume; the probe did not put it behind the head")
+			}
+			got, err := lane.store.GetDispositionCommand(ctx, sessionstore.GetDispositionCommandRequest{TenantID: tenant, SessionID: "session-behind", CommandID: behind.Record.Descriptor.CommandID})
+			if err != nil || got.Record.State != sessionstore.InboxStateRejected {
+				t.Fatalf("the command behind = (%q, %v), want rejected", got.Record.State, err)
+			}
+			for _, session := range applying {
+				stuck, err := lane.store.GetDispositionCommand(ctx, sessionstore.GetDispositionCommandRequest{TenantID: tenant, SessionID: session, CommandID: sessionwire.CommandID("create-" + string(session))})
+				if err != nil || stuck.Record.State != sessionstore.InboxStateApplying {
+					t.Fatalf("%s = (%q, %v), want still applying", session, stuck.Record.State, err)
+				}
+			}
+			return
+		}
+	}
+	t.Fatal("the expired pending command behind three applying ones was never rejected across 6 passes")
 }

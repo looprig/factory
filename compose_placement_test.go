@@ -2,6 +2,7 @@ package factory_test
 
 import (
 	"context"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -232,5 +233,89 @@ func TestAPlacementControllerIsNoLongerRequiredAndStillAccepted(t *testing.T) {
 	}
 	if _, err := factory.New(append(factory.RequiredOptions(), factory.WithPlacementController(factory.FakeSeams{}))...); err != nil {
 		t.Fatalf("New with WithPlacementController = %v, want it still accepted", err)
+	}
+}
+
+// truncatingProbe answers the disposition due view with a continuation that
+// never ends, so every pass of every sweep reading it is truncated.
+type truncatingProbe struct {
+	*pendingProbe
+}
+
+func (p *truncatingProbe) ListDueDispositionCommands(ctx context.Context, req sessionstore.ListDueDispositionCommandsRequest) (sessionstore.DispositionDueCommandPage, error) {
+	if err := ctx.Err(); err != nil {
+		return sessionstore.DispositionDueCommandPage{}, err
+	}
+	return sessionstore.DispositionDueCommandPage{Limit: req.Limit, NextCursor: "more"}, nil
+}
+
+// syncBuffer is a log sink safe for the sweep goroutines.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf strings.Builder
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+// TestATruncatedPassIsLogged holds the one signal that a shard's due view is
+// outgrowing a pass: it was computed and discarded, which made starvation
+// silent. Both sweeps reading the disposition view are held, and a truncated
+// pass is the only thing that may produce the line.
+func TestATruncatedPassIsLogged(t *testing.T) {
+	t.Parallel()
+
+	logs := &syncBuffer{}
+	p := &truncatingProbe{pendingProbe: &pendingProbe{probe: &probe{}}}
+	limits := factory.DefaultReconcileLimits()
+	limits.Interval = 5 * time.Millisecond
+	limits.ClaimTTL = 50 * time.Millisecond
+	limits.MaxConcurrent = 1
+	options := append(factory.RequiredOptionsExcept(
+		"WithCommands", "WithGates", "WithHostTargets", "WithSessionReader",
+		"WithReplicaID", "WithCatalog", "WithDirectory",
+	),
+		factory.WithReplicaID("replica-under-test"),
+		factory.WithCommands(p),
+		factory.WithGates(p),
+		factory.WithHostTargets(p),
+		factory.WithSessionReader(p),
+		factory.WithReconcileLimits(limits),
+		factory.WithCatalog(p),
+		factory.WithDirectory(p),
+		factory.WithDepartment(probeTemplate()),
+		factory.WithPendingCommands(p),
+		factory.WithLogger(slog.New(slog.NewJSONHandler(logs, nil))),
+	)
+	server, err := factory.New(options...)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = server.Stop(ctx)
+	})
+	if err := server.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	for _, sweep := range []string{"dispositions", "placement"} {
+		eventually(t, "a truncated "+sweep+" pass was logged", func() bool {
+			return strings.Contains(logs.String(), `"level":"WARN","msg":"sweep: a pass ended with the shard's due backlog unread","sweep":"`+sweep+`"`)
+		})
+	}
+	// The control: the legacy view answers empty pages, so its sweep is never
+	// truncated and must never produce the line.
+	if strings.Contains(logs.String(), `"sweep":"commands"`) {
+		t.Fatalf("an untruncated pass was logged as truncated: %s", logs.String())
 	}
 }

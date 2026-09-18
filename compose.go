@@ -441,20 +441,24 @@ type sweep struct {
 // touches, and a claim licenses nothing -- but it is fixed so a test can state
 // what this replica does rather than observe what it happened to do.
 func (c *components) sweeps(cfg config) []sweep {
+	log := logger(cfg)
 	passes := []sweep{
 		{name: "commands", run: func(ctx context.Context) error {
-			_, err := c.commandSweeper.Sweep(ctx, cfg.service)
+			result, err := c.commandSweeper.Sweep(ctx, cfg.service)
+			warnTruncated(ctx, log, "commands", result.Shard, result.Truncated)
 			return err
 		}},
 		// The disposition deadline sweep. Unconditional, unlike "placement":
 		// it needs nothing beyond the required Commands seam, and without it a
 		// command no Host applied would stay open forever.
 		{name: "dispositions", run: func(ctx context.Context) error {
-			_, err := c.dispositionSweeper.Sweep(ctx, cfg.service)
+			result, err := c.dispositionSweeper.Sweep(ctx, cfg.service)
+			warnTruncated(ctx, log, "dispositions", result.Shard, result.Truncated)
 			return err
 		}},
 		{name: "gates", run: func(ctx context.Context) error {
-			_, err := c.gateSweeper.Sweep(ctx, cfg.service)
+			result, err := c.gateSweeper.Sweep(ctx, cfg.service)
+			warnTruncated(ctx, log, "gates", result.Shard, result.Truncated)
 			return err
 		}},
 		// The TARGET half of the record sweep and not the claim half. There is
@@ -469,14 +473,31 @@ func (c *components) sweeps(cfg config) []sweep {
 	}
 	if c.pending != nil {
 		// B5's trigger, composed only when the durable query it reads was
-		// supplied, so a composition without one runs exactly the three
-		// sweeps it always did.
+		// supplied, so a composition without one runs exactly the sweeps it
+		// always did.
 		passes = append(passes, sweep{name: "placement", run: func(ctx context.Context) error {
-			_, err := c.pending.Sweep(ctx, cfg.service)
+			result, err := c.pending.Sweep(ctx, cfg.service)
+			warnTruncated(ctx, log, "placement", result.Shard, result.Truncated)
 			return err
 		}})
 	}
 	return passes
+}
+
+// warnTruncated reports a pass that ended with a shard's backlog unread.
+//
+// A truncated pass is not a failure -- the rest of the shard is met by the next
+// pass over it, and the disposition, gate and placement sweeps resume from
+// where they stopped -- but it IS the signal that a shard's due view is
+// outgrowing MaxDuePerSweep*MaxConcurrent, which is how a sweep that re-reads
+// from the head starves. It used to be computed and dropped here, which made
+// that condition silent.
+func warnTruncated(ctx context.Context, log *slog.Logger, sweep string, shard int, truncated bool) {
+	if !truncated {
+		return
+	}
+	log.WarnContext(ctx, "sweep: a pass ended with the shard's due backlog unread",
+		slog.String("sweep", sweep), slog.Int("shard", shard))
 }
 
 // idleLink keeps the pool's idle reaper on the same cadence as the sweeps.

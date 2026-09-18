@@ -81,11 +81,30 @@ type PendingSweeperConfig struct {
 
 // PendingSweeper places the sessions with open commands, one control shard per
 // pass, round-robin.
+//
+// It REMEMBERS WHERE EACH SHARD'S PASS STOPPED, and without that it starves.
+// The due view is deadline-ordered from the head, and the head is where rows
+// this sweep skips pile up: an applying command past its deadline, a claimed
+// one whose claim outlived it, and -- until the disposition deadline sweep
+// retires them -- expired pending ones. A pass that always read from the head
+// would, once a shard held more than MaxPages*PageLimit of those, never again
+// reach a live create behind them (the B5 spec gate's F3: 2 expired rows ahead
+// of a live create at 2 rows per pass, never attached across 5 passes). So a
+// truncated pass keeps the store's continuation for its shard, the next pass
+// over that shard resumes from it, and only a pass that reaches the end
+// re-arms at the head against a fresh bound. Retirement keeps the head short;
+// this is what makes the sweep correct even when it does not.
+//
+// The cost is stated: a resumed pass carries the bound its cycle STARTED with,
+// which is the store's rule for a continuation, so a command admitted after a
+// long cycle began is met when the next cycle starts rather than immediately.
+// The position is advice: a restarted replica starts every shard at the head.
 type PendingSweeper struct {
 	cfg PendingSweeperConfig
 
-	mu   sync.Mutex
-	next int
+	mu      sync.Mutex
+	next    int
+	cursors map[int]sessionwire.Cursor
 }
 
 // NewPendingSweeper validates a configuration before it can reach a store.
@@ -106,7 +125,7 @@ func NewPendingSweeper(cfg PendingSweeperConfig) (*PendingSweeper, error) {
 	case cfg.MaxPages < 1:
 		return nil, fmt.Errorf("%w: MaxPages must be positive", ErrInvalidPendingSweeperConfig)
 	}
-	return &PendingSweeper{cfg: cfg}, nil
+	return &PendingSweeper{cfg: cfg, cursors: map[int]sessionwire.Cursor{}}, nil
 }
 
 // PendingSweepResult is what one pass over one shard did.
@@ -116,6 +135,9 @@ type PendingSweepResult struct {
 	Examined   int
 	Unreadable int
 	Truncated  bool
+	// Resumed reports that this pass continued from the position an earlier
+	// truncated pass over the same shard kept, rather than from the head.
+	Resumed bool
 
 	// Sessions is the number of distinct sessions this pass reconciled.
 	Sessions int
@@ -153,13 +175,14 @@ func (s *PendingSweeper) Sweep(ctx context.Context, principal identity.Principal
 	if err := s.cfg.Authorizer.AuthorizeServiceSweep(ctx, principal); err != nil {
 		return PendingSweepResult{}, err
 	}
-	shard, err := s.rotate()
+	shard, cursor, err := s.begin()
 	if err != nil {
 		return PendingSweepResult{}, err
 	}
-	result := PendingSweepResult{Shard: shard, Outcomes: map[Outcome]int{}}
+	result := PendingSweepResult{Shard: shard, Resumed: cursor != "", Outcomes: map[Outcome]int{}}
 	now := s.cfg.Clock.Now()
-	sessions, err := s.collect(ctx, shard, now, &result)
+	sessions, next, err := s.collect(ctx, shard, cursor, now, &result)
+	s.commit(shard, next)
 	if err != nil {
 		return result, err
 	}
@@ -199,14 +222,16 @@ func (s *PendingSweeper) Sweep(ctx context.Context, principal identity.Principal
 	return result, nil
 }
 
-// collect reads one shard's open commands, bounded by MaxPages, and groups
-// them by session in first-seen order.
+// collect reads one shard's open commands from cursor, bounded by MaxPages,
+// groups them by session in first-seen order, and returns the position to
+// keep.
 //
 // The bound is on the PASS for admission.Reconciler's reason: draining a busy
 // shard here would hold the rotor, and with it every other shard's placement.
-func (s *PendingSweeper) collect(ctx context.Context, shard int, now time.Time, result *PendingSweepResult) ([]*openSession, error) {
+// What is not read this pass is read by the next pass over the shard, from
+// where this one stopped.
+func (s *PendingSweeper) collect(ctx context.Context, shard int, cursor sessionwire.Cursor, now time.Time, result *PendingSweepResult) ([]*openSession, sessionwire.Cursor, error) {
 	var (
-		cursor   sessionwire.Cursor
 		order    []*openSession
 		sessions = map[sessionKey]*openSession{}
 	)
@@ -217,7 +242,12 @@ func (s *PendingSweeper) collect(ctx context.Context, shard int, now time.Time, 
 		}
 		page, err := s.cfg.Pending.ListDueDispositionCommands(ctx, req)
 		if err != nil {
-			return nil, fmt.Errorf("placement: page control shard %d for open commands: %w", shard, err)
+			if refusedCursor(err) {
+				// The position is what was refused; keeping it would present it
+				// forever and the shard would silently stop being placed.
+				return nil, "", fmt.Errorf("placement: resume control shard %d: %w", shard, err)
+			}
+			return nil, cursor, fmt.Errorf("placement: page control shard %d for open commands: %w", shard, err)
 		}
 		result.Pages++
 		result.Examined += page.Examined
@@ -248,29 +278,54 @@ func (s *PendingSweeper) collect(ctx context.Context, shard int, now time.Time, 
 		}
 		cursor = page.NextCursor
 		if cursor == "" {
-			return order, nil
+			return order, "", nil
 		}
 	}
 	result.Truncated = true
-	return order, nil
+	return order, cursor, nil
 }
 
-// rotate advances the round-robin rotor, for admission.Reconciler.rotate's
+// refusedCursor reports the store refusing a continuation itself.
+func refusedCursor(err error) bool {
+	var inbox *sessionstore.InboxError
+	return errors.As(err, &inbox) && inbox.Code == sessionstore.InboxErrorCursor
+}
+
+// begin advances the round-robin rotor and hands back the shard to sweep with
+// the position this sweep last reached in it, for admission.Reconciler.rotate's
 // reasons: before the work, independent of its outcome, and against the
-// store's own shard count read on every pass.
-func (s *PendingSweeper) rotate() (int, error) {
+// store's own shard count read on every pass. A position for a shard that no
+// longer exists is dropped, as the gate sweeper drops one.
+func (s *PendingSweeper) begin() (int, sessionwire.Cursor, error) {
 	shards := s.cfg.Pending.ControlShards()
 	if shards < sessionstore.MinControlShards {
-		return 0, fmt.Errorf("placement: the store reports %d control shards, so no shard can be swept", shards)
+		return 0, "", fmt.Errorf("placement: the store reports %d control shards, so no shard can be swept", shards)
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.next >= shards {
 		s.next = 0
 	}
+	for shard := range s.cursors {
+		if shard >= shards {
+			delete(s.cursors, shard)
+		}
+	}
 	shard := s.next
 	s.next = (shard + 1) % shards
-	return shard, nil
+	return shard, s.cursors[shard], nil
+}
+
+// commit keeps the position a pass reached for its shard. An empty position is
+// removed, so the next pass over that shard re-arms at the head.
+func (s *PendingSweeper) commit(shard int, cursor sessionwire.Cursor) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if cursor == "" {
+		delete(s.cursors, shard)
+		return
+	}
+	s.cursors[shard] = cursor
 }
 
 func (s *PendingSweeper) logger() *slog.Logger {
