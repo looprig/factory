@@ -269,10 +269,10 @@ func newLivenessHost(t *testing.T) *livenessHost {
 	if err := node.Run(); err != nil {
 		t.Fatalf("node.Run: %v", err)
 	}
-	host.server = httptest.NewServer(centrifuge.NewWebsocketHandler(node, centrifuge.WebsocketConfig{
+	host.server = httptest.NewServer(RequireJSONSubprotocol(centrifuge.NewWebsocketHandler(node, centrifuge.WebsocketConfig{
 		CheckOrigin: func(*http.Request) bool { return true },
 		Compression: false,
-	}))
+	})))
 	host.target.Endpoint = sessionwire.InternalEndpoint("ws" + strings.TrimPrefix(host.server.URL, "http"))
 	t.Cleanup(func() {
 		host.closeOnce.Do(func() {

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"sync"
 	"time"
 
@@ -190,7 +191,17 @@ func (d *CentrifugeDialer) Dial(ctx context.Context, target Target, observer Obs
 		GetToken: func(centrifugego.ConnectionTokenEvent) (string, error) {
 			return d.credential.ServiceToken(context.Background())
 		},
-		Data:              data,
+		Data: data,
+		// A Host answers the upgrade HTTP 400 unless the client NAMES the JSON
+		// protocol (host@v0.2.1 selectsJSONProtocol; the gate is the same at
+		// v0.1.0). centrifuge-go's JSON client sends no subprotocol on its own,
+		// and the other route Host accepts -- format=json in the query -- is
+		// closed by Core's InternalEndpoint.Validate, which refuses a query
+		// string. So the header is the only way a Factory reaches a Host at
+		// all, and its absence is why no v0.1.x Factory ever held a link to
+		// one: every stand-in in the suite accepted a header-less upgrade.
+		// The stand-ins now gate exactly as a Host does.
+		Header:            http.Header{"Sec-WebSocket-Protocol": {"centrifuge-json"}},
 		Name:              ClientName,
 		Version:           d.version,
 		HandshakeTimeout:  d.limits.DialTimeout,

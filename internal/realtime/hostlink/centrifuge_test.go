@@ -560,6 +560,7 @@ type hostServer struct {
 	node *centrifuge.Node
 
 	mu             sync.Mutex
+	upgradeHeaders []http.Header
 	connectRecords []connectRecord
 	rpcCalls       []rpcCall
 	disconnected   int
@@ -681,7 +682,14 @@ func newHostServer(t *testing.T, opts hostOptions) *hostServer {
 		CheckOrigin: func(*http.Request) bool { return true },
 		Compression: false,
 	})
-	server := httptest.NewServer(handler)
+	// Behind the same JSON-protocol gate a real Host puts in front of its
+	// WebSocket handler, so a dial that a Host would answer 400 fails here too.
+	server := httptest.NewServer(hostlink.RequireJSONSubprotocol(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		host.mu.Lock()
+		host.upgradeHeaders = append(host.upgradeHeaders, r.Header.Clone())
+		host.mu.Unlock()
+		handler.ServeHTTP(w, r)
+	})))
 	t.Cleanup(func() {
 		// Bounded Shutdown first: an unbounded Close waits for the outstanding
 		// request that a wedged read loop is still holding, so this order is
@@ -698,6 +706,14 @@ func newHostServer(t *testing.T, opts hostOptions) *hostServer {
 
 func (h *hostServer) target() hostlink.Target {
 	return hostlink.Target{Host: h.id, Endpoint: sessionwire.InternalEndpoint(h.url)}
+}
+
+// upgrades reports the HTTP headers of every upgrade request that passed the
+// JSON-protocol gate.
+func (h *hostServer) upgrades() []http.Header {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return append([]http.Header(nil), h.upgradeHeaders...)
 }
 
 func (h *hostServer) connects() []connectRecord {
