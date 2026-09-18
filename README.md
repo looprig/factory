@@ -351,6 +351,20 @@ pooled advertisement is still never selected, because Factory cannot see which
 tenants a Host serves and refusing is the only enforcement of specification
 section 12 available to it.
 
+**Every command is a disposition command (Gap 2).** Input, interrupt,
+restore and gate response are admitted into the same DISPOSITION inbox a create
+is, under the session's own immutable binding, so a Host that holds the session
+consumes and applies them; before this change they went to the legacy inbox,
+which no Host can reach. An oversized payload of any kind is stored by
+reference. A command for a session bound to the legacy protocol is refused
+`runtime_unavailable`. A "dispositions" sweep, composed in every composition,
+rejects a disposition command no Host applied before its apply deadline --
+only while it is `pending` or `claimed` under a lapsed claim, never once an
+attempt exists -- and a retry of it then answers `rejected /
+runtime_unavailable`. `Commands` accordingly names the disposition admission,
+retry read, payload upload, rejection and due query in place of `AdmitCommand`
+and `GetCommand`; a `*sessionstore.Store` satisfies it.
+
 **One gap is declared rather than worked around.** The released Host serves
 HostLink per tenant, at `/hostlink/<tenant>`, and its capacity report
 advertises ONE `internal_endpoint`; Core names no convention for deriving a

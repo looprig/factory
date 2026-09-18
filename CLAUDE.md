@@ -997,17 +997,20 @@ supplies both `WithSessionBinding` and `WithPublicCreates`, and refuses
 `runtime_unavailable` when it does not; there is no
 `ErrCreateIdentityProtocolUnavailable` any more, and the legacy create is refused
 before any durable write and routed to by no edge. The durable cases in
-`durable_test.go` seed a pre-existing legacy-bound catalog row directly, because
-a released store may still hold such sessions and commands against them must
-still be admitted.
+`durable_test.go` seed a **disposition-bound** session through the store's
+public-create plane: every command is admitted into the disposition family
+(Gap 2, below), and a command for a legacy-bound session is refused
+`runtime_unavailable`.
 
 **`A3.3-retryable` is settled, and the answer is 422.** `runtime_unavailable`
 does **not** map to 503. The set was **enumerated at the pin**: six `refusal()`
 sites in `internal/admission/service.go` carrying **four distinct conditions** —
 a create's `AgentID` naming no configured target (`:184`, `:358`), the create
 reservation this composition cannot author (`:186`), an **existing** session's
-pinned target no longer being configured (`:272`), and a payload past
-`MaxInboxPayloadBytes` (`:279`, `:391`). **Every one is permanent** until the
+pinned target no longer being configured (`:272`), and — since Gap 2 replaced
+the oversized-payload refusal, which the disposition family stores by reference
+instead — a session bound to the **legacy** protocol
+(`ErrLegacySessionUnsupported`, classified in `commandRefusal`). **Every one is permanent** until the
 deployment's configuration or the request itself changes, and that — not any
 inability to tell a transient member apart — is the argument: `retryable:true`
 promises that repeating the identical bytes could succeed, and none of the four
@@ -1533,6 +1536,48 @@ operations with `Supports`. The scan is unchanged — parsed from the pinned sou
 if `go.mod` has moved off `pinnedCoreVersion`, with
 `TestTheHostLinkVocabularyScanSeesANewType` as its positive control — so the
 next growth asks a human again.
+
+### Gap 2: every command is a disposition command
+
+**A session created on a Host can now be talked to.** Until this change only
+the create was admitted into the DISPOSITION family; input, interrupt, restore
+and gate response went to the LEGACY inbox through `AdmitCommand`, which a Host
+can never reach (it takes residency through `AcquireResidency`, which pins
+disposition), and which the store refuses for a disposition session anyway. So a
+session could be created on a Host and never spoken to again.
+
+- **Admission.** `internal/admission` admits all five kinds with
+  `AdmitDispositionCommand`, under the binding the catalog holds (or, on a
+  retry, the winner's own descriptor binding — the store requires equality and
+  nothing here constructs one). The retry read is `GetDispositionCommand`. An
+  oversized payload of any kind is uploaded with `PutCommandPayload` and
+  admitted by reference (A3.1 step 5), because the disposition inbox compares a
+  retry on digest and size rather than on the object reference;
+  `ErrPayloadProtocolUnavailable` is gone. `commandRefusal` is the one
+  classifier: a content mismatch is `command_rejected`, the store's
+  `binding.protocol_mode` refusal (invalid or conflict — never backend) is
+  `runtime_unavailable` wrapping `ErrLegacySessionUnsupported`, everything else
+  a fault. **No mixed-family admission remains**: `CommandStore` has no legacy
+  method, and `clientlink`'s seam-shape rule refuses a method returning a
+  legacy `InboxEntry`.
+- **The deadline sweep.** A Host never rejects on its own clock — it declares no
+  seam for `RejectDispositionCommand` and leaves the deadline to Factory — so
+  `admission.DispositionReconciler` (`dispositions.go`, the "dispositions"
+  sweep, composed unconditionally) pages one control shard per pass bounded at
+  **now**, and rejects with a zero residency only a command that is `pending`,
+  or `claimed` under a lapsed claim, past its deadline and carrying **no
+  attempt**. An `applying` command is never asked about: there is no
+  caller-authored rejection once an attempt exists. The legacy `Reconciler` still
+  runs, for legacy rows a store may already hold.
+- **What a rejection says.** The disposition record has no reason member, so
+  `command.StatusForDisposition` describes an **attemptless** rejection — whose
+  only producer in this fleet is that sweep — as `rejected /
+  runtime_unavailable`, as the legacy sweep did. A rejection carrying an attempt
+  (the store's not_applied settlement) stays unreadable.
+- **Seam.** `factory.Commands` gained `AdmitDispositionCommand`,
+  `GetDispositionCommand`, `PutCommandPayload`, `RejectDispositionCommand` and
+  `ListDueDispositionCommands`, and lost `AdmitCommand` and `GetCommand`. A
+  `*sessionstore.Store` satisfies it. Pre-1.0, a minor bump.
 
 ### B5: the attach caller, and what triggers it
 
