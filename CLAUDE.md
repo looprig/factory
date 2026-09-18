@@ -1569,6 +1569,22 @@ session could be created on a Host and never spoken to again.
   attempt**. An `applying` command is never asked about: there is no
   caller-authored rejection once an attempt exists. The legacy `Reconciler` still
   runs, for legacy rows a store may already hold.
+- **Neither sweep starves (the B5 spec gate's F3).** The due view is
+  deadline-ordered from the head, and the head is where rows a sweep skips pile
+  up — applying commands, live claims, and (for placement) expired commands. A
+  pass that always re-read from the head would never again reach a row behind
+  more than `MaxDuePerSweep*MaxConcurrent` of them. So `DispositionReconciler`
+  and `placement.PendingSweeper` keep the store's continuation per shard, as the
+  gate sweeper already did: a truncated pass's successor over that shard resumes
+  from it, a pass that reaches the end re-arms at the head against a fresh
+  bound, a continuation the store refuses (`InboxErrorCursor`) is dropped, and a
+  transient fault keeps it. Retirement keeps the head short; the positions are
+  what make each sweep correct when it does not. A resumed pass carries the
+  bound its cycle started with, so a command admitted mid-cycle is met on the
+  next cycle. `TestALiveCreateBehindMoreThanAPassOfExpiredRowsIsStillPlaced` is
+  the gate's probe, committed. Every truncated pass of the commands,
+  dispositions, gates and placement sweeps is logged at WARN (`warnTruncated`);
+  it was computed and discarded.
 - **What a rejection says.** The disposition record has no reason member, so
   `command.StatusForDisposition` describes an **attemptless** rejection — whose
   only producer in this fleet is that sweep — as `rejected /

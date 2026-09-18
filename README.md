@@ -361,7 +361,10 @@ reference. A command for a session bound to the legacy protocol is refused
 rejects a disposition command no Host applied before its apply deadline --
 only while it is `pending` or `claimed` under a lapsed claim, never once an
 attempt exists -- and a retry of it then answers `rejected /
-runtime_unavailable`. `Commands` accordingly names the disposition admission,
+runtime_unavailable`. The deadline and placement sweeps each keep a position
+per shard across passes, so a live command behind more than a pass of rows
+they must skip is still reached, and a pass that ends with a shard's backlog
+unread is logged at WARN. `Commands` accordingly names the disposition admission,
 retry read, payload upload, rejection and due query in place of `AdmitCommand`
 and `GetCommand`; a `*sessionstore.Store` satisfies it.
 
