@@ -215,7 +215,6 @@ func RequiredOptions() []Option {
 		WithSessionReader(seams),
 		WithCommands(seams),
 		WithDirectory(seams),
-		WithPlacementController(seams),
 		WithCatalog(seams),
 		WithGates(seams),
 		WithHostTargets(seams),

@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"log/slog"
 	"net/http"
 	"strings"
 	"time"
@@ -135,6 +136,8 @@ type config struct {
 	sessionBinding SessionBindingTemplate
 	publicCreates  PublicCreates
 	objects        ObjectLimits
+	pending        PendingCommands
+	logger         *slog.Logger
 
 	ui   http.Handler
 	uiFS fs.FS
@@ -235,7 +238,10 @@ func WithDirectory(d Directory) Option {
 	})
 }
 
-// WithPlacementController supplies the placement controller.
+// WithPlacementController supplies a PlacementController. Optional since
+// v0.3.0, and nothing reads the value; see PlacementController.
+//
+// Deprecated: nothing reads it. See PlacementController.
 func WithPlacementController(p PlacementController) Option {
 	return option("WithPlacementController", func(c *config) error {
 		if p == nil {

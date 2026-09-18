@@ -1332,8 +1332,8 @@ Host's gate; with the header absent every dial in the package fails, and
 `TestTheStandInRefusesAnUpgradeThatDoesNotNameTheJSONProtocol` pins the gate so
 it cannot be quietly weakened.
 
-**The capability gate, and the one transient it must not misreport.** Bind and
-unbind are admitted against the `hostlink_methods` the Host advertised in its
+**The capability gate, and the one transient it must not misreport.** Bind,
+unbind and attach are admitted against the `hostlink_methods` the Host advertised in its
 connect reply, snapshotted under `mu`, and refused locally with
 `*UnsupportedMethodError` otherwise. Between a dropped connection and the next
 reply there is no set to admit against, and that window is refused with
@@ -1507,14 +1507,12 @@ The Kubernetes adapter is **internal**, built as **two binaries from the one
 `factory.PlacementController`'s `EnsurePlacement(ctx, sessionstore.DesiredWorkload)`
 predates that answer and cannot identify a workload — a `DesiredWorkload` is a
 payload and a version label with no tenant, session or generation — so nothing
-here implements it. Reconciling the public option surface with H5 (most likely
-by deleting the option, since the adapter is internal) is A9.1/D1.1 composition
-work and is deliberately not done here.
+here implements it. B5 dropped its requirement (see below); the option is still
+accepted.
 
 ### One gap closed by Core, one still declared
 
-**The wire carries an attachment since `core v0.8.0`, and the caller that sends
-it is not built.** The current pin is `core v0.9.1`. A4.2 step 2 has the
+**The wire carries an attachment since `core v0.8.0`, and B5 sends it.** The current pin is `core v0.9.1`. A4.2 step 2 has the
 selected candidate asked to acquire or attach. At `core v0.7.0` no request
 could carry that — bind and unbind refuse a zero `LeaseEpoch`, drain asks a Host
 to *give up* a session —
@@ -1530,20 +1528,69 @@ bind still refuses a zero epoch, `epoch_mismatch` still carries the **other
 holder's** epoch and Core still names no `lease_held`, and the vocabulary remains
 the twelve names introduced by v0.8.0. Core v0.9.1 additionally puts the
 optional `hostlink_methods` capability signal on the negotiation response; the
-HostLink transport retains it and gates its reserved bind and unbind operations
-with `Supports`. The scan is unchanged — parsed from the pinned source, refused
+HostLink transport retains it and gates its reserved bind, unbind and attach
+operations with `Supports`. The scan is unchanged — parsed from the pinned source, refused
 if `go.mod` has moved off `pinnedCoreVersion`, with
 `TestTheHostLinkVocabularyScanSeesANewType` as its positive control — so the
 next growth asks a human again.
 
-`OutcomeAttachPooled` still **names** a Host and stops, and the reason is now the
-caller, not the wire. A caller sending `hostlink.attach` to a **v0.1.0 Host**
-has the method resolved as a channel and is answered `runtime_unavailable` from
-the not-bound branch, indistinguishable from a Host that genuinely refused; an
-attach caller must therefore gate on the negotiated `Supports` result. The
-HostLink transport already applies that rule to bind and unbind, but no attach
-caller or driver is shipped, so it lives above this package and is owed, not
-shipped.
+### B5: the attach caller, and what triggers it
+
+**`OutcomeAttachPooled` is now acted on.** With `Config.Links` composed (the
+root composes it over the HostLink pool as `placementLinks`), `Reconcile`'s
+pooled arm runs `placePooled` under the claim: re-read the catalog and the
+owner, page the candidates, ask each ranked admissible one to attach, and bind
+with the epoch the **attach returned**. Without `Links` it still only names the
+candidate, which is what every pre-B5 test drives.
+
+- **The host fence is the candidate's capacity report**, and `attachRequest` is
+  the only builder. `actor_id` is the sweep's service identity, `mode` comes
+  from the catalog (`attachMode`: no journal progress and no checkpoint is
+  `create`), and the idempotency key names the intent and **not the Host**,
+  because section 15 step 5 retries "through the same key" and the retry may
+  reach another Host.
+- **Every answer has one meaning, in `attachAnswer`:** accepted → bind and wake;
+  `epoch_mismatch` → the registry was stale, abandon the page, back off, re-run
+  from the owner read (bounded by `ReplaceAttempts`, `ErrRegistryStale` after);
+  any other code, `runtime_unavailable` included → this candidate refused, try
+  the next; `ErrAttachUnsupported` → exclude and **log by Host id**;
+  `ErrHostUnreachable` → skip; anything else → **abort**, because the request
+  may have reached the Host. `current_lease_epoch` is never read.
+- **Classification lives in the composition's adapter** (`classifyAttach` in
+  `compose.go`), because this package names no transport type for routing's
+  reason. Only failures before the request left the process become
+  `ErrHostUnreachable`.
+- **The owner and the record are re-read under the claim.** The pre-claim read
+  is what lets an owned session skip the claim; acting on it after the claim
+  would widen the window between the read and the claim into the whole
+  acquisition. `TestTheOwnerIsRereadUnderTheClaim` is the reader.
+- **The route is transient.** `bindAndDeliver` binds, delivers the wake, and
+  unbinds a route it created; a route that already existed (a viewer's) is left
+  alone. Leaving placement's routes in the pool would pin links against the
+  reaper and make the next placement of the same session to another Host a
+  binding conflict.
+- **An owned session with a wake is bound with the REGISTRY's epoch** (section
+  15 step 1) and takes no claim; with nothing to wake it touches no Host.
+
+**The trigger is `PendingSweeper`, a sweep over the disposition inbox**
+(`pending.go`), composed only with `WithPendingCommands`. The inbox files every
+open disposition command at its apply deadline, so one page at
+`now + ApplyDeadline` is every command still open. A session is placed when it
+has a pending or claimed command inside its deadline, or an **applying** one at
+any age (only a successor runtime settles it); the wake is its live pending
+commands. It is a sweep and not admission because I1.2 case 3 kills the
+admitting replica, and section 10.4 lets any replica reconcile due work; an
+admission-time kick would be a latency optimisation on top, and is not built.
+
+**`WithPlacementController` is no longer required.** Nothing ever read it but
+the required-seams table; `EnsurePlacement(DesiredWorkload)` cannot identify a
+workload. The option and type remain (removal is a break) and are marked
+`Deprecated`.
+
+**Known gap, stated rather than worked around:** the released Host serves
+HostLink per tenant at `/hostlink/<tenant>` and advertises one endpoint, and
+Core names no convention for a tenant's address on a Host, so a pooled Host is
+reachable from this pool only for the tenant its advertised endpoint names.
 
 **Tenant-exclusive pooled capacity is refused, not admitted.** Section 12 makes
 Factory placement the enforcer of tenant exclusivity for a pooled Host without
@@ -1557,8 +1604,7 @@ pooled placement at all until the directory carries a tenant dimension, which is
 H8's per-tenant Department and a specification section 7 change that is not this
 repository's to book.
 
-Not built here: the caller that sends the A4.2 step 2 attachment,
-drain-before-delete of D2.2, and the authorship of a dedicated workload's
+Not built here: drain-before-delete of D2.2, and the authorship of a dedicated workload's
 payload — `Desired` is an INPUT, because what a launch template should contain
 is a composition question A9.1 owns.
 

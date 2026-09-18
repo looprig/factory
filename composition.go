@@ -3,6 +3,7 @@ package factory
 import (
 	"context"
 	"fmt"
+	"log/slog"
 
 	sessionwire "github.com/looprig/core/sessionwire/v1"
 	"github.com/looprig/factory/identity"
@@ -428,4 +429,41 @@ func cloneTemplates(templates []LaunchTemplate) []LaunchTemplate {
 		copied[i].Workload.Payload = append([]byte(nil), template.Workload.Payload...)
 	}
 	return copied
+}
+
+// WithPendingCommands supplies the durable query pooled placement is triggered
+// from. Optional.
+//
+// With it, a "placement" sweep runs on the reconcile interval: one control
+// shard per pass, every session with a command still open and no live owner is
+// attached to the first ranked admissible Host that advertises
+// hostlink.attach and accepts, bound with the epoch that Host answered, and
+// woken with its pending commands. The trigger is the durable inbox rather
+// than admission so that a replica which did not admit a command -- because
+// the one that did has died -- still places the session.
+//
+// Without it, this replica places nothing: a session is made resident only by
+// another replica composed with it, or by a Host that attaches itself.
+func WithPendingCommands(p PendingCommands) Option {
+	return option("WithPendingCommands", func(cfg *config) error {
+		if p == nil {
+			return nilDependency("WithPendingCommands")
+		}
+		cfg.pending = p
+		return nil
+	})
+}
+
+// WithLogger supplies the logger for this module's operational diagnostics:
+// today, a pooled candidate excluded because it does not advertise
+// hostlink.attach, and a session with open commands that could not be placed.
+// Optional; slog.Default() is used when it is not supplied.
+func WithLogger(l *slog.Logger) Option {
+	return option("WithLogger", func(cfg *config) error {
+		if l == nil {
+			return &OptionError{Option: "WithLogger", Err: ErrNilDependency}
+		}
+		cfg.logger = l
+		return nil
+	})
 }

@@ -50,8 +50,9 @@ import (
 // admitted an input, or that created a session, is the same error as one that
 // restores, and a guard naming only the instance the runbook mentioned would
 // pass on every one of them. The five V1 commands are Admitter's methods; the
-// sixth is the legacy create; EnsurePlacement is the other way a viewer could
-// cause a cold session to become resident.
+// sixth is the legacy create; EnsurePlacement and Attach are the other ways a
+// viewer could cause a cold session to become resident -- Attach is the
+// HostLink request B5 sends, and it is the one that actually does.
 var admissionEntryPoints = []string{
 	"AdmitCreate",
 	"AdmitGateResponse",
@@ -59,6 +60,7 @@ var admissionEntryPoints = []string{
 	"AdmitInterrupt",
 	"AdmitLegacyCreate",
 	"AdmitRestore",
+	"Attach",
 	"EnsurePlacement",
 }
 

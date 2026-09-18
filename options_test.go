@@ -31,7 +31,6 @@ func TestRequiredOptionsCompose(t *testing.T) {
 		"reads":      server.cfg.reads != nil,
 		"commands":   server.cfg.commands != nil,
 		"directory":  server.cfg.directory != nil,
-		"placement":  server.cfg.placement != nil,
 		"clock":      server.cfg.clock != nil,
 		"uuids":      server.cfg.uuids != nil,
 	}
@@ -144,6 +143,8 @@ func TestNewRejectsANilDependency(t *testing.T) {
 		WithCommands(nil),
 		WithDirectory(nil),
 		WithPlacementController(nil),
+		WithPendingCommands(nil),
+		WithLogger(nil),
 		WithClock(nil),
 		WithUUIDSource(nil),
 		WithUIHandler(nil),

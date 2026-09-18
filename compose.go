@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"sync"
 
@@ -41,6 +42,9 @@ type components struct {
 	gateSweeper    *reconcile.GateSweeper
 	placement      *placement.Reconciler
 	records        *placement.RecordSweeper
+	// pending is nil unless WithPendingCommands supplied the durable query
+	// that triggers placement; see sweeps.
+	pending *placement.PendingSweeper
 }
 
 // composeComponents builds the component graph from a validated composition.
@@ -148,9 +152,36 @@ func composeComponents(cfg config, credentials *internalidentity.Authenticator) 
 		HolderID:       cfg.replicaID,
 		ClaimTTL:       cfg.reconcile.ClaimTTL,
 		CandidateLimit: cfg.reconcile.MaxDuePerSweep,
+		// B5: the pooled arm ATTACHES through this replica's HostLink pool
+		// and binds with the epoch the Host answered, rather than naming a
+		// candidate and stopping. The actor is the sweep's service identity:
+		// placement runs from a sweeper with no user behind it, and Core's
+		// actor_id names who asked for residency, never whose authority a
+		// command carries.
+		Links:   placementLinks{pool: pool},
+		ActorID: cfg.service.Subject(),
+		Logger:  logger(cfg),
 	})
 	if err != nil {
 		return nil, &OptionError{Option: "WithReconcileLimits", Err: err}
+	}
+	var pending *placement.PendingSweeper
+	if cfg.pending != nil {
+		pending, err = placement.NewPendingSweeper(placement.PendingSweeperConfig{
+			Authorizer: cfg.authorizer,
+			Pending:    cfg.pending,
+			Placer:     placer,
+			Clock:      cfg.clock,
+			// The horizon is the apply deadline admission gives every
+			// command, so every command accepted up to now is inside it.
+			Horizon:   cfg.reconcile.ApplyDeadline,
+			PageLimit: cfg.reconcile.MaxDuePerSweep,
+			MaxPages:  cfg.reconcile.MaxConcurrent,
+			Logger:    logger(cfg),
+		})
+		if err != nil {
+			return nil, &OptionError{Option: "WithPendingCommands", Err: err}
+		}
 	}
 	records, err := placement.NewRecordSweeper(placement.SweeperConfig{
 		Targets: cfg.hostTargets,
@@ -175,6 +206,7 @@ func composeComponents(cfg config, credentials *internalidentity.Authenticator) 
 		gateSweeper:    gateSweeper,
 		placement:      placer,
 		records:        records,
+		pending:        pending,
 	}, nil
 }
 
@@ -253,6 +285,73 @@ func (b poolBinder) DeliverCommand(ctx context.Context, tenant sessionwire.Tenan
 	return b.pool.DeliverCommand(ctx, tenant, session, delivery)
 }
 
+// placementLinks is the adapter between internal/placement and the HostLink
+// pool, and the ONE place a transport failure is classified into placement's
+// vocabulary. It holds no state.
+//
+// The classification is the whole of its job, and each arm is a decision:
+//
+//   - A Host's own HostLinkError becomes *placement.AttachRefusal, whose code
+//     placement branches on.
+//   - A method the Host did not advertise becomes ErrAttachUnsupported: the
+//     pool refused it LOCALLY and nothing was sent, which is what lets a mixed
+//     fleet exclude a Host that predates attach rather than read its
+//     runtime_unavailable as a refusal.
+//   - A failure BEFORE the request left this process -- a dial that failed, a
+//     link between connections, a pool at its link ceiling -- becomes
+//     ErrHostUnreachable, the one transport failure placement moves past.
+//   - Everything else is returned as itself, and placement ABORTS on it: the
+//     request may have reached the Host, and the Host may have acted.
+type placementLinks struct{ pool *hostlink.Pool }
+
+func (l placementLinks) Attach(ctx context.Context, endpoint sessionwire.InternalEndpoint, req sessionwire.HostLinkAttachRequest) (sessionwire.HostLinkRegistryObservation, error) {
+	observation, err := l.pool.Attach(ctx, hostlink.Target{Host: req.HostID, Endpoint: endpoint}, req)
+	return observation, classifyAttach(err)
+}
+
+func (l placementLinks) Bind(ctx context.Context, endpoint sessionwire.InternalEndpoint, req sessionwire.HostLinkBindRequest) error {
+	return l.pool.Bind(ctx, hostlink.Target{Host: req.HostID, Endpoint: endpoint}, req)
+}
+
+func (l placementLinks) Unbind(ctx context.Context, req sessionwire.HostLinkUnbindRequest) error {
+	return l.pool.Unbind(ctx, req)
+}
+
+func (l placementLinks) DeliverCommand(ctx context.Context, tenant sessionwire.TenantID, session sessionwire.SessionID, delivery sessionwire.HostLinkCommandDelivery) error {
+	return l.pool.DeliverCommand(ctx, tenant, session, delivery)
+}
+
+func (l placementLinks) RouteFor(tenant sessionwire.TenantID, session sessionwire.SessionID) (sessionwire.HostID, bool) {
+	return l.pool.RouteFor(tenant, session)
+}
+
+// classifyAttach maps a pool attach failure onto placement's vocabulary. See
+// placementLinks for what each arm means.
+func classifyAttach(err error) error {
+	if err == nil {
+		return nil
+	}
+	var refusal *hostlink.HostRefusal
+	if errors.As(err, &refusal) {
+		return &placement.AttachRefusal{HostLinkError: refusal.HostLinkError}
+	}
+	if errors.Is(err, hostlink.ErrUnsupportedMethod) {
+		return fmt.Errorf("%w: %w", placement.ErrAttachUnsupported, err)
+	}
+	if errors.Is(err, hostlink.ErrDialFailed) || errors.Is(err, hostlink.ErrLinkReconnecting) || errors.Is(err, hostlink.ErrLinkLimit) {
+		return fmt.Errorf("%w: %w", placement.ErrHostUnreachable, err)
+	}
+	return err
+}
+
+// logger is the composition's logger, defaulting to the process's.
+func logger(cfg config) *slog.Logger {
+	if cfg.logger != nil {
+		return cfg.logger
+	}
+	return slog.Default()
+}
+
 // departmentTargets resolves a create's agent against the CONFIGURED launch
 // targets, and against nothing else.
 //
@@ -322,7 +421,7 @@ type sweep struct {
 // touches, and a claim licenses nothing -- but it is fixed so a test can state
 // what this replica does rather than observe what it happened to do.
 func (c *components) sweeps(cfg config) []sweep {
-	return []sweep{
+	passes := []sweep{
 		{name: "commands", run: func(ctx context.Context) error {
 			_, err := c.commandSweeper.Sweep(ctx, cfg.service)
 			return err
@@ -341,6 +440,16 @@ func (c *components) sweeps(cfg config) []sweep {
 			return err
 		}},
 	}
+	if c.pending != nil {
+		// B5's trigger, composed only when the durable query it reads was
+		// supplied, so a composition without one runs exactly the three
+		// sweeps it always did.
+		passes = append(passes, sweep{name: "placement", run: func(ctx context.Context) error {
+			_, err := c.pending.Sweep(ctx, cfg.service)
+			return err
+		}})
+	}
+	return passes
 }
 
 // idleLink keeps the pool's idle reaper on the same cadence as the sweeps.

@@ -65,9 +65,12 @@ an explicit `nil` dependency is an error rather than a request for the default,
 because the seams that have defaults are defaulted by their ABSENCE.
 
 The seams a deployer supplies are `identity.Verifier`, `Authorizer`,
-`SessionReader`, `Commands`, `Directory`, `PlacementController`, the CSRF
-configuration, and optionally a `Clock`, a `UUIDSource`, a session cookie name,
-a default tenant, limits and a UI. Authentication is supplied as a VERIFIER and
+`SessionReader`, `Commands`, `Directory`, the CSRF configuration, and
+optionally a `Clock`, a `UUIDSource`, a session cookie name, a default tenant,
+limits, a UI, a `*slog.Logger` (`WithLogger`) and the `PendingCommands` query
+that triggers pooled placement (`WithPendingCommands`). `PlacementController`
+is no longer required and nothing reads it; the option is still accepted so an
+existing composition keeps composing. Authentication is supplied as a VERIFIER and
 not as an authenticator: Factory composes exactly one authenticator, because
 which credential authenticated a request must have one answer and a second one
 is an origin guard that skips its CSRF rules silently. The
@@ -329,17 +332,34 @@ added `ObserveWorkload`, `RequestDrain`, and `DeleteWorkload` as `EnsureWorkload
 companions rides `v0.2.0`. Once `v1.0.0` is cut, widening it becomes a major
 release.
 
-**Two gaps are declared rather than worked around.** The pinned `core v0.9.1`
-carries `HostLinkAttachRequest` and the negotiation reply's optional
-`hostlink_methods` capability signal, but this package has no caller that sends
-attach. `internal/placement` therefore names the selected Host in
-`OutcomeAttachPooled` and stops there; a future caller must gate attach on the
-negotiated `Supports` result because an older Host routes the unknown method as
-a channel and answers `runtime_unavailable`. The HostLink transport does use
-that signal to refuse unsupported bind and unbind operations locally. And a
-`tenant_exclusive` pooled advertisement is never selected, because Factory
-cannot see which tenants a Host serves and refusing is the only enforcement of
-specification section 12 available to it.
+**Pooled placement attaches (B5).** With `WithPendingCommands`, a
+"placement" sweep pages one control shard of the disposition inbox per
+interval and, for each session with an open command and no live owner, asks
+the first ranked admissible candidate to `hostlink.attach` -- fenced by that
+candidate's `host_id`/`host_generation` from its capacity report, with the
+sweep's service identity as `actor_id` -- then binds with the lease epoch the
+Host **answered** and delivers the pending commands as a wake. A candidate that
+did not advertise `hostlink.attach` in its connect reply is never sent one: it
+is excluded and logged by Host id, because an older Host routes the method as
+a channel and answers `runtime_unavailable`, indistinguishable from a genuine
+refusal. `epoch_mismatch` means the registry was stale: placement re-reads it
+and retries, bounded with backoff, and never binds with the refusal's
+`current_lease_epoch` (the other holder's). Every other coded refusal moves on
+to the next candidate; a failure after the request may have reached the Host
+aborts the attempt so no second attach is put in flight. A `tenant_exclusive`
+pooled advertisement is still never selected, because Factory cannot see which
+tenants a Host serves and refusing is the only enforcement of specification
+section 12 available to it.
+
+**One gap is declared rather than worked around.** The released Host serves
+HostLink per tenant, at `/hostlink/<tenant>`, and its capacity report
+advertises ONE `internal_endpoint`; Core names no convention for deriving a
+tenant's HostLink address from a Host's. Factory dials the advertised endpoint
+as-is and keys its links by Host, so a pooled Host is reachable here for the
+tenant its advertised endpoint names, and an attach for any other tenant is
+refused by that Host (`runtime_unavailable`, foreign tenant) and placed
+elsewhere. Cross-tenant pooled placement onto one Host needs that convention in
+Core first.
 
 ## Status
 

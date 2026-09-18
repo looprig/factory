@@ -82,6 +82,8 @@ func publicSeams() map[reflect.Type][]reflect.Type {
 		iface[factory.HostTargets]():        {iface[placement.TargetSweep]()},
 		iface[factory.HostLinkCredential](): {iface[hostlink.Credential]()},
 		iface[factory.WorkloadController](): {iface[placement.WorkloadController]()},
+		// B5's trigger: the disposition due view the pending sweep pages.
+		iface[factory.PendingCommands](): {iface[placement.PendingCommands]()},
 		iface[factory.Directory](): {
 			iface[admission.Directory](), iface[httpapi.Directory](),
 			iface[placement.Directory](), iface[routing.Resolver](),
@@ -237,6 +239,9 @@ func allSeams() []reflect.Type {
 		// the repair relay, which this composition does not build.
 		iface[routing.Binder](),
 		iface[routing.Hinter](),
+		// internal/placement's HostLink half, implemented by this composition
+		// over the pool (placementLinks), for routing.Binder's reason.
+		iface[placement.HostLinks](),
 	}
 }
 

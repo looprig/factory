@@ -79,10 +79,35 @@ type Directory interface {
 	Candidates(ctx context.Context, req sessionstore.ListCompatibleHostsRequest) (sessionstore.HostTargetPage, error)
 }
 
-// PlacementController drives desired placement.
+// PlacementController is the placement seam this module shipped before it had
+// a placement caller.
+//
+// It is NO LONGER REQUIRED, and nothing reads it. EnsurePlacement takes a
+// DesiredWorkload, which names no tenant, session or generation, so no
+// implementation could identify what it was asked to place; H5 put the
+// platform adapter behind WorkloadController instead, and pooled placement is
+// driven by this module's own HostLink attach (see WithPendingCommands). The
+// option is still ACCEPTED, so a composition that supplies one keeps
+// composing; removing the type or the option would break that caller for no
+// gain.
+//
+// Deprecated: nothing reads it. Pooled placement attaches through the HostLink
+// and dedicated placement goes through WorkloadController.
 type PlacementController interface {
 	EnsurePlacement(ctx context.Context, desired sessionstore.DesiredWorkload) error
 	ReleasePlacement(ctx context.Context, tenant sessionwire.TenantID, session sessionwire.SessionID) error
+}
+
+// PendingCommands is the disposition inbox's service-plane due query: the
+// durable record of every session with open work. A *sessionstore.Store
+// satisfies it.
+//
+// It is what TRIGGERS pooled placement. With it, every sweep interval pages
+// one control shard for commands still open, and each session with one and no
+// live owner is attached to a Host and woken; see WithPendingCommands.
+type PendingCommands interface {
+	ControlShards() int
+	ListDueDispositionCommands(ctx context.Context, req sessionstore.ListDueDispositionCommandsRequest) (sessionstore.DispositionDueCommandPage, error)
 }
 
 // WorkloadController owns the lifecycle of a dedicated session's workload.
@@ -198,7 +223,6 @@ func New(opts ...Option) (*Server, error) {
 		{"WithSessionReader", cfg.reads != nil},
 		{"WithCommands", cfg.commands != nil},
 		{"WithDirectory", cfg.directory != nil},
-		{"WithPlacementController", cfg.placement != nil},
 		{"WithCatalog", cfg.catalog != nil},
 		{"WithGates", cfg.gates != nil},
 		{"WithHostTargets", cfg.hostTargets != nil},
