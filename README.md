@@ -319,8 +319,12 @@ module. H5 keeps the Kubernetes adapter internal to `cmd/controller` alone;
 `cmd/factory` supplies no workload create/delete RBAC, so a nil controller is a
 supported configuration and a dedicated session reaching the tenant-facing
 replica is refused by name. Widening this exported method set is a source
-compatibility break for external implementations and must ship in the next
-major release.
+compatibility break for external implementations. **While this module is pre-1.0
+(owner ruling 2026-09-18), such a widening ships as a MINOR bump** — the `v0.x`
+contract every module in this workspace is released under — and the widening that
+added `EnsureWorkload`/`ObserveWorkload`/`RequestDrain`/`DeleteWorkload`'s
+companions rides `v0.2.0`. Once `v1.0.0` is cut, widening it becomes a major
+release.
 
 **Two gaps are declared rather than worked around.** The pinned `core v0.9.1`
 carries `HostLinkAttachRequest` and the negotiation reply's optional
