@@ -205,6 +205,9 @@ func (d *CentrifugeDialer) Dial(ctx context.Context, target Target, observer Obs
 	}
 
 	link := &centrifugeLink{host: target.Host, observer: observer, settled: make(chan error, 1)}
+	link.subs = map[string]*sessionSub{}
+	link.orphans = map[string]SessionSink{}
+	link.subscribeTimeout = d.limits.DialTimeout
 	link.client = centrifugego.NewJsonClient(string(target.Endpoint), centrifugego.Config{
 		// GetToken is the ONLY credential path, and Config.Token is
 		// deliberately left empty. Setting both looks like belt and braces and
@@ -332,6 +335,10 @@ type centrifugeLink struct {
 	// undelivered command, which is a retry loop against a Host that has
 	// already given its final answer.
 	terminal error
+
+	// subscriptionState is the live-tail half of the link (subscribe.go). Its
+	// maps are guarded by mu like everything above.
+	subscriptionState
 }
 
 func (l *centrifugeLink) Host() sessionwire.HostID { return l.host }
@@ -565,6 +572,11 @@ func (l *centrifugeLink) onConnecting(centrifugego.ConnectingEvent) {
 	if previousGeneration != nil {
 		previousGeneration.cancel()
 	}
+	// Every session tail on the connection that just went away is ended NOW,
+	// before the transport can resubscribe it on the next one. See
+	// endAllSubscriptions for why the transport's own resubscribe must never
+	// run: this link owns the order re-bind, then subscribe.
+	l.endAllSubscriptions(true)
 }
 
 // onConnected verifies the version the Host selected.
@@ -577,6 +589,7 @@ func (l *centrifugeLink) onConnected(e centrifugego.ConnectedEvent) {
 	negotiated, err := verifyNegotiation(e.Data)
 	if err != nil {
 		l.fail(err)
+		l.endAllSubscriptions(false)
 		// Closing from inside a transport callback would block the callback on
 		// the client's own teardown, so it is handed to a goroutine.
 		go l.client.Close()
@@ -587,8 +600,11 @@ func (l *centrifugeLink) onConnected(e centrifugego.ConnectedEvent) {
 			l.connecting = false
 		}
 		l.mu.Unlock()
+		// Only now, with a verified reply and a capability set to admit a bind
+		// against, may a sink lost to the previous connection re-bind.
+		l.restoreOrphans()
 	}
-	l.settle(err)
+	l.settleDial(err)
 }
 
 // onDisconnected reports a TERMINAL close.
@@ -600,7 +616,8 @@ func (l *centrifugeLink) onConnected(e centrifugego.ConnectedEvent) {
 func (l *centrifugeLink) onDisconnected(e centrifugego.DisconnectedEvent) {
 	err := &HostDisconnect{Host: l.host, Code: e.Code, Reason: e.Reason}
 	l.fail(err)
-	l.settle(err)
+	l.endAllSubscriptions(false)
+	l.settleDial(err)
 }
 
 // onMessage decodes one asynchronous Host observation.
@@ -630,7 +647,7 @@ func (l *centrifugeLink) onMessage(e centrifugego.MessageEvent) {
 	}
 }
 
-func (l *centrifugeLink) settle(err error) {
+func (l *centrifugeLink) settleDial(err error) {
 	l.once.Do(func() { l.settled <- err })
 }
 

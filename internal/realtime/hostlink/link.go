@@ -363,6 +363,18 @@ func (p *Pool) Bind(ctx context.Context, target Target, req sessionwire.HostLink
 		// The BINDING is not recorded, because the Host does not have it. The
 		// LINK is kept: the Host answered, so the connection is good, and
 		// discarding it would turn one lease disagreement into a dial storm.
+		//
+		// Except when the link is TERMINAL, which is the one failure that is
+		// not the Host answering. A dead link kept here would refuse every
+		// later bind for this Host before sending anything, and -- unlike an
+		// attach's -- a viewer's route pins it against the reaper, so a Host
+		// that closed this replica out would never be dialled again. Attach
+		// has evicted on this evidence since B5; a bind is the path Gap 3's
+		// re-bind after a lost tail takes, so it must too.
+		if terminalLinkError(err) {
+			p.dropLinkLocked(target.Host, pooled)
+			_ = pooled.link.Close(context.Background())
+		}
 		return err
 	}
 	pooled.bindings[key] = struct{}{}
@@ -469,10 +481,20 @@ func terminalLinkError(err error) bool {
 // be closed on this caller's evidence.
 func (p *Pool) evict(host sessionwire.HostID, stale *pooledLink) {
 	p.mu.Lock()
+	dropped := p.dropLinkLocked(host, stale)
+	p.mu.Unlock()
+	if dropped {
+		_ = stale.link.Close(context.Background())
+	}
+}
+
+// dropLinkLocked removes a dead link and every route naming its Host, if the
+// link is still the one the pool holds for that Host. It reports whether it
+// removed anything; closing the link is the caller's.
+func (p *Pool) dropLinkLocked(host sessionwire.HostID, stale *pooledLink) bool {
 	current, ok := p.links[host]
 	if !ok || current != stale {
-		p.mu.Unlock()
-		return
+		return false
 	}
 	delete(p.links, host)
 	for key, routed := range p.routes {
@@ -480,8 +502,7 @@ func (p *Pool) evict(host sessionwire.HostID, stale *pooledLink) {
 			delete(p.routes, key)
 		}
 	}
-	p.mu.Unlock()
-	_ = stale.link.Close(context.Background())
+	return true
 }
 
 // attachAnswers reports whether an accepted observation is about what the

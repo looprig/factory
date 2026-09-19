@@ -567,6 +567,24 @@ type hostServer struct {
 	clients        map[string]*centrifuge.Client
 	negotiation    string
 	methods        []string
+	// binds is which session channels each connection holds an accepted bind
+	// for, keyed by the Centrifuge client id. It is what the stand-in's
+	// subscribe gate reads, as host v0.2.1's Multiplexer.MaySubscribe does:
+	// a connection may subscribe to a channel only while it holds the bind
+	// that minted it, and a reconnect is a new client id that holds nothing.
+	binds map[string]map[string]bool
+	// subscribeAttempts counts every subscribe the stand-in answered, allowed
+	// or refused, per channel.
+	subscribeAttempts map[string]int
+	// subscribeHold, when set, delays every subscribe answer until it closes.
+	subscribeHold chan struct{}
+}
+
+// holdSubscribes delays every later subscribe answer until release closes.
+func (h *hostServer) holdSubscribes(release chan struct{}) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.subscribeHold = release
 }
 
 func newHostServer(t *testing.T, opts hostOptions) *hostServer {
@@ -587,8 +605,11 @@ func newHostServer(t *testing.T, opts hostOptions) *hostServer {
 		id:          hostOne,
 		node:        node,
 		clients:     map[string]*centrifuge.Client{},
+		binds:       map[string]map[string]bool{},
 		negotiation: opts.rawNegotiation,
-		methods:     append([]string(nil), methods...),
+
+		subscribeAttempts: map[string]int{},
+		methods:           append([]string(nil), methods...),
 	}
 
 	node.OnConnecting(func(_ context.Context, e centrifuge.ConnectEvent) (centrifuge.ConnectReply, error) {
@@ -657,20 +678,49 @@ func newHostServer(t *testing.T, opts hostOptions) *hostServer {
 			host.mu.Lock()
 			host.rpcCalls = append(host.rpcCalls, rpcCall{method: e.Method, data: append([]byte(nil), e.Data...)})
 			host.mu.Unlock()
+			var (
+				data []byte
+				err  error
+			)
 			if opts.rpc != nil {
-				data, err := opts.rpc(e.Method, e.Data)
-				cb(centrifuge.RPCReply{Data: data}, err)
-				return
+				data, err = opts.rpc(e.Method, e.Data)
 			}
 			// An empty body is the legitimate success shape. A non-empty body
 			// must be a bare Core HostLinkError; returning {} here would make
 			// the stand-in bless a malformed reply.
-			cb(centrifuge.RPCReply{}, nil)
+			if err == nil && len(data) == 0 {
+				host.recordBind(client.ID(), e.Method, e.Data)
+			}
+			cb(centrifuge.RPCReply{Data: data}, err)
+		})
+		client.OnSubscribe(func(e centrifuge.SubscribeEvent, cb centrifuge.SubscribeCallback) {
+			host.mu.Lock()
+			host.subscribeAttempts[e.Channel]++
+			allowed := host.binds[client.ID()][e.Channel]
+			hold := host.subscribeHold
+			host.mu.Unlock()
+			if hold != nil {
+				go func() {
+					<-hold
+					if !allowed {
+						cb(centrifuge.SubscribeReply{}, centrifuge.ErrorPermissionDenied)
+						return
+					}
+					cb(centrifuge.SubscribeReply{}, nil)
+				}()
+				return
+			}
+			if !allowed {
+				cb(centrifuge.SubscribeReply{}, centrifuge.ErrorPermissionDenied)
+				return
+			}
+			cb(centrifuge.SubscribeReply{}, nil)
 		})
 		client.OnDisconnect(func(centrifuge.DisconnectEvent) {
 			host.mu.Lock()
 			host.disconnected++
 			delete(host.clients, client.ID())
+			delete(host.binds, client.ID())
 			host.mu.Unlock()
 		})
 	})
@@ -702,6 +752,66 @@ func newHostServer(t *testing.T, opts hostOptions) *hostServer {
 	})
 	host.url = "ws" + strings.TrimPrefix(server.URL, "http")
 	return host
+}
+
+// recordBind applies an ACCEPTED bind or unbind to the stand-in's gate.
+func (h *hostServer) recordBind(client, method string, data []byte) {
+	var key struct {
+		TenantID  sessionwire.TenantID  `json:"tenant_id"`
+		SessionID sessionwire.SessionID `json:"session_id"`
+	}
+	if method != sessionwire.HostLinkMethodBind && method != sessionwire.HostLinkMethodUnbind {
+		return
+	}
+	if err := json.Unmarshal(data, &key); err != nil {
+		return
+	}
+	channel := sessionwire.HostLinkChannel(key.TenantID, key.SessionID)
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if method == sessionwire.HostLinkMethodUnbind {
+		delete(h.binds[client], channel)
+		return
+	}
+	if h.binds[client] == nil {
+		h.binds[client] = map[string]bool{}
+	}
+	h.binds[client][channel] = true
+}
+
+// publish puts one payload on a session channel, as a Host's tail does: once,
+// to whoever is subscribed, with no history.
+func (h *hostServer) publish(t *testing.T, channel string, data []byte) {
+	t.Helper()
+	if _, err := h.node.Publish(channel, data); err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+}
+
+// subscribers reports how many connections are subscribed to a channel.
+func (h *hostServer) subscribers(channel string) int {
+	return h.node.Hub().NumSubscribers(channel)
+}
+
+// subscribes reports how many subscribes to a channel the stand-in answered.
+func (h *hostServer) subscribes(channel string) int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.subscribeAttempts[channel]
+}
+
+// unsubscribeEveryone removes every connection's subscription to a channel,
+// server-side, with the given code.
+func (h *hostServer) unsubscribeEveryone(channel string, code uint32) {
+	h.mu.Lock()
+	clients := make([]*centrifuge.Client, 0, len(h.clients))
+	for _, client := range h.clients {
+		clients = append(clients, client)
+	}
+	h.mu.Unlock()
+	for _, client := range clients {
+		client.Unsubscribe(channel, centrifuge.Unsubscribe{Code: code, Reason: "stand-in"})
+	}
 }
 
 func (h *hostServer) target() hostlink.Target {
