@@ -41,6 +41,32 @@ func (r *publicationRecorder) unsubs() []uint32 {
 	return append([]uint32(nil), r.unsubscribed...)
 }
 
+// watchNoFatal is watch for a goroutine that may not call t.Fatal: it
+// answers nil when the subscribe fails or is not answered.
+func watchNoFatal(client *centrifugego.Client, channel string) *publicationRecorder {
+	sub, err := client.NewSubscription(channel)
+	if err != nil {
+		return nil
+	}
+	recorder := &publicationRecorder{}
+	subscribed := make(chan struct{}, 1)
+	sub.OnSubscribed(func(centrifugego.SubscribedEvent) { send(subscribed, struct{}{}) })
+	sub.OnUnsubscribed(func(e centrifugego.UnsubscribedEvent) {
+		recorder.mu.Lock()
+		recorder.unsubscribed = append(recorder.unsubscribed, e.Code)
+		recorder.mu.Unlock()
+	})
+	if err := sub.Subscribe(); err != nil {
+		return nil
+	}
+	select {
+	case <-subscribed:
+		return recorder
+	case <-time.After(waitFor):
+		return nil
+	}
+}
+
 func watch(t *testing.T, client *centrifugego.Client, channel string) *publicationRecorder {
 	t.Helper()
 	sub, err := client.NewSubscription(channel)
