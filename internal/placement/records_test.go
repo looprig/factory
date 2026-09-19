@@ -156,7 +156,7 @@ func (f *sweepFixture) publish(t *testing.T, host sessionwire.HostID, generation
 	if _, err := f.store.PublishHostTarget(context.Background(), sessionstore.PublishHostTargetRequest{
 		Key: sweepTargetKey, HostID: host, HostGeneration: generation, ObservedAt: f.clock.now,
 		Advertisement: sessionstore.HostAdvertisement{
-			InternalEndpoint:  sessionwire.InternalEndpoint("wss://" + string(host) + ".internal/hostlink"),
+			InternalEndpoint:  sessionwire.InternalEndpoint("wss://" + string(host) + ".internal"),
 			IsolationClass:    sessionwire.HostIsolationClassCrossTenantIsolated,
 			Accepting:         true,
 			AvailableCapacity: capacity,

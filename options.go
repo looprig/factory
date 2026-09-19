@@ -580,8 +580,11 @@ func (l ClientLinkLimits) Validate() error {
 
 // HostLinkLimits bounds this replica's demand-driven HostLink pool.
 type HostLinkLimits struct {
-	// MaxLinks bounds concurrent HostLinks. One link multiplexes every session
-	// binding to one Host, so this bounds Hosts, not sessions.
+	// MaxLinks bounds concurrent HostLinks. Since v0.5.0 a Host serves each
+	// tenant over its own HostLink, so one link multiplexes every session
+	// binding of ONE tenant to one Host, and this bounds (Host, tenant) pairs
+	// -- Hosts times the tenants this replica serves on each -- not sessions.
+	// A deployment that sized it by Hosts alone should re-size it.
 	MaxLinks int
 	// DialTimeout bounds one dial.
 	DialTimeout time.Duration

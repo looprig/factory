@@ -53,7 +53,7 @@ func observationFor(req sessionwire.HostLinkAttachRequest, epoch uint64) session
 		AgentID:                req.AgentID,
 		RuntimeCompatibilityID: req.RuntimeCompatibilityID,
 		Placement:              sessionwire.HostPlacementPooled,
-		InternalEndpoint:       "wss://host-1.internal:8443/hostlink",
+		InternalEndpoint:       "wss://host-1.internal:8443",
 		Residency:              sessionwire.SessionResidencyResident,
 		Accepting:              true,
 		LeaseEpoch:             epoch,

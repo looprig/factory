@@ -46,7 +46,7 @@ func (p *lifecycleProbe) ObserveWorkload(_ context.Context, intent sessionstore.
 		Version: sessionwire.CurrentWireVersion, TenantID: intent.TenantID, SessionID: intent.SessionID,
 		HostID: "host-dedicated", HostGeneration: 1, AgentID: intent.AgentID,
 		RuntimeCompatibilityID: intent.RuntimeCompatibilityID, Placement: intent.Placement,
-		InternalEndpoint: "wss://host-dedicated.internal/hostlink", Residency: sessionwire.SessionResidencyResident,
+		InternalEndpoint: "wss://host-dedicated.internal", Residency: sessionwire.SessionResidencyResident,
 		Accepting: p.state == "", LeaseEpoch: 1,
 		ObservedAt: time.Unix(1, 0).UTC(), ExpiresAt: time.Unix(2, 0).UTC(),
 	}, true, nil

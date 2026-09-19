@@ -100,7 +100,7 @@ func TestComposeLiveBindsThenSubscribesAndDeliversTheFirstTailWithoutAReset(t *t
 	cfg.directory = ownerDirectory{owner: sessionwire.HostLinkRegistryObservation{
 		Version: sessionwire.CurrentWireVersion, TenantID: "tenant-a", SessionID: "s-1",
 		HostID: "host-1", HostGeneration: 1, AgentID: "agent", RuntimeCompatibilityID: "runtime-1",
-		Placement: sessionwire.HostPlacementPooled, InternalEndpoint: "ws://host-1.internal/hostlink/tenant-a",
+		Placement: sessionwire.HostPlacementPooled, InternalEndpoint: "ws://host-1.internal",
 		Residency: sessionwire.SessionResidencyResident, Accepting: true, LeaseEpoch: 1,
 		ObservedAt: now, ExpiresAt: now.Add(time.Hour),
 	}}

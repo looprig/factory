@@ -96,15 +96,18 @@ func (p *Pool) Subscribe(ctx context.Context, tenant sessionwire.TenantID, sessi
 		p.mu.Unlock()
 		return ErrPoolClosed
 	}
-	host, ok := p.routes[routeKey{tenant: tenant, session: session}]
+	key := routeKey{tenant: tenant, session: session}
+	host, ok := p.routes[key]
 	if !ok {
 		p.mu.Unlock()
 		return fmt.Errorf("%w: session %q", ErrUnknownBinding, session)
 	}
-	pooled, ok := p.links[host]
+	// The ROUTE'S TENANT'S link, which is the connection its bind went over:
+	// a Host admits a subscribe only there, and R-1 admits it nowhere else.
+	pooled, ok := p.links[key.link(host)]
 	if !ok {
 		p.mu.Unlock()
-		return fmt.Errorf("%w: session %q is routed to %q, which has no link", ErrUnknownBinding, session, host)
+		return fmt.Errorf("%w: session %q is routed to %q, which has no link for tenant %q", ErrUnknownBinding, session, host, tenant)
 	}
 	link := pooled.link
 	p.mu.Unlock()
@@ -116,7 +119,9 @@ func (p *Pool) Subscribe(ctx context.Context, tenant sessionwire.TenantID, sessi
 	return subscriber.Subscribe(ctx, tenant, session, sink)
 }
 
-// Unsubscribe stops a session's live tail on EVERY link that carries one.
+// Unsubscribe stops a session's live tail on EVERY link OF ITS TENANT that
+// carries one. Another tenant's links cannot carry it -- a subscribe is made
+// only over the route's own tenant's link -- so they are not asked.
 //
 // It does not consult the route, deliberately: an unsubscribe is how the owner
 // drops a tail whose route is being given up, and a route may already have
@@ -127,8 +132,10 @@ func (p *Pool) Subscribe(ctx context.Context, tenant sessionwire.TenantID, sessi
 func (p *Pool) Unsubscribe(tenant sessionwire.TenantID, session sessionwire.SessionID) {
 	p.mu.Lock()
 	links := make([]Link, 0, len(p.links))
-	for _, pooled := range p.links {
-		links = append(links, pooled.link)
+	for linked, pooled := range p.links {
+		if linked.tenant == tenant {
+			links = append(links, pooled.link)
+		}
 	}
 	p.mu.Unlock()
 	for _, link := range links {

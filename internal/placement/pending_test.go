@@ -133,7 +133,7 @@ func publishPooled(t *testing.T, store *sessionstore.Store, clock *movableClock,
 		Key:    sessionstore.HostTargetKey{AgentID: testAgent, RuntimeCompatibilityID: testRuntime, Placement: sessionwire.HostPlacementPooled},
 		HostID: host, HostGeneration: 3, ObservedAt: clock.now,
 		Advertisement: sessionstore.HostAdvertisement{
-			InternalEndpoint: sessionwire.InternalEndpoint("wss://" + string(host) + ".internal/hostlink"),
+			InternalEndpoint: sessionwire.InternalEndpoint("wss://" + string(host) + ".internal"),
 			IsolationClass:   sessionwire.HostIsolationClassCrossTenantIsolated, Accepting: true, AvailableCapacity: 8,
 			ExpiresAt: clock.now.Add(time.Minute),
 		},

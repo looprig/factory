@@ -28,7 +28,7 @@ func observation(host sessionwire.HostID, generation, epoch uint64) sessionwire.
 		Version: sessionwire.CurrentWireVersion, TenantID: bindTenant, SessionID: bindSession,
 		HostID: host, HostGeneration: generation, AgentID: bindAgent, RuntimeCompatibilityID: bindRuntime,
 		Placement:        sessionwire.HostPlacementPooled,
-		InternalEndpoint: sessionwire.InternalEndpoint("wss://" + string(host) + ".internal/hostlink"),
+		InternalEndpoint: sessionwire.InternalEndpoint("wss://" + string(host) + ".internal"),
 		Residency:        sessionwire.SessionResidencyResident, Accepting: true, LeaseEpoch: epoch,
 		ObservedAt: directoryNow, ExpiresAt: directoryNow.Add(time.Minute),
 	}
@@ -181,7 +181,7 @@ func TestABindingIsKeyedByEveryIdentityItRoutesOn(t *testing.T) {
 	if binding.Key != want {
 		t.Fatalf("key = %+v, want %+v", binding.Key, want)
 	}
-	if binding.Endpoint != "wss://host-a.internal/hostlink" {
+	if binding.Endpoint != "wss://host-a.internal" {
 		t.Errorf("endpoint = %q, want the observed internal endpoint", binding.Endpoint)
 	}
 	if binding.RuntimeCompatibilityID != bindRuntime {
@@ -202,7 +202,7 @@ func TestABindingIsKeyedByEveryIdentityItRoutesOn(t *testing.T) {
 	if sent.Version != sessionwire.CurrentWireVersion {
 		t.Errorf("bind version = %d, want the current wire version", sent.Version)
 	}
-	if binder.endpoints[0] != "wss://host-a.internal/hostlink" {
+	if binder.endpoints[0] != "wss://host-a.internal" {
 		t.Errorf("bind endpoint = %q, want the observed one", binder.endpoints[0])
 	}
 }
@@ -886,7 +886,7 @@ func TestTheDirectoryIsTheResolver(t *testing.T) {
 		ObservedAt: clock.now, ExpiresAt: clock.now.Add(time.Minute),
 		Route: sessionstore.HostRoute{
 			HostID: "host-a", HostGeneration: 4, AgentID: bindAgent, RuntimeCompatibilityID: bindRuntime,
-			Placement: sessionwire.HostPlacementPooled, InternalEndpoint: "wss://host-a.internal/hostlink",
+			Placement: sessionwire.HostPlacementPooled, InternalEndpoint: "wss://host-a.internal",
 			Residency: sessionwire.SessionResidencyResident, Accepting: true,
 		},
 	}); err != nil {

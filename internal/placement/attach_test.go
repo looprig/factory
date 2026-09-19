@@ -139,7 +139,7 @@ func acceptedObservation(req sessionwire.HostLinkAttachRequest, epoch uint64) se
 		Version: sessionwire.CurrentWireVersion, TenantID: req.TenantID, SessionID: req.SessionID,
 		HostID: req.HostID, HostGeneration: req.HostGeneration, AgentID: req.AgentID,
 		RuntimeCompatibilityID: req.RuntimeCompatibilityID, Placement: sessionwire.HostPlacementPooled,
-		InternalEndpoint: sessionwire.InternalEndpoint("wss://" + string(req.HostID) + ".internal/attached"),
+		InternalEndpoint: sessionwire.InternalEndpoint("wss://attached." + string(req.HostID) + ".internal"),
 		Residency:        sessionwire.SessionResidencyResident, Accepting: true, LeaseEpoch: epoch,
 		ObservedAt: reconcileNow, ExpiresAt: reconcileNow.Add(time.Minute),
 	}
@@ -250,7 +250,7 @@ func TestAnUnownedPooledSessionIsAttachedAndBoundWithTheReturnedEpoch(t *testing
 	if err := sent.Validate(); err != nil {
 		t.Errorf("attach does not validate under Core: %v", err)
 	}
-	if f.links.endpoints[0] != "wss://host-a.internal/hostlink" {
+	if f.links.endpoints[0] != "wss://host-a.internal" {
 		t.Errorf("attach endpoint = %q, want the capacity report's", f.links.endpoints[0])
 	}
 	if result.Attached.LeaseEpoch != attachedEpoch {
@@ -263,7 +263,7 @@ func TestAnUnownedPooledSessionIsAttachedAndBoundWithTheReturnedEpoch(t *testing
 	if bind.req.LeaseEpoch != attachedEpoch || bind.req.HostID != "host-a" || bind.req.HostGeneration != 1 {
 		t.Errorf("bind = %+v, want host-a/1 at the returned epoch %d", bind.req, attachedEpoch)
 	}
-	if bind.endpoint != "wss://host-a.internal/attached" {
+	if bind.endpoint != "wss://attached.host-a.internal" {
 		t.Errorf("bind endpoint = %q, want the observation's", bind.endpoint)
 	}
 	if err := bind.req.Validate(); err != nil {

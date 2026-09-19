@@ -28,8 +28,8 @@ const (
 	// nothing, which this lane has already been burned by.
 	hostOne   sessionwire.HostID           = "host-1"
 	hostTwo   sessionwire.HostID           = "host-2"
-	endpoint1 sessionwire.InternalEndpoint = "wss://host-1.internal:8443/hostlink"
-	endpoint2 sessionwire.InternalEndpoint = "wss://host-2.internal:8443/hostlink"
+	endpoint1 sessionwire.InternalEndpoint = "wss://host-1.internal:8443"
+	endpoint2 sessionwire.InternalEndpoint = "wss://host-2.internal:8443"
 	tenant    sessionwire.TenantID         = "tenant-a"
 )
 
@@ -77,7 +77,8 @@ func TestTwoHostsGetTwoLinks(t *testing.T) {
 	if got := pool.Links(); got != 2 {
 		t.Errorf("Links() = %d, want 2", got)
 	}
-	if got, want := dialer.targets(), []hostlink.Target{target(hostOne, endpoint1), target(hostTwo, endpoint2)}; !reflect.DeepEqual(got, want) {
+	// The pool dials each Host's DERIVED tenant address, never the base.
+	if got, want := dialer.targets(), []hostlink.Target{target(hostOne, endpoint1+"/hostlink/tenant-a"), target(hostTwo, endpoint2+"/hostlink/tenant-a")}; !reflect.DeepEqual(got, want) {
 		t.Errorf("dialled %v, want %v", got, want)
 	}
 }

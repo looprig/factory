@@ -215,7 +215,7 @@ func TestOwnerComesOnlyFromTheLiveSessionRegistry(t *testing.T) {
 	_, err := store.PutHostRegistration(context.Background(), sessionstore.PutHostRegistrationRequest{
 		TenantID: tenant, SessionID: session, LeaseEpoch: 7, ObservedAt: clock.now, ExpiresAt: clock.now.Add(time.Minute),
 		Route: sessionstore.HostRoute{HostID: "host-owner", HostGeneration: 9, AgentID: "agent-a", RuntimeCompatibilityID: "runtime-v1",
-			Placement: sessionwire.HostPlacementPooled, InternalEndpoint: "wss://host-owner.internal/hostlink",
+			Placement: sessionwire.HostPlacementPooled, InternalEndpoint: "wss://host-owner.internal",
 			Residency: sessionwire.SessionResidencyResident, Accepting: true},
 	})
 	if err != nil {
@@ -377,7 +377,7 @@ func targetRequest(clock *movableClock, key sessionstore.HostTargetKey, host ses
 	}
 	return sessionstore.PublishHostTargetRequest{
 		Key: key, HostID: host, HostGeneration: generation, ObservedAt: clock.now,
-		Advertisement: sessionstore.HostAdvertisement{InternalEndpoint: sessionwire.InternalEndpoint("wss://" + string(host) + ".internal/hostlink"),
+		Advertisement: sessionstore.HostAdvertisement{InternalEndpoint: sessionwire.InternalEndpoint("wss://" + string(host) + ".internal"),
 			IsolationClass: isolation, Accepting: accepting, AvailableCapacity: capacity, ExpiresAt: clock.now.Add(ttl)},
 	}
 }

@@ -320,7 +320,7 @@ func closedPlanes(s *Server) []plane {
 				// ErrTargetMismatch and proved nothing.
 				return s.components.pool.Bind(ctx, hostlink.Target{
 					Host:     "host-a",
-					Endpoint: sessionwire.InternalEndpoint("ws://127.0.0.1:1/hostlink"),
+					Endpoint: sessionwire.InternalEndpoint("ws://127.0.0.1:1"),
 				}, sessionwire.HostLinkBindRequest{
 					Version:                sessionwire.CurrentWireVersion,
 					TenantID:               tenant,

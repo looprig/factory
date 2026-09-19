@@ -152,7 +152,7 @@ func (f *fixture) publishTarget(t *testing.T, host sessionwire.HostID, capacity 
 		Key:    sessionstore.HostTargetKey{AgentID: testAgent, RuntimeCompatibilityID: testRuntime, Placement: sessionwire.HostPlacementPooled},
 		HostID: host, HostGeneration: 1, ObservedAt: f.clock.now,
 		Advertisement: sessionstore.HostAdvertisement{
-			InternalEndpoint: sessionwire.InternalEndpoint("wss://" + string(host) + ".internal/hostlink"),
+			InternalEndpoint: sessionwire.InternalEndpoint("wss://" + string(host) + ".internal"),
 			IsolationClass:   class, Accepting: true, AvailableCapacity: capacity,
 			ExpiresAt: f.clock.now.Add(time.Minute),
 		},
@@ -169,7 +169,7 @@ func (f *fixture) putOwner(t *testing.T, placement sessionwire.HostPlacement) {
 		ObservedAt: f.clock.now, ExpiresAt: f.clock.now.Add(time.Minute),
 		Route: sessionstore.HostRoute{
 			HostID: "host-owner", HostGeneration: 2, AgentID: testAgent, RuntimeCompatibilityID: testRuntime,
-			Placement: placement, InternalEndpoint: "wss://host-owner.internal/hostlink",
+			Placement: placement, InternalEndpoint: "wss://host-owner.internal",
 			Residency: sessionwire.SessionResidencyResident, Accepting: true,
 		},
 	}); err != nil {

@@ -44,6 +44,38 @@ var ErrUnsupportedMethod = errors.New("hostlink: host did not advertise the requ
 // and is queued by the transport instead.
 var ErrLinkReconnecting = errors.New("hostlink: link is reconnecting")
 
+// ErrNoTenantEndpoint reports a Host whose advertised base cannot carry one
+// tenant's HostLink address: Core's sessionwire.HostLinkEndpoint refused to
+// derive it. It is a PER-TENANT fact about one Host -- a tenant too long for
+// the address that base leaves room for (too_long), a tenant Core will not
+// route (unroutable_tenant), or a base that is not a bare base at all
+// (base_names_tenant, base_not_bare), which refuses every tenant -- and it is
+// decided BEFORE anything is dialled, so it costs no connection.
+//
+// A caller treats it as "this Host cannot serve this tenant": placement skips
+// the candidate for that tenant and asks the next one, and a routing bind
+// leaves the session unbound for the next poll. It is never a reason to
+// abandon the Host for another tenant.
+var ErrNoTenantEndpoint = errors.New("hostlink: the host's advertised base cannot carry this tenant's address")
+
+// EndpointError is ErrNoTenantEndpoint with its detail: which Host, which
+// tenant, and Core's typed refusal, whose Code a caller may branch on and a log
+// line should carry.
+type EndpointError struct {
+	Host   sessionwire.HostID
+	Tenant sessionwire.TenantID
+	Cause  *sessionwire.HostLinkEndpointError
+}
+
+func (e *EndpointError) Error() string {
+	return fmt.Sprintf("%s: host %q tenant %q: %s", ErrNoTenantEndpoint, e.Host, e.Tenant, e.Cause.Code)
+}
+
+// Unwrap makes the error both ErrNoTenantEndpoint and Core's
+// *HostLinkEndpointError, so a caller can test the class with errors.Is and
+// read the code with errors.As without knowing this type.
+func (e *EndpointError) Unwrap() []error { return []error{ErrNoTenantEndpoint, e.Cause} }
+
 // UnsupportedMethodError identifies the reserved operation refused locally
 // because the negotiated HostLink capability set did not contain it.
 type UnsupportedMethodError struct {
@@ -111,7 +143,8 @@ func (e *HostRefusal) Error() string {
 // on one side, fails there rather than configuring a zero.
 type Limits struct {
 	// MaxLinks bounds concurrent HostLinks. One link multiplexes every session
-	// binding to one Host, so this bounds Hosts, not sessions.
+	// binding of ONE TENANT to one Host, so this bounds (Host, tenant) pairs --
+	// Hosts times the tenants this replica serves on each -- never sessions.
 	MaxLinks int
 	// DialTimeout bounds one dial.
 	DialTimeout time.Duration
@@ -190,12 +223,24 @@ type Config struct {
 	Now func() time.Time
 }
 
-// Pool holds at most one physical HostLink per Host.
+// Pool holds at most one physical HostLink per (Host, tenant).
 //
 // The invariant it exists for is in one sentence: a session binding never costs
-// a connection, and a connection is never shared between Hosts. Everything else
-// here -- the ceiling, the idle window, the conflict refusal -- protects that
-// sentence against the ways a caller can accidentally violate it.
+// a connection, and a connection is never shared between Hosts OR BETWEEN
+// TENANTS. Everything else here -- the ceiling, the idle window, the conflict
+// refusal -- protects that sentence against the ways a caller can accidentally
+// violate it.
+//
+// The tenant half is v0.5.0's (Gap 1), and it is the Host's rule, not a
+// preference: a Host serves each tenant's HostLink at its own derived address
+// and authenticates the connection for the tenant that address names, so a
+// link IS one tenant's. Keying by (Host, tenant) is what lets one pooled Host
+// hold several tenants' sessions at once, and it is what keeps R-1 structural:
+// every route names its tenant, a route's link is looked up under that tenant,
+// so no path here can deliver, bind or subscribe one tenant's session over
+// another tenant's connection. Every per-link structure -- the negotiated
+// capability set, reconnect state, live-tail subscriptions and their regMu --
+// lives INSIDE the link, and is therefore per (Host, tenant) by construction.
 //
 // Nothing in this type coordinates with another Factory replica. Runbook A7.1
 // step 2 is a decision, not an omission: several replicas each hold their own
@@ -230,7 +275,7 @@ type Pool struct {
 	// context or the next reconnect, so this lock is held for a bounded time.
 	mu     sync.Mutex
 	closed bool
-	links  map[sessionwire.HostID]*pooledLink
+	links  map[linkKey]*pooledLink
 	// routes maps a tenant-scoped session to the Host it is bound to. It is
 	// keyed by BOTH ids: a session id is unique within a tenant, and a map
 	// keyed by session alone would let one tenant's binding answer for
@@ -241,6 +286,18 @@ type Pool struct {
 type routeKey struct {
 	tenant  sessionwire.TenantID
 	session sessionwire.SessionID
+}
+
+// linkKey names one physical link: one tenant's HostLink to one Host. A route
+// (tenant, session) -> Host resolves to exactly one of these, linkKey{Host,
+// tenant}, and that lookup is the whole of R-1 in this package.
+type linkKey struct {
+	host   sessionwire.HostID
+	tenant sessionwire.TenantID
+}
+
+func (k routeKey) link(host sessionwire.HostID) linkKey {
+	return linkKey{host: host, tenant: k.tenant}
 }
 
 type pooledLink struct {
@@ -278,7 +335,7 @@ func NewPool(cfg Config) (*Pool, error) {
 		observer: observer,
 		limits:   limits,
 		now:      now,
-		links:    map[sessionwire.HostID]*pooledLink{},
+		links:    map[linkKey]*pooledLink{},
 		routes:   map[routeKey]sessionwire.HostID{},
 	}, nil
 }
@@ -286,18 +343,47 @@ func NewPool(cfg Config) (*Pool, error) {
 // Limits returns the limits this pool was composed with, defaults included.
 func (p *Pool) Limits() Limits { return p.limits }
 
-// Links reports the physical connections this pool currently holds.
+// Links reports the physical connections this pool currently holds: one per
+// (Host, tenant) pair.
 func (p *Pool) Links() int {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return len(p.links)
 }
 
-// Bindings reports the session routes multiplexed over one Host's link.
+// TenantLinks reports how many tenants' links this pool holds to one Host.
+func (p *Pool) TenantLinks(host sessionwire.HostID) int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	n := 0
+	for key := range p.links {
+		if key.host == host {
+			n++
+		}
+	}
+	return n
+}
+
+// Bindings reports the session routes multiplexed over one Host's links, over
+// every tenant.
 func (p *Pool) Bindings(host sessionwire.HostID) int {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	pooled, ok := p.links[host]
+	n := 0
+	for key, pooled := range p.links {
+		if key.host == host {
+			n += len(pooled.bindings)
+		}
+	}
+	return n
+}
+
+// TenantBindings reports the session routes multiplexed over one tenant's link
+// to one Host.
+func (p *Pool) TenantBindings(host sessionwire.HostID, tenantID sessionwire.TenantID) int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	pooled, ok := p.links[linkKey{host: host, tenant: tenantID}]
 	if !ok {
 		return 0
 	}
@@ -343,6 +429,10 @@ func (p *Pool) Bind(ctx context.Context, target Target, req sessionwire.HostLink
 	if err := req.Validate(); err != nil {
 		return err
 	}
+	dial, err := tenantTarget(target, req.TenantID)
+	if err != nil {
+		return err
+	}
 
 	key := routeKey{tenant: req.TenantID, session: req.SessionID}
 
@@ -365,7 +455,7 @@ func (p *Pool) Bind(ctx context.Context, target Target, req sessionwire.HostLink
 		return fmt.Errorf("%w: session %q is bound to %q", ErrBindingConflict, req.SessionID, bound)
 	}
 
-	pooled, err := p.acquireLocked(ctx, target)
+	pooled, err := p.acquireLocked(ctx, key.link(target.Host), dial)
 	if err != nil {
 		return err
 	}
@@ -381,7 +471,7 @@ func (p *Pool) Bind(ctx context.Context, target Target, req sessionwire.HostLink
 		// that closed this replica out would never be dialled again. Attach
 		// has evicted on this evidence since B5; a bind is the path Gap 3's
 		// re-bind after a lost tail takes, so it must too.
-		if terminalLinkError(err) && p.dropLinkLocked(target.Host, pooled) {
+		if terminalLinkError(err) && p.dropLinkLocked(key.link(target.Host), pooled) {
 			dead = pooled.link
 		}
 		return err
@@ -436,13 +526,18 @@ func (p *Pool) Attach(ctx context.Context, target Target, req sessionwire.HostLi
 	if err := req.Validate(); err != nil {
 		return sessionwire.HostLinkRegistryObservation{}, err
 	}
+	dial, err := tenantTarget(target, req.TenantID)
+	if err != nil {
+		return sessionwire.HostLinkRegistryObservation{}, err
+	}
+	linked := linkKey{host: target.Host, tenant: req.TenantID}
 
 	p.mu.Lock()
 	if p.closed {
 		p.mu.Unlock()
 		return sessionwire.HostLinkRegistryObservation{}, ErrPoolClosed
 	}
-	pooled, err := p.acquireLocked(ctx, target)
+	pooled, err := p.acquireLocked(ctx, linked, dial)
 	if err != nil {
 		p.mu.Unlock()
 		return sessionwire.HostLinkRegistryObservation{}, err
@@ -453,7 +548,7 @@ func (p *Pool) Attach(ctx context.Context, target Target, req sessionwire.HostLi
 	observation, err := link.Attach(ctx, req)
 	if err != nil {
 		if terminalLinkError(err) {
-			p.evict(target.Host, pooled)
+			p.evict(linked, pooled)
 		}
 		return sessionwire.HostLinkRegistryObservation{}, err
 	}
@@ -473,8 +568,10 @@ func terminalLinkError(err error) bool {
 	return errors.Is(err, ErrUnsupportedProtocol) || errors.As(err, &disconnect)
 }
 
-// evict drops a dead link from the pool, with every route that names its Host,
-// and closes it.
+// evict drops a dead link from the pool, with every route that names its Host
+// FOR ITS TENANT, and closes it. Another tenant's link to the same Host is a
+// different connection and is left alone: one tenant's terminal close is not
+// evidence about another's.
 //
 // A terminal link kept in the table would be handed to every later caller for
 // that Host, each of which would be refused before sending anything -- so a
@@ -488,26 +585,27 @@ func terminalLinkError(err error) bool {
 // It removes the entry only if it is still the one the caller used: a racing
 // caller may already have evicted it and dialled a replacement, which must not
 // be closed on this caller's evidence.
-func (p *Pool) evict(host sessionwire.HostID, stale *pooledLink) {
+func (p *Pool) evict(linked linkKey, stale *pooledLink) {
 	p.mu.Lock()
-	dropped := p.dropLinkLocked(host, stale)
+	dropped := p.dropLinkLocked(linked, stale)
 	p.mu.Unlock()
 	if dropped {
 		_ = stale.link.Close(context.Background())
 	}
 }
 
-// dropLinkLocked removes a dead link and every route naming its Host, if the
-// link is still the one the pool holds for that Host. It reports whether it
-// removed anything; closing the link is the caller's.
-func (p *Pool) dropLinkLocked(host sessionwire.HostID, stale *pooledLink) bool {
-	current, ok := p.links[host]
+// dropLinkLocked removes a dead link and every route it carried -- the routes
+// naming its Host under its tenant -- if the link is still the one the pool
+// holds for that pair. It reports whether it removed anything; closing the
+// link is the caller's.
+func (p *Pool) dropLinkLocked(linked linkKey, stale *pooledLink) bool {
+	current, ok := p.links[linked]
 	if !ok || current != stale {
 		return false
 	}
-	delete(p.links, host)
+	delete(p.links, linked)
 	for key, routed := range p.routes {
-		if routed == host {
+		if key.link(routed) == linked {
 			delete(p.routes, key)
 		}
 	}
@@ -571,10 +669,10 @@ func (p *Pool) Unbind(ctx context.Context, req sessionwire.HostLinkUnbindRequest
 	// later caller as well as killing this one. It fails closed instead, and
 	// the orphaned route is DROPPED: a route naming nothing that survived its
 	// own refusal would refuse every later bind for that session as a conflict.
-	pooled, ok := p.links[host]
+	pooled, ok := p.links[key.link(host)]
 	if !ok {
 		delete(p.routes, key)
-		return fmt.Errorf("%w: session %q was routed to %q, which has no link", ErrUnknownBinding, req.SessionID, host)
+		return fmt.Errorf("%w: session %q was routed to %q, which has no link for tenant %q", ErrUnknownBinding, req.SessionID, host, req.TenantID)
 	}
 	delete(p.routes, key)
 	delete(pooled.bindings, key)
@@ -604,18 +702,21 @@ func (p *Pool) DeliverCommand(ctx context.Context, tenantID sessionwire.TenantID
 		p.mu.Unlock()
 		return ErrPoolClosed
 	}
-	host, ok := p.routes[routeKey{tenant: tenantID, session: sessionID}]
+	key := routeKey{tenant: tenantID, session: sessionID}
+	host, ok := p.routes[key]
 	if !ok {
 		p.mu.Unlock()
 		return fmt.Errorf("%w: session %q", ErrUnknownBinding, sessionID)
 	}
 	// Fails closed for the reason Unbind does. The route is left in place here
 	// rather than dropped, because a delivery is not the caller that owns the
-	// route's lifetime; Unbind is.
-	pooled, ok := p.links[host]
+	// route's lifetime; Unbind is. The link is the ROUTE'S TENANT'S: a
+	// delivery is never sent over another tenant's connection, even to the
+	// same Host.
+	pooled, ok := p.links[key.link(host)]
 	if !ok {
 		p.mu.Unlock()
-		return fmt.Errorf("%w: session %q is routed to %q, which has no link", ErrUnknownBinding, sessionID, host)
+		return fmt.Errorf("%w: session %q is routed to %q, which has no link for tenant %q", ErrUnknownBinding, sessionID, host, tenantID)
 	}
 	link := pooled.link
 	p.mu.Unlock()
@@ -643,7 +744,7 @@ func (p *Pool) ReapIdle() int {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	reaped := 0
-	for host, pooled := range p.links {
+	for linked, pooled := range p.links {
 		if len(pooled.bindings) > 0 {
 			continue
 		}
@@ -654,7 +755,7 @@ func (p *Pool) ReapIdle() int {
 		if pooled.idleSince.After(deadline) {
 			continue
 		}
-		delete(p.links, host)
+		delete(p.links, linked)
 		// Close is best effort: the link is gone from the pool either way, and
 		// a reaper that reported an error would have nobody to report it to.
 		_ = pooled.link.Close(context.Background())
@@ -681,7 +782,7 @@ func (p *Pool) Close(ctx context.Context) error {
 	for _, pooled := range p.links {
 		links = append(links, pooled)
 	}
-	p.links = map[sessionwire.HostID]*pooledLink{}
+	p.links = map[linkKey]*pooledLink{}
 	p.routes = map[routeKey]sessionwire.HostID{}
 	p.mu.Unlock()
 
@@ -694,26 +795,47 @@ func (p *Pool) Close(ctx context.Context) error {
 	return errors.Join(errs...)
 }
 
-// acquireLocked returns the pooled link for target, dialling if needed.
+// acquireLocked returns the pooled link for one (Host, tenant), dialling dial
+// -- that tenant's DERIVED address -- if there is none.
 //
-// The ceiling is checked before the dial and only for a host that has no link,
-// so it bounds HOSTS. A pool that checked it per bind would refuse the second
-// session on a Host it is already connected to, which is the opposite of what
-// this type is for.
-func (p *Pool) acquireLocked(ctx context.Context, target Target) (*pooledLink, error) {
-	if pooled, ok := p.links[target.Host]; ok {
+// The ceiling is checked before the dial and only for a pair that has no link,
+// so it bounds (Host, tenant) pairs. A pool that checked it per bind would
+// refuse the second session of a tenant on a Host it is already connected to,
+// which is the opposite of what this type is for.
+func (p *Pool) acquireLocked(ctx context.Context, linked linkKey, dial Target) (*pooledLink, error) {
+	if pooled, ok := p.links[linked]; ok {
 		return pooled, nil
 	}
 	if len(p.links) >= p.limits.MaxLinks {
-		return nil, fmt.Errorf("%w: %d links open, cannot dial %q", ErrLinkLimit, len(p.links), target.Host)
+		return nil, fmt.Errorf("%w: %d links open, cannot dial %q for tenant %q", ErrLinkLimit, len(p.links), linked.host, linked.tenant)
 	}
-	link, err := p.dialer.Dial(ctx, target, p.observer)
+	link, err := p.dialer.Dial(ctx, dial, p.observer)
 	if err != nil {
 		return nil, err
 	}
 	pooled := &pooledLink{link: link, bindings: map[routeKey]struct{}{}, idleSince: p.now()}
-	p.links[target.Host] = pooled
+	p.links[linked] = pooled
 	return pooled, nil
+}
+
+// tenantTarget is the address this pool dials for one tenant's link to a Host:
+// Core's HostLinkEndpoint over the Host's advertised BASE. It is the ONE place
+// an address is derived, so every path that opens a link -- bind, attach, and
+// through them delivery, the live tail and placement -- dials the same one.
+//
+// A refusal is an *EndpointError (ErrNoTenantEndpoint), returned before
+// anything is dialled: nothing about the Host was learned, and nothing about
+// another tenant was decided.
+func tenantTarget(base Target, tenantID sessionwire.TenantID) (Target, error) {
+	endpoint, err := sessionwire.HostLinkEndpoint(base.Endpoint, tenantID)
+	if err != nil {
+		var refused *sessionwire.HostLinkEndpointError
+		if errors.As(err, &refused) {
+			return Target{}, &EndpointError{Host: base.Host, Tenant: tenantID, Cause: refused}
+		}
+		return Target{}, fmt.Errorf("%w: host %q tenant %q: %w", ErrNoTenantEndpoint, base.Host, tenantID, err)
+	}
+	return Target{Host: base.Host, Endpoint: endpoint}, nil
 }
 
 func validateHost(host sessionwire.HostID) error {

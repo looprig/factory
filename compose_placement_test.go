@@ -173,8 +173,10 @@ func TestTheDispositionDeadlineSweepIsDrivenInEveryComposition(t *testing.T) {
 // TestAPendingSessionReachesTheHostLinkDialer is the composed path end to end
 // on Factory's side: the sweep finds the session, the reconciler claims it
 // under the replica's identifier, finds the candidate, and asks the HostLink
-// pool to attach -- which DIALS the candidate's endpoint with the JSON
-// subprotocol a Host requires. The recording server refuses the upgrade, so
+// pool to attach -- which DIALS the tenant's address DERIVED from the
+// candidate's advertised base (Gap 1: base + /hostlink/<tenant>, never the base
+// verbatim, which a v0.3.0 Host answers 404) with the JSON subprotocol a Host
+// requires. The recording server refuses the upgrade, so
 // the attach never completes; what is measured is that the attach was
 // attempted at the candidate's address.
 func TestAPendingSessionReachesTheHostLinkDialer(t *testing.T) {
@@ -195,7 +197,7 @@ func TestAPendingSessionReachesTheHostLinkDialer(t *testing.T) {
 	defer server.Close()
 
 	p := &pendingProbe{probe: &probe{}}
-	p.candidate = sessionwire.InternalEndpoint("ws" + strings.TrimPrefix(server.URL, "http") + "/hostlink/tenant-a")
+	p.candidate = sessionwire.InternalEndpoint("ws" + strings.TrimPrefix(server.URL, "http"))
 	if err := composedWithPlacement(t, p, true).Start(context.Background()); err != nil {
 		t.Fatalf("Start: %v", err)
 	}

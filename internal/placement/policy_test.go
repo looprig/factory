@@ -28,7 +28,7 @@ func residentOwner(record sessionstore.CatalogRecord) sessionwire.HostLinkRegist
 		Version: sessionwire.CurrentWireVersion, TenantID: record.TenantID, SessionID: record.SessionID,
 		HostID: "host-owner", HostGeneration: 3, AgentID: record.AgentID,
 		RuntimeCompatibilityID: record.RuntimeCompatibilityID, Placement: record.DesiredPlacement,
-		InternalEndpoint: "wss://host-owner.internal/hostlink",
+		InternalEndpoint: "wss://host-owner.internal",
 		Residency:        sessionwire.SessionResidencyResident, Accepting: true, LeaseEpoch: 4,
 		ObservedAt: policyNow, ExpiresAt: policyNow.Add(time.Minute),
 	}
@@ -38,7 +38,7 @@ func pooledCandidate(host sessionwire.HostID, capacity uint64) sessionwire.HostL
 	return sessionwire.HostLinkCapacityReport{
 		Version: sessionwire.CurrentWireVersion, HostID: host, HostGeneration: 1,
 		AgentID: "agent-a", RuntimeCompatibilityID: "runtime-v1",
-		Placement: sessionwire.HostPlacementPooled, InternalEndpoint: sessionwire.InternalEndpoint("wss://" + string(host) + ".internal/hostlink"),
+		Placement: sessionwire.HostPlacementPooled, InternalEndpoint: sessionwire.InternalEndpoint("wss://" + string(host) + ".internal"),
 		IsolationClass: sessionwire.HostIsolationClassCrossTenantIsolated,
 		Accepting:      true, AvailableCapacity: capacity,
 		ObservedAt: policyNow, ExpiresAt: policyNow.Add(time.Minute),

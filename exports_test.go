@@ -159,7 +159,7 @@ func TestNewStoreDirectoryReadsTheStoresRegistryAndTargetIndex(t *testing.T) {
 		_, err := store.PublishHostTarget(ctx, sessionstore.PublishHostTargetRequest{
 			Key: key, HostID: host, HostGeneration: 1, ObservedAt: clock.now,
 			Advertisement: sessionstore.HostAdvertisement{
-				InternalEndpoint: sessionwire.InternalEndpoint("wss://" + string(host) + ".internal/hostlink"),
+				InternalEndpoint: sessionwire.InternalEndpoint("wss://" + string(host) + ".internal"),
 				IsolationClass:   sessionwire.HostIsolationClassCrossTenantIsolated,
 				Accepting:        accepting, AvailableCapacity: capacity, ExpiresAt: clock.now.Add(time.Minute),
 			},
@@ -183,7 +183,7 @@ func TestNewStoreDirectoryReadsTheStoresRegistryAndTargetIndex(t *testing.T) {
 	if _, err := store.PutHostRegistration(ctx, sessionstore.PutHostRegistrationRequest{
 		TenantID: tenant, SessionID: session, LeaseEpoch: 7, ObservedAt: clock.now, ExpiresAt: clock.now.Add(time.Minute),
 		Route: sessionstore.HostRoute{HostID: "host-large", HostGeneration: 1, AgentID: "agent-a", RuntimeCompatibilityID: "runtime-v1",
-			Placement: sessionwire.HostPlacementPooled, InternalEndpoint: "wss://host-large.internal/hostlink",
+			Placement: sessionwire.HostPlacementPooled, InternalEndpoint: "wss://host-large.internal",
 			Residency: sessionwire.SessionResidencyResident, Accepting: true},
 	}); err != nil {
 		t.Fatalf("PutHostRegistration: %v", err)

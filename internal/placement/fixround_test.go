@@ -180,7 +180,7 @@ func TestPlacementOverTheRealPoolLeavesAViewersRoute(t *testing.T) {
 	f, pool, dialer := realPoolReconciler(t)
 	viewer := sessionwire.HostLinkBindRequest{Version: sessionwire.CurrentWireVersion, TenantID: testTenant, SessionID: testSession,
 		HostID: "host-a", HostGeneration: 1, LeaseEpoch: 1, RuntimeCompatibilityID: testRuntime, IdempotencyKey: "viewer"}
-	if err := pool.Bind(context.Background(), hostlink.Target{Host: "host-a", Endpoint: "wss://host-a.internal/attached"}, viewer); err != nil {
+	if err := pool.Bind(context.Background(), hostlink.Target{Host: "host-a", Endpoint: "wss://attached.host-a.internal"}, viewer); err != nil {
 		t.Fatal(err)
 	}
 	result, err := f.reconciler.Reconcile(context.Background(), Request{TenantID: testTenant, SessionID: testSession, Wake: []sessionwire.CommandID{"cmd-1"}})

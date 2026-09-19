@@ -107,7 +107,7 @@ func TestTheDispositionSweepDefersToThisReplicasPlacementClaim(t *testing.T) {
 	clock.set(start.Add(2 * time.Minute)) // the create is expired
 	if _, err := store.PublishHostTarget(ctx, sessionstore.PublishHostTargetRequest{
 		Key: key, HostID: "host-a", HostGeneration: 1, ObservedAt: clock.Now(),
-		Advertisement: sessionstore.HostAdvertisement{InternalEndpoint: "wss://host-a.internal/hostlink",
+		Advertisement: sessionstore.HostAdvertisement{InternalEndpoint: "wss://host-a.internal",
 			IsolationClass: sessionwire.HostIsolationClassCrossTenantIsolated, Accepting: true, AvailableCapacity: 4,
 			ExpiresAt: clock.Now().Add(time.Minute)},
 	}); err != nil {

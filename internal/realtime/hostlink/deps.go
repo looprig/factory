@@ -29,6 +29,14 @@ import (
 
 // Target is one Host and the address to reach it at.
 //
+// SINCE v0.5.0 THE ENDPOINT A CALLER HANDS THE POOL IS THE HOST'S ADVERTISED
+// BASE, and the pool derives each tenant's address from it with Core's
+// sessionwire.HostLinkEndpoint(base, tenant). A Host serves a separate
+// HostLink per tenant, at HostLinkPathPrefix plus the tenant under its base
+// (core v0.10.0, host v0.3.0), and a verbatim dial of the base is answered
+// 404. The Dialer is handed the DERIVED address, so a Target reaching Dial
+// names one tenant's link; nothing above the pool ever holds a derived one.
+//
 // The two travel together because neither is usable alone: the identity is what
 // the pool keys a connection by and what a bind record must name, and the
 // endpoint is a durable routing observation that a registry entry or capacity
