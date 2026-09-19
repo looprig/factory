@@ -168,9 +168,38 @@ func TestTheDispositionHolderIsDistinctAndAlwaysStorable(t *testing.T) {
 	if got := dispositionHolder("replica-a"); got != "replica-a/dispositions" {
 		t.Fatalf("dispositionHolder(replica-a) = %q", got)
 	}
+	// G1: the boundary itself. An id that exactly fits keeps its plain form
+	// at exactly MaxIDBytes; one byte more is hashed. A bound one over would
+	// produce a 257-byte holder the store refuses on every claim.
+	const suffix = "/dispositions"
+	fits := strings.Repeat("f", sessionwire.MaxIDBytes-len(suffix))
+	if got := dispositionHolder(fits); got != fits+suffix || len(got) != sessionwire.MaxIDBytes {
+		t.Fatalf("dispositionHolder(%d bytes) = %d bytes, want the plain form at exactly %d", len(fits), len(got), sessionwire.MaxIDBytes)
+	}
+	over := fits + "f"
+	if got := dispositionHolder(over); got == over+suffix || len(got) > sessionwire.MaxIDBytes || !strings.HasSuffix(got, suffix) {
+		t.Fatalf("dispositionHolder(%d bytes) = %q (%d bytes), want it hashed within %d", len(over), got, len(got), sessionwire.MaxIDBytes)
+	}
 	long := strings.Repeat("r", sessionwire.MaxIDBytes)
 	got := dispositionHolder(long)
 	if len(got) > sessionwire.MaxIDBytes || got == long || !strings.HasSuffix(got, "/dispositions") || got != dispositionHolder(long) {
 		t.Fatalf("dispositionHolder(%d bytes) = %q (%d bytes), want a stable, distinct id within %d bytes", len(long), got, len(got), sessionwire.MaxIDBytes)
+	}
+}
+
+// TestTheLegacyCommandSweepClaimsUnderAHolderOfItsOwn is the v0.3.0 regate's
+// L1: the N1 pattern, closed for the legacy sweep before placement can ever
+// reconcile a legacy session. Its holder is stable, distinct from the replica's
+// and from the disposition sweep's, and always storable.
+func TestTheLegacyCommandSweepClaimsUnderAHolderOfItsOwn(t *testing.T) {
+	t.Parallel()
+
+	if got := commandHolder("replica-a"); got != "replica-a/commands" {
+		t.Fatalf("commandHolder(replica-a) = %q", got)
+	}
+	long := strings.Repeat("r", sessionwire.MaxIDBytes)
+	got := commandHolder(long)
+	if len(got) > sessionwire.MaxIDBytes || got == dispositionHolder(long) || got != commandHolder(long) {
+		t.Fatalf("commandHolder(%d bytes) = %q, want a stable holder distinct from the disposition sweep's", len(long), got)
 	}
 }

@@ -384,10 +384,25 @@ func TestTheSweepsClaimUnderTheComposedReplicaIdentifier(t *testing.T) {
 	})
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	// Every holder is the replica's identifier or a sweep's scope of it
+	// (v0.3.0: dispositions; v0.4.0: the legacy command sweep, regate L1) --
+	// never an identifier minted independently of the composed one.
+	derived := map[string]bool{
+		"replica-under-test":              true,
+		"replica-under-test/commands":     true,
+		"replica-under-test/dispositions": true,
+	}
+	legacy := false
 	for _, holder := range p.sweepHolders {
-		if holder != "replica-under-test" {
-			t.Fatalf("a claim names holder %q, want the composed replica identifier", holder)
+		if !derived[holder] {
+			t.Fatalf("a claim names holder %q, want the composed replica identifier or a sweep's scope of it", holder)
 		}
+		legacy = legacy || holder == "replica-under-test/commands"
+	}
+	// The due row this probe answers is a LEGACY one, so the legacy sweep is
+	// what claimed, and it must have claimed under its own holder (L1).
+	if !legacy {
+		t.Fatalf("no claim names the legacy sweep's holder: %v", p.sweepHolders)
 	}
 }
 

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -284,6 +285,15 @@ func TestTheProductionWaitSleepsAJitteredBackoffAndHonoursCancellation(t *testin
 	}
 	if elapsed := time.Since(start); elapsed < 100*time.Millisecond || elapsed > 180*time.Millisecond {
 		t.Fatalf("a wait drawn as 100ms took %v, want within [100ms, 180ms]", elapsed)
+	}
+	// G4: production's draw -- a nil one -- IS jittered, not the nominal
+	// duration or a multiple of it. Compared by identity, since two functions
+	// that happen to agree on the durations tried are not the same draw.
+	if got, want := reflect.ValueOf((&Reconciler{}).drawOrDefault()).Pointer(), reflect.ValueOf(jittered).Pointer(); got != want {
+		t.Fatal("a Reconciler with no injected draw does not draw from jittered")
+	}
+	if got, want := reflect.ValueOf(drawn.drawOrDefault()).Pointer(), reflect.ValueOf(drawn.draw).Pointer(); got != want {
+		t.Fatal("an injected draw is not the one the wait uses")
 	}
 	r := &Reconciler{}
 	start = time.Now()

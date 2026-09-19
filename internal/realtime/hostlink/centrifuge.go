@@ -64,6 +64,9 @@ var ErrHostFailed = errors.New("hostlink: the host answered with a failure carry
 // after a rollback that did not complete, and after an attach whose
 // observation it could not publish -- in which case the session IS resident.
 // Host's own contract is "not a placement outcome, but a Factory may retry".
+// A caller that moves on to another Host instead is safe only because of the
+// session LEASE: while this Host holds it, any other candidate refuses
+// epoch_mismatch, so no second residency can form.
 // It is still not a *HostRefusal: it names no reason a caller may branch on.
 type HostFailure struct {
 	// Method is the RPC method the Host answered.

@@ -1645,7 +1645,7 @@ candidate, which is what every pre-B5 test drives.
   change -- become `ErrHostUnreachable`. A Host's own code-less ANSWER, which
   `hostlink` now surfaces as `*HostFailure` (centrifuge-go returns `*Error`
   only for a reply the server sent), becomes `ErrAttachFailed`, and placement
-  tries the next candidate. That reply is NOT a promise the Host rolled back:
+  tries the next candidate. That reply is NOT a placement outcome, and NOT a promise the Host rolled back:
   host v0.2.1 also sends it after an incomplete rollback, and when the session
   IS resident but its observation could not be published. Moving on is safe
   because the session LEASE guards residency: while that Host holds it, the

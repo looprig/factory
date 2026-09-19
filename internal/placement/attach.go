@@ -194,11 +194,7 @@ func (r *Reconciler) wait(ctx context.Context, d time.Duration) error {
 	if r.cfg.Wait != nil {
 		return r.cfg.Wait(ctx, d)
 	}
-	draw := r.draw
-	if draw == nil {
-		draw = jittered
-	}
-	timer := time.NewTimer(draw(d))
+	timer := time.NewTimer(r.drawOrDefault()(d))
 	defer timer.Stop()
 	select {
 	case <-timer.C:
@@ -206,6 +202,17 @@ func (r *Reconciler) wait(ctx context.Context, d time.Duration) error {
 	case <-ctx.Done():
 		return ctx.Err()
 	}
+}
+
+// drawOrDefault is the draw the default wait uses: the injected one, or
+// jittered. It is its own function so production's choice is observable (B5
+// v0.3.0 regate G4): a nil draw that defaulted to the nominal duration would
+// never jitter, and every replica would retry a contended session in step.
+func (r *Reconciler) drawOrDefault() func(time.Duration) time.Duration {
+	if r.draw != nil {
+		return r.draw
+	}
+	return jittered
 }
 
 func (r *Reconciler) logger() *slog.Logger {

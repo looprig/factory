@@ -348,7 +348,7 @@ and retries, bounded with backoff, and never binds with the refusal's
 to the next candidate, and so does a Host's own code-less failure reply (a
 transport error answer such as centrifuge's `ErrorInternal`) -- so one Host
 whose launches always fail cannot block placement on the healthy ones. That
-reply does not mean the Host rolled back (host v0.2.1 also sends it after an
+reply is not a placement outcome, and it does not mean the Host rolled back (host v0.2.1 also sends it after an
 incomplete rollback, or when the session is resident but its observation
 could not be published); moving on is safe because the session lease makes
 any other candidate refuse `epoch_mismatch` while that Host still holds it,

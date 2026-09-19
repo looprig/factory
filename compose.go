@@ -157,10 +157,15 @@ func composeComponents(cfg config, credentials *internalidentity.Authenticator) 
 		Settlement: cfg.commands,
 		Claims:     cfg.commands,
 		Clock:      cfg.clock,
-		HolderID:   cfg.replicaID,
-		ClaimTTL:   cfg.reconcile.ClaimTTL,
-		PageLimit:  cfg.reconcile.MaxDuePerSweep,
-		MaxPages:   cfg.reconcile.MaxConcurrent,
+		// Its own holder too, for the disposition sweep's reason below (the
+		// v0.3.0 regate's L1). It is unreachable today -- placement reconciles
+		// only disposition-bound sessions and legacy rows live only on legacy
+		// ones -- but under the replica's own id this sweep would EXTEND a
+		// placement claim on a legacy session and then release it mid-attach.
+		HolderID:  commandHolder(cfg.replicaID),
+		ClaimTTL:  cfg.reconcile.ClaimTTL,
+		PageLimit: cfg.reconcile.MaxDuePerSweep,
+		MaxPages:  cfg.reconcile.MaxConcurrent,
 	})
 	if err != nil {
 		return nil, &OptionError{Option: "WithReconcileLimits", Err: err}
@@ -362,8 +367,11 @@ func (c *components) realtimeHandler() http.Handler {
 //     LEASE guards residency: a Host still holding it makes the next
 //     candidate refuse epoch_mismatch, so no second residency can form, and
 //     placement converges on the owner. host v0.2.1's own comment asks a
-//     Factory to treat this as no placement outcome but a retry; moving on
-//     IS that retry, against the next candidate.
+//     Factory to treat this as no placement outcome but a retry, and says
+//     "the attach is idempotent per key" -- a retry to the SAME Host. Moving
+//     on to the next candidate is therefore a DIVERGENCE from that contract,
+//     not conformance with it, and it is taken knowingly: it is safe only
+//     because of the lease, as above.
 //   - Everything else is returned as itself, and placement ABORTS on it: a
 //     cancelled or timed-out request, or a lost connection, may have reached
 //     the Host, and the Host may have acted.
@@ -575,8 +583,15 @@ func (c *components) stopRealtime(ctx context.Context) error {
 // suffix is replaced by its SHA-256 before the suffix is added: still stable
 // for the process, still distinct from the replica's own id, and never refused
 // by the store on every pass.
-func dispositionHolder(replicaID string) string {
-	const suffix = "/dispositions"
+func dispositionHolder(replicaID string) string { return sweepHolder(replicaID, "/dispositions") }
+
+// commandHolder is the legacy command deadline sweep's holder, derived the same
+// way and for the same reason as dispositionHolder.
+func commandHolder(replicaID string) string { return sweepHolder(replicaID, "/commands") }
+
+// sweepHolder scopes the replica's id to one sweep, hashing an id too long to
+// carry the suffix within sessionwire.MaxIDBytes.
+func sweepHolder(replicaID, suffix string) string {
 	if len(replicaID)+len(suffix) <= sessionwire.MaxIDBytes {
 		return replicaID + suffix
 	}
