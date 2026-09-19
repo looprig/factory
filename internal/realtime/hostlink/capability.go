@@ -42,6 +42,59 @@ type Negotiator interface {
 	Negotiated() (sessionwire.VersionNegotiationResponse, error)
 }
 
+// acquireUnlocked returns the pooled link for one (Host, tenant), dialling it
+// with the pool's lock RELEASED. It trades acquireLocked's coalescing -- two
+// callers racing for the same missing link may both dial -- for never stalling
+// the pool behind a dial: the loser's link is closed and the winner's used, and
+// the ceiling and closed checks are repeated under the lock after the dial.
+func (p *Pool) acquireUnlocked(ctx context.Context, linked linkKey, dial Target) (*pooledLink, error) {
+	p.mu.Lock()
+	if p.closed {
+		p.mu.Unlock()
+		return nil, ErrPoolClosed
+	}
+	if pooled, ok := p.links[linked]; ok {
+		p.mu.Unlock()
+		return pooled, nil
+	}
+	if len(p.links) >= p.limits.MaxLinks {
+		n := len(p.links)
+		p.mu.Unlock()
+		return nil, fmt.Errorf("%w: %d links open, cannot dial %q for tenant %q", ErrLinkLimit, n, linked.host, linked.tenant)
+	}
+	p.mu.Unlock()
+
+	link, err := p.dialer.Dial(ctx, dial, p.observer)
+	if err != nil {
+		return nil, err
+	}
+
+	p.mu.Lock()
+	var refused error
+	var pooled *pooledLink
+	kept := false // whether OUR dial became the pool's link (links may not be comparable)
+	switch existing, ok := p.links[linked]; {
+	case p.closed:
+		refused = ErrPoolClosed
+	case ok:
+		pooled = existing // a racer dialled first; ours is surplus
+	case len(p.links) >= p.limits.MaxLinks:
+		refused = fmt.Errorf("%w: %d links open, cannot keep %q for tenant %q", ErrLinkLimit, len(p.links), linked.host, linked.tenant)
+	default:
+		pooled = &pooledLink{link: link, bindings: map[routeKey]struct{}{}, idleSince: p.now()}
+		p.links[linked] = pooled
+		kept = true
+	}
+	p.mu.Unlock()
+	if !kept {
+		_ = link.Close(context.Background())
+	}
+	if refused != nil {
+		return nil, refused
+	}
+	return pooled, nil
+}
+
 // Negotiated implements Negotiator.
 func (l *centrifugeLink) Negotiated() (sessionwire.VersionNegotiationResponse, error) {
 	l.mu.Lock()
@@ -61,8 +114,12 @@ func (l *centrifugeLink) Negotiated() (sessionwire.VersionNegotiationResponse, e
 // gate-response predicate (GateResponseCapable unless the composition
 // supplied another).
 //
-// The link is acquired, dialling if needed, under the pool's lock as Attach
-// acquires one, and read outside it. A link that cannot report its reply
+// The link is acquired WITHOUT holding the pool's lock across a dial (spec
+// gate N2): this is the one path a public HTTP request (a gate response) can
+// reach that may open a link, and holding Pool.mu across a dial to an owner
+// whose base black-holes would stall every bind, unbind and delivery on every
+// Host for up to DialTimeout. See acquireUnlocked. The dial is bounded by the
+// caller's context as well as the dialer's own timeout. A link that cannot report its reply
 // answers false: an unknown capability is not one. A read that fails --
 // reconnecting, or a link that turned terminal -- is returned, and a terminal
 // link is evicted as Attach evicts one, so the caller can tell "this Host
@@ -77,18 +134,11 @@ func (p *Pool) AcceptsGateResponses(ctx context.Context, target Target, tenantID
 	}
 	linked := linkKey{host: target.Host, tenant: tenantID}
 
-	p.mu.Lock()
-	if p.closed {
-		p.mu.Unlock()
-		return false, ErrPoolClosed
-	}
-	pooled, err := p.acquireLocked(ctx, linked, dial)
+	pooled, err := p.acquireUnlocked(ctx, linked, dial)
 	if err != nil {
-		p.mu.Unlock()
 		return false, err
 	}
 	link := pooled.link
-	p.mu.Unlock()
 
 	negotiator, ok := link.(Negotiator)
 	if !ok {
