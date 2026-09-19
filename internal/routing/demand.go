@@ -570,11 +570,14 @@ func (d *Demand) refreshLocked(ctx context.Context, key sessionKey, entry *deman
 	if found {
 		d.bindings.Observe(ctx, observed)
 	}
-	if _, bound := d.bindings.Binding(key.tenant, key.session); bound && found {
+	if _, bound := d.bindings.Binding(key.tenant, key.session); bound && found && d.bindings.transportHolds(key) {
 		return
 	}
 	// The owner is gone, or the observation contradicted the route, or
-	// something else invalidated it. Give the demand back so serveLocked takes
+	// something else invalidated it -- including the TRANSPORT having dropped
+	// the route under this table (a Binder that reports RouteHeld): placement's
+	// transient unbind of a session a viewer bound in the meantime is one way,
+	// and without this check no poll ever noticed (v0.4.0 spec gate C1). Give the demand back so serveLocked takes
 	// a fresh one: Bindings.Acquire COUNTS, so rebinding without releasing
 	// would leave this replica holding two units of demand for one subscriber
 	// and the last release would then never unbind. The error has nowhere to

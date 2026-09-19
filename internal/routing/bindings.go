@@ -57,6 +57,26 @@ type Binder interface {
 	DeliverCommand(ctx context.Context, tenant sessionwire.TenantID, session sessionwire.SessionID, delivery sessionwire.HostLinkCommandDelivery) error
 }
 
+// RouteReporter is an OPTIONAL Binder capability: whether the transport still
+// holds a session's route. A table's binding is local state, and a transport
+// shared with another writer -- the HostLink pool, which placement binds and
+// unbinds through directly -- can drop the route under it. A Binder that
+// reports it lets the ownership poll repair that; one that does not is
+// trusted, as before.
+type RouteReporter interface {
+	RouteHeld(tenant sessionwire.TenantID, session sessionwire.SessionID) bool
+}
+
+// transportHolds reports whether the Binder's transport still holds the
+// session's route, or true when the Binder cannot say.
+func (b *Bindings) transportHolds(key sessionKey) bool {
+	reporter, ok := b.binder.(RouteReporter)
+	if !ok {
+		return true
+	}
+	return reporter.RouteHeld(key.tenant, key.session)
+}
+
 // BindingKey identifies one Factory-local route, and identity is the WHOLE
 // ownership tuple rather than the session. A4.3 step 1.
 //

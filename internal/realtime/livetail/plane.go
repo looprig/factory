@@ -294,6 +294,15 @@ func (p *Plane) Unbind(ctx context.Context, req sessionwire.HostLinkUnbindReques
 	return p.links.Unbind(ctx, req)
 }
 
+// RouteHeld is routing.RouteReporter: whether the pool still holds the
+// session's route. Placement binds and unbinds through the same pool, so its
+// transient unbind can drop a route a viewer's binding relies on; reporting it
+// lets the next ownership poll re-bind instead of trusting the table forever.
+func (p *Plane) RouteHeld(tenant sessionwire.TenantID, session sessionwire.SessionID) bool {
+	_, held := p.links.RouteFor(tenant, session)
+	return held
+}
+
 // DeliverCommand is the pool's, unchanged.
 func (p *Plane) DeliverCommand(ctx context.Context, tenant sessionwire.TenantID, session sessionwire.SessionID, delivery sessionwire.HostLinkCommandDelivery) error {
 	return p.links.DeliverCommand(ctx, tenant, session, delivery)

@@ -247,6 +247,7 @@ func allSeams() []reflect.Type {
 		iface[routing.Tail](),
 		iface[routing.Publisher](),
 		iface[routing.Rebinder](),
+		iface[routing.RouteReporter](),
 		iface[livetail.Links](),
 		iface[livetail.Viewers](),
 		iface[livetail.Relay](),
