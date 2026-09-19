@@ -141,6 +141,9 @@ type Demand struct {
 	hints    Hinter
 	clock    Clock
 	limits   DemandLimits
+	// watcher is told when a session starts and stops being watched; it is
+	// discardWatcher unless SetWatcher composed one.
+	watcher Watcher
 
 	mu       sync.Mutex
 	closed   bool
@@ -197,8 +200,49 @@ func NewDemand(bindings *Bindings, tips TipReader, hints Hinter, clock Clock, li
 		hints:    hints,
 		clock:    clock,
 		limits:   limits,
+		watcher:  discardWatcher{},
 		sessions: map[sessionKey]*demandSession{},
 	}, nil
+}
+
+// Watcher is told when this replica starts and stops watching a session.
+//
+// It exists for Gap 3's live tail, which needs to know one thing only this
+// type can say: whether a tail went live INSIDE the first subscriber's own
+// Acquire. A tail started there is gapless for every viewer -- the first
+// viewer's subscribe has not been acknowledged yet, so its durable read comes
+// after -- while a tail started by any later poll or rebind may have missed
+// records every current viewer was relying on it for, and is owed a reset.
+//
+// EVERY METHOD IS CALLED WITH THIS TYPE'S LOCK HELD, so an implementation must
+// not block and must not call back into this package. The composition's is a
+// few map writes under a leaf mutex.
+type Watcher interface {
+	// Watching is called for a session's FIRST local subscriber, before the
+	// bind that subscriber provokes.
+	Watching(tenant sessionwire.TenantID, session sessionwire.SessionID)
+	// Served is called once that first serve has returned, bound or not.
+	Served(tenant sessionwire.TenantID, session sessionwire.SessionID)
+	// Unwatched is called when the session's last subscriber is gone, or the
+	// plane closed.
+	Unwatched(tenant sessionwire.TenantID, session sessionwire.SessionID)
+}
+
+type discardWatcher struct{}
+
+func (discardWatcher) Watching(sessionwire.TenantID, sessionwire.SessionID)  {}
+func (discardWatcher) Served(sessionwire.TenantID, sessionwire.SessionID)    {}
+func (discardWatcher) Unwatched(sessionwire.TenantID, sessionwire.SessionID) {}
+
+// SetWatcher composes the watcher. It is a composition-time call, made before
+// the first Acquire; a nil watcher restores the default, which does nothing.
+func (d *Demand) SetWatcher(w Watcher) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if w == nil {
+		w = discardWatcher{}
+	}
+	d.watcher = w
 }
 
 // Acquire records one local subscriber for a session and, if it is the first,
@@ -245,7 +289,9 @@ func (d *Demand) Acquire(ctx context.Context, tenant sessionwire.TenantID, sessi
 	// context.WithoutCancel here, or context.Background, is indistinguishable.
 	pollCtx, cancel := context.WithTimeout(ctx, d.limits.PollTimeout)
 	defer cancel()
+	d.watcher.Watching(tenant, session)
 	d.serveLocked(pollCtx, key, entry)
+	d.watcher.Served(tenant, session)
 	d.scheduleLocked(key, entry)
 	return nil
 }
@@ -373,6 +419,7 @@ func (d *Demand) Len() int {
 func (d *Demand) teardownLocked(ctx context.Context, key sessionKey, entry *demandSession) error {
 	entry.cancelPoll()
 	delete(d.sessions, key)
+	d.watcher.Unwatched(key.tenant, key.session)
 	if !entry.held {
 		return nil
 	}

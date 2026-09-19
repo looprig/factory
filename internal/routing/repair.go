@@ -492,6 +492,73 @@ func (r *Relay) HostLinkClosed(ctx context.Context, tenant sessionwire.TenantID,
 	return r.repairHostLocked(ctx, key, host)
 }
 
+// Resync tells every DeliveryBinding of a session where to read from, because
+// the live tail feeding it has just (re)started and whatever the Host
+// published while it was not running is gone.
+//
+// It is the half of a repair that does not touch the tail: no Stop, no rebind,
+// no Resume. Gap 3 needs it because a tail can START over a hole -- a viewer
+// watched a session this replica could not yet bind, a poll then bound it, and
+// every record committed in between reached nobody -- and a Host keeps no
+// history, so the only honest answer is a session.reset naming the one tip read
+// here. It is built exactly as HostLinkClosed's is (resetBindingLocked, one tip
+// for every binding), so the two cannot describe a gap differently.
+//
+// The caller must call it AFTER the new tail is live: a reset sent before
+// would have its consumer re-read the journal while records were still going
+// nowhere.
+func (r *Relay) Resync(ctx context.Context, tenant sessionwire.TenantID, session sessionwire.SessionID) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.closed {
+		return ErrRelayClosed
+	}
+	key := sessionKey{tenant: tenant, session: session}
+	host := r.hosts[key]
+	if host == nil {
+		return ErrNoHostBinding
+	}
+	tip, err := r.readTipLocked(ctx, key)
+	if err != nil {
+		// Fail closed, as repairHostLocked does: a reset naming no tip is not a
+		// repair instruction, and streaming on past a gap nobody was told about
+		// is the defect.
+		for _, binding := range sortedBindings(host) {
+			r.closeBindingLocked(ctx, host, binding, "resync tip unavailable")
+		}
+		host.queue.Clear()
+		return err
+	}
+	var failures []error
+	for _, binding := range sortedBindings(host) {
+		if err := r.resetBindingLocked(ctx, key, host, binding, tip); err != nil {
+			failures = append(failures, err)
+		}
+	}
+	host.queue.Clear()
+	return errors.Join(failures...)
+}
+
+// Forget drops a session's HostBinding and every queue it holds.
+//
+// It is Open's inverse, for a session this replica has stopped watching; Close
+// is the same thing for every session at once. Nothing queued is lost that
+// anybody could read: a binding nobody holds has no consumer.
+func (r *Relay) Forget(tenant sessionwire.TenantID, session sessionwire.SessionID) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	key := sessionKey{tenant: tenant, session: session}
+	host := r.hosts[key]
+	if host == nil {
+		return
+	}
+	host.queue.Close()
+	for _, binding := range host.deliveries {
+		binding.queue.Close()
+	}
+	delete(r.hosts, key)
+}
+
 // repairHostLocked is runbook A7.3 step 4, in its stated order.
 //
 // Stop the live tail; capture ONE durable tip; reset every affected
