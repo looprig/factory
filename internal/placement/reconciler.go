@@ -251,8 +251,12 @@ type Result struct {
 	Excluded      []sessionwire.HostID
 	Unreachable   []sessionwire.HostID
 	Unaddressable []sessionwire.HostID
-	Refused       []CandidateRefusal
-	Failed        []sessionwire.HostID
+	// Incapable names the candidates skipped because the session has a
+	// pending gate response and the candidate cannot apply one (or could not
+	// be asked).
+	Incapable []sessionwire.HostID
+	Refused   []CandidateRefusal
+	Failed    []sessionwire.HostID
 
 	// Replacements counts the times placement re-ran after an epoch_mismatch.
 	Replacements int

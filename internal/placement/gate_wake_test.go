@@ -8,6 +8,7 @@ import (
 	"github.com/looprig/factory/internal/command"
 	"github.com/looprig/sessionstore"
 	"slices"
+	"strings"
 	"testing"
 
 	sessionwire "github.com/looprig/core/sessionwire/v1"
@@ -17,7 +18,9 @@ import (
 // delivers a gate response to a Host the one capability predicate does not
 // admit -- nor to one it could not ask -- while every other wake is delivered;
 // the capable control delivers both. The question is asked once per wake, of
-// the Host the route was just bound to.
+// the Host the route was just bound to. It is driven on the OWNED path (a
+// live owner is woken, no placement filter runs): an unowned session with a
+// pending gate response is placed only on a capable Host, below.
 func TestAGateResponseWakeIsWithheldFromAHostThatCannotApplyOne(t *testing.T) {
 	t.Parallel()
 	for name, row := range map[string]struct {
@@ -32,7 +35,7 @@ func TestAGateResponseWakeIsWithheldFromAHostThatCannotApplyOne(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
 			f := newAttachFixture(t, nil)
-			f.publishTarget(t, "host-a", 4, sessionwire.HostIsolationClassCrossTenantIsolated)
+			f.putOwner(t, sessionwire.HostPlacementPooled)
 			f.links.gateCapable, f.links.gateErr = row.capable, row.err
 			result, err := f.reconciler.Reconcile(t.Context(), Request{
 				TenantID: testTenant, SessionID: testSession,
@@ -51,8 +54,8 @@ func TestAGateResponseWakeIsWithheldFromAHostThatCannotApplyOne(t *testing.T) {
 			if withheld := 3 - len(row.want); result.WithheldGateResponses != withheld {
 				t.Fatalf("WithheldGateResponses = %d, want %d", result.WithheldGateResponses, withheld)
 			}
-			if len(asks) != 1 || asks[0] != "host-a" {
-				t.Fatalf("the capability was asked of %v, want host-a once", asks)
+			if len(asks) != 1 || asks[0] != "host-owner" {
+				t.Fatalf("the capability was asked of %v, want the owner once", asks)
 			}
 		})
 	}
@@ -90,5 +93,71 @@ func TestTheSweepNamesItsGateResponseWakes(t *testing.T) {
 	if len(placer.requests) != 1 || !slices.Equal(placer.requests[0].Wake, []sessionwire.CommandID{"c-input", "c-gate"}) ||
 		!slices.Equal(placer.requests[0].GateResponses, []sessionwire.CommandID{"c-gate"}) {
 		t.Fatalf("requests = %+v, want wake [c-input c-gate] naming c-gate as the gate response", placer.requests)
+	}
+}
+
+// TestASessionWithAPendingGateResponseIsPlacedOnlyOnACapableHost is the
+// capable-only placement filter: the top-ranked candidate cannot apply a gate
+// response and is skipped with a WARN; the capable one is attached and is the
+// only one asked to attach. With no capable candidate the session waits.
+func TestASessionWithAPendingGateResponseIsPlacedOnlyOnACapableHost(t *testing.T) {
+	t.Parallel()
+
+	gateWake := func(f *attachFixture) (Result, error) {
+		return f.reconciler.Reconcile(t.Context(), Request{
+			TenantID: testTenant, SessionID: testSession,
+			Wake: []sessionwire.CommandID{"cmd-gate"}, GateResponses: []sessionwire.CommandID{"cmd-gate"},
+		})
+	}
+
+	f := newAttachFixture(t, nil)
+	f.publishTarget(t, "host-old", 9, sessionwire.HostIsolationClassCrossTenantIsolated)
+	f.publishTarget(t, "host-new", 2, sessionwire.HostIsolationClassCrossTenantIsolated)
+	f.links.gateCapableHosts = map[sessionwire.HostID]bool{"host-new": true}
+	result, err := gateWake(f)
+	if err != nil || result.Decision.Outcome != OutcomeAttachPooled || result.Attached.HostID != "host-new" {
+		t.Fatalf("Reconcile = (%+v, %v), want attached to host-new", result, err)
+	}
+	if !slices.Equal(result.Incapable, []sessionwire.HostID{"host-old"}) {
+		t.Fatalf("Incapable = %v, want [host-old]", result.Incapable)
+	}
+	if hosts := f.links.attachedHosts(); !slices.Equal(hosts, []sessionwire.HostID{"host-new"}) {
+		t.Fatalf("attaches = %v, want host-new only", hosts)
+	}
+	if !strings.Contains(f.logs.String(), `"msg":"placement: skipped a pooled candidate that cannot apply this session's pending gate response; the session waits for a capable Host","host_id":"host-old"`) {
+		t.Fatalf("no WARN naming host-old: %s", f.logs.String())
+	}
+	if !slices.Equal(f.links.delivered, []sessionwire.CommandID{"cmd-gate"}) {
+		t.Fatalf("delivered %v, want the gate response to the capable Host", f.links.delivered)
+	}
+
+	none := newAttachFixture(t, nil)
+	none.publishTarget(t, "host-old", 9, sessionwire.HostIsolationClassCrossTenantIsolated)
+	none.links.gateCapableHosts = map[sessionwire.HostID]bool{}
+	result, err = gateWake(none)
+	if err != nil || result.Decision.Outcome != OutcomeNoCapacity || len(none.links.attachedHosts()) != 0 {
+		t.Fatalf("with no capable Host = (%+v, %v) attaches=%v, want no capacity and no attach", result, err, none.links.attachedHosts())
+	}
+
+	// A Host that could not be asked is not capable, whatever else came back.
+	unasked := newAttachFixture(t, nil)
+	unasked.publishTarget(t, "host-new", 2, sessionwire.HostIsolationClassCrossTenantIsolated)
+	unasked.links.gateCapableHosts = map[sessionwire.HostID]bool{"host-new": true}
+	unasked.links.gateErr = errors.New("reconnecting")
+	result, err = gateWake(unasked)
+	if err != nil || result.Decision.Outcome != OutcomeNoCapacity || len(unasked.links.attachedHosts()) != 0 {
+		t.Fatalf("with a Host that could not be asked = (%+v, %v) attaches=%v, want the session to wait", result, err, unasked.links.attachedHosts())
+	}
+}
+
+// TestASessionWithNoPendingGateResponseIsPlacedWithoutAsking: the filter costs
+// nothing for every other session.
+func TestASessionWithNoPendingGateResponseIsPlacedWithoutAsking(t *testing.T) {
+	t.Parallel()
+	f := newAttachFixture(t, nil)
+	f.publishTarget(t, "host-old", 9, sessionwire.HostIsolationClassCrossTenantIsolated)
+	result := f.mustPlace(t, "cmd-input")
+	if result.Attached.HostID != "host-old" || len(f.links.gateAsks) != 0 {
+		t.Fatalf("attached %q with %d capability asks, want host-old and none", result.Attached.HostID, len(f.links.gateAsks))
 	}
 }

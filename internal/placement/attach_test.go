@@ -59,6 +59,8 @@ type scriptedLinks struct {
 	gateCapable bool
 	gateErr     error
 	gateAsks    []sessionwire.HostID
+	// gateCapableHosts, when set, answers per Host instead of gateCapable.
+	gateCapableHosts map[sessionwire.HostID]bool
 }
 
 func newScriptedLinks() *scriptedLinks {
@@ -124,11 +126,14 @@ func (l *scriptedLinks) DeliverCommand(_ context.Context, tenant sessionwire.Ten
 }
 
 // AcceptsGateResponses answers the capability question. The zero value
-// refuses, as production does until host v0.4.0 fixes the signal.
+// refuses, as production does for a Host whose reply lacks Core's token.
 func (l *scriptedLinks) AcceptsGateResponses(_ context.Context, owner sessionwire.HostLinkRegistryObservation) (bool, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	l.gateAsks = append(l.gateAsks, owner.HostID)
+	if l.gateCapableHosts != nil {
+		return l.gateCapableHosts[owner.HostID], l.gateErr
+	}
 	return l.gateCapable, l.gateErr
 }
 

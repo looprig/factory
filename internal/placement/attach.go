@@ -321,6 +321,10 @@ func (r *Reconciler) placePooled(ctx context.Context, req Request, writes int) (
 			if !admissible(candidate, record) {
 				continue
 			}
+			if len(req.GateResponses) > 0 && !r.appliesGateResponses(ctx, req, candidate) {
+				result.Incapable = append(result.Incapable, candidate.HostID)
+				continue
+			}
 			observation, err := r.cfg.Links.Attach(ctx, candidate.InternalEndpoint, attachRequest(record, candidate, mode, r.cfg.ActorID))
 			switch answer, code := attachAnswer(err); answer {
 			case answerAccepted:
@@ -372,6 +376,37 @@ func (r *Reconciler) placePooled(ctx context.Context, req Request, writes int) (
 			return result, ErrRegistryStale
 		}
 	}
+}
+
+// appliesGateResponses is the capable-only placement filter: a session with a
+// PENDING gate response is placed only on a Host whose connect reply carries
+// Core's gate_response capability token (hostlink.GateResponseCapable, asked
+// through the same Links seam the wake uses). A candidate that cannot -- or
+// could not be asked -- is skipped and logged, and if none can, the session
+// waits (OutcomeNoCapacity) for a capable Host rather than being placed where
+// its answer would be refused or left applying. Without it a mixed fleet
+// re-places a session with an admitted answer onto a v0.3.0 Host.
+func (r *Reconciler) appliesGateResponses(ctx context.Context, req Request, candidate sessionwire.HostLinkCapacityReport) bool {
+	capable, err := r.cfg.Links.AcceptsGateResponses(ctx, sessionwire.HostLinkRegistryObservation{
+		TenantID: req.TenantID, SessionID: req.SessionID,
+		HostID: candidate.HostID, HostGeneration: candidate.HostGeneration,
+		InternalEndpoint: candidate.InternalEndpoint,
+	})
+	if err == nil && capable {
+		return true
+	}
+	attrs := []any{
+		slog.String("host_id", string(candidate.HostID)),
+		slog.Uint64("host_generation", candidate.HostGeneration),
+		slog.String("tenant_id", string(req.TenantID)),
+		slog.String("session_id", string(req.SessionID)),
+		slog.Int("pending_gate_responses", len(req.GateResponses)),
+	}
+	if err != nil {
+		attrs = append(attrs, slog.String("error", err.Error()))
+	}
+	r.logger().WarnContext(ctx, "placement: skipped a pooled candidate that cannot apply this session's pending gate response; the session waits for a capable Host", attrs...)
+	return false
 }
 
 // answer is attachAnswer's closed classification.
