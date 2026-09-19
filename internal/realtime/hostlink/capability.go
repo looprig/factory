@@ -13,25 +13,20 @@ import (
 // refusal before anything is written, and placement's withheld wake -- asks
 // it through Pool.AcceptsGateResponses, and nothing else decides.
 //
-// IT ANSWERS FALSE FOR EVERY REPLY, deliberately, and that is today's
-// behaviour kept: no released Host can apply a gate_response through the
-// disposition path (host v0.3.0 refuses the kind), and the signal the Host
-// that can -- host v0.4.0, built in parallel -- will advertise is not yet
-// fixed. A `hostlink_methods` entry is the likely shape, since Core v0.9.0
-// put the capability signal on the negotiation reply for exactly this kind of
-// gate and its decoder tolerates unknown names; but the name is Host's and
-// Core's to choose, and a name invented here would be a promise no Host made.
+// The signal is Core's capability token HostLinkCapabilityGateResponse
+// ("hostlink.command.gate_response", core v0.11.0), which a Host that applies
+// gate_response through the disposition path (host >= v0.4.0) lists in its
+// connect reply's hostlink_methods. It is a TOKEN, not a method: nothing is
+// dispatched on it. The match is Supports' exact-name match, so a substring,
+// a "hostlink.v1."-prefixed spelling or any other near miss is not the
+// capability, and a Host that predates it (host v0.3.0 advertises only the
+// five reserved methods) is refused, which keeps its behaviour unchanged.
 //
-// THIS IS THE SEAM. When host v0.4.0 fixes the signal, change this body --
-// for a hostlink_methods entry, to `return reply.Supports(<the method>)` --
-// and nothing else: Pool.AcceptsGateResponses, the admission gate and the
-// placement wake already route every decision here, and
-// TestTheGateResponseCapabilityRefusesEveryReplyToday is the test that must
-// then be rewritten from "refuses everything" to "admits exactly the
-// advertised Host".
+// It deliberately reads NOTHING else. In particular the catalog's LeaseEpoch
+// is never read as a capability signal (owner ruling, 2026-09-19): a
+// per-session, caller-asserted value cannot answer a per-process question.
 func GateResponseCapable(reply sessionwire.VersionNegotiationResponse) bool {
-	_ = reply
-	return false
+	return reply.Supports(sessionwire.HostLinkCapabilityGateResponse)
 }
 
 // Negotiator is the capability of a Link that can report the connect reply its

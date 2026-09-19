@@ -8,16 +8,21 @@ import (
 	"github.com/looprig/factory/internal/realtime/hostlink"
 )
 
-type advertisingDialer struct{ dialled []hostlink.Target }
+type advertisingDialer struct {
+	methods map[sessionwire.HostID][]string
+	dialled []hostlink.Target
+}
 
 func (d *advertisingDialer) Dial(_ context.Context, target hostlink.Target, _ hostlink.Observer) (hostlink.Link, error) {
 	d.dialled = append(d.dialled, target)
-	return advertisingLink{host: target.Host}, nil
+	return advertisingLink{host: target.Host, methods: d.methods[target.Host]}, nil
 }
 
-// advertisingLink's Host advertises every reserved method and several names a
-// gate_response capability might plausibly take.
-type advertisingLink struct{ host sessionwire.HostID }
+// advertisingLink's Host advertises the methods its dialer was given.
+type advertisingLink struct {
+	host    sessionwire.HostID
+	methods []string
+}
 
 func (l advertisingLink) Host() sessionwire.HostID { return l.host }
 func (advertisingLink) Bind(context.Context, sessionwire.HostLinkBindRequest) error {
@@ -33,19 +38,21 @@ func (advertisingLink) DeliverCommand(context.Context, sessionwire.TenantID, ses
 	return nil
 }
 func (advertisingLink) Close(context.Context) error { return nil }
-func (advertisingLink) Negotiated() (sessionwire.VersionNegotiationResponse, error) {
-	return sessionwire.VersionNegotiationResponse{Version: sessionwire.CurrentWireVersion}.WithHostLinkMethods(
-		sessionwire.HostLinkMethodBind, sessionwire.HostLinkMethodAttach, "hostlink.gate_response", "gate_response"), nil
+func (l advertisingLink) Negotiated() (sessionwire.VersionNegotiationResponse, error) {
+	return sessionwire.VersionNegotiationResponse{Version: sessionwire.CurrentWireVersion}.WithHostLinkMethods(l.methods...), nil
 }
 
-// TestTheComposedGateResponseQuestionAsksTheOwnersTenantLinkAndRefuses: the
-// adapter admission and placement share asks the OWNER's link for the
-// session's TENANT, at the address derived from the owner's advertised base,
-// and -- under the production predicate, until host v0.4.0 fixes the signal --
-// answers "cannot" however much the Host advertises.
-func TestTheComposedGateResponseQuestionAsksTheOwnersTenantLinkAndRefuses(t *testing.T) {
+// TestTheComposedGateResponseQuestionAsksTheOwnersTenantLink: the adapter
+// admission and placement share asks the OWNER's link for the session's
+// TENANT, at the address derived from the owner's advertised base, and under
+// the production predicate answers from Core's token alone: host-9 advertises
+// near misses and is refused, host-10 advertises the token and is capable.
+func TestTheComposedGateResponseQuestionAsksTheOwnersTenantLink(t *testing.T) {
 	t.Parallel()
-	dialer := &advertisingDialer{}
+	dialer := &advertisingDialer{methods: map[sessionwire.HostID][]string{
+		"host-9":  {sessionwire.HostLinkMethodBind, sessionwire.HostLinkMethodAttach, "hostlink.gate_response", "gate_response"},
+		"host-10": {sessionwire.HostLinkMethodBind, sessionwire.HostLinkCapabilityGateResponse},
+	}}
 	pool, err := hostlink.NewPool(hostlink.Config{Dialer: dialer})
 	if err != nil {
 		t.Fatal(err)
@@ -62,5 +69,14 @@ func TestTheComposedGateResponseQuestionAsksTheOwnersTenantLinkAndRefuses(t *tes
 	}
 	if len(dialer.dialled) != 1 || dialer.dialled[0] != (hostlink.Target{Host: "host-9", Endpoint: "ws://10.1.2.3:7100/hostlink/tenant-b"}) {
 		t.Fatalf("dialled %v, want host-9's tenant-b link once", dialer.dialled)
+	}
+	capable := owner
+	capable.HostID, capable.InternalEndpoint = "host-10", "ws://10.1.2.4:7100"
+	for _, ask := range []func(context.Context, sessionwire.HostLinkRegistryObservation) (bool, error){
+		gateResponders{pool: pool}.AcceptsGateResponses, placementLinks{pool: pool}.AcceptsGateResponses,
+	} {
+		if ok, err := ask(context.Background(), capable); err != nil || !ok {
+			t.Fatalf("a Host advertising Core's token = (%v, %v), want (true, nil)", ok, err)
+		}
 	}
 }

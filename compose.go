@@ -104,8 +104,8 @@ func composeComponents(cfg config, credentials *internalidentity.Authenticator) 
 		// The gate_response capability gate: a gate response is admitted
 		// only for an owner that can apply one, asked of the owner's link
 		// for the session's tenant and decided by
-		// hostlink.GateResponseCapable. Until host v0.4.0 fixes the signal
-		// that predicate refuses every Host.
+		// hostlink.GateResponseCapable: the owner's connect reply must carry
+		// Core's token sessionwire.HostLinkCapabilityGateResponse.
 		GateResponders: gateResponders{pool: pool},
 	})
 	if err != nil {

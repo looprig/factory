@@ -15,49 +15,66 @@ import (
 // promise.
 const testGateMethod = "test.only.gate-response-capability"
 
-// TestTheGateResponseCapabilityRefusesEveryReplyToday is the DEFAULT, held:
-// no reply -- none advertised, every reserved method, and names a Host might
-// plausibly choose -- makes a Host gate_response-capable, because no released
-// Host can apply one and the signal is not fixed. When host v0.4.0 fixes it,
-// this test is rewritten to "admits exactly the advertised Host".
-func TestTheGateResponseCapabilityRefusesEveryReplyToday(t *testing.T) {
+// TestTheGateResponseCapabilityIsExactlyCoresToken: a Host is gate_response-
+// capable when, and only when, its connect reply lists Core's token. The token
+// is spelled here as an ABSOLUTE LITERAL, because a fixture built from the
+// constant under test would pass for any value the constant took.
+func TestTheGateResponseCapabilityIsExactlyCoresToken(t *testing.T) {
 	t.Parallel()
 
-	for name, methods := range map[string][]string{
-		"no methods": nil,
-		"every reserved method": {sessionwire.HostLinkMethodBind, sessionwire.HostLinkMethodUnbind,
-			sessionwire.HostLinkMethodAttach, sessionwire.HostLinkMethodDrain, sessionwire.HostLinkMethodDrainStatus},
-		"plausible names": {"hostlink.gate_response", "hostlink.gate.respond", "gate_response", testGateMethod},
+	const token = "hostlink.command.gate_response"
+	if sessionwire.HostLinkCapabilityGateResponse != token {
+		t.Fatalf("Core's token is %q, want %q", sessionwire.HostLinkCapabilityGateResponse, token)
+	}
+	five := []string{sessionwire.HostLinkMethodBind, sessionwire.HostLinkMethodUnbind,
+		sessionwire.HostLinkMethodAttach, sessionwire.HostLinkMethodDrain, sessionwire.HostLinkMethodDrainStatus}
+	for name, row := range map[string]struct {
+		methods []string
+		want    bool
+	}{
+		"a reply with no hostlink_methods member":      {nil, false},
+		"the five methods only (a v0.3.0 Host)":        {five, false},
+		"the five methods and the token (v0.4.0)":      {append(append([]string(nil), five...), token), true},
+		"the token alone":                              {[]string{token}, true},
+		"the token as a substring":                     {[]string{"x" + token, token + ".v2", "hostlink.command.gate_response_v2"}, false},
+		"the token under the channel prefix":           {[]string{"hostlink.v1." + token, "hostlink.v1.command.gate_response"}, false},
+		"near misses a Host might plausibly have used": {[]string{"hostlink.gate_response", "gate_response", testGateMethod}, false},
 	} {
 		reply := sessionwire.VersionNegotiationResponse{Version: sessionwire.CurrentWireVersion}
-		if methods != nil {
-			reply = reply.WithHostLinkMethods(methods...)
+		if row.methods != nil {
+			reply = reply.WithHostLinkMethods(row.methods...)
 		}
-		if hostlink.GateResponseCapable(reply) {
-			t.Errorf("%s: GateResponseCapable = true; no Host may be treated as able to apply a gate_response before host v0.4.0 fixes the signal", name)
+		if got := hostlink.GateResponseCapable(reply); got != row.want {
+			t.Errorf("%s: GateResponseCapable = %v, want %v", name, got, row.want)
 		}
 	}
 }
 
-// TestADefaultPoolRefusesAGateResponseCapabilityOverARealLink: the composed
-// default, over a real socket to a stand-in that advertises everything --
-// including the test-only name -- answers "cannot", and asks over the
-// tenant's own derived address.
-func TestADefaultPoolRefusesAGateResponseCapabilityOverARealLink(t *testing.T) {
+// TestTheDefaultPoolAnswersFromTheHostsRealReply: the composed default
+// predicate over real sockets -- a stand-in advertising Core's token is
+// capable, one advertising the five methods and a near miss is not -- asked
+// over the tenant's own derived address.
+func TestTheDefaultPoolAnswersFromTheHostsRealReply(t *testing.T) {
 	t.Parallel()
 
-	host := newHostServer(t, hostOptions{token: serviceToken, methods: []string{sessionwire.HostLinkMethodBind, testGateMethod}})
+	capable := newHostServer(t, hostOptions{token: serviceToken, methods: []string{sessionwire.HostLinkMethodBind, sessionwire.HostLinkCapabilityGateResponse}})
+	older := newHostServer(t, hostOptions{token: serviceToken, methods: []string{sessionwire.HostLinkMethodBind, sessionwire.HostLinkMethodUnbind,
+		sessionwire.HostLinkMethodAttach, sessionwire.HostLinkMethodDrain, sessionwire.HostLinkMethodDrainStatus, testGateMethod}})
 	pool, err := hostlink.NewPool(hostlink.Config{Dialer: dialerFor(t, serviceToken)})
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = pool.Close(context.Background()) })
 
-	ok, err := pool.AcceptsGateResponses(context.Background(), host.target(), tenant)
-	if err != nil || ok {
-		t.Fatalf("AcceptsGateResponses = (%v, %v), want (false, nil) under the default predicate", ok, err)
+	if ok, err := pool.AcceptsGateResponses(context.Background(), capable.target(), tenant); err != nil || !ok {
+		t.Fatalf("a Host advertising the token = (%v, %v), want (true, nil)", ok, err)
 	}
-	if got := pool.TenantLinks(host.id); got != 1 {
+	other := older.target()
+	other.Host = hostTwo // the stand-ins share a Host id; links are keyed by (Host, tenant)
+	if ok, err := pool.AcceptsGateResponses(context.Background(), other, tenant); err != nil || ok {
+		t.Fatalf("a Host advertising the five methods = (%v, %v), want (false, nil)", ok, err)
+	}
+	if got := pool.TenantLinks(capable.id); got != 1 {
 		t.Fatalf("the question opened %d links to the Host, want the tenant's one", got)
 	}
 }

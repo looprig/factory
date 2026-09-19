@@ -55,10 +55,11 @@ var ErrLegacySessionUnsupported = errors.New("admission: the session is bound to
 // fresh-owner check just accepted, and answered by the one capability
 // predicate (hostlink.GateResponseCapable, through GateResponders).
 //
-// Until host v0.4.0 fixes the capability signal that predicate answers "no"
-// for every Host, so every gate response to a Host-resident session is refused
-// here -- which is today's behaviour kept, since no released Host publishes a
-// gate a response could answer.
+// The predicate admits exactly a Host whose connect reply carries Core's token
+// sessionwire.HostLinkCapabilityGateResponse (host >= v0.4.0). A v0.3.0 Host
+// does not, so a gate response to a session it owns is refused here -- its
+// behaviour unchanged. The catalog's LeaseEpoch is NOT consulted: it is never
+// a capability signal (owner ruling, 2026-09-19).
 var ErrGateResponseUnsupported = errors.New("admission: the session's owner cannot apply a gate response")
 
 // ErrLegacyCreateUnsupported reports that Factory cannot create a session on
