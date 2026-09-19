@@ -56,14 +56,15 @@ var ErrHostFailed = errors.New("hostlink: the host answered with a failure carry
 // HostFailure is a Host's own ANSWER to an RPC that carried no Core record: a
 // transport-level error reply, such as centrifuge's ErrorInternal (code 100).
 //
-// It is kept apart from every other RPC failure because it is not ambiguous.
-// A cancelled context, a lost connection or an unanswered request may have
-// reached a Host that then acted; a HostFailure is the Host having answered,
-// and host v0.2.1 answers a failed attach this way only after undoing its own
-// partial work (hostlink/attach.go errAttachFailed). A caller may therefore
-// treat it as that Host's final word on this request, which is what lets
-// placement try the next candidate instead of stopping. It is still not a
-// *HostRefusal: it names no reason a caller may branch on.
+// It is kept apart from every other RPC failure because the Host ANSWERED: a
+// cancelled context, a lost connection or an unanswered request is a plain
+// error, and centrifuge-go builds *Error only from a reply the server sent.
+// It says nothing about what the Host holds. host v0.2.1 answers a failed
+// attach this way (hostlink/attach.go errAttachFailed) after a failed launch,
+// after a rollback that did not complete, and after an attach whose
+// observation it could not publish -- in which case the session IS resident.
+// Host's own contract is "not a placement outcome, but a Factory may retry".
+// It is still not a *HostRefusal: it names no reason a caller may branch on.
 type HostFailure struct {
 	// Method is the RPC method the Host answered.
 	Method string

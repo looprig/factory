@@ -125,7 +125,13 @@ type Config struct {
 // It holds no per-session state. Everything it decides from is read within the
 // call: the catalog record, the registry observation and one capacity page. A
 // replica that restarts mid-placement leaves only a claim, which lapses.
-type Reconciler struct{ cfg Config }
+type Reconciler struct {
+	cfg Config
+	// draw turns a nominal backoff into the wait actually slept. Nil is
+	// jittered; a test sets a fixed draw so the default wait's use of it is
+	// observable (B5 v0.3.0 quality gate QJ1/QJ2).
+	draw func(time.Duration) time.Duration
+}
 
 // NewReconciler validates a configuration before it can reach a store.
 func NewReconciler(cfg Config) (*Reconciler, error) {

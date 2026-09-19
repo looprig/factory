@@ -551,3 +551,68 @@ func TestAnAttachOnAClosedPoolIsRefused(t *testing.T) {
 		t.Errorf("dials = %d, want 0", got)
 	}
 }
+
+// TestALateEvictionDoesNotDropTheLinkThatReplacedTheDeadOne is Pool.evict's
+// guard (B5 v0.3.0 quality gate QH3b). Two attaches are in flight on a link
+// that turns out terminal; the first evicts it and a third attach dials a
+// fresh link and a viewer binds on it; THEN the slow second attach reports the
+// same terminal error. Its eviction names the OLD link and must be a no-op:
+// dropping whatever link is current would close the fresh one, strand the
+// viewer's route, and force yet another dial.
+func TestALateEvictionDoesNotDropTheLinkThatReplacedTheDeadOne(t *testing.T) {
+	t.Parallel()
+
+	dead := fmt.Errorf("%w: host selected version 2", hostlink.ErrUnsupportedProtocol)
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	dials := 0
+	dialer := newRecordingDialer()
+	dialer.onDial = func(link *fakeLink) {
+		dials++
+		if dials > 1 {
+			return // the replacement accepts
+		}
+		link.attachReply = func(req sessionwire.HostLinkAttachRequest) (sessionwire.HostLinkRegistryObservation, error) {
+			if req.SessionID == "s-slow" {
+				close(entered)
+				<-release
+			}
+			return sessionwire.HostLinkRegistryObservation{}, dead
+		}
+	}
+	pool := newPool(t, dialer, hostlink.Limits{})
+	slow := make(chan error, 1)
+	go func() {
+		_, err := pool.Attach(context.Background(), target(hostOne, endpoint1), attachRequest(hostOne, "s-slow"))
+		slow <- err
+	}()
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the slow attach never reached the link")
+	}
+	old := dialer.link(hostOne)
+	if _, err := pool.Attach(context.Background(), target(hostOne, endpoint1), attachRequest(hostOne, "s-fast")); !errors.Is(err, dead) {
+		t.Fatalf("the fast attach = %v, want the terminal error", err)
+	}
+	if _, err := pool.Attach(context.Background(), target(hostOne, endpoint1), attachRequest(hostOne, "s-new")); err != nil {
+		t.Fatalf("the attach after eviction = %v, want the fresh link to accept", err)
+	}
+	fresh := dialer.link(hostOne)
+	if fresh == old {
+		t.Fatal("the premise is a fresh link; the dialer handed back the old one")
+	}
+	mustBind(t, pool, target(hostOne, endpoint1), bindRequest(hostOne, "s-viewer"))
+
+	close(release)
+	if err := <-slow; !errors.Is(err, dead) {
+		t.Fatalf("the slow attach = %v, want the terminal error", err)
+	}
+	if _, routed := pool.RouteFor(tenant, "s-viewer"); !routed || fresh.closes() != 0 || old.closes() != 1 {
+		t.Fatalf("after the late eviction: viewer routed=%t, fresh closes=%d, old closes=%d; want the fresh link and its route untouched",
+			routed, fresh.closes(), old.closes())
+	}
+	if _, err := pool.Attach(context.Background(), target(hostOne, endpoint1), attachRequest(hostOne, "s-again")); err != nil || dialer.dials() != 2 {
+		t.Fatalf("the next attach = %v after %d dials, want the fresh link reused", err, dialer.dials())
+	}
+}

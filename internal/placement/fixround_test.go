@@ -262,8 +262,31 @@ func TestTheProductionWaitSleepsAJitteredBackoffAndHonoursCancellation(t *testin
 			}
 		}
 	}
-	r := &Reconciler{}
+	// d=1ns cannot halve, and must not draw zero: the band is exactly {1ns}.
+	for range 50 {
+		if got := jittered(1); got != 1 {
+			t.Fatalf("jittered(1ns) = %v, want 1ns", got)
+		}
+	}
+	// The default wait sleeps the DRAW, not the nominal duration, and not a
+	// multiple of it: a one-second nominal backoff drawn as 100ms must return
+	// in about 100ms (QJ1: jitter dropped would sleep 1s; QJ2: a doubled draw
+	// would sleep 200ms).
+	drawn := &Reconciler{draw: func(d time.Duration) time.Duration {
+		if d != time.Second {
+			t.Errorf("the draw was asked for %v, want the nominal 1s", d)
+		}
+		return 100 * time.Millisecond
+	}}
 	start := time.Now()
+	if err := drawn.wait(context.Background(), time.Second); err != nil {
+		t.Fatalf("wait = %v", err)
+	}
+	if elapsed := time.Since(start); elapsed < 100*time.Millisecond || elapsed > 180*time.Millisecond {
+		t.Fatalf("a wait drawn as 100ms took %v, want within [100ms, 180ms]", elapsed)
+	}
+	r := &Reconciler{}
+	start = time.Now()
 	if err := r.wait(context.Background(), 60*time.Millisecond); err != nil {
 		t.Fatalf("wait = %v", err)
 	}

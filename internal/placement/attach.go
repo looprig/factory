@@ -53,13 +53,17 @@ var ErrHostUnreachable = errors.New("placement: host could not be reached")
 // centrifuge's ErrorInternal. A HostLinks implementation wraps it.
 //
 // It moves placement on to the next candidate, like a coded refusal and unlike
-// the ambiguous failures that abort. The difference from an abort is that the
-// Host answered: host v0.2.1 sends this only after undoing its own partial
-// work (a launch that failed, a store it could not reach), so there is no
-// attach in flight for a second candidate to race. Aborting on it instead let
-// one Host whose launches always fail -- and which therefore never loses
-// capacity and is ranked first on every pass -- block placement for every
-// session of its agent and runtime (B5 quality gate Q1).
+// the ambiguous failures that abort. It is NOT a placement outcome and not a
+// promise that the Host rolled back: host v0.2.1 sends it after a failed
+// launch, but also after a rollback that could not complete, and after an
+// attach that succeeded but whose observation could not be published -- the
+// session may be RESIDENT there. What makes moving on safe is the session
+// lease: a Host that still holds it makes the next candidate refuse
+// epoch_mismatch, so no second residency can form, and the re-read converges
+// on the owner. Aborting on it instead let one Host whose launches always fail
+// -- and which therefore never loses capacity and is ranked first on every
+// pass -- block placement for every session of its agent and runtime (B5
+// quality gate Q1).
 var ErrAttachFailed = errors.New("placement: host answered the attach with a failure")
 
 // ErrRegistryStale reports that every re-placement this call was allowed ended
@@ -190,7 +194,11 @@ func (r *Reconciler) wait(ctx context.Context, d time.Duration) error {
 	if r.cfg.Wait != nil {
 		return r.cfg.Wait(ctx, d)
 	}
-	timer := time.NewTimer(jittered(d))
+	draw := r.draw
+	if draw == nil {
+		draw = jittered
+	}
+	timer := time.NewTimer(draw(d))
 	defer timer.Stop()
 	select {
 	case <-timer.C:
