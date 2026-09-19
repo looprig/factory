@@ -252,10 +252,14 @@ func TestTheReplacementBoundsAreRefusedPastTheirCeilings(t *testing.T) {
 func TestTheProductionWaitSleepsAJitteredBackoffAndHonoursCancellation(t *testing.T) {
 	t.Parallel()
 
-	for range 2000 {
-		d := time.Duration(1 + int(time.Now().UnixNano()%1000))
-		if got := jittered(d); got < d/2 || got > d {
-			t.Fatalf("jittered(%v) = %v, want within [%v, %v]", d, got, d/2, d)
+	// Every nominal duration from 1ns to 2µs, 50 draws each: a draw outside
+	// [d/2, d] for any of them is a failure, and with d >= 4 a jitter drawn
+	// from [0, d] or [d, 2d] leaves the band on a draw nearly every time.
+	for d := time.Duration(1); d <= 2*time.Microsecond; d++ {
+		for range 50 {
+			if got := jittered(d); got < d/2 || got > d {
+				t.Fatalf("jittered(%v) = %v, want within [%v, %v]", d, got, d/2, d)
+			}
 		}
 	}
 	r := &Reconciler{}
