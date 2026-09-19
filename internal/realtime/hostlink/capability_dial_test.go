@@ -70,7 +70,9 @@ func TestACapabilityDialDoesNotStallThePool(t *testing.T) {
 	<-dialer.entered
 
 	bound := make(chan error, 1)
-	go func() { bound <- pool.Bind(context.Background(), target(hostOne, base1), tenantBind(tenant, hostOne, "s-1")) }()
+	go func() {
+		bound <- pool.Bind(context.Background(), target(hostOne, base1), tenantBind(tenant, hostOne, "s-1"))
+	}()
 	select {
 	case err := <-bound:
 		if err != nil {
