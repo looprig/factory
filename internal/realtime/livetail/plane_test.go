@@ -235,6 +235,7 @@ func TestAMailboxOverflowIsRepairedNotBufferedWithoutBound(t *testing.T) {
 	r.dir.put(host.observation(tenantA, session, 3))
 	r.watch(t, tenantA, session)
 	channel := sessionwire.HostLinkChannel(tenantA, session)
+	r.awaitTail(t, host, channel)
 	gate := make(chan struct{})
 	var release sync.Once
 	open := func() { release.Do(func() { close(gate) }) }

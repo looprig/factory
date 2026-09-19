@@ -356,6 +356,25 @@ func (c *manualClock) AfterFunc(_ time.Duration, f func()) func() bool {
 	}
 }
 
+// awaitTail is the precondition every case that publishes on a watched
+// session's channel needs: a live tail at the Host. r.watch returns once the
+// demand is taken, and Demand.Acquire answers nil even when its first serve
+// bound nothing -- a subscribe past the dial timeout under load, or no owner
+// yet -- leaving the retry to the next ownership poll, which this rig's manual
+// clock never fires on its own. So the wait drives the poll itself (quality
+// gate F2): publishing to a channel nobody subscribes to made the overflow
+// case wait 20s for something that could not happen.
+func (r *rig) awaitTail(t *testing.T, host *standIn, channel string) {
+	t.Helper()
+	r.wait(t, "a live tail at the Host", func() bool {
+		if host.subscribers(channel) == 1 {
+			return true
+		}
+		r.clock.tick()
+		return host.subscribers(channel) == 1
+	})
+}
+
 // tick runs every armed poll once.
 func (c *manualClock) tick() {
 	c.mu.Lock()
