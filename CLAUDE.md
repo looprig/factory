@@ -660,8 +660,9 @@ A6.1 built `internal/realtime/clientlink`: the browser-facing duplex connection,
 split into an `Engine` that decides and a Centrifuge adapter that carries. Every
 decision — protocol version, credential, channel, RPC method — is the Engine's,
 so the policy is drivable without a socket and the adapter has nothing to
-choose. `factory.New` does **not** compose it yet; `/v1/realtime` still answers
-501 and now names A9.1 as its owner.
+choose. `factory.New` composes it at `Start` (A9.1): `/v1/realtime` answers
+503 before `Start` and after `Stop`, and since v0.4.0 the node also carries a
+watched session's live output (see "The live tail").
 
 **Two properties of the transport are load-bearing and were measured, not
 assumed.**
@@ -2325,9 +2326,35 @@ start sends the reset. **Re-bind, then subscribe, then reset.** An owner
 very call before its re-bind fails, and Restored is then the only thing left
 that re-binds (measured; `TestAnOwnersUnsubscribeDuringTheReconnectStillHearsRestored`).
 A server-side unsubscribe with a resubscribe code (>= 2500) is ended the same
-way rather than tolerated. Nothing new is held across `client.RPC`, and no
-callback takes a lock anything calling the transport holds: `Plane.mu` and the
-link's `mu` are leaves, and the Relay is called only from a drainer goroutine.
+way rather than tolerated. No callback takes a lock anything calling the
+transport holds: `Plane.mu` and the link's `mu` are leaves, and the Relay is
+called only from a drainer goroutine. **What IS held across a Host round trip,
+stated because v0.4.0's first cut claimed nothing was:** `routing.Demand`'s one
+mutex across a bind (`Acquire`, a poll, `Rebind` -- and `Plane.Bind` waits for
+the subscribe's answer too), and the pool's across a bind RPC, as before. So a
+slow Host delays other sessions' binds and polls. It no longer delays their
+DELIVERY: the Relay's one mutex used to be held across a repair's stop, tip read,
+rebind and resume, and one session's 3s bind stalled an unrelated session's
+record 2.9s (quality gate F3); `Relay.repair` now does that I/O with the lock
+released, re-locking only to apply the resets.
+
+**Every transport registry change is serialised under the link's `regMu`, and a
+withdrawal only acts on its own subscription** (spec gate F2). centrifuge-go
+keys its subscription registry, and the unsubscribe it sends a Host, by CHANNEL
+NAME, so a late discard of an old subscription -- the second one every owner
+unsubscribe used to provoke through `OnUnsubscribed`, or a late
+`endAllSubscriptions` withdrawal -- unsubscribed a NEWER tail at the Host while
+the link believed it live. `regMu` is never taken on a callback goroutine
+(`Client.Close` holds the client lock while draining callbacks; the gate's
+inline-discard mutants hang the suite). Likewise a mailbox overflow no longer
+starts its own unsubscribe: the repair's `Tail.Stop` withdraws the tail in
+order, and an unordered withdrawal landing after the re-subscribe removed the
+new tail (both gates' F1).
+
+**A tip read that fails during a repair closes every affected viewer and STILL
+re-binds** (quality gate F1). It used to leave the tail stopped with the route
+held, and nothing -- no poll, no restored link -- ever re-bound it: a session
+silent for as long as it was watched.
 **A bind that meets a terminal link now evicts it**, as attach did since B5: a
 viewer's route otherwise pins a dead link and the re-bind never reaches the Host.
 
@@ -2341,9 +2368,13 @@ same channel instead of the old `unpublishedHints` refusal; `ErrNoHintPublisher`
 is kept, Deprecated) runs only for an UNBOUND watched session, and wui ignores a
 hint in its live phase. (3) `Frame.CommittedAppendSeq` is a vacuous fence
 (above). (4) A placement transient unbind racing a viewer's bind of the same
-session can drop the viewer's pool route (pre-existing: routes are not
-reference-counted); the tail keeps flowing -- a Host publishes regardless of
-bind -- and the next poll repairs the route.
+session can drop the viewer's pool route (routes are not reference-counted);
+the tail keeps flowing -- a Host publishes regardless of bind -- and since the
+fix round the next ownership poll notices the missing pool route
+(`routing.RouteReporter`, reported by the plane) and re-binds. Before, the poll
+trusted the routing table's own binding and never did (spec gate C1). (5)
+`Demand`'s mutex across a bind means one slow Host delays other sessions' binds
+and polls, not their delivery (above).
 
 ## Not implemented yet
 

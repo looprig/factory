@@ -307,7 +307,8 @@ durable journal. On a HostLink reconnect Factory withdraws every tail itself
 re-binds on the new connection, then subscribes, then resets. Limits: a private
 record between public ones makes resets name an older sequence than necessary
 (over-repair), and Host silence while bound still looks like idle.
-`factory.New` composes neither the pool nor the reaper's cadence; A9.1 owns that.
+`factory.New` composes the pool, and `Start` drives the reaper on the sweep
+cadence.
 
 ## Placement
 
@@ -425,11 +426,10 @@ Core first.
 
 ## Status
 
-Seams and identity derivation. `contract.go` states the cross-service contract,
-`server.go` / `options.go` state the composition, and `internal/identity`
-derives principals; the HTTP API, admission, routing and placement are the
-subject of later tasks in runbook 05. The realtime transport is pinned and
-measured (A5.1), the ClientLink engine is built (A6.1) and the HostLink pool and
-dialer are built (A7.1); `factory.New` composes none of the three. Target
-discovery (A4.1), the placement policy and reconciler (A4.2) and the local
-HostBindings table (A4.3) are built and likewise uncomposed.
+`factory.New` composes the whole service: identity, the HTTP API, admission,
+the ClientLink node (started by `Start`), the HostLink pool, the routing table
+and demand plane, placement and its sweeps, and -- since v0.4.0 -- the live
+tail (`routing.Relay` between the HostLink subscription and the ClientLink).
+Still open: the default `cmd/factory` binary (A9.2), multi-tenant pooled Hosts
+(Gap 1: links keyed by Host only), and resident gate publication (sessionstore
+v0.12.0 / host v0.4.0).
