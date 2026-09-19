@@ -66,6 +66,21 @@ var ErrHostUnreachable = errors.New("placement: host could not be reached")
 // quality gate Q1).
 var ErrAttachFailed = errors.New("placement: host answered the attach with a failure")
 
+// ErrTenantUnaddressable classifies a candidate whose advertised BASE cannot
+// carry this session's tenant's HostLink address: Core's HostLinkEndpoint
+// refused to derive it (a tenant too long for what the base leaves room for,
+// a tenant Core will not route, or a base that is not bare). A HostLinks
+// implementation wraps it, and keeps Core's *sessionwire.HostLinkEndpointError
+// reachable with errors.As so the code can be logged.
+//
+// It is PER TENANT and decided before anything is dialled: the candidate is
+// skipped for this session's tenant and the next one is asked, exactly as for
+// an unreachable Host, and nothing about the Host is concluded for any other
+// tenant. It is logged because it is a deployment fact an operator can act on
+// -- a Host whose name leaves no room for a tenant, or one still advertising a
+// pre-v0.3.0 endpoint -- and a silent skip would read as "no capacity".
+var ErrTenantUnaddressable = errors.New("placement: the candidate's advertised base cannot carry this tenant's HostLink address")
+
 // ErrRegistryStale reports that every re-placement this call was allowed ended
 // in epoch_mismatch: the session's lease is held elsewhere and the registry has
 // not caught up. The work is left for the next sweep, which re-reads the
@@ -322,6 +337,15 @@ func (r *Reconciler) placePooled(ctx context.Context, req Request, writes int) (
 					slog.String("session_id", string(req.SessionID)))
 			case answerUnreachable:
 				result.Unreachable = append(result.Unreachable, candidate.HostID)
+			case answerUnaddressable:
+				result.Unaddressable = append(result.Unaddressable, candidate.HostID)
+				r.logger().WarnContext(ctx, "placement: skipped a pooled candidate whose advertised base cannot carry this tenant's HostLink address",
+					slog.String("host_id", string(candidate.HostID)),
+					slog.Uint64("host_generation", candidate.HostGeneration),
+					slog.String("tenant_id", string(req.TenantID)),
+					slog.String("session_id", string(req.SessionID)),
+					slog.String("code", string(endpointCode(err))),
+					slog.String("internal_endpoint", string(candidate.InternalEndpoint)))
 			case answerFailed:
 				result.Failed = append(result.Failed, candidate.HostID)
 				r.logger().WarnContext(ctx, "placement: a pooled candidate failed the attach; trying the next",
@@ -356,6 +380,7 @@ const (
 	answerUnsupported
 	answerUnreachable
 	answerFailed
+	answerUnaddressable
 )
 
 // attachAnswer classifies one attach outcome. It is total over the error, and
@@ -381,6 +406,9 @@ func attachAnswer(err error) (answer, sessionwire.HostLinkErrorCode) {
 	if errors.Is(err, ErrAttachUnsupported) {
 		return answerUnsupported, ""
 	}
+	if errors.Is(err, ErrTenantUnaddressable) {
+		return answerUnaddressable, ""
+	}
 	if errors.Is(err, ErrHostUnreachable) {
 		return answerUnreachable, ""
 	}
@@ -388,6 +416,15 @@ func attachAnswer(err error) (answer, sessionwire.HostLinkErrorCode) {
 		return answerFailed, ""
 	}
 	return answerAbort, ""
+}
+
+// endpointCode is Core's derivation refusal code carried by err, or empty.
+func endpointCode(err error) sessionwire.HostLinkEndpointCode {
+	var refused *sessionwire.HostLinkEndpointError
+	if errors.As(err, &refused) {
+		return refused.Code
+	}
+	return ""
 }
 
 // bindAttached binds this replica's route with the epoch the ATTACH returned.

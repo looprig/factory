@@ -28,6 +28,7 @@ func TestEveryAttachFailureIsClassifiedOntoPlacementsVocabulary(t *testing.T) {
 		unsupported
 		unreachable
 		failed
+		unaddressable
 		abort
 	)
 	refusal := sessionwire.HostLinkError{Code: sessionwire.HostLinkErrorEpochMismatch, CurrentLeaseEpoch: 93}
@@ -45,7 +46,10 @@ func TestEveryAttachFailureIsClassifiedOntoPlacementsVocabulary(t *testing.T) {
 		// refuses BEFORE sending, so the Host is unreachable, not ambiguous.
 		"wire version": {fmt.Errorf("hostlink: hostlink.attach: %w: host selected 2", hostlink.ErrUnsupportedProtocol), unreachable},
 		// B5 quality gate Q1: the Host's own code-less answer.
-		"host failure":             {&hostlink.HostFailure{Method: sessionwire.HostLinkMethodAttach, Code: 100, Message: "internal server error"}, failed},
+		"host failure": {&hostlink.HostFailure{Method: sessionwire.HostLinkMethodAttach, Code: 100, Message: "internal server error"}, failed},
+		// Gap 1: the candidate's base cannot carry this tenant's address.
+		"tenant unaddressable": {&hostlink.EndpointError{Host: "host-a", Tenant: "tenant-a",
+			Cause: &sessionwire.HostLinkEndpointError{Code: sessionwire.HostLinkEndpointCodeTooLong}}, unaddressable},
 		"pool closed":              {hostlink.ErrPoolClosed, abort},
 		"malformed reply":          {fmt.Errorf("%w: empty", hostlink.ErrMalformedAttachReply), abort},
 		"observation of elsewhere": {fmt.Errorf("%w: generation", hostlink.ErrAttachMismatch), abort},
@@ -57,6 +61,10 @@ func TestEveryAttachFailureIsClassifiedOntoPlacementsVocabulary(t *testing.T) {
 		isUnsupported := errors.Is(got, placement.ErrAttachUnsupported)
 		isUnreachable := errors.Is(got, placement.ErrHostUnreachable)
 		isFailed := errors.Is(got, placement.ErrAttachFailed)
+		isUnaddressable := errors.Is(got, placement.ErrTenantUnaddressable)
+		if isUnaddressable != (row.want == unaddressable) {
+			t.Errorf("%s: classifyAttach = %v, ErrTenantUnaddressable = %t", name, got, isUnaddressable)
+		}
 		if isFailed != (row.want == failed) {
 			t.Errorf("%s: classifyAttach = %v, ErrAttachFailed = %t", name, got, isFailed)
 		}
@@ -77,8 +85,13 @@ func TestEveryAttachFailureIsClassifiedOntoPlacementsVocabulary(t *testing.T) {
 			if isUnreachable || isUnsupported || isRefusal {
 				t.Errorf("%s: classifyAttach = %v, want ErrAttachFailed alone", name, got)
 			}
+		case unaddressable:
+			var code *sessionwire.HostLinkEndpointError
+			if isUnreachable || isUnsupported || isRefusal || !errors.As(got, &code) || code.Code != sessionwire.HostLinkEndpointCodeTooLong {
+				t.Errorf("%s: classifyAttach = %v, want ErrTenantUnaddressable alone, keeping Core's code", name, got)
+			}
 		case abort:
-			if isRefusal || isUnsupported || isUnreachable || isFailed || !errors.Is(got, row.err) {
+			if isRefusal || isUnsupported || isUnreachable || isFailed || isUnaddressable || !errors.Is(got, row.err) {
 				t.Errorf("%s: classifyAttach = %v, want the error itself, unclassified", name, got)
 			}
 		}

@@ -366,6 +366,11 @@ func (c *components) realtimeHandler() http.Handler {
 //
 //   - A Host's own HostLinkError becomes *placement.AttachRefusal, whose code
 //     placement branches on.
+//   - A Host whose advertised BASE cannot carry the session's tenant's address
+//     (hostlink.ErrNoTenantEndpoint, Core's HostLinkEndpoint refusal) becomes
+//     placement.ErrTenantUnaddressable, with Core's typed refusal kept for the
+//     log. Nothing was dialled, and it says nothing about another tenant:
+//     placement skips the candidate for this tenant and asks the next.
 //   - A method the Host did not advertise becomes ErrAttachUnsupported: the
 //     pool refused it LOCALLY and nothing was sent, which is what lets a mixed
 //     fleet exclude a Host that predates attach rather than read its
@@ -423,6 +428,9 @@ func classifyAttach(err error) error {
 	var refusal *hostlink.HostRefusal
 	if errors.As(err, &refusal) {
 		return &placement.AttachRefusal{HostLinkError: refusal.HostLinkError}
+	}
+	if errors.Is(err, hostlink.ErrNoTenantEndpoint) {
+		return fmt.Errorf("%w: %w", placement.ErrTenantUnaddressable, err)
 	}
 	if errors.Is(err, hostlink.ErrUnsupportedMethod) {
 		return fmt.Errorf("%w: %w", placement.ErrAttachUnsupported, err)

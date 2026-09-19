@@ -274,8 +274,24 @@ func (p *Plane) Close(ctx context.Context) error {
 // fails undoes the bind and fails the whole call, so a route this replica
 // holds is always one carrying a live tail -- a route without one would read,
 // to every viewer, exactly like an idle session.
+//
+// The endpoint is the owner's advertised BASE; the pool derives the tenant's
+// address. A base that cannot carry this tenant's address (Gap 1,
+// hostlink.ErrNoTenantEndpoint) leaves the session unbound, as every failed
+// bind does, and is logged with Core's code, because the routing plane's next
+// poll will meet the same answer and nothing else would ever say why a watched
+// session stays silent.
 func (p *Plane) Bind(ctx context.Context, endpoint sessionwire.InternalEndpoint, req sessionwire.HostLinkBindRequest) error {
 	if err := p.links.Bind(ctx, hostlink.Target{Host: req.HostID, Endpoint: endpoint}, req); err != nil {
+		var unaddressable *hostlink.EndpointError
+		if errors.As(err, &unaddressable) {
+			p.log.WarnContext(ctx, "livetail: the session's owner advertises a base that cannot carry its tenant's HostLink address; the session stays unbound",
+				slog.String("host_id", string(req.HostID)),
+				slog.String("tenant_id", string(req.TenantID)),
+				slog.String("session_id", string(req.SessionID)),
+				slog.String("code", string(unaddressable.Cause.Code)),
+				slog.String("internal_endpoint", string(endpoint)))
+		}
 		return err
 	}
 	if err := p.links.Subscribe(ctx, req.TenantID, req.SessionID, p.newSink(req.TenantID, req.SessionID)); err != nil {

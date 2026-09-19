@@ -234,13 +234,15 @@ type Result struct {
 
 	// Excluded names the admissible candidates skipped because they do not
 	// advertise hostlink.attach; Unreachable those this replica could not ask;
-	// Refused those that answered with a HostLinkError; Failed those that
-	// answered with a failure carrying no code (ErrAttachFailed). Each is in
-	// the order asked.
-	Excluded    []sessionwire.HostID
-	Unreachable []sessionwire.HostID
-	Refused     []CandidateRefusal
-	Failed      []sessionwire.HostID
+	// Unaddressable those whose advertised base cannot carry this session's
+	// tenant's HostLink address (ErrTenantUnaddressable); Refused those that
+	// answered with a HostLinkError; Failed those that answered with a failure
+	// carrying no code (ErrAttachFailed). Each is in the order asked.
+	Excluded      []sessionwire.HostID
+	Unreachable   []sessionwire.HostID
+	Unaddressable []sessionwire.HostID
+	Refused       []CandidateRefusal
+	Failed        []sessionwire.HostID
 
 	// Replacements counts the times placement re-ran after an epoch_mismatch.
 	Replacements int
