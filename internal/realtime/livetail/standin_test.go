@@ -461,15 +461,51 @@ func (r *rig) watch(t *testing.T, tenant sessionwire.TenantID, sid sessionwire.S
 	}
 }
 
-func eventually(t *testing.T, what string, condition func() bool) {
+// eventually waits for condition, and on its deadline reports what WAS
+// observed, from every dump given: a bare "did not happen" says nothing about
+// what the viewers received instead.
+func eventually(t *testing.T, what string, condition func() bool, dumps ...func() string) {
 	t.Helper()
 	deadline := time.Now().Add(waitFor)
 	for !condition() {
 		if time.Now().After(deadline) {
-			t.Fatalf("%s did not happen within %v", what, waitFor)
+			observed := make([]string, 0, len(dumps))
+			for _, dump := range dumps {
+				observed = append(observed, dump())
+			}
+			t.Fatalf("%s did not happen within %v; observed: %s", what, waitFor, strings.Join(observed, "; "))
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
+}
+
+// describe renders one viewer stream and the Host's wire log for a channel.
+func describe(t *testing.T, records []string, host *standIn, channel string) string {
+	t.Helper()
+	var wire []string
+	for _, e := range host.events() {
+		if e.channel == channel {
+			wire = append(wire, e.kind)
+		}
+	}
+	return fmt.Sprintf("viewers=%v host_wire=%v host_subscribers=%d", kinds(t, records), wire, host.subscribers(channel))
+}
+
+func boolString(b bool) string { return fmt.Sprint(b) }
+
+// wait is eventually with the rig's whole observable state as the dump: every
+// session's viewer stream, every close, and every route the pool holds.
+func (r *rig) wait(t *testing.T, what string, condition func() bool) {
+	t.Helper()
+	eventually(t, what, condition, func() string {
+		r.viewers.mu.Lock()
+		defer r.viewers.mu.Unlock()
+		var parts []string
+		for key, records := range r.viewers.records {
+			parts = append(parts, fmt.Sprintf("%s=%v", key, kinds(t, records)))
+		}
+		return fmt.Sprintf("viewers{%s} closes=%v", strings.Join(parts, " "), r.viewers.closes)
+	})
 }
 
 func joined(items []string) string { return strings.Join(items, " ") }

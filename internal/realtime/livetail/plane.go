@@ -467,11 +467,14 @@ func (k *sink) Publication(data []byte) {
 		}
 		s.events = kept
 		s.gen = 0
+		// The subscription is NOT withdrawn here. The repair this queues
+		// withdraws it synchronously (Relay.HostLinkClosed -> Tail.Stop), in
+		// order with its own re-bind and re-subscribe; a withdrawal started
+		// here would run in no order with them and, landing after the
+		// re-subscribe, would remove the NEW tail (v0.4.0 gates F1/F2).
+		// Until the repair runs, the old tail's frames are dropped by the
+		// generation check above.
 		p.pushLocked(s, event{kind: evLost})
-		// The subscription itself is withdrawn too, off this goroutine: its
-		// frames are being discarded, so it must not stay live under a route
-		// that the repair is about to replace.
-		go p.links.Unsubscribe(k.key.tenant, k.key.session)
 		return
 	}
 	p.pushLocked(s, event{kind: evFrame, data: data})

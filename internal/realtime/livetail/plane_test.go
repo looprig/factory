@@ -43,7 +43,7 @@ func TestTheFirstViewersTailIsBoundThenSubscribedAndDeliveredInOrder(t *testing.
 		sent = append(sent, record)
 		host.publish(t, channel, record)
 	}
-	eventually(t, "five records at the viewers", func() bool { return len(r.viewers.of(tenantA, session)) == 5 })
+	r.wait(t, "five records at the viewers", func() bool { return len(r.viewers.of(tenantA, session)) == 5 })
 	for index, got := range r.viewers.of(tenantA, session) {
 		if got != string(sent[index]) {
 			t.Fatalf("record %d = %s, want the Host's bytes %s", index, got, sent[index])
@@ -65,10 +65,10 @@ func TestAViewerOfAnotherTenantReceivesNothing(t *testing.T) {
 
 	host.publish(t, sessionwire.HostLinkChannel(tenantA, session), enduring(t, tenantA, session, 1))
 	host.publish(t, sessionwire.HostLinkChannel(tenantA, session), enduring(t, tenantA, session, 2))
-	eventually(t, "tenant A's records", func() bool { return len(r.viewers.of(tenantA, session)) == 2 })
+	r.wait(t, "tenant A's records", func() bool { return len(r.viewers.of(tenantA, session)) == 2 })
 	// The control: B's own record arrives, and only it.
 	host.publish(t, sessionwire.HostLinkChannel(tenantB, session), enduring(t, tenantB, session, 9))
-	eventually(t, "tenant B's own record", func() bool { return len(r.viewers.of(tenantB, session)) == 1 })
+	r.wait(t, "tenant B's own record", func() bool { return len(r.viewers.of(tenantB, session)) == 1 })
 	if got := joined(kinds(t, r.viewers.of(tenantB, session))); got != "E9" {
 		t.Fatalf("tenant B's viewers received %s, want only E9", got)
 	}
@@ -96,10 +96,10 @@ func TestATailStartedByALaterPollOwesTheViewersAReset(t *testing.T) {
 
 	r.dir.put(host.observation(tenantA, session, 3))
 	r.clock.tick()
-	eventually(t, "the reset", func() bool { return len(r.viewers.of(tenantA, session)) == 2 })
+	r.wait(t, "the reset", func() bool { return len(r.viewers.of(tenantA, session)) == 2 })
 	channel := sessionwire.HostLinkChannel(tenantA, session)
 	host.publish(t, channel, enduring(t, tenantA, session, 13))
-	eventually(t, "the record after it", func() bool { return len(r.viewers.of(tenantA, session)) == 3 })
+	r.wait(t, "the record after it", func() bool { return len(r.viewers.of(tenantA, session)) == 3 })
 	if got := joined(kinds(t, r.viewers.of(tenantA, session))); got != "T12 R0/12 E13" {
 		t.Fatalf("viewers received %q, want the hint, a reset naming the tip, then E13", got)
 	}
@@ -124,16 +124,16 @@ func TestAHostLinkDropMidStreamIsRepairedRebindThenSubscribeThenReset(t *testing
 	channel := sessionwire.HostLinkChannel(tenantA, session)
 	host.publish(t, channel, enduring(t, tenantA, session, 1))
 	host.publish(t, channel, enduring(t, tenantA, session, 2))
-	eventually(t, "the first two records", func() bool { return len(r.viewers.of(tenantA, session)) == 2 })
+	r.wait(t, "the first two records", func() bool { return len(r.viewers.of(tenantA, session)) == 2 })
 	firstClient := host.events()[0].client
 
 	r.tips.set(5)
 	host.drop()
-	eventually(t, "the tail to be re-subscribed on the new connection", func() bool {
+	r.wait(t, "the tail to be re-subscribed on the new connection", func() bool {
 		return host.count("subscribe", channel) == 2
 	})
 	host.publish(t, channel, enduring(t, tenantA, session, 6))
-	eventually(t, "E6 after the repair", func() bool {
+	r.wait(t, "E6 after the repair", func() bool {
 		got := kinds(t, r.viewers.of(tenantA, session))
 		return len(got) > 0 && got[len(got)-1] == "E6"
 	})
@@ -190,7 +190,7 @@ func TestTheLastViewerLeavingStopsTheTail(t *testing.T) {
 	if err := r.demand.Release(context.Background(), tenantA, session); err != nil {
 		t.Fatalf("Release: %v", err)
 	}
-	eventually(t, "the Host to drop the subscription", func() bool { return host.subscribers(channel) == 0 })
+	r.wait(t, "the Host to drop the subscription", func() bool { return host.subscribers(channel) == 0 })
 	host.publish(t, channel, enduring(t, tenantA, session, 1))
 	time.Sleep(100 * time.Millisecond)
 	if got := r.viewers.of(tenantA, session); len(got) != 0 {
@@ -210,15 +210,15 @@ func TestAnOwnerChangeStopsTheStaleTailAndResetsFromTheNewOne(t *testing.T) {
 	r.watch(t, tenantA, session)
 	channel := sessionwire.HostLinkChannel(tenantA, session)
 	oldHost.publish(t, channel, enduring(t, tenantA, session, 1))
-	eventually(t, "E1", func() bool { return len(r.viewers.of(tenantA, session)) == 1 })
+	r.wait(t, "E1", func() bool { return len(r.viewers.of(tenantA, session)) == 1 })
 
 	r.tips.set(4)
 	r.dir.put(newHost.observation(tenantA, session, 4))
 	r.clock.tick()
-	eventually(t, "the old Host to lose the tail", func() bool { return oldHost.subscribers(channel) == 0 })
-	eventually(t, "the new tail", func() bool { return newHost.subscribers(channel) == 1 })
+	r.wait(t, "the old Host to lose the tail", func() bool { return oldHost.subscribers(channel) == 0 })
+	r.wait(t, "the new tail", func() bool { return newHost.subscribers(channel) == 1 })
 	newHost.publish(t, channel, enduring(t, tenantA, session, 5))
-	eventually(t, "E5", func() bool { return len(r.viewers.of(tenantA, session)) == 3 })
+	r.wait(t, "E5", func() bool { return len(r.viewers.of(tenantA, session)) == 3 })
 	if got := joined(kinds(t, r.viewers.of(tenantA, session))); got != "E1 R1/4 E5" {
 		t.Fatalf("viewers received %q, want E1, a reset from the new tail, then E5", got)
 	}
@@ -248,13 +248,16 @@ func TestAMailboxOverflowIsRepairedNotBufferedWithoutBound(t *testing.T) {
 	for seq := uint64(1); seq <= 10; seq++ {
 		host.publish(t, channel, enduring(t, tenantA, session, seq))
 	}
-	eventually(t, "the tail to be withdrawn", func() bool { return host.count("unsubscribe", channel) >= 1 })
+	r.wait(t, "the mailbox to overflow into a queued repair", func() bool {
+		_, lost := livetail.Pending(r.plane, tenantA, session)
+		return lost
+	})
 	r.tips.set(10)
 	r.viewers.mu.Lock()
 	r.viewers.gate = nil
 	r.viewers.mu.Unlock()
 	open()
-	eventually(t, "a reset", func() bool {
+	r.wait(t, "a reset", func() bool {
 		for _, k := range kinds(t, r.viewers.of(tenantA, session)) {
 			if strings.HasPrefix(k, "R") && strings.HasSuffix(k, "/10") {
 				return true
@@ -265,7 +268,7 @@ func TestAMailboxOverflowIsRepairedNotBufferedWithoutBound(t *testing.T) {
 	if got := len(r.viewers.of(tenantA, session)); got > 6 {
 		t.Fatalf("the viewers received %d records: the backlog was not bounded (%v)", got, kinds(t, r.viewers.of(tenantA, session)))
 	}
-	eventually(t, "the tail to be re-subscribed", func() bool { return host.count("subscribe", channel) >= 2 })
+	r.wait(t, "the tail to be re-subscribed", func() bool { return host.count("subscribe", channel) >= 2 })
 }
 
 // TestARecordTheRelayRefusesIsRepairedNotSkipped: a Host publication that is
@@ -280,10 +283,10 @@ func TestARecordTheRelayRefusesIsRepairedNotSkipped(t *testing.T) {
 	r.watch(t, tenantA, session)
 	channel := sessionwire.HostLinkChannel(tenantA, session)
 	host.publish(t, channel, enduring(t, tenantA, session, 1))
-	eventually(t, "E1", func() bool { return len(r.viewers.of(tenantA, session)) == 1 })
+	r.wait(t, "E1", func() bool { return len(r.viewers.of(tenantA, session)) == 1 })
 	r.tips.set(3)
 	host.publish(t, channel, []byte(`{"type":"not-a-record"}`))
-	eventually(t, "a reset", func() bool {
+	r.wait(t, "a reset", func() bool {
 		got := kinds(t, r.viewers.of(tenantA, session))
 		return len(got) >= 2 && got[1] == "R1/3"
 	})
@@ -298,23 +301,39 @@ func TestAResetThatCannotBeBuiltMakesEveryViewerRepair(t *testing.T) {
 	r := newRig(t, rigOptions{})
 	r.dir.put(host.observation(tenantA, session, 3))
 	r.watch(t, tenantA, session)
-	channel := sessionwire.HostLinkChannel(tenantA, session)
 	r.tips.mu.Lock()
 	r.tips.err = errors.New("store unavailable")
 	r.tips.mu.Unlock()
 	host.drop()
-	eventually(t, "the viewers to be closed", func() bool { return r.viewers.closed(tenantA, session) >= 1 })
-	_ = channel
+	r.wait(t, "the viewers to be closed", func() bool { return r.viewers.closed(tenantA, session) >= 1 })
 }
 
-// TestNewRefusesAnIncompleteComposition.
+// TestNewRefusesAnIncompleteComposition drives every refusal arm, each from a
+// valid composition with exactly one member broken, and the valid one itself
+// as the control.
 func TestNewRefusesAnIncompleteComposition(t *testing.T) {
 	t.Parallel()
 
-	good := livetail.Config{
-		Links: nil, Viewers: func() livetail.Viewers { return nil }, MailboxLimit: 1, EventTimeout: time.Second,
+	valid := func() livetail.Config {
+		return livetail.Config{
+			Links: &scriptedLinks{}, Viewers: func() livetail.Viewers { return nil }, MailboxLimit: 1, EventTimeout: time.Second,
+		}
 	}
-	if _, err := livetail.New(good); !errors.Is(err, livetail.ErrInvalidConfig) {
-		t.Fatalf("nil Links = %v, want ErrInvalidConfig", err)
+	if _, err := livetail.New(valid()); err != nil {
+		t.Fatalf("the valid composition was refused: %v", err)
+	}
+	for name, breakIt := range map[string]func(*livetail.Config){
+		"nil Links":           func(c *livetail.Config) { c.Links = nil },
+		"nil Viewers":         func(c *livetail.Config) { c.Viewers = nil },
+		"zero MailboxLimit":   func(c *livetail.Config) { c.MailboxLimit = 0 },
+		"zero EventTimeout":   func(c *livetail.Config) { c.EventTimeout = 0 },
+		"negative mailbox":    func(c *livetail.Config) { c.MailboxLimit = -1 },
+		"negative event time": func(c *livetail.Config) { c.EventTimeout = -time.Second },
+	} {
+		cfg := valid()
+		breakIt(&cfg)
+		if _, err := livetail.New(cfg); !errors.Is(err, livetail.ErrInvalidConfig) {
+			t.Errorf("%s: New = %v, want ErrInvalidConfig", name, err)
+		}
 	}
 }
