@@ -64,3 +64,29 @@ func TestAnOversizedGateResponseIsRefusedAtTheInlineBound(t *testing.T) {
 		t.Fatalf("an oversized gate response wrote: uploads=%d admitted=%q", len(over.commands.uploads), over.commands.lastAdmit.CommandID)
 	}
 }
+
+// TestAStoredOversizedGateResponseIsAnsweredFromItsRecordOnRetry (quality
+// gate Q15): the size refusal runs AFTER the retry read. A gate response an
+// earlier Factory admitted BY REFERENCE is a durable command; retrying it
+// under the same CommandID and content must answer from that record, not be
+// refused 400 as though it were new. With the check moved before the retry,
+// the retry is refused.
+func TestAStoredOversizedGateResponseIsAnsweredFromItsRecordOnRetry(t *testing.T) {
+	f := newServiceFixture(t)
+	resolvableSession(f)
+	const size = 64<<10 + 100
+	req := gateResponseOfSize(t, "stored-big", size)
+	payload, err := canonicalCommand(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// What an earlier Factory did: admit it by reference.
+	stored, created, err := f.service.admit(context.Background(), "tenant-a", "session-a", "stored-big", CommandGateResponse, existingBinding, payload)
+	if err != nil || !created || stored.Record.Descriptor.PayloadObject == nil {
+		t.Fatalf("seeding the by-reference record = (%+v, %v, %v)", stored.Record.Descriptor.PayloadObject, created, err)
+	}
+	retry, created, err := f.service.AdmitGateResponse(context.Background(), f.principal, req)
+	if err != nil || created || retry.Record.Descriptor.CommandID != "stored-big" || retry.Record.Descriptor.PayloadObject == nil {
+		t.Fatalf("the retry = (%+v, %v, %v), want the stored by-reference record, not a refusal", retry.Record.Descriptor, created, err)
+	}
+}

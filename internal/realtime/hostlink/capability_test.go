@@ -176,9 +176,59 @@ func (d *negotiatingDialer) Dial(_ context.Context, tgt hostlink.Target, _ hostl
 
 type negotiatingLink struct {
 	*opLink
-	err error
+	err   error
+	reply sessionwire.VersionNegotiationResponse
 }
 
 func (l *negotiatingLink) Negotiated() (sessionwire.VersionNegotiationResponse, error) {
-	return sessionwire.VersionNegotiationResponse{}, l.err
+	if l.err != nil {
+		return sessionwire.VersionNegotiationResponse{}, l.err
+	}
+	return l.reply, nil
+}
+
+// perTenantNegotiatingDialer dials a link whose capability read is chosen by
+// the tenant address it was dialled at.
+type perTenantNegotiatingDialer struct {
+	byEndpoint map[sessionwire.InternalEndpoint]*negotiatingLink
+}
+
+func (d *perTenantNegotiatingDialer) Dial(_ context.Context, tgt hostlink.Target, _ hostlink.Observer) (hostlink.Link, error) {
+	link, ok := d.byEndpoint[tgt.Endpoint]
+	if !ok {
+		return nil, errors.New("unexpected address " + string(tgt.Endpoint))
+	}
+	return link, nil
+}
+
+// TestTheCapabilityIsReadFromTheAskedTenantsLink (quality gate Q7): two tenants'
+// links to ONE Host answer differently -- tenant-a's is reconnecting, tenant-b's
+// is live and capable -- and each question is answered from its own tenant's
+// link. A read answered from "any link of this Host" would give tenant-a a
+// yes it has not got, or tenant-b a transient it is not in.
+func TestTheCapabilityIsReadFromTheAskedTenantsLink(t *testing.T) {
+	t.Parallel()
+	dialer := &perTenantNegotiatingDialer{byEndpoint: map[sessionwire.InternalEndpoint]*negotiatingLink{
+		base1 + "/hostlink/tenant-a": {opLink: &opLink{host: hostOne}, err: hostlink.ErrLinkReconnecting},
+		base1 + "/hostlink/tenant-b": {opLink: &opLink{host: hostOne}, reply: sessionwire.VersionNegotiationResponse{Version: sessionwire.CurrentWireVersion}.
+			WithHostLinkMethods(sessionwire.HostLinkCapabilityGateResponse)},
+	}}
+	pool, err := hostlink.NewPool(hostlink.Config{Dialer: dialer})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = pool.Close(context.Background()) })
+
+	// Both links exist before either question, so a read keyed by Host alone
+	// has two links to pick from.
+	mustBind(t, pool, target(hostOne, base1), tenantBind(tenant, hostOne, "s-1"))
+	mustBind(t, pool, target(hostOne, base1), tenantBind(tenantB, hostOne, "s-1"))
+	for range 3 { // map order must not decide it
+		if ok, err := pool.AcceptsGateResponses(context.Background(), target(hostOne, base1), tenant); ok || !errors.Is(err, hostlink.ErrLinkReconnecting) {
+			t.Fatalf("tenant-a (reconnecting) = (%v, %v), want (false, ErrLinkReconnecting)", ok, err)
+		}
+		if ok, err := pool.AcceptsGateResponses(context.Background(), target(hostOne, base1), tenantB); err != nil || !ok {
+			t.Fatalf("tenant-b (live, capable) = (%v, %v), want (true, nil)", ok, err)
+		}
+	}
 }
