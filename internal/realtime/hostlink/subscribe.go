@@ -194,6 +194,11 @@ type subscriptionState struct {
 	// call into the client, so a callback waiting for regMu could wait on a
 	// Close that waits on it. Callbacks hand withdrawals to a goroutine.
 	regMu sync.Mutex
+	// beforeSubscribeSend is a TEST seam, nil in every composition: it runs
+	// between a subscription's registration and the send of its subscribe,
+	// which is the window the regate's N4 orphan lived in, so a test can put a
+	// withdrawal there deterministically.
+	beforeSubscribeSend func()
 	// subscribeTimeout bounds one subscribe's wait for the Host's answer, on
 	// top of the caller's context. It is the dial timeout: a subscribe is one
 	// round trip on a connection that is already up, and a Host slower than a
@@ -255,7 +260,31 @@ func (l *centrifugeLink) Subscribe(ctx context.Context, tenant sessionwire.Tenan
 		l.discard(sub)
 		return l.await(ctx, entry)
 	}
-	if err := sub.Subscribe(); err != nil {
+	if hook := l.beforeSubscribeSend; hook != nil {
+		hook()
+	}
+	// The subscribe is SENT under regMu, after re-checking that the entry is
+	// still current (v0.4.0 regate N4). A withdrawal landing after the check
+	// above -- an owner Unsubscribe, a dropped connection -- has already
+	// removed the entry and discarded the registration, and sending anyway
+	// left an orphan subscription at the Host that nothing on this link would
+	// ever withdraw. Under regMu a withdrawal either happened before the
+	// re-check (nothing is sent) or waits in discard until the send is out,
+	// and then unsubscribes it. Sending under regMu is allowed: regMu's
+	// holders call into the client, and no callback takes it (rule 2,
+	// regmu_structure_test.go).
+	l.regMu.Lock()
+	l.mu.Lock()
+	current = l.subs[channel] == entry
+	l.mu.Unlock()
+	if !current {
+		l.regMu.Unlock()
+		l.discard(sub)
+		return l.await(ctx, entry)
+	}
+	err = sub.Subscribe()
+	l.regMu.Unlock()
+	if err != nil {
 		l.withdraw(entry, err)
 		return fmt.Errorf("hostlink: subscribe %s: %w", channel, err)
 	}

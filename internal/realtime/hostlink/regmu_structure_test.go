@@ -52,7 +52,7 @@ func TestTheRegMuReaderCatchesEveryRegateMutant(t *testing.T) {
 	for _, m := range []struct{ id, old, new string }{
 		{"X2d", "\tl.regMu.Lock()\n\tdefer l.regMu.Unlock()\n\tcurrent, ok", "\tcurrent, ok"},
 		{"X2e", "\tl.regMu.Lock()\n\tdefer l.regMu.Unlock()\n\tsub, err := l.client.NewSubscription(channel)", "\tsub, err := l.client.NewSubscription(channel)"},
-		{"X2f", "\t\tl.discard(sub)\n\t\treturn l.await(ctx, entry)", "\t\t_ = l.client.RemoveSubscription(sub)\n\t\treturn l.await(ctx, entry)"},
+		{"X2f", "still this one's.\n\t\tl.discard(sub)\n\t\treturn l.await(ctx, entry)", "still this one's.\n\t\t_ = l.client.RemoveSubscription(sub)\n\t\treturn l.await(ctx, entry)"},
 		{"D1", "\t\tif sub != nil {\n\t\t\tgo l.discard(sub)\n\t\t}\n\t\tif live {", "\t\tif sub != nil {\n\t\t\tl.discard(sub)\n\t\t}\n\t\tif live {"},
 		{"D2", "\t\t\tgo l.discard(sub)\n\t\t}\n\t})\n\tsub.OnSubscribing", "\t\t\tl.discard(sub)\n\t\t}\n\t})\n\tsub.OnSubscribing"},
 		{"D3", "\tsub.OnSubscribed(func(centrifugego.SubscribedEvent) {\n", "\tsub.OnSubscribed(func(centrifugego.SubscribedEvent) {\n\t\tl.regMu.Lock()\n\t\tl.regMu.Unlock()\n"},
