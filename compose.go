@@ -75,6 +75,9 @@ func composeComponents(cfg config, credentials *internalidentity.Authenticator) 
 		return nil, &OptionError{Option: "WithHostLinkCredential", Err: err}
 	}
 	var dialer hostlink.Dialer = realDialer
+	if cfg.hostDialer != nil {
+		dialer = cfg.hostDialer
+	}
 	pool, err := hostlink.NewPool(hostlink.Config{
 		Dialer: dialer,
 		Limits: hostlink.Limits(cfg.host),
