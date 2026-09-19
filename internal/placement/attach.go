@@ -271,6 +271,8 @@ func (r *Reconciler) logger() *slog.Logger {
 //     retry under the same key rather than put a second attach in flight.
 func (r *Reconciler) placePooled(ctx context.Context, req Request, writes int) (Result, error) {
 	result := Result{DesiredWrites: writes}
+	incapableWhy := map[sessionwire.HostID]string{}
+	defer func() { r.reportIncapable(ctx, req, &result, incapableWhy) }()
 	// The RECORD is re-read under the claim for the owner's reason: a racer may
 	// have changed the desired state between Reconcile's first read and the
 	// claim, and the attach is built from this record's agent and runtime.
@@ -321,9 +323,19 @@ func (r *Reconciler) placePooled(ctx context.Context, req Request, writes int) (
 			if !admissible(candidate, record) {
 				continue
 			}
-			if len(req.GateResponses) > 0 && !r.appliesGateResponses(ctx, req, candidate) {
-				result.Incapable = append(result.Incapable, candidate.HostID)
-				continue
+			if len(req.GateResponses) > 0 {
+				switch verdict, err := r.appliesGateResponses(ctx, req, candidate); verdict {
+				case gateUnaddressable:
+					result.Unaddressable = append(result.Unaddressable, candidate.HostID)
+					r.logUnaddressable(ctx, req, candidate, err)
+					continue
+				case gateIncapable:
+					result.Incapable = append(result.Incapable, candidate.HostID)
+					if err != nil {
+						incapableWhy[candidate.HostID] = err.Error()
+					}
+					continue
+				}
 			}
 			observation, err := r.cfg.Links.Attach(ctx, candidate.InternalEndpoint, attachRequest(record, candidate, mode, r.cfg.ActorID))
 			switch answer, code := attachAnswer(err); answer {
@@ -348,13 +360,7 @@ func (r *Reconciler) placePooled(ctx context.Context, req Request, writes int) (
 				result.Unreachable = append(result.Unreachable, candidate.HostID)
 			case answerUnaddressable:
 				result.Unaddressable = append(result.Unaddressable, candidate.HostID)
-				r.logger().WarnContext(ctx, "placement: skipped a pooled candidate whose advertised base cannot carry this tenant's HostLink address",
-					slog.String("host_id", string(candidate.HostID)),
-					slog.Uint64("host_generation", candidate.HostGeneration),
-					slog.String("tenant_id", string(req.TenantID)),
-					slog.String("session_id", string(req.SessionID)),
-					slog.String("code", string(endpointCode(err))),
-					slog.String("internal_endpoint", string(candidate.InternalEndpoint)))
+				r.logUnaddressable(ctx, req, candidate, err)
 			case answerFailed:
 				result.Failed = append(result.Failed, candidate.HostID)
 				r.logger().WarnContext(ctx, "placement: a pooled candidate failed the attach; trying the next",
@@ -378,35 +384,112 @@ func (r *Reconciler) placePooled(ctx context.Context, req Request, writes int) (
 	}
 }
 
+// gateCapability is the capable-only placement filter's answer for one
+// candidate.
+type gateCapability uint8
+
+const (
+	gateCapable gateCapability = iota
+	gateIncapable
+	gateUnaddressable
+)
+
 // appliesGateResponses is the capable-only placement filter: a session with a
 // PENDING gate response is placed only on a Host whose connect reply carries
 // Core's gate_response capability token (hostlink.GateResponseCapable, asked
 // through the same Links seam the wake uses). A candidate that cannot -- or
-// could not be asked -- is skipped and logged, and if none can, the session
-// waits (OutcomeNoCapacity) for a capable Host rather than being placed where
-// its answer would be refused or left applying. Without it a mixed fleet
-// re-places a session with an admitted answer onto a v0.3.0 Host.
-func (r *Reconciler) appliesGateResponses(ctx context.Context, req Request, candidate sessionwire.HostLinkCapacityReport) bool {
+// could not be asked -- is skipped (Result.Incapable), and if none can, the
+// session waits (OutcomeNoCapacity) for a capable Host rather than being
+// placed where its answer would be refused or left applying.
+//
+// A candidate whose base cannot address the tenant is NOT "incapable": the
+// question could not even be addressed, and it is recorded and logged as
+// unaddressable with Core's code, exactly as the attach path does (spec gate
+// N4). The incapable skips are reported by reportIncapable, once per pass.
+func (r *Reconciler) appliesGateResponses(ctx context.Context, req Request, candidate sessionwire.HostLinkCapacityReport) (gateCapability, error) {
 	capable, err := r.cfg.Links.AcceptsGateResponses(ctx, sessionwire.HostLinkRegistryObservation{
 		TenantID: req.TenantID, SessionID: req.SessionID,
 		HostID: candidate.HostID, HostGeneration: candidate.HostGeneration,
 		InternalEndpoint: candidate.InternalEndpoint,
 	})
-	if err == nil && capable {
-		return true
+	switch {
+	case err == nil && capable:
+		return gateCapable, nil
+	case errors.Is(err, ErrTenantUnaddressable):
+		return gateUnaddressable, err
+	default:
+		return gateIncapable, err
 	}
-	attrs := []any{
+}
+
+// logUnaddressable is the one WARN for a candidate whose advertised base cannot
+// carry this session's tenant's address, from either the attach or the filter.
+func (r *Reconciler) logUnaddressable(ctx context.Context, req Request, candidate sessionwire.HostLinkCapacityReport, err error) {
+	r.logger().WarnContext(ctx, "placement: skipped a pooled candidate whose advertised base cannot carry this tenant's HostLink address",
 		slog.String("host_id", string(candidate.HostID)),
 		slog.Uint64("host_generation", candidate.HostGeneration),
 		slog.String("tenant_id", string(req.TenantID)),
 		slog.String("session_id", string(req.SessionID)),
+		slog.String("code", string(endpointCode(err))),
+		slog.String("internal_endpoint", string(candidate.InternalEndpoint)))
+}
+
+// incapableReportInterval is how long a session's "waiting for a capable
+// Host" WARN is suppressed after it was last written. A session with a pending
+// gate response and no capable Host is re-examined on every sweep; one line per
+// skipped candidate per sweep (quality gate F6) buried the one fact an operator
+// needs, which is that the session is waiting and on which Hosts.
+const incapableReportInterval = 5 * time.Minute
+
+// maxIncapableReports bounds the suppression table; past it, expired entries
+// are pruned before a new one is added, and if none has expired the report is
+// simply written (never silently dropped for want of room).
+const maxIncapableReports = 4096
+
+// reportIncapable writes ONE WARN per placement pass listing every candidate
+// the filter skipped as incapable, and at most one per session per
+// incapableReportInterval.
+func (r *Reconciler) reportIncapable(ctx context.Context, req Request, result *Result, reasons map[sessionwire.HostID]string) {
+	if len(result.Incapable) == 0 {
+		return
+	}
+	key := sessionKey{tenant: req.TenantID, session: req.SessionID}
+	now := r.cfg.Clock.Now()
+	r.reportsMu.Lock()
+	if last, ok := r.reports[key]; ok && now.Sub(last) < incapableReportInterval {
+		r.reportsMu.Unlock()
+		return
+	}
+	if r.reports == nil {
+		r.reports = map[sessionKey]time.Time{}
+	}
+	if len(r.reports) >= maxIncapableReports {
+		for k, at := range r.reports {
+			if now.Sub(at) >= incapableReportInterval {
+				delete(r.reports, k)
+			}
+		}
+	}
+	if len(r.reports) < maxIncapableReports {
+		r.reports[key] = now
+	}
+	r.reportsMu.Unlock()
+	hosts := make([]string, 0, len(result.Incapable))
+	for _, host := range result.Incapable {
+		entry := string(host)
+		if reason := reasons[host]; reason != "" {
+			entry += " (" + reason + ")"
+		}
+		hosts = append(hosts, entry)
+	}
+	r.logger().WarnContext(ctx, "placement: skipped pooled candidates that cannot apply this session's pending gate response",
+		slog.String("tenant_id", string(req.TenantID)),
+		slog.String("session_id", string(req.SessionID)),
 		slog.Int("pending_gate_responses", len(req.GateResponses)),
-	}
-	if err != nil {
-		attrs = append(attrs, slog.String("error", err.Error()))
-	}
-	r.logger().WarnContext(ctx, "placement: skipped a pooled candidate that cannot apply this session's pending gate response; the session waits for a capable Host", attrs...)
-	return false
+		slog.Any("skipped_hosts", hosts),
+		// waiting: no capable candidate was found this pass, so the session
+		// waits -- for at most its pending answer's apply deadline.
+		slog.Bool("waiting", result.Decision.Outcome != OutcomeAttachPooled))
 }
 
 // answer is attachAnswer's closed classification.

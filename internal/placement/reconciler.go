@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strconv"
+	"sync"
 	"time"
 
 	sessionwire "github.com/looprig/core/sessionwire/v1"
@@ -131,6 +132,11 @@ type Reconciler struct {
 	// jittered; a test sets a fixed draw so the default wait's use of it is
 	// observable (B5 v0.3.0 quality gate QJ1/QJ2).
 	draw func(time.Duration) time.Duration
+
+	// reports is when each session's "waiting for a capable Host" WARN was
+	// last written; see reportIncapable.
+	reportsMu sync.Mutex
+	reports   map[sessionKey]time.Time
 }
 
 // NewReconciler validates a configuration before it can reach a store.

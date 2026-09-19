@@ -430,7 +430,14 @@ func (l placementLinks) RouteFor(tenant sessionwire.TenantID, session sessionwir
 }
 
 func (l placementLinks) AcceptsGateResponses(ctx context.Context, owner sessionwire.HostLinkRegistryObservation) (bool, error) {
-	return gateResponders(l).AcceptsGateResponses(ctx, owner)
+	capable, err := gateResponders(l).AcceptsGateResponses(ctx, owner)
+	if errors.Is(err, hostlink.ErrNoTenantEndpoint) {
+		// Placement's vocabulary for a base that cannot address the tenant,
+		// as classifyAttach maps it, so the filter reports it as such (spec
+		// gate N4) rather than as a Host that cannot apply gate responses.
+		return false, fmt.Errorf("%w: %w", placement.ErrTenantUnaddressable, err)
+	}
+	return capable, err
 }
 
 // gateResponders is the gate_response capability question asked of the pool:

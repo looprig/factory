@@ -2,9 +2,12 @@ package factory
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	sessionwire "github.com/looprig/core/sessionwire/v1"
+	"github.com/looprig/factory/internal/admission"
+	"github.com/looprig/factory/internal/placement"
 	"github.com/looprig/factory/internal/realtime/hostlink"
 )
 
@@ -69,6 +72,19 @@ func TestTheComposedGateResponseQuestionAsksTheOwnersTenantLink(t *testing.T) {
 	}
 	if len(dialer.dialled) != 1 || dialer.dialled[0] != (hostlink.Target{Host: "host-9", Endpoint: "ws://10.1.2.3:7100/hostlink/tenant-b"}) {
 		t.Fatalf("dialled %v, want host-9's tenant-b link once", dialer.dialled)
+	}
+	// A base that cannot address the tenant reaches placement in placement's
+	// own vocabulary, with Core's code kept (spec gate N4); admission sees
+	// the plain fault.
+	unaddressable := owner
+	unaddressable.HostID, unaddressable.InternalEndpoint = "host-11", "ws://10.1.2.5:7100/pods/x"
+	_, err = placementLinks{pool: pool}.AcceptsGateResponses(context.Background(), unaddressable)
+	var code *sessionwire.HostLinkEndpointError
+	if !errors.Is(err, placement.ErrTenantUnaddressable) || !errors.As(err, &code) || code.Code != sessionwire.HostLinkEndpointCodeBaseNotBare {
+		t.Fatalf("an unaddressable candidate reached placement as %v, want ErrTenantUnaddressable carrying base_not_bare", err)
+	}
+	if _, err := (gateResponders{pool: pool}).AcceptsGateResponses(context.Background(), unaddressable); errors.Is(err, placement.ErrTenantUnaddressable) || errors.Is(err, admission.ErrGateResponderUnavailable) {
+		t.Fatalf("admission's adapter classified an unaddressable owner as %v, want a plain fault", err)
 	}
 	capable := owner
 	capable.HostID, capable.InternalEndpoint = "host-10", "ws://10.1.2.4:7100"
