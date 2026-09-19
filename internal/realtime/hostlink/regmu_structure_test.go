@@ -236,8 +236,7 @@ func startsWithRegMu(body *ast.BlockStmt) bool {
 func scanBody(body *ast.BlockStmt) (bool, []string) {
 	takes := false
 	var calls []string
-	var walk func(n ast.Node) bool
-	walk = func(n ast.Node) bool {
+	walk := func(n ast.Node) bool {
 		switch x := n.(type) {
 		case *ast.GoStmt:
 			return false
