@@ -9,10 +9,10 @@ import (
 	"github.com/looprig/factory/internal/realtime/hostlink"
 )
 
-// testGateMethod is a capability name used ONLY to drive the mechanism's
-// accepting half. It is deliberately not a plausible HostLink method: the real
-// signal is host v0.4.0's to fix, and a test spelling a guess would read as a
-// promise.
+// testGateMethod is a name used ONLY to drive the mechanism with an injected
+// predicate, and as a near miss the production predicate must refuse. It is
+// deliberately not Core's token (sessionwire.HostLinkCapabilityGateResponse,
+// "hostlink.command.gate_response"), which is the real signal.
 const testGateMethod = "test.only.gate-response-capability"
 
 // TestTheGateResponseCapabilityIsExactlyCoresToken: a Host is gate_response-

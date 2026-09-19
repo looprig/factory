@@ -277,7 +277,7 @@ broker and no leader: closing one replica's pool leaves the others' connections
 and routes untouched, measured over fakes and over real sockets.
 
 **Core owns the HostLink framing contract, not only the record bodies.** Core
-v0.9.1's (pinned: v0.10.0) `sessionwire/v1` defines the bare connect codecs, reserved method
+v0.9.1's (pinned: v0.11.0) `sessionwire/v1` defines the bare connect codecs, reserved method
 names, and injective `HostLinkChannel` derivation that Factory and Host must
 share. The asynchronous `{type, data}` push envelope is the only framing still
 local to Factory; it is not a Core record or a HostLink RPC method. The Host half
@@ -445,13 +445,26 @@ candidate's) link for the session's tenant:
   before anything is written.
 - **The wake.** A gate-response wake is withheld from a bound Host without the
   token and counted (`WithheldGateResponses`).
-- **Placement.** A session with a pending gate response is placed only on a
-  candidate with the token; others are skipped with a WARN, and with none the
-  session waits.
+- **Placement (pooled only).** A session with a pending gate response is placed
+  only on a candidate with the token; the others are skipped and reported in
+  one WARN per pass, at most once per session every 5 minutes. **With none, the
+  WHOLE session waits** — its inputs and interrupts included — for at most the
+  pending answer's apply deadline (`ReconcileLimits.ApplyDeadline`, default
+  5 minutes). The expiry sweep then rejects the answer and the session places
+  normally; a command admitted behind it may expire in that window. A dedicated
+  placement hands the record to the workload controller unfiltered.
+- **Staleness.** A capability read uses the link's latest reply and is not
+  fenced to the owner's generation, so it can be one reply stale across a Host
+  restart the link has not yet noticed.
+- **Transients.** A gate response whose owner cannot be reached (its link
+  reconnecting, the link ceiling full, a failed dial) is answered `503
+  unavailable`, retryable, with nothing written. The capability read dials, if
+  it must, outside the pool's lock.
 
 **A gate response is never stored by reference.** Every other command larger
 than the inbox's inline bound (`sessionstore.MaxInboxPayloadBytes`, 64 KiB of
-canonical command payload) is uploaded and admitted by reference; a NEW gate
+canonical command payload — the ENCODED size, where JSON escaping can make it
+several times the body sent) is uploaded and admitted by reference; a NEW gate
 response over it is refused `400 invalid_request` (`ErrGateResponseTooLarge`)
 before anything is written, because host v0.4.0 blocks a session's whole
 command stream behind a by-reference gate response until its apply deadline,

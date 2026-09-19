@@ -1479,7 +1479,19 @@ IS delivering, since the owner reads the durable stream — and a nil
 the pending sweep from the durable kind) from a Host that cannot apply it and
 counts it in `WithheldGateResponses`. **Placement** places a session with a
 pending gate response only on a candidate carrying the token (`appliesGateResponses`,
-`Result.Incapable`, a WARN; with none the session waits). **The mixed-fleet
+`Result.Incapable`; one aggregated WARN per pass, at most once per session per
+5 minutes; a candidate whose base cannot address the tenant is Unaddressable
+with Core's code, not Incapable). With none, **the whole session waits** —
+inputs and interrupts too — for at most the pending answer's `ApplyDeadline`
+(default 5 m), after which the expiry sweep rejects the answer and placement
+resumes; a command admitted behind it can expire in that window. The filter is
+**pooled only**: a dedicated placement hands the record to the controller
+unfiltered. A transient failure to reach the owner is
+`admission.ErrGateResponderUnavailable` (classified in `compose.go`), answered
+503 retryable at the edge. The capability read acquires its link with
+`acquireUnlocked` — the dial runs outside `Pool.mu`, since a public request can
+trigger it — and its answer can be one reply stale (it is not fenced to the
+owner's generation). **The mixed-fleet
 residue**: an answer admitted under a v0.4.0 owner that lands on a v0.3.0 Host
 after re-placement (or was claimed there) sits `applying` until a v0.4.0
 successor settles it `not_applied`; the filter keeps a *pending* one off an
@@ -1488,7 +1500,7 @@ Hosts serving gating agents together.
 
 **A gate response is never admitted by reference** (host v0.4.0 spec gate C1):
 above `sessionstore.MaxInboxPayloadBytes` (64 KiB, measured on the same
-canonical payload `admit` stores) a NEW gate response is refused
+canonical ENCODED payload `admit` stores, not on the bytes sent) a NEW gate response is refused
 `invalid_request` with `ErrGateResponseTooLarge`, after the retry read and
 before any write. A Host blocks the session's command stream behind a
 by-reference gate response until its apply deadline.
@@ -1590,7 +1602,7 @@ accepted.
 
 ### One gap closed by Core, one still declared
 
-**The wire carries an attachment since `core v0.8.0`, and B5 sends it.** The current pin is `core v0.10.0`. A4.2 step 2 has the
+**The wire carries an attachment since `core v0.8.0`, and B5 sends it.** The current pin is `core v0.11.0`. A4.2 step 2 has the
 selected candidate asked to acquire or attach. At `core v0.7.0` no request
 could carry that — bind and unbind refuse a zero `LeaseEpoch`, drain asks a Host
 to *give up* a session —

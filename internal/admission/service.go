@@ -84,8 +84,16 @@ var ErrGateResponderUnavailable = errors.New("admission: the session's owner cou
 // body is held by reference as BLOCKING: the session's whole command stream
 // waits behind it until its apply deadline, and every command admitted after
 // it expires with it (host v0.4.0 spec gate C1). So it is refused before
-// anything is written. The size is the caller's own bytes, which is why the
-// code is invalid_request (400) and not a state conflict. A retry of a gate
+// anything is written.
+//
+// The size measured is the CANONICAL ENCODED size -- len(canonicalCommand),
+// the very bytes admit stores and the store checks against the bound -- not
+// the size of the body the caller sent (quality gate F5). encoding/json
+// escapes '<', '>' and '&' to six bytes each and compacts raw values, so a body
+// of about 11 KiB of '<' canonicalises past 64 KiB and is refused; the refusal
+// message carries the canonical size. It is still a function of the caller's
+// own request alone, which is why the code is invalid_request (400) and not a
+// state conflict. A retry of a gate
 // response already stored -- which only an earlier Factory could have
 // admitted by reference -- still answers from its record.
 var ErrGateResponseTooLarge = errors.New("admission: a gate response larger than the inline inbox payload bound is refused")
@@ -312,7 +320,7 @@ func (s *Service) AdmitGateResponse(ctx context.Context, principal identity.Prin
 	}
 	if len(payload) > sessionstore.MaxInboxPayloadBytes {
 		return sessionstore.DispositionInboxEntry{}, false, refusal(sessionwire.ErrorCodeInvalidRequest,
-			fmt.Errorf("%w: %d bytes, the bound is %d", ErrGateResponseTooLarge, len(payload), sessionstore.MaxInboxPayloadBytes))
+			fmt.Errorf("%w: %d bytes canonically encoded, the bound is %d", ErrGateResponseTooLarge, len(payload), sessionstore.MaxInboxPayloadBytes))
 	}
 	entry, err := s.existingCompatible(ctx, principal.Tenant(), req.SessionID)
 	if err != nil {

@@ -9,9 +9,11 @@ import (
 
 // GateResponseCapable is THE ONE STATEMENT of "the Host at the other end of
 // this link can apply a gate_response command", read from the Host's connect
-// reply. Every gate on gate_response delivery in this module -- admission's
-// refusal before anything is written, and placement's withheld wake -- asks
-// it through Pool.AcceptsGateResponses, and nothing else decides.
+// reply. Every gate on gate_response delivery in this module asks it through
+// Pool.AcceptsGateResponses, and nothing else decides: admission's refusal
+// before anything is written, placement's withheld wake, and the pooled
+// placement filter that puts a session with a pending gate response only on a
+// Host carrying the token.
 //
 // The signal is Core's capability token HostLinkCapabilityGateResponse
 // ("hostlink.command.gate_response", core v0.11.0), which a Host that applies
@@ -25,6 +27,15 @@ import (
 // It deliberately reads NOTHING else. In particular the catalog's LeaseEpoch
 // is never read as a capability signal (owner ruling, 2026-09-19): a
 // per-session, caller-asserted value cannot answer a per-process question.
+//
+// The answer can be ONE REPLY STALE (quality gate F7, spec N3). It is read
+// from the link's most recent verified reply, and a reply names no Host
+// incarnation, so it is not fenced to the owner's HostGeneration: a Host
+// restarted at another version, whose old connection this link has not yet
+// noticed is dead, is answered from the previous reply until the reconnect
+// lands. The same window exists for every reserved-method gate; the
+// mixed-fleet rule (do not run Hosts that differ in this capability side by
+// side for gating agents) is what bounds its consequence.
 func GateResponseCapable(reply sessionwire.VersionNegotiationResponse) bool {
 	return reply.Supports(sessionwire.HostLinkCapabilityGateResponse)
 }
