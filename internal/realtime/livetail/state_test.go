@@ -274,3 +274,55 @@ func (r *closeRecordingRelay) closed() bool {
 	defer r.mu.Unlock()
 	return r.done
 }
+
+// forgetGatedRelay blocks its Forget until released, holding a drainer inside
+// the unwatched session's last event.
+type forgetGatedRelay struct {
+	recordingRelay
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (r *forgetGatedRelay) Forget(tenant sessionwire.TenantID, session sessionwire.SessionID) {
+	close(r.entered)
+	<-r.release
+	r.recordingRelay.Forget(tenant, session)
+}
+
+// TestASubscribedArrivingWhileTheForgetIsDrainingOpensNothing (quality gate
+// W4, the window its first reader missed): between Unwatched and the drainer
+// deleting the entry, a late Subscribed finds the entry still there. It must
+// be refused as unwatched; accepted, it would queue a start behind the Forget
+// and re-open Relay state for a session nobody watches.
+func TestASubscribedArrivingWhileTheForgetIsDrainingOpensNothing(t *testing.T) {
+	t.Parallel()
+
+	links := &scriptedLinks{}
+	relay := &forgetGatedRelay{entered: make(chan struct{}), release: make(chan struct{})}
+	plane, err := livetail.New(livetail.Config{
+		Links: links, Viewers: func() livetail.Viewers { return nil }, MailboxLimit: 8, EventTimeout: time.Second,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	plane.Attach(relay, nil)
+	t.Cleanup(func() { _ = plane.Close(context.Background()) })
+	plane.Watching(tenantA, session)
+	if err := plane.Bind(context.Background(), "ws://host-1", sessionwire.HostLinkBindRequest{TenantID: tenantA, SessionID: session, HostID: "host-1"}); err != nil {
+		t.Fatalf("Bind: %v", err)
+	}
+	plane.Served(tenantA, session)
+	plane.Unwatched(tenantA, session)
+	select {
+	case <-relay.entered:
+	case <-time.After(waitFor):
+		t.Fatal("the drainer never reached the Forget")
+	}
+	links.sink(0).Subscribed()
+	close(relay.release)
+	settle(t, plane, "the plane to forget the session", func() bool { return livetail.Sessions(plane) == 0 })
+	ops := relay.opsSeen()
+	if len(ops) == 0 || ops[len(ops)-1] != "forget" {
+		t.Fatalf("relay ops = %v: something reached the Relay after the Forget", ops)
+	}
+}
