@@ -1457,11 +1457,15 @@ Host still advertising `…/hostlink/<tenant>`.
 ### The gate_response capability gate (v0.5.0)
 
 **`hostlink.GateResponseCapable` is the ONE predicate** over a Host's connect
-reply that says "this Host can apply a gate_response command", and it answers
-**false for every reply** until host v0.4.0 fixes the signal. Do not invent a
-method name: when the signal is fixed, change that body (for a
-`hostlink_methods` entry, `reply.Supports(<method>)`) and rewrite
-`TestTheGateResponseCapabilityRefusesEveryReplyToday`; nothing else moves.
+reply that says "this Host can apply a gate_response command": it is
+`reply.Supports(sessionwire.HostLinkCapabilityGateResponse)`, the token
+`hostlink.command.gate_response` (core v0.11.0, advertised by host ≥ v0.4.0 in
+`hostlink_methods` — "reserved methods plus capability tokens"; a token is
+never dispatched, never equals a method and never starts with `hostlink.v1.`).
+**Never read `CatalogRecord.LeaseEpoch` as a capability** (owner ruling
+2026-09-19: a per-session, caller-asserted value cannot answer a per-process
+question). `TestTheGateResponseCapabilityIsExactlyCoresToken` spells the token
+as a literal and refuses a substring and the prefixed spelling.
 `Pool.AcceptsGateResponses` asks it over the owner's link FOR THE SESSION'S
 TENANT (the `Negotiator` capability reads the link's current reply: a
 reconnecting link is a transient error, a terminal one is evicted, a link that
@@ -1473,9 +1477,14 @@ IS delivering, since the owner reads the durable stream — and a nil
 `GateResponders` refuses too; a failure to ask is a fault with no public code.
 **Placement** withholds a gate-response wake (`Request.GateResponses`, filled by
 the pending sweep from the durable kind) from a Host that cannot apply it and
-counts it in `WithheldGateResponses`. The residue: a gate response admitted for
-a capable owner and later re-placed onto an incapable Host is read by that Host
-from the stream regardless; host v0.3.0 refuses the kind safely.
+counts it in `WithheldGateResponses`. **Placement** places a session with a
+pending gate response only on a candidate carrying the token (`appliesGateResponses`,
+`Result.Incapable`, a WARN; with none the session waits). **The mixed-fleet
+residue**: an answer admitted under a v0.4.0 owner that lands on a v0.3.0 Host
+after re-placement (or was claimed there) sits `applying` until a v0.4.0
+successor settles it `not_applied`; the filter keeps a *pending* one off an
+incapable Host but cannot recall one in flight. Do not run v0.3.0 and v0.4.0
+Hosts serving gating agents together.
 
 The pool carries the control plane AND, since v0.4.0 (Gap 3), a session's
 **live tail**: `Pool.Subscribe` subscribes the session's `HostLinkChannel` on

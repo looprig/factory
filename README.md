@@ -430,17 +430,31 @@ readers accept a gate page a Host wrote on a disposition session (older readers
 refuse it). `TestAHostPublishedDispositionGateIsReadByThePinnedStore` writes a
 gate the way a Host does and reads it through both of Factory's gate readers.
 
-**A gate response is delivered only to a Host that can apply one, and today no
-Host can.** Admitting a gate response IS delivering it — the owner reads it from
-the durable stream — so admission asks the fresh owner, over its link for the
-session's tenant, and refuses `409 gate_not_resumable`
-(`ErrGateResponseUnsupported`) before anything is written when the answer is
-no; placement likewise withholds a gate-response wake from such a Host. The
-answer comes from ONE predicate, `hostlink.GateResponseCapable`, which refuses
-every Host until host v0.4.0 fixes its capability signal — changing that
-function body is the whole switch. Until then a Host-resident agent that opens
-a gate still stalls until its gate deadline (a v0.3.0 Host publishes no gate,
-so the answer there is `gate_resolved`, as before).
+**A gate response is delivered only to a Host that can apply one: a Host whose
+connect reply lists Core's token `hostlink.command.gate_response`**
+(`sessionwire.HostLinkCapabilityGateResponse`, core v0.11.0; advertised by
+host ≥ v0.4.0 in `hostlink_methods`). The answer comes from ONE predicate,
+`hostlink.GateResponseCapable` — exact-name `Supports`, so a substring or a
+`hostlink.v1.`-prefixed spelling is not the capability, and the catalog's
+`LeaseEpoch` is never read as one. Three places ask it, over the owner's (or
+candidate's) link for the session's tenant:
+
+- **Admission.** Admitting a gate response IS delivering it — the owner reads
+  it from the durable stream — so a gate response for an owner without the
+  token is refused `409 gate_not_resumable` (`ErrGateResponseUnsupported`)
+  before anything is written.
+- **The wake.** A gate-response wake is withheld from a bound Host without the
+  token and counted (`WithheldGateResponses`).
+- **Placement.** A session with a pending gate response is placed only on a
+  candidate with the token; others are skipped with a WARN, and with none the
+  session waits.
+
+**Mixed fleets: do not run v0.3.0 and v0.4.0 Hosts that serve gating agents
+together.** An answer admitted under a v0.4.0 owner that is then re-placed onto
+a v0.3.0 Host — or that was already claimed there — sits `applying` until a
+v0.4.0 successor settles it `not_applied`. The placement filter keeps a
+*pending* answer off an incapable Host, but it cannot recall one already in
+flight.
 
 ## Status
 
@@ -448,7 +462,6 @@ so the answer there is `gate_resolved`, as before).
 the ClientLink node (started by `Start`), the HostLink pool, the routing table
 and demand plane, placement and its sweeps, and -- since v0.4.0 -- the live
 tail (`routing.Relay` between the HostLink subscription and the ClientLink).
-Since v0.5.0 one pooled Host serves several tenants (Gap 1). Still open: the
-default `cmd/factory` binary (A9.2), and admitting gate responses to a Host that
-can apply them (host v0.4.0 fixes the capability signal; the predicate is
-`hostlink.GateResponseCapable`).
+Since v0.5.0 one pooled Host serves several tenants (Gap 1), and a gate
+response reaches a Host that advertises `hostlink.command.gate_response`
+(host ≥ v0.4.0). Still open: the default `cmd/factory` binary (A9.2).
