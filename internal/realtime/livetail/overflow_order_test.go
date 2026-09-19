@@ -14,16 +14,25 @@ import (
 	"github.com/looprig/factory/internal/routing"
 )
 
-// laggingLinks is the real pool, except that an Unsubscribe issued from a
-// goroutine the overflow arm of the sink STARTED is held until the repair's
-// re-subscribe has returned -- a scheduler running that goroutine late, which
-// nothing orders against the repair.
+// laggingLinks is the real pool, except that it COUNTS every Unsubscribe not
+// issued from a session drainer -- the only goroutine ordered against the
+// repair -- and holds each such one until the repair's re-subscribe has
+// returned, as a scheduler running it late would.
+//
+// The count is what makes the reader deterministic (v0.4.0 regate N3). The
+// first version only held an unordered Unsubscribe and then asserted on E11,
+// and when the late withdrawal reached the pool AFTER the re-subscribe it was
+// held for 10s while E11 had already arrived -- so the X1 mutant (the overflow
+// arm's own `go Unsubscribe`) was killed 30 times in 31. "No Unsubscribe off
+// the drainer" is the rule itself, and it does not depend on which side of the
+// re-subscribe the stray call lands.
 type laggingLinks struct {
 	*hostlink.Pool
-	mu       sync.Mutex
-	held     bool
-	release  chan struct{}
-	released bool
+	mu        sync.Mutex
+	held      bool
+	release   chan struct{}
+	released  bool
+	unordered []string
 }
 
 func (d *laggingLinks) Subscribe(ctx context.Context, tenant sessionwire.TenantID, sid sessionwire.SessionID, sink hostlink.SessionSink) error {
@@ -40,9 +49,10 @@ func (d *laggingLinks) Subscribe(ctx context.Context, tenant sessionwire.TenantI
 func (d *laggingLinks) Unsubscribe(tenant sessionwire.TenantID, sid sessionwire.SessionID) {
 	buf := make([]byte, 1<<16)
 	stack := string(buf[:runtime.Stack(buf, false)])
-	if strings.Contains(stack, "created by github.com/looprig/factory/internal/realtime/livetail.(*sink)") {
+	if !strings.Contains(stack, "livetail.(*Plane).drain") {
 		d.mu.Lock()
 		d.held = true
+		d.unordered = append(d.unordered, stack)
 		release := d.release
 		d.mu.Unlock()
 		select {
@@ -93,6 +103,14 @@ func TestAnOverflowNeverWithdrawsTheRepairedTail(t *testing.T) {
 	open := func() { once.Do(func() { close(gate) }) }
 	t.Cleanup(func() {
 		open()
+		// Teardown's own Unsubscribes run off the drainer; nothing is being
+		// repaired any more, so they are released rather than held.
+		links.mu.Lock()
+		if !links.released {
+			links.released = true
+			close(links.release)
+		}
+		links.mu.Unlock()
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		_ = demand.Close(ctx)
@@ -130,4 +148,10 @@ func TestAnOverflowNeverWithdrawsTheRepairedTail(t *testing.T) {
 		_, routed := pool.RouteFor(tenantA, session)
 		return describe(t, vw.of(tenantA, session), host, channel) + " route_held=" + boolString(routed)
 	})
+	links.mu.Lock()
+	defer links.mu.Unlock()
+	if len(links.unordered) != 0 {
+		t.Fatalf("%d Unsubscribe(s) were issued off the session's drainer, unordered with the repair; the first from:\n%s",
+			len(links.unordered), links.unordered[0])
+	}
 }
