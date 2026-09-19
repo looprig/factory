@@ -161,6 +161,23 @@ type Frame struct {
 // (fanOutLocked), which a channel-wide publisher that never answers
 // ErrWouldBlock does not reach in composition. Nothing in Demand or Bindings
 // names this type, and no repair holds this mutex while calling them.
+//
+// # PRECONDITION: calls for ONE session are serialised by the caller
+//
+// Because the mutex is released across a repair's I/O, this type no longer
+// orders two calls for the same session against each other, and it relies on
+// its caller to. Receive, Pump, HostLinkClosed, Resync and Forget for one
+// (tenant, session) must never run concurrently: a second repair entered while
+// the first is inside its tip read or rebind clears the first's stopped state
+// early, admits a live frame between the two, and publishes a session.reset
+// whose tip goes BACKWARDS (the v0.4.0 regate constructed
+// E41, R41/77, E78, R41/45). Until d23cb6e the mutex serialised it; since
+// then the precondition is load-bearing and is met by composition, not here:
+// internal/realtime/livetail calls every one of these methods only from the
+// session's single drainer goroutine (Plane.handle) and from Plane.Close after
+// the drainers are stopped. Different sessions MAY run concurrently; that is
+// the point of releasing the lock. A new caller that is not the plane's
+// drainer must serialise per session itself.
 type Relay struct {
 	tips      TipReader
 	rebinder  Rebinder

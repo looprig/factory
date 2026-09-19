@@ -42,7 +42,11 @@
 // goroutine. That is what lets the transport's callbacks (hostlink sinks) and
 // routing.Demand (Watcher, called under Demand's lock) reach it without ever
 // being part of a cycle. The Relay is called only from a session's drainer
-// goroutine, which holds no lock of this package while it does so.
+// goroutine, which holds no lock of this package while it does so -- and that
+// is ALSO what satisfies routing.Relay's precondition that calls for one
+// session are serialised (it releases its own lock across a repair's I/O and
+// no longer orders them itself). pushLocked starts a drainer only when none is
+// running, so one session never has two; keep it that way.
 //
 // # What IS held across a Host round trip, stated because an earlier version
 // # of this comment claimed nothing was
