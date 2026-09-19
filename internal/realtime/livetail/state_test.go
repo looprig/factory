@@ -166,3 +166,111 @@ func TestCloseIsBoundedByItsContextEvenWhenTheRelayIsBusy(t *testing.T) {
 		t.Fatal("Close ignored its context while the Relay was busy")
 	}
 }
+
+// recordingRebinder records Rebind calls.
+type recordingRebinder struct {
+	mu    sync.Mutex
+	calls int
+}
+
+func (r *recordingRebinder) Rebind(context.Context, sessionwire.TenantID, sessionwire.SessionID) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.calls++
+	return nil
+}
+
+func (r *recordingRebinder) count() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.calls
+}
+
+// TestRestoredDoesNotRebindARouteStillHeld (quality gate W2): Restored asks
+// for a re-bind only when the route is gone. One that is held -- a poll or the
+// repair already re-bound it -- is live, and re-binding it would tear that
+// tail down and send every viewer a needless reset.
+func TestRestoredDoesNotRebindARouteStillHeld(t *testing.T) {
+	t.Parallel()
+
+	links, relay, rebinder := &scriptedLinks{}, &recordingRelay{}, &recordingRebinder{}
+	plane, err := livetail.New(livetail.Config{
+		Links: links, Viewers: func() livetail.Viewers { return nil }, MailboxLimit: 8, EventTimeout: time.Second,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	plane.Attach(relay, rebinder)
+	t.Cleanup(func() { _ = plane.Close(context.Background()) })
+	plane.Watching(tenantA, session)
+	if err := plane.Bind(context.Background(), "ws://host-1", sessionwire.HostLinkBindRequest{TenantID: tenantA, SessionID: session, HostID: "host-1"}); err != nil {
+		t.Fatalf("Bind: %v", err)
+	}
+	plane.Served(tenantA, session)
+	links.sink(0).Restored() // scriptedLinks.RouteFor always reports the route held
+	settle(t, plane, "the Restored event to drain", func() bool { n, _ := livetail.Pending(plane, tenantA, session); return n == 0 })
+	time.Sleep(20 * time.Millisecond)
+	if got := rebinder.count(); got != 0 {
+		t.Fatalf("Restored re-bound a route still held %d times", got)
+	}
+}
+
+// TestAnEndedTailsLatePublicationIsDropped (quality gate W3): after Ended the
+// plane accepts nothing more from that subscription; the repair it queued
+// resets the viewers from a tip, and a frame from the dead tail delivered
+// after that would sit behind a reset that already covered it.
+func TestAnEndedTailsLatePublicationIsDropped(t *testing.T) {
+	t.Parallel()
+
+	links, relay := &scriptedLinks{}, &recordingRelay{}
+	plane := newScriptedPlane(t, links, relay)
+	plane.Watching(tenantA, session)
+	if err := plane.Bind(context.Background(), "ws://host-1", sessionwire.HostLinkBindRequest{TenantID: tenantA, SessionID: session, HostID: "host-1"}); err != nil {
+		t.Fatalf("Bind: %v", err)
+	}
+	plane.Served(tenantA, session)
+	links.sink(0).Ended()
+	links.sink(0).Publication([]byte(`"after-ended"`))
+	time.Sleep(50 * time.Millisecond)
+	if got := relay.got(); len(got) != 0 {
+		t.Fatalf("an ended tail's publication reached the Relay: %v", got)
+	}
+}
+
+// TestCloseClosesTheRelay (quality gate W12).
+func TestCloseClosesTheRelay(t *testing.T) {
+	t.Parallel()
+
+	relay := &closeRecordingRelay{}
+	plane, err := livetail.New(livetail.Config{
+		Links: &scriptedLinks{}, Viewers: func() livetail.Viewers { return nil }, MailboxLimit: 8, EventTimeout: time.Second,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	plane.Attach(relay, nil)
+	if err := plane.Close(context.Background()); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if !relay.closed() {
+		t.Fatal("Plane.Close left the Relay open")
+	}
+}
+
+type closeRecordingRelay struct {
+	recordingRelay
+	mu   sync.Mutex
+	done bool
+}
+
+func (r *closeRecordingRelay) Close() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.done = true
+}
+
+func (r *closeRecordingRelay) closed() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.done
+}

@@ -794,3 +794,48 @@ func TestASubscribeReplacesAStaleRegistration(t *testing.T) {
 	}
 	waitUntilLiveness(t, "the tail live", func() bool { return host.node.Hub().NumSubscribers(channel) == 1 })
 }
+
+// countingSink counts Restored.
+type countingSink struct {
+	nopSink
+	restored atomic.Int32
+}
+
+func (s *countingSink) Restored() { s.restored.Add(1) }
+
+// TestAPendingSubscribeLostToADropIsNotRestored (quality gate W13): only a
+// LIVE tail lost to a dropped connection is an orphan owed Restored. A
+// subscribe still pending at the drop is answered ErrLinkReconnecting to its
+// own caller, who owns the retry; restoring it too would re-bind a session
+// nobody asked this link to re-bind. Driven at the two functions directly: a
+// stand-in holding a subscribe open also holds its own disconnect.
+func TestAPendingSubscribeLostToADropIsNotRestored(t *testing.T) {
+	t.Parallel()
+
+	host := newLivenessHost(t)
+	link := dialLiveness(t, host, time.Second)
+	pending, live := &countingSink{}, &countingSink{}
+	pendingEntry := &sessionSub{channel: "pending", sink: pending, settled: make(chan struct{})}
+	liveEntry := &sessionSub{channel: "live", sink: live, settled: make(chan struct{}), live: true}
+	link.mu.Lock()
+	link.subs["pending"] = pendingEntry
+	link.subs["live"] = liveEntry
+	link.mu.Unlock()
+
+	link.endAllSubscriptions(true)
+	link.restoreOrphans()
+	select {
+	case <-pendingEntry.settled:
+		if !errors.Is(pendingEntry.err, ErrLinkReconnecting) {
+			t.Fatalf("the pending subscribe was answered %v, want ErrLinkReconnecting", pendingEntry.err)
+		}
+	default:
+		t.Fatal("the pending subscribe was not answered")
+	}
+	if got := pending.restored.Load(); got != 0 {
+		t.Fatalf("a subscribe that never went live was told Restored %d times", got)
+	}
+	if got := live.restored.Load(); got != 1 {
+		t.Fatalf("the live tail was told Restored %d times, want 1 (the control)", got)
+	}
+}

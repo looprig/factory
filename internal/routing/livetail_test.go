@@ -169,3 +169,29 @@ func TestTheWatcherBracketsTheFirstServeAndHearsTheLastRelease(t *testing.T) {
 		t.Fatalf("Close did not report the session it tore down: %s", got)
 	}
 }
+
+// TestResyncDropsAnUnpumpedRouteBacklog (quality gate W1): records queued on
+// the route before a restarted tail's reset are from before the reset's tip
+// capture; delivering them after it would put them behind the reset that
+// already told the consumer where to read from.
+func TestResyncDropsAnUnpumpedRouteBacklog(t *testing.T) {
+	f := newRelayFixture(t, testRepairLimits, 50)
+	f.open(bindSession, linkA)
+	f.mustFeed(bindSession, 1)
+	if err := f.relay.Receive(context.Background(), bindTenant, bindSession, Frame{
+		Encoded: enduringRecord(t, bindSession, 2), CommittedAppendSeq: 1_000,
+	}); err != nil {
+		t.Fatalf("the backlog: %v", err)
+	}
+	if err := f.relay.Resync(context.Background(), bindTenant, bindSession); err != nil {
+		t.Fatalf("Resync: %v", err)
+	}
+	if err := f.relay.Pump(context.Background(), bindTenant, bindSession); err != nil {
+		t.Fatalf("Pump: %v", err)
+	}
+	for _, encoded := range f.pub.to(linkA) {
+		if strings.Contains(encoded, `"journal_seq":2`) {
+			t.Fatalf("the pre-reset route backlog was delivered after the reset: %v", f.pub.to(linkA))
+		}
+	}
+}
