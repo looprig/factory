@@ -120,13 +120,13 @@ func (l RepairLimits) Validate() error {
 // watermark bound is that somebody other than the record says how far the
 // journal has been committed.
 //
-// A DECLARED GAP. Core v0.8.0's HostLink vocabulary has no member carrying it,
-// and no session-event push exists there at all -- hostlink's own doc records
-// that Core defines the record bodies and no transport framing for them. So the
-// Host half that will supply this does not exist in this repository, and the
-// HostLink edge composing the two is A9.1's. Until then the honest reading of
-// this field is "what the producer declares", and the relay fences against it
-// rather than trusting the frame.
+// A DECLARED GAP. Core v0.9.1's session-channel records carry no member a Host
+// could state its committed append sequence in. internal/realtime/livetail,
+// which feeds this relay from the HostLink subscription since v0.4.0, passes
+// the publication's own covered_through -- a vacuous fence, because Core
+// requires covered_through == journal_seq -- until an additive Core member can
+// tighten it. The honest reading of this field is "what the producer
+// declares", and the relay fences against it rather than trusting the frame.
 //
 // CoalesceKey is FACTORY-LOCAL and read only for an ephemeral record. Core
 // gives an ephemeral publication no identity at all, so a path that coalesced

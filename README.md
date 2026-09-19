@@ -287,12 +287,26 @@ reply is verified, because centrifuge-go resolves connect futures before it runs
 which runs on its own goroutine so that a centrifuge-go v0.12.0 double-callback
 wedge costs one leaked goroutine rather than a caller.
 
-The pool carries the control plane only. A7.3 moved the per-binding queues and
-the backpressure repair *above* it, into `internal/realtime/delivery` and
-`routing.Relay`; the live publication consumer itself remains absent. Core's
-HostLink framing now defines the session channel and command-delivery shape, but
-Factory has not yet consumed the live publication stream. Choosing which Host a
-session belongs to is A7.2.
+The pool carries the control plane and, since v0.4.0, a session's live tail:
+a subscribe to the session's `HostLinkChannel` made after a successful bind on
+the same connection. The per-binding queues and the backpressure repair sit
+*above* it, in `internal/realtime/delivery` and `routing.Relay`. Choosing which
+Host a session belongs to is A7.2.
+
+## Live output (Gap 3, v0.4.0)
+
+A watched session's live output reaches the viewers watching it.
+`internal/realtime/livetail` composes `routing.Relay` between the HostLink
+subscription and the ClientLink: each record a Host publishes is published once
+to `session:{tenant}:{session}`, the channel wui subscribes to, in order. A Host
+keeps no history, so every time a session's tail starts (other than inside the
+first viewer's own subscribe) or stops unasked, the viewers receive a
+`session.reset` -- sent after the new tail is live -- and repair from the
+durable journal. On a HostLink reconnect Factory withdraws every tail itself
+(centrifuge-go's automatic resubscribe would reach a Host before the re-bind),
+re-binds on the new connection, then subscribes, then resets. Limits: a private
+record between public ones makes resets name an older sequence than necessary
+(over-repair), and Host silence while bound still looks like idle.
 `factory.New` composes neither the pool nor the reaper's cadence; A9.1 owns that.
 
 ## Placement

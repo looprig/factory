@@ -10,17 +10,15 @@
 // # What this package is and is not
 //
 // Pool holds at most one physical connection per Host and multiplexes every
-// session binding to that Host over it. It owns the CONTROL plane: bind,
-// unbind, command delivery, and the capacity and registry observations a Host
-// pushes. It does NOT carry session event data. The per-binding queues and the
-// backpressure repair now live ABOVE this package, in
-// internal/realtime/delivery and internal/routing's Relay; what is still absent
-// here is the LIVE TAIL itself. Core v0.9.1 names the session channel a Host
-// publishes on (sessionwire.HostLinkChannel), so the framing gap this package
-// used to record is closed for the control plane, but no subscription to that
-// channel exists here yet. Nothing here may be read as having solved any of the
-// three. It also does not decide WHICH Host a session belongs to; that is
-// A7.2's demand-driven binding, which calls Bind and Unbind.
+// session binding to that Host over it. It owns the CONTROL plane -- bind,
+// unbind, attach, command delivery, and the capacity and registry observations
+// a Host pushes -- and, since v0.4.0, a session's LIVE TAIL: Pool.Subscribe
+// subscribes sessionwire.HostLinkChannel on the link that holds the session's
+// bind (subscribe.go). The per-binding queues and the backpressure repair live
+// ABOVE this package, in internal/realtime/delivery and internal/routing's
+// Relay, composed by internal/realtime/livetail. It does not decide WHICH Host
+// a session belongs to; that is A7.2's demand-driven binding, which calls Bind
+// and Unbind.
 package hostlink
 
 import (

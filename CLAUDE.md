@@ -1424,11 +1424,12 @@ would still collect the link, whose binding set really is empty, and the next
 with `ErrUnknownBinding`, and `Unbind` drops an orphaned route rather than
 keeping one that would refuse every later bind as a conflict.
 
-The pool carries the **control** plane only. Session event data and the live
-tail are still absent — Core v0.8.0 defines no session-event push, so there is
-no framing here to carry one — and the per-binding queues and backpressure
-repair now sit *above* this package, in `internal/realtime/delivery` and
-`routing.Relay`. Nothing here may be read as having solved any of the three. Choosing *which* Host a session
+The pool carries the control plane AND, since v0.4.0 (Gap 3), a session's
+**live tail**: `Pool.Subscribe` subscribes the session's `HostLinkChannel` on
+the link that holds its bind (see "The live tail" below). The per-binding
+queues and backpressure repair sit *above* this package, in
+`internal/realtime/delivery` and `routing.Relay`, and are composed by
+`internal/realtime/livetail`. Choosing *which* Host a session
 belongs to is A7.2's demand-driven binding, which calls `Bind` and `Unbind`.
 `ReapIdle` is a method rather than a goroutine because A9.1 owns the start/stop
 ordering that would give it a lifetime.
@@ -2008,9 +2009,10 @@ than cells are stated as such.
 ## Bounded delivery and backpressure repair
 
 A7.3 added `internal/realtime/delivery` (the bounded queue, above the transport)
-and `routing.Relay` (the repair that an overflow owes). Nothing composes them
-yet; the HostLink edge that feeds a `Relay` and the ClientLink edge that
-implements its `Publisher` are A9.1's, with the rest.
+and `routing.Relay` (the repair that an overflow owes). Since v0.4.0 both are
+composed: `internal/realtime/livetail` feeds the Relay from the HostLink
+subscription and implements its `Publisher` over the ClientLink (see "The live
+tail").
 
 **The invariant is one sentence: an enduring record is never discarded
 silently.** Every bound either evicts a record carrying no durable content, or
@@ -2065,10 +2067,12 @@ reads.** Core v0.9.1 **does** define the session-channel record bodies and the
 HostLink framing for their per-session channel —
 `enduring_publication`, `ephemeral_publication`, `journal_tip`, `session.reset` —
 and `Relay.classify` dispatches on exactly that discriminator. The transport
-framing gap is closed for control-plane RPCs, but this module still has no
-subscription to the session channel or live event stream, and no **member on
-any record** from which a Host's committed append sequence could be read. The
-latter makes the upper watermark bound unimplementable from the wire. The field
+framing gap is closed, and since v0.4.0 this module subscribes to the session
+channel, but there is still no **member on any record** from which a Host's
+committed append sequence could be read. That makes the upper watermark bound
+unimplementable from the wire, so `livetail` passes the publication's own
+`covered_through` -- a DECLARED VACUOUS fence, since Core requires
+`covered_through == journal_seq`; an additive Core member can tighten it. The field
 is the seam the Host half will fill; until it exists the honest reading is "what
 the producer declares", and the relay fences against it.
 **For the same reason there is no ephemeral producer in this module**, so the
@@ -2243,6 +2247,104 @@ the module arm reaches zero files today and the test **logs** that too. What it 
 through a func value reached from a field, map or slice, and a wrapper spelled
 some other name.
 
+## The live tail (Gap 3, v0.4.0)
+
+**A watched session's live output reaches the viewers watching it.** Host v0.2.1
+publishes one `EnduringPublication` per committed public event on
+`HostLinkChannel(tenant, session)`, **with no history**; before v0.4.0 Factory
+never subscribed, so everything a Host published went nowhere.
+`internal/realtime/livetail.Plane` composes what already existed --
+`routing.Relay` (complete since A7.3, constructed in `composeLive` for the first
+time), `routing.Demand`, the HostLink pool -- and adds three edges:
+
+- **A HostLink subscribe AFTER a successful bind, on the same connection.**
+  `Plane.Bind` is the routing table's `Binder`: `pool.Bind`, then
+  `pool.Subscribe`; a subscribe that fails undoes the bind and fails the call,
+  so a route this replica holds always carries a tail. A Host accepts a
+  subscribe only on the connection holding the bind (`MaySubscribe`), and the
+  pool refuses a subscribe for a session it holds no route for. A subscribe is a
+  transport operation, not a HostLink method, so it needs no `hostlink_methods`
+  entry. Placement's transient binds go through `placementLinks` and do NOT
+  subscribe.
+- **A ClientLink publish** to `session:{tenant}:{session}`
+  (`clientlink.SessionChannel`, the demand grammar's inverse and the channel wui
+  subscribes to), **channel-wide, once per record**. The Relay holds ONE
+  DeliveryBinding per session (`channelLink`), so its reset is the channel's;
+  the per-viewer bound is the transport's byte queue plus `DisconnectSlow`
+  (3008), and a disconnected viewer repairs on reconnect (wui U2.1).
+  `CloseLink` becomes `Handler.CloseSession`: every viewer of that session is
+  unsubscribed server-side with 2000 (below the 2500 resubscribe band), off the
+  calling goroutine because the OnUnsubscribe it triggers takes the Engine's lock.
+- **A per-session drainer** that feeds `Relay.Receive` + `Pump` from the
+  subscription's sink, in order. The sink runs on centrifuge-go's callback
+  goroutine -- which for a publication is the goroutine READING the connection
+  -- so it never blocks: it appends to a bounded mailbox (the Relay's
+  HostBinding queue size). A mailbox at its bound is a LOST tail (repaired
+  below), never unbounded growth.
+
+**The rule: a Host keeps no history, so every tail START is followed by a
+session.reset, sent AFTER the tail is live -- except the one start inside the
+first viewer's own subscribe.** That start is gapless: `Engine.Bind` calls
+`Demand.Acquire` before the viewer's subscribe is acknowledged, so its durable
+read comes later. Any other start (a poll binding a session that had no owner
+when the viewer arrived, a re-bind after a repair, an owner change) may have
+missed records every current viewer relied on, and wui's join trusts live
+publications without gap detection (private records make public sequences
+sparse), so a missed record would be SILENT. `routing.Watcher` is how the plane
+tells the two apart (`Watching` before the first serve, `Served` after), and
+`Relay.Resync` is the reset: one tip, each binding's own last contiguous, no
+tail touched. It is queued behind the live marker in the mailbox, so it is
+published before anything the new tail carries.
+
+**Every tail that STOPS without being asked is `Relay.HostLinkClosed`**: stop,
+one tip, reset every binding, `Demand.Rebind` (unbind + bind, and the bind
+re-subscribes), resume. A refused record (the Relay would not classify it) is a
+hole and takes the same repair. Every OWNER-initiated stop -- `Plane.Unbind`,
+which `Bindings.Release`/`Observe` reach when the last viewer leaves or the
+route drops, and `Tail.Stop` -- unsubscribes, because **a Host never
+unsubscribes a Factory**, not on unbind and not on `InvalidateSession`.
+`Pool.Unsubscribe` reaches every link, not the routed one, because the route may
+already be gone. The plane gives each subscription a generation, so a stopped
+or replaced tail's late publication never reaches the Relay.
+
+**Reconnect ordering is owned here, and centrifuge-go's own resubscribe never
+runs.** centrifuge-go moves every subscription back to subscribing on a
+transport close and resubscribes it the moment the next connection is up
+(`client.go:1476`, `:1531`) -- before anything is re-bound there, so a Host
+refuses it, or, if a queued bind raced ahead, ACCEPTS it and the tail restarts
+over a hole. So: `onConnecting` ends every tail (`endAllSubscriptions`),
+synchronously removing the entries so every old callback is ignored, and tells
+each sink `Ended`; the transport-side withdrawal runs on its own goroutine
+(normally inside the reconnect delay, when an Unsubscribe is local-only) because
+`Client.Close` holds the client lock while it drains this callback queue. The
+repair's re-bind fails fast (`ErrLinkReconnecting`), leaving the session unbound;
+`onConnected`, once the new reply is verified, tells each orphaned sink
+`Restored`, and the plane re-binds -- which subscribes -- and that new tail's
+start sends the reset. **Re-bind, then subscribe, then reset.** An owner
+`Unsubscribe` does NOT cancel the orphan: the repair stops the tail through that
+very call before its re-bind fails, and Restored is then the only thing left
+that re-binds (measured; `TestAnOwnersUnsubscribeDuringTheReconnectStillHearsRestored`).
+A server-side unsubscribe with a resubscribe code (>= 2500) is ended the same
+way rather than tolerated. Nothing new is held across `client.RPC`, and no
+callback takes a lock anything calling the transport holds: `Plane.mu` and the
+link's `mu` are leaves, and the Relay is called only from a drainer goroutine.
+**A bind that meets a terminal link now evicts it**, as attach did since B5: a
+viewer's route otherwise pins a dead link and the re-bind never reaches the Host.
+
+**Known limits, booked rather than hidden.** (1) A private record between two
+public ones makes the Relay's `lastContiguous` stick (Core requires
+`covered_through == journal_seq` on a live publication), so a reset names an
+older sequence than it could and viewers over-repair; advancing it needs a
+journal read over the gap, not the tip read, and is not cheap. (2) Host silence
+still looks like idle while BOUND: the `journal_tip` hint (now published to the
+same channel instead of the old `unpublishedHints` refusal; `ErrNoHintPublisher`
+is kept, Deprecated) runs only for an UNBOUND watched session, and wui ignores a
+hint in its live phase. (3) `Frame.CommittedAppendSeq` is a vacuous fence
+(above). (4) A placement transient unbind racing a viewer's bind of the same
+session can drop the viewer's pool route (pre-existing: routes are not
+reference-counted); the tail keeps flowing -- a Host publishes regardless of
+bind -- and the next poll repairs the route.
+
 ## Not implemented yet
 
 A2.4 implements `/objects/{oid}` and `/objects/{oid}/metadata` in the internal
@@ -2286,7 +2388,8 @@ default verifier option, because a deployment supplies the `Verifier` and there
 is no credible default for one. `internal/realtime` holds the ClientLink engine
 (A6.1), the HostLink pool and dialer (A7.1), the bounded delivery queue (A7.3)
 and the pinned transport spike (A5.1); none of the four is composed by
-`factory.New`, and neither is `routing.Relay`. `cmd/factory` and `internal/placement/kubernetes` do not
+`factory.New` -- except that, since v0.4.0, the HostLink pool, the ClientLink,
+`routing.Relay` and the live tail ARE composed (see "The live tail"). `cmd/factory` and `internal/placement/kubernetes` do not
 exist; their exemptions grant nothing today and `TestBoundaryScopesAreNotStale`
 will fail if one of those directories appears without a Go file in it. Do not
 add a placeholder Go file to satisfy it: that would permanently satisfy a live
