@@ -839,3 +839,46 @@ func TestAPendingSubscribeLostToADropIsNotRestored(t *testing.T) {
 		t.Fatalf("the live tail was told Restored %d times, want 1 (the control)", got)
 	}
 }
+
+// TestTheCapabilityReadInTheConnectingWindowIsATransientNotAReply: between a
+// dropped connection and the next reply, Negotiated answers ErrLinkReconnecting
+// rather than any reply -- the previous Host may have restarted without the
+// capability, and a zeroed reply read as "cannot" would be a capability fact
+// made from a transient. After the new reply lands it answers that reply.
+func TestTheCapabilityReadInTheConnectingWindowIsATransientNotAReply(t *testing.T) {
+	t.Parallel()
+
+	host := newLivenessHost(t)
+	link := dialLiveness(t, host, 300*time.Millisecond)
+	serverClient := <-host.connected
+
+	host.setNegotiation(`{"version":1,"hostlink_methods":["hostlink.bind"]}`)
+	serverClient.Disconnect(centrifuge.Disconnect{Code: 4000, Reason: "test capability change"})
+	waitForState(t, link.client, centrifugego.StateConnecting)
+	time.Sleep(20 * time.Millisecond)
+	if got := link.client.State(); got != centrifugego.StateConnecting {
+		t.Fatalf("left the Connecting window early: %s", got)
+	}
+	if reply, err := link.Negotiated(); !errors.Is(err, ErrLinkReconnecting) {
+		t.Fatalf("Negotiated in the Connecting window = (%+v, %v), want ErrLinkReconnecting", reply, err)
+	}
+	select {
+	case <-host.reconnected:
+	case <-time.After(3 * time.Second):
+		t.Fatal("reconnect did not complete")
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		reply, err := link.Negotiated()
+		if err == nil {
+			if !reply.Supports("hostlink.bind") {
+				t.Fatalf("Negotiated after the reconnect = %+v, want the new reply", reply)
+			}
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("Negotiated never settled after the reconnect: %v", err)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
