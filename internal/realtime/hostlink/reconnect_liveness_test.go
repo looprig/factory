@@ -746,3 +746,51 @@ func (nopSink) Subscribed()        {}
 func (nopSink) Publication([]byte) {}
 func (nopSink) Ended()             {}
 func (nopSink) Restored()          {}
+
+// TestALateDiscardOfAnOldTailLeavesTheNewerOneAlone (quality gate W17): a
+// withdrawal of a subscription that is no longer the channel's registration
+// is a no-op. Unguarded, it would unsubscribe the NEWER tail at the Host,
+// because the transport addresses that unsubscribe by channel name.
+func TestALateDiscardOfAnOldTailLeavesTheNewerOneAlone(t *testing.T) {
+	t.Parallel()
+
+	host := newLivenessHost(t)
+	link := dialLiveness(t, host, time.Second)
+	channel := sessionwire.HostLinkChannel("tenant-a", "s-1")
+	if err := link.Subscribe(context.Background(), "tenant-a", "s-1", nopSink{}); err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+	link.mu.Lock()
+	old := link.subs[channel].sub
+	link.mu.Unlock()
+	link.Unsubscribe("tenant-a", "s-1")
+	waitUntilLiveness(t, "the first tail withdrawn", func() bool { return host.node.Hub().NumSubscribers(channel) == 0 })
+	if err := link.Subscribe(context.Background(), "tenant-a", "s-1", nopSink{}); err != nil {
+		t.Fatalf("re-Subscribe: %v", err)
+	}
+	waitUntilLiveness(t, "the new tail live", func() bool { return host.node.Hub().NumSubscribers(channel) == 1 })
+
+	link.discard(old) // the late withdrawal
+	time.Sleep(200 * time.Millisecond)
+	if got := host.node.Hub().NumSubscribers(channel); got != 1 {
+		t.Fatalf("a late discard of the OLD tail left the Host holding %d subscriptions, want the new one", got)
+	}
+}
+
+// TestASubscribeReplacesAStaleRegistration (quality gate W18): a registration
+// a previous subscription left behind -- its removal runs off the callback
+// goroutine -- must not make the next subscribe fail as a duplicate.
+func TestASubscribeReplacesAStaleRegistration(t *testing.T) {
+	t.Parallel()
+
+	host := newLivenessHost(t)
+	link := dialLiveness(t, host, time.Second)
+	channel := sessionwire.HostLinkChannel("tenant-a", "s-1")
+	if _, err := link.client.NewSubscription(channel); err != nil {
+		t.Fatalf("planting a stale registration: %v", err)
+	}
+	if err := link.Subscribe(context.Background(), "tenant-a", "s-1", nopSink{}); err != nil {
+		t.Fatalf("Subscribe over a stale registration = %v, want it replaced", err)
+	}
+	waitUntilLiveness(t, "the tail live", func() bool { return host.node.Hub().NumSubscribers(channel) == 1 })
+}

@@ -346,6 +346,16 @@ func (p *Pool) Bind(ctx context.Context, target Target, req sessionwire.HostLink
 
 	key := routeKey{tenant: req.TenantID, session: req.SessionID}
 
+	// A terminal link this bind evicts is closed AFTER the pool's lock is
+	// released, as evict does: Client.Close waits for the link's callback
+	// queue to drain, and a pool lock held across that is a deadlock the day
+	// any callback reaches the pool. Deferred first, so it runs last.
+	var dead Link
+	defer func() {
+		if dead != nil {
+			_ = dead.Close(context.Background())
+		}
+	}()
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if p.closed {
@@ -371,9 +381,8 @@ func (p *Pool) Bind(ctx context.Context, target Target, req sessionwire.HostLink
 		// that closed this replica out would never be dialled again. Attach
 		// has evicted on this evidence since B5; a bind is the path Gap 3's
 		// re-bind after a lost tail takes, so it must too.
-		if terminalLinkError(err) {
-			p.dropLinkLocked(target.Host, pooled)
-			_ = pooled.link.Close(context.Background())
+		if terminalLinkError(err) && p.dropLinkLocked(target.Host, pooled) {
+			dead = pooled.link
 		}
 		return err
 	}

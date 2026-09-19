@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 
 	centrifugego "github.com/centrifugal/centrifuge-go"
@@ -171,6 +172,21 @@ type subscriptionState struct {
 	// connection. They are told Restored on the next successful handshake and
 	// forgotten. An owner's Unsubscribe does not remove one; see Unsubscribe.
 	orphans map[string]SessionSink
+	// regMu serialises every change to the TRANSPORT's subscription registry
+	// that this link makes -- registering, replacing, unsubscribing and
+	// removing -- and it is the only thing that makes a late withdrawal safe.
+	// centrifuge-go keys that registry, and the unsubscribe it sends a Host,
+	// by CHANNEL NAME (client.go:296 RemoveSubscription, :2114 unsubscribe),
+	// so a withdrawal of an OLD subscription that ran after a newer one was
+	// registered for the same channel would unsubscribe the newer one at the
+	// Host while this link still believed it live. Under regMu a withdrawal
+	// first checks that the registration is still ITS subscription.
+	//
+	// It is NEVER taken on a transport callback goroutine: Client.Close holds
+	// the client lock while it drains the callback queue, and regMu's holders
+	// call into the client, so a callback waiting for regMu could wait on a
+	// Close that waits on it. Callbacks hand withdrawals to a goroutine.
+	regMu sync.Mutex
 	// subscribeTimeout bounds one subscribe's wait for the Host's answer, on
 	// top of the caller's context. It is the dial timeout: a subscribe is one
 	// round trip on a connection that is already up, and a Host slower than a
@@ -227,8 +243,9 @@ func (l *centrifugeLink) Subscribe(ctx context.Context, tenant sessionwire.Tenan
 	l.mu.Unlock()
 	if !current {
 		// Withdrawn between the reservation and now: the owner unsubscribed,
-		// or the connection dropped. Nothing was sent.
-		_ = l.client.RemoveSubscription(sub)
+		// or the connection dropped. Nothing was sent, and the registration
+		// is removed only while it is still this one's.
+		l.discard(sub)
 		return l.await(ctx, entry)
 	}
 	if err := sub.Subscribe(); err != nil {
@@ -241,6 +258,8 @@ func (l *centrifugeLink) Subscribe(ctx context.Context, tenant sessionwire.Tenan
 // newSubscription registers a subscription for channel with the transport,
 // replacing a stale registration a previous subscription left behind.
 func (l *centrifugeLink) newSubscription(channel string) (*centrifugego.Subscription, error) {
+	l.regMu.Lock()
+	defer l.regMu.Unlock()
 	sub, err := l.client.NewSubscription(channel)
 	if !errors.Is(err, centrifugego.ErrDuplicateSubscription) {
 		return sub, err
@@ -289,8 +308,12 @@ func (l *centrifugeLink) install(entry *sessionSub, sub *centrifugego.Subscripti
 		// Reached for a Host refusal, a server-side unsubscribe and a client
 		// Close. The owner's own Unsubscribe removes the entry FIRST, so it is
 		// never current here and the owner's sink is not told Ended.
-		l.lose(entry, fmt.Errorf("%w: %d %s", ErrSubscribeRefused, event.Code, event.Reason))
-		go l.discard(sub)
+		// Only a CURRENT entry is withdrawn: an owner's Unsubscribe has
+		// already withdrawn its own, and a second, late withdrawal is the
+		// hazard regMu exists for.
+		if l.lose(entry, fmt.Errorf("%w: %d %s", ErrSubscribeRefused, event.Code, event.Reason)) {
+			go l.discard(sub)
+		}
 	})
 	sub.OnSubscribing(func(event centrifugego.SubscribingEvent) {
 		if event.Code == subscribingTransportClosed {
@@ -311,8 +334,9 @@ func (l *centrifugeLink) install(entry *sessionSub, sub *centrifugego.Subscripti
 		// resubscribe is exactly what this link may not allow -- publications
 		// in between are gone and nobody would be told -- so the subscription
 		// is ended and withdrawn, and the sink repairs.
-		l.lose(entry, ErrSubscribeRefused)
-		go l.discard(sub)
+		if l.lose(entry, ErrSubscribeRefused) {
+			go l.discard(sub)
+		}
 	})
 	sub.OnError(func(event centrifugego.SubscriptionErrorEvent) {
 		// A subscribe error the transport would retry on its own (a temporary
@@ -334,8 +358,9 @@ func (l *centrifugeLink) install(entry *sessionSub, sub *centrifugego.Subscripti
 }
 
 // lose ends one entry that stopped without its owner asking: a live one tells
-// its sink Ended, a pending one answers its waiter.
-func (l *centrifugeLink) lose(entry *sessionSub, cause error) {
+// its sink Ended, a pending one answers its waiter. It reports whether the
+// entry was still current, which is whether its caller may withdraw it.
+func (l *centrifugeLink) lose(entry *sessionSub, cause error) bool {
 	l.mu.Lock()
 	current := l.subs[entry.channel] == entry
 	live := entry.live
@@ -344,13 +369,14 @@ func (l *centrifugeLink) lose(entry *sessionSub, cause error) {
 	}
 	l.mu.Unlock()
 	if !current {
-		return
+		return false
 	}
 	if live {
 		entry.sink.Ended()
-		return
+		return true
 	}
 	l.settle(entry, cause)
+	return true
 }
 
 // withdraw removes an entry the owner's own path gave up on, answering its
@@ -437,18 +463,26 @@ func (l *centrifugeLink) Unsubscribe(tenant sessionwire.TenantID, session sessio
 }
 
 // discard unsubscribes a subscription at the transport and forgets its
-// registration. It never blocks on the Host: an unsubscribe while connected is
-// one write, and while not connected it is local only.
+// registration -- but ONLY while the registration for its channel is still
+// this subscription, checked and acted on under regMu.
 //
-// The registration is removed only while it is still THIS subscription's.
-// RemoveSubscription deletes by channel name, so an unguarded removal running
-// late would delete a newer subscription's registration for the same channel,
-// and that one could then never be unsubscribed at the Host.
+// That check is the whole of its safety. centrifuge-go's Subscription.Unsubscribe
+// sends the Host an unsubscribe for the CHANNEL whenever any registration for
+// the channel exists (client.go:2114), and RemoveSubscription deletes by
+// channel (client.go:296), so a discard of an old subscription that ran after
+// a newer one had been registered would kill the newer one at the Host. A
+// stale discard is therefore a no-op. It never blocks on the Host: an
+// unsubscribe while connected is one write, and while not connected it is
+// local only. It must not be called on a transport callback goroutine (regMu).
 func (l *centrifugeLink) discard(sub *centrifugego.Subscription) {
-	_ = sub.Unsubscribe()
-	if current, ok := l.client.GetSubscription(sub.Channel); ok && current == sub {
-		_ = l.client.RemoveSubscription(sub)
+	l.regMu.Lock()
+	defer l.regMu.Unlock()
+	current, ok := l.client.GetSubscription(sub.Channel)
+	if !ok || current != sub {
+		return
 	}
+	_ = sub.Unsubscribe()
+	_ = l.client.RemoveSubscription(sub)
 }
 
 // endAllSubscriptions ends every subscription on a connection that went away,
@@ -463,18 +497,21 @@ func (l *centrifugeLink) discard(sub *centrifugego.Subscription) {
 // it, accepts it and starts a tail with a hole behind it that nobody was told
 // about.
 //
-// TWO MECHANISMS, and only the first is load-bearing. The entry is removed
-// from subs HERE, synchronously, so every callback of the old subscription --
-// including a publication from a resubscribe the Host accepted -- finds it not
-// current and is dropped, and its sink hears Ended now. The transport-side
-// withdrawal (discard) runs on its OWN GOROUTINE and normally lands inside the
-// reconnect delay, while the client is not connected, so the automatic
-// resubscribe finds nothing to send. It may not run inline: Client.Close holds
-// the client's lock while it waits for this very callback queue to drain
-// (moveToClosed), and a callback that asked for that lock would deadlock the
-// close. If it lands late, the Host is sent an unsubscribe for a tail this
-// link already ignores, and the owner's next Subscribe replaces the stale
-// registration (newSubscription).
+// TWO MECHANISMS. The entry is removed from subs HERE, synchronously, so every
+// callback of the old subscription -- including a publication from a
+// resubscribe the Host accepted -- finds it not current and is dropped, and
+// its sink hears Ended now. The transport-side withdrawal (discard) runs on
+// its OWN GOROUTINE and normally lands inside the reconnect delay, while the
+// client is not connected, so the automatic resubscribe finds nothing to send.
+// It may not run inline: Client.Close holds the client's lock while it waits
+// for this very callback queue to drain (moveToClosed), and a callback that
+// asked for that lock would deadlock the close (the spec gate's mutants D1 and
+// D2 hang the suite exactly so). If it lands late it is SAFE ONLY BECAUSE
+// discard is guarded: when the owner has since re-subscribed the channel, the
+// new registration replaced the old one under regMu (newSubscription), and a
+// late discard of the old one finds it is no longer the registration and does
+// nothing. An unguarded late discard would unsubscribe the NEW tail at the
+// Host, because the transport addresses that unsubscribe by channel name.
 //
 // orphan says whether the sinks should hear Restored after the next
 // handshake: true for a reconnect, false for a terminal close.
