@@ -11,6 +11,7 @@ import (
 
 	sessionwire "github.com/looprig/core/sessionwire/v1"
 	"github.com/looprig/factory/identity"
+	"github.com/looprig/factory/internal/realtime/hostlink"
 )
 
 // Composition errors. Every failure New reports wraps one of these sentinels,
@@ -100,6 +101,12 @@ type Option struct {
 }
 
 type config struct {
+	// hostDialer replaces the real HostLink transport. No Option sets it: it
+	// exists so this package's own tests can drive the COMPOSED wiring above
+	// the transport (a root-package test may not import centrifuge, so it
+	// cannot stand up a Host). nil takes the real CentrifugeDialer.
+	hostDialer hostlink.Dialer
+
 	verifier      identity.Verifier
 	cookieName    string
 	defaultTenant sessionwire.TenantID

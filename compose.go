@@ -66,7 +66,7 @@ type components struct {
 // states separately. Every rejection is attributed to the option carrying the
 // offending value, for the reason composeRouter's are.
 func composeComponents(cfg config, credentials *internalidentity.Authenticator) (*components, error) {
-	dialer, err := hostlink.NewCentrifugeDialer(hostlink.DialerConfig{
+	realDialer, err := hostlink.NewCentrifugeDialer(hostlink.DialerConfig{
 		Credential: cfg.hostCredential,
 		Version:    cfg.version,
 		Limits:     hostlink.Limits(cfg.host),
@@ -74,6 +74,7 @@ func composeComponents(cfg config, credentials *internalidentity.Authenticator) 
 	if err != nil {
 		return nil, &OptionError{Option: "WithHostLinkCredential", Err: err}
 	}
+	var dialer hostlink.Dialer = realDialer
 	pool, err := hostlink.NewPool(hostlink.Config{
 		Dialer: dialer,
 		Limits: hostlink.Limits(cfg.host),
@@ -437,7 +438,28 @@ func (l placementLinks) AcceptsGateResponses(ctx context.Context, owner sessionw
 type gateResponders struct{ pool *hostlink.Pool }
 
 func (g gateResponders) AcceptsGateResponses(ctx context.Context, owner sessionwire.HostLinkRegistryObservation) (bool, error) {
-	return g.pool.AcceptsGateResponses(ctx, hostlink.Target{Host: owner.HostID, Endpoint: owner.InternalEndpoint}, owner.TenantID)
+	capable, err := g.pool.AcceptsGateResponses(ctx, hostlink.Target{Host: owner.HostID, Endpoint: owner.InternalEndpoint}, owner.TenantID)
+	return capable, classifyCapabilityRead(err)
+}
+
+// classifyCapabilityRead marks a TRANSIENT failure to reach the owner --
+// its link reconnecting, the link ceiling full, a failed dial (a terminal
+// close is in that class too), a wire-version change the next Host may not
+// share, the pool shutting down -- as admission.ErrGateResponderUnavailable,
+// which the HTTP edge answers 503 retryable (quality gate F1). Anything else,
+// a base that cannot address the tenant included, stays a plain fault: it is a
+// deployment fact a retry will not change.
+func classifyCapabilityRead(err error) error {
+	if err == nil {
+		return nil
+	}
+	for _, transient := range []error{hostlink.ErrLinkReconnecting, hostlink.ErrLinkLimit, hostlink.ErrDialFailed,
+		hostlink.ErrUnsupportedProtocol, hostlink.ErrPoolClosed} {
+		if errors.Is(err, transient) {
+			return fmt.Errorf("%w: %w", admission.ErrGateResponderUnavailable, err)
+		}
+	}
+	return err
 }
 
 // classifyAttach maps a pool attach failure onto placement's vocabulary. See

@@ -62,6 +62,18 @@ var ErrLegacySessionUnsupported = errors.New("admission: the session is bound to
 // a capability signal (owner ruling, 2026-09-19).
 var ErrGateResponseUnsupported = errors.New("admission: the session's owner cannot apply a gate response")
 
+// ErrGateResponderUnavailable classifies a failure to ASK the owner whether it
+// applies gate responses that is a transient condition of the path to it --
+// its link reconnecting, this replica's link ceiling full, a dial that failed,
+// a pool shutting down -- rather than an answer about the Host. The
+// composition's GateResponders wraps it; admission returns it as a fault (no
+// public code), and the HTTP edge answers it 503 unavailable, which is
+// RETRYABLE, for storeUnavailable's reason: a transient deployment condition
+// answered as a non-retryable 500 tells a client not to retry at exactly the
+// moment retrying works (quality gate F1). Nothing is written before it, and a
+// retry under the same CommandID is idempotent.
+var ErrGateResponderUnavailable = errors.New("admission: the session's owner could not be reached to ask whether it applies gate responses")
+
 // ErrGateResponseTooLarge is the cause of the invalid_request refusal a NEW
 // gate response gets when its canonical command payload is larger than
 // sessionstore.MaxInboxPayloadBytes (64 KiB), the most the disposition inbox

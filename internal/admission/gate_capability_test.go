@@ -78,3 +78,23 @@ func TestTheCapabilityIsAskedOnlyForAGateResponse(t *testing.T) {
 		t.Fatalf("an input asked the gate_response capability %d times", f.gates.calls)
 	}
 }
+
+// TestAnUnreachableOwnerIsAFaultThatKeepsItsClassification: a GateResponders
+// failure marked ErrGateResponderUnavailable leaves admission as a FAULT -- no
+// public code, nothing written, per TestNoDependencyFaultBecomesAPublicCode --
+// that still carries the classification the HTTP edge answers 503 retryable
+// (quality gate F1).
+func TestAnUnreachableOwnerIsAFaultThatKeepsItsClassification(t *testing.T) {
+	f := newServiceFixture(t)
+	resolvableSession(f)
+	f.gates.failing = "AcceptsGateResponses"
+	f.gates.wrap = ErrGateResponderUnavailable
+	_, _, err := f.service.AdmitGateResponse(context.Background(), f.principal, gateAnswer("answer-u"))
+	var classified *Error
+	if errors.As(err, &classified) || !errors.Is(err, ErrGateResponderUnavailable) || !errors.Is(err, errInjectedFault) {
+		t.Fatalf("AdmitGateResponse = %v, want an unclassified fault carrying ErrGateResponderUnavailable and the cause", err)
+	}
+	if f.commands.lastAdmit.CommandID != "" {
+		t.Fatal("a gate response whose owner could not be asked was written")
+	}
+}

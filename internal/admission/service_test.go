@@ -317,6 +317,9 @@ func (d *serviceDirectory) Owner(_ context.Context, tenant sessionwire.TenantID,
 // name it.
 type serviceGateResponders struct {
 	faultInjector
+	// wrap, when set, is wrapped around an injected fault, as the
+	// composition wraps a transient one.
+	wrap      error
 	refuse    bool
 	calls     int
 	lastOwner sessionwire.HostLinkRegistryObservation
@@ -326,6 +329,9 @@ func (g *serviceGateResponders) AcceptsGateResponses(_ context.Context, owner se
 	g.calls++
 	g.lastOwner = owner
 	if err := g.enter("AcceptsGateResponses"); err != nil {
+		if g.wrap != nil {
+			return false, fmt.Errorf("%w: %w", g.wrap, err)
+		}
 		return false, err
 	}
 	return !g.refuse, nil
@@ -1019,6 +1025,12 @@ func TestADependencyFaultIsNotADecisionAboutTheCommand(t *testing.T) {
 // named in unreachedDependencyMethods with a reason; and every fault must
 // produce SOME failure, or an injector that armed nothing would leave every
 // call on its happy path with "nothing was classified" trivially true.
+//
+// A fault stays a fault here even when it is TRANSIENT: a GateResponders
+// failure the composition marks ErrGateResponderUnavailable carries no public
+// code out of admission, and it is the HTTP edge that answers it 503
+// retryable (quality gate F1; TestAnUnreachableOwnerIsAFaultThatKeepsItsClassification
+// and TestATransientCapabilityReadIsAnsweredRetryable).
 func TestNoDependencyFaultBecomesAPublicCode(t *testing.T) {
 	sites := faultSites(t)
 	if len(sites) < 2 {

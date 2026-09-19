@@ -494,6 +494,17 @@ func admissionFailure(err error) apiError {
 	if failure, ok := storeUnavailable(err); ok {
 		return failure
 	}
+	if errors.Is(err, admission.ErrGateResponderUnavailable) {
+		// The owner could not be reached to ask whether it applies gate
+		// responses: a reconnecting link, a full link ceiling, a failed dial.
+		// Transient and nothing was written, so 503 and retryable, as a
+		// draining store is (quality gate F1).
+		return apiError{
+			status:  http.StatusServiceUnavailable,
+			code:    ErrorCodeUnavailable,
+			message: "the session's owner could not be reached at the moment",
+		}
+	}
 	return internalFailure()
 }
 
