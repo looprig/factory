@@ -17,6 +17,7 @@ import (
 	"github.com/looprig/factory/internal/placement"
 	"github.com/looprig/factory/internal/realtime/clientlink"
 	"github.com/looprig/factory/internal/realtime/hostlink"
+	"github.com/looprig/factory/internal/realtime/livetail"
 	"github.com/looprig/factory/internal/reconcile"
 	"github.com/looprig/factory/internal/routing"
 	"github.com/looprig/sessionstore"
@@ -35,6 +36,10 @@ type components struct {
 	pool       *hostlink.Pool
 	bindings   *routing.Bindings
 	demand     *routing.Demand
+	// live carries a watched session's output from its Host to its viewers
+	// (Gap 3): it is the routing table's Binder, the demand plane's Hinter
+	// and Watcher, and the Tail and Publisher of the relay it drives.
+	live *livetail.Plane
 	// realtime is nil until Start, and the router reads it through a supplier
 	// on every request rather than holding it. See RouterConfig.Realtime.
 	realtimeMu sync.RWMutex
@@ -101,22 +106,50 @@ func composeComponents(cfg config, credentials *internalidentity.Authenticator) 
 		return nil, &OptionError{Option: "WithHostLinkLimits", Err: err}
 	}
 
-	// The Binder adapter internal/routing's own documentation books to this
-	// task. The pool takes its target as a struct because the identity and the
-	// address are unusable apart; the routing table names only Core, so it
-	// passes the endpoint beside the request. Composing the two is this one
-	// function and no state.
-	bindings, err := routing.NewBindings(cfg.directory, poolBinder{pool: pool})
+	// Gap 3: the live-tail plane. It is the routing table's Binder -- a bind
+	// is followed by a subscribe on the same HostLink connection, which is
+	// the order a Host requires -- and it publishes to the ClientLink node,
+	// which does not exist until Start, so the node is supplied late.
+	c := &components{}
+	live, err := livetail.New(livetail.Config{
+		Links: pool,
+		Viewers: func() livetail.Viewers {
+			if handler := c.clientLink(); handler != nil {
+				return handler
+			}
+			return nil
+		},
+		// The inbound bound is the Relay's own HostBinding queue: one
+		// session's undelivered tail, before anything fans out.
+		MailboxLimit: routing.DefaultRepairLimits().HostBindingQueue,
+		EventTimeout: cfg.client.DemandTimeout,
+		Logger:       logger(cfg),
+	})
+	if err != nil {
+		return nil, &OptionError{Option: "WithClientLinkLimits", Err: err}
+	}
+	bindings, err := routing.NewBindings(cfg.directory, live)
 	if err != nil {
 		return nil, &OptionError{Option: "WithDirectory", Err: err}
 	}
-	demand, err := routing.NewDemand(bindings, cfg.reads, unpublishedHints{}, cfg.clock, routing.DemandLimits{
+	// The hint publisher is the same ClientLink channel the live tail uses:
+	// an unbound watched session's viewers are told the durable tip.
+	demand, err := routing.NewDemand(bindings, cfg.reads, live, cfg.clock, routing.DemandLimits{
 		OwnershipPollInterval: cfg.client.DemandReleaseDebounce + cfg.reconcile.Interval,
 		PollTimeout:           cfg.client.DemandTimeout,
 	})
 	if err != nil {
 		return nil, &OptionError{Option: "WithClientLinkLimits", Err: err}
 	}
+	demand.SetWatcher(live)
+	// routing.Relay, complete since A7.3 and constructed here for the first
+	// time. Its Rebinder is the demand plane, its Tail and Publisher the live
+	// plane, and its tip reads the same durable read the hints use.
+	relay, err := routing.NewRelay(cfg.reads, demand, live, live, routing.DefaultRepairLimits())
+	if err != nil {
+		return nil, &OptionError{Option: "WithSessionReader", Err: err}
+	}
+	live.Attach(relay, demand)
 
 	commandSweeper, err := admission.NewReconciler(admission.ReconcilerConfig{
 		Authorizer: cfg.authorizer,
@@ -224,18 +257,26 @@ func composeComponents(cfg config, credentials *internalidentity.Authenticator) 
 		return nil, &OptionError{Option: "WithHostTargets", Err: err}
 	}
 
-	return &components{
-		admissions:         service,
-		pool:               pool,
-		bindings:           bindings,
-		demand:             demand,
-		commandSweeper:     commandSweeper,
-		dispositionSweeper: dispositionSweeper,
-		gateSweeper:        gateSweeper,
-		placement:          placer,
-		records:            records,
-		pending:            pending,
-	}, nil
+	c.admissions = service
+	c.pool = pool
+	c.bindings = bindings
+	c.demand = demand
+	c.live = live
+	c.commandSweeper = commandSweeper
+	c.dispositionSweeper = dispositionSweeper
+	c.gateSweeper = gateSweeper
+	c.placement = placer
+	c.records = records
+	c.pending = pending
+	return c, nil
+}
+
+// clientLink is the running ClientLink node, or nil before Start and after
+// Stop. The live plane publishes through it.
+func (c *components) clientLink() *clientlink.Handler {
+	c.realtimeMu.RLock()
+	defer c.realtimeMu.RUnlock()
+	return c.realtime
 }
 
 // startRealtime builds and RUNS the ClientLink node.
@@ -295,23 +336,6 @@ func (c *components) realtimeHandler() http.Handler {
 // ---------------------------------------------------------------------------
 // The adapters this composition owns.
 // ---------------------------------------------------------------------------
-
-// poolBinder is the one adapter between the routing table and the HostLink
-// pool. It holds no state, so there is no second answer to "which Host serves
-// this session" for it to hold.
-type poolBinder struct{ pool *hostlink.Pool }
-
-func (b poolBinder) Bind(ctx context.Context, endpoint sessionwire.InternalEndpoint, req sessionwire.HostLinkBindRequest) error {
-	return b.pool.Bind(ctx, hostlink.Target{Host: req.HostID, Endpoint: endpoint}, req)
-}
-
-func (b poolBinder) Unbind(ctx context.Context, req sessionwire.HostLinkUnbindRequest) error {
-	return b.pool.Unbind(ctx, req)
-}
-
-func (b poolBinder) DeliverCommand(ctx context.Context, tenant sessionwire.TenantID, session sessionwire.SessionID, delivery sessionwire.HostLinkCommandDelivery) error {
-	return b.pool.DeliverCommand(ctx, tenant, session, delivery)
-}
 
 // placementLinks is the adapter between internal/placement and the HostLink
 // pool, and the ONE place a transport failure is classified into placement's
@@ -425,29 +449,14 @@ func (d departmentTargets) IsKnown(_ context.Context, key sessionstore.HostTarge
 	return false, nil
 }
 
-// unpublishedHints is the journal-tip hint publisher this replica does not
-// have, and it is a NAMED refusal rather than a convenient no-op.
+// ErrNoHintPublisher was what a journal-tip hint reported while this module
+// composed no hint publisher. Since v0.4.0 the hint is published to the
+// session's ClientLink channel, the same one the live tail uses, and nothing
+// returns this any more.
 //
-// internal/realtime/clientlink registers no OnPublish handler and exports no
-// publication surface at all, by design: A6.1's node is a command and
-// subscription plane. So there is nowhere for a hint to go, and
-// routing.Demand's poll already ignores the result because a hint is best
-// effort -- a client that receives none reads the range it is missing through
-// the durable query plane, which authorizes it in its own right.
-//
-// What is LOST is latency, not correctness, and it is on the owed list rather
-// than hidden here: a viewer on this replica learns of work started elsewhere
-// when it next reads, instead of when the tip moves.
-type unpublishedHints struct{}
-
-// ErrNoHintPublisher is what a hint publish reports. It is returned rather
-// than nil so that a future composition which forgets to replace this cannot
-// look like one that succeeded.
+// Deprecated: nothing returns it; it is kept so a caller comparing against it
+// still compiles.
 var ErrNoHintPublisher = errors.New("factory: this replica composes no journal-tip hint publisher")
-
-func (unpublishedHints) PublishJournalTip(context.Context, sessionwire.JournalTip) error {
-	return ErrNoHintPublisher
-}
 
 // sweep is one named periodic pass.
 //

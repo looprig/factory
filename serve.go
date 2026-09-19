@@ -423,6 +423,12 @@ func (s *Server) Stop(ctx context.Context) error {
 	if err := s.components.bindings.Close(ctx); err != nil && firstErr == nil {
 		firstErr = err
 	}
+	// The live-tail plane after the routing state that fed it and before the
+	// links its tails ran over: every tail was stopped by the unbinds above,
+	// so what is left is its drainers, which it waits for.
+	if err := s.components.live.Close(ctx); err != nil && firstErr == nil {
+		firstErr = err
+	}
 	if err := s.components.pool.Close(ctx); err != nil && firstErr == nil {
 		firstErr = err
 	}

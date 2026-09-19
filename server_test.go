@@ -14,6 +14,7 @@ import (
 	"github.com/looprig/factory/internal/placement"
 	"github.com/looprig/factory/internal/realtime/clientlink"
 	"github.com/looprig/factory/internal/realtime/hostlink"
+	"github.com/looprig/factory/internal/realtime/livetail"
 	"github.com/looprig/factory/internal/reconcile"
 	"github.com/looprig/factory/internal/routing"
 )
@@ -236,12 +237,19 @@ func allSeams() []reflect.Type {
 		// make by pairing a row here. What this list still buys them is
 		// TestNoSeamNamesAStoragePrimitive.
 		// internal/routing's remaining seams. They are here rather than in
-		// publicSeams because this composition implements them: Binder is the
-		// HostLink pool behind poolBinder, Hinter has no implementation at all
-		// (see unpublishedHints), and Publisher, Tail and Rebinder belong to
-		// the repair relay, which this composition does not build.
+		// publicSeams because this composition implements them: since v0.4.0
+		// (Gap 3) the live-tail plane is the Binder (a bind followed by a
+		// subscribe), the Hinter, the Watcher, and the relay's Tail and
+		// Publisher; the demand plane is the relay's Rebinder.
 		iface[routing.Binder](),
 		iface[routing.Hinter](),
+		iface[routing.Watcher](),
+		iface[routing.Tail](),
+		iface[routing.Publisher](),
+		iface[routing.Rebinder](),
+		iface[livetail.Links](),
+		iface[livetail.Viewers](),
+		iface[livetail.Relay](),
 		// internal/placement's HostLink half, implemented by this composition
 		// over the pool (placementLinks), for routing.Binder's reason.
 		iface[placement.HostLinks](),
