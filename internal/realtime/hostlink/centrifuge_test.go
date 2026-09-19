@@ -1023,21 +1023,30 @@ func TestATerminalDisconnectOnALiveLinkStopsItAnswering(t *testing.T) {
 	// (centrifuge@v0.38.0/disconnect.go:122).
 	host.disconnectEveryone(centrifuge.DisconnectInvalidToken)
 
-	// The wait is written out rather than delegated to waitUntil so that a
-	// failure names a VALUE: a link that answered would be reporting some other
-	// error, and "no HostDisconnect within 20s" alone would read as this box's
-	// load. The last error actually seen is carried into the message.
+	// The wait reads the link's state WITHOUT sending anything (v0.4.0 regate
+	// N5). It used to probe with Bind, and centrifuge's server closes the
+	// connection on a goroutine (centrifuge@v0.38.0 client.go:1044), so the
+	// first probing Bind could reach the Host before the close did -- a
+	// legitimate RPC on a still-live link that the count below then read as
+	// "2 rpcs, want 1" (1 run in 60). Negotiated reports the terminal error
+	// once the link has it, and sends no RPC. A failure still names a VALUE:
+	// the last state actually seen is carried into the message.
+	negotiator := link.(hostlink.Negotiator)
 	var closed *hostlink.HostDisconnect
 	var last error
 	for deadline := time.Now().Add(waitFor); ; {
-		last = link.Bind(context.Background(), bindRequest(hostOne, "s-2"))
+		_, last = negotiator.Negotiated()
 		if errors.As(last, &closed) {
 			break
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("the link kept answering after a terminal disconnect: last Bind error = %v, want a *HostDisconnect", last)
+			t.Fatalf("the link never recorded the terminal disconnect: last state = %v, want a *HostDisconnect", last)
 		}
 		time.Sleep(10 * time.Millisecond)
+	}
+	// Now that the link knows, a Bind is refused locally with that error.
+	if err := link.Bind(context.Background(), bindRequest(hostOne, "s-2")); !errors.As(err, &closed) {
+		t.Errorf("Bind after a terminal disconnect = %v, want the HostDisconnect", err)
 	}
 	// The verdict is taken from values, not from the wait.
 	if closed.Code != 3500 {
