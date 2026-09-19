@@ -48,9 +48,25 @@ func (l *scriptedLinks) sink(i int) hostlink.SessionSink {
 type recordingRelay struct {
 	mu       sync.Mutex
 	received []string
+	ops      []string
 }
 
-func (r *recordingRelay) Open(sessionwire.TenantID, sessionwire.SessionID) error { return nil }
+func (r *recordingRelay) op(name string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.ops = append(r.ops, name)
+}
+
+func (r *recordingRelay) opsSeen() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]string(nil), r.ops...)
+}
+
+func (r *recordingRelay) Open(sessionwire.TenantID, sessionwire.SessionID) error {
+	r.op("open")
+	return nil
+}
 func (r *recordingRelay) Subscribe(sessionwire.TenantID, sessionwire.SessionID, routing.LinkID) error {
 	return nil
 }
@@ -69,7 +85,7 @@ func (r *recordingRelay) HostLinkClosed(context.Context, sessionwire.TenantID, s
 func (r *recordingRelay) Resync(context.Context, sessionwire.TenantID, sessionwire.SessionID) error {
 	return nil
 }
-func (r *recordingRelay) Forget(sessionwire.TenantID, sessionwire.SessionID) {}
+func (r *recordingRelay) Forget(sessionwire.TenantID, sessionwire.SessionID) { r.op("forget") }
 func (r *recordingRelay) Close()                                             {}
 
 func (r *recordingRelay) got() []string {

@@ -43,6 +43,18 @@
 // routing.Demand (Watcher, called under Demand's lock) reach it without ever
 // being part of a cycle. The Relay is called only from a session's drainer
 // goroutine, which holds no lock of this package while it does so.
+//
+// # What IS held across a Host round trip, stated because an earlier version
+// # of this comment claimed nothing was
+//
+// routing.Demand's one mutex is held across a bind: Demand.Acquire, a poll and
+// Demand.Rebind all bind under it, and Plane.Bind -- the Binder -- makes the
+// bind RPC and then waits for the subscribe's answer. So a Host slow to answer
+// delays other sessions' BINDS and polls on this replica. It does not delay
+// their DELIVERY: a drainer's Receive and Pump take only the Relay's mutex, and
+// since v0.4.0's fix round the Relay no longer holds that across a repair's
+// rebind (routing.Relay.repair). The pool's mutex is held across a bind RPC
+// too, as it always was (hostlink.Pool.Bind).
 package livetail
 
 import (
@@ -229,8 +241,23 @@ func (p *Plane) Close(ctx context.Context) error {
 	case <-ctx.Done():
 		err = ctx.Err()
 	}
-	if relay != nil {
+	if relay == nil {
+		return err
+	}
+	// Closing the Relay takes its mutex, which a drainer still running past
+	// ctx may hold; so the close is bounded by ctx too, and finishes on its own
+	// goroutine if ctx ends first (quality gate F8).
+	closed := make(chan struct{})
+	go func() {
 		relay.Close()
+		close(closed)
+	}()
+	select {
+	case <-closed:
+	case <-ctx.Done():
+		if err == nil {
+			err = ctx.Err()
+		}
 	}
 	return err
 }
