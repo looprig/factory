@@ -1186,24 +1186,24 @@ func TestRepairingOneHostBindingLeavesEveryOtherSessionAlone(t *testing.T) {
 	}
 }
 
-// TestATipThatCannotBeReadClosesTheAffectedLinksAndLeavesTheTailStopped is
-// axis C's third value and the fail-closed direction. A reset naming no tip is
-// not a repair instruction, and resuming a tail over a gap nobody was told
-// about is exactly the defect.
-func TestATipThatCannotBeReadClosesTheAffectedLinksAndLeavesTheTailStopped(t *testing.T) {
+// TestATipThatCannotBeReadClosesTheAffectedLinksAndStillRebinds is the
+// fail-closed arm of a HostBinding repair, as corrected by the v0.4.0 quality
+// gate's F1. Every affected ClientLink is closed -- a reset naming no tip is
+// no instruction -- and the pre-repair backlog never reaches anybody; but the
+// repair then STILL rebinds and resumes. Leaving the tail stopped (the earlier
+// rule) left the route held, so nothing ever re-bound it, and a stopped
+// HostBinding discarded every later frame: a session silent for as long as it
+// was watched.
+func TestATipThatCannotBeReadClosesTheAffectedLinksAndStillRebinds(t *testing.T) {
 	f := newRelayFixture(t, testRepairLimits)
 	f.open(bindSession, linkA, linkB)
 	f.open(otherSession, linkC)
 	f.mustFeed(bindSession, 1)
 	f.mustFeed(otherSession, 1)
 
-	// A PRE-REPAIR BACKLOG ON THE ROUTE QUEUE, deliberately not pumped. Without
-	// it this case cannot see the failed path's own host.queue.Clear(): a
-	// mutation deleting that one statement survived the whole module until this
-	// line existed, because every other record in the fixture had already been
-	// pumped out of the route queue. The record must not reach the client that
-	// subscribes below, which never received a reset and has no idea a repair
-	// was attempted.
+	// A PRE-REPAIR BACKLOG ON THE ROUTE QUEUE, deliberately not pumped, so the
+	// failed path's own host.queue.Clear() is observable: the record must not
+	// reach the client that subscribes below, which never received a reset.
 	if err := f.relay.Receive(context.Background(), bindTenant, bindSession, Frame{
 		Encoded: enduringRecord(t, bindSession, 2), CommittedAppendSeq: 1_000,
 	}); err != nil {
@@ -1225,48 +1225,28 @@ func TestATipThatCannotBeReadClosesTheAffectedLinksAndLeavesTheTailStopped(t *te
 	if f.relay.Bindings(bindTenant, otherSession) != 1 {
 		t.Error("the unrelated session lost a binding")
 	}
-	if len(f.rebinder.sessions) != 0 || len(f.tail.resumes) != 0 {
-		t.Errorf("a failed repair rebound (%v) or resumed (%v) anyway", f.rebinder.sessions, f.tail.resumes)
+	// The repair went on: stop, rebind, resume after sequence zero -- the
+	// same order a successful repair takes.
+	want := []string{"stop:" + string(bindSession), "rebind:" + string(bindSession), "resume:" + string(bindSession) + ":0"}
+	if strings.Join(f.tail.order, ",") != strings.Join(want, ",") {
+		t.Fatalf("a failed tip read's repair did %v, want %v", f.tail.order, want)
 	}
-	// THE TAIL IS LEFT STOPPED, and this is where that is observable: a client
-	// that subscribes AFTER the failed repair must not be served from the tail
-	// the repair gave up on. A mutation deleting the stopped guard survived
-	// until this arm existed, because the arm before it asserted about a link
-	// the repair had already closed -- which receives nothing either way.
+
+	// A client subscribing after it is served by the RESUMED tail, and never
+	// by the pre-repair backlog.
 	if err := f.relay.Subscribe(bindTenant, bindSession, linkA); err != nil {
 		t.Fatalf("Subscribe after the failed repair: %v", err)
 	}
-	if err := f.relay.Receive(context.Background(), bindTenant, bindSession, Frame{
-		Encoded: enduringRecord(t, bindSession, 3), CommittedAppendSeq: 1_000,
-	}); err != nil {
-		t.Fatalf("a frame arriving on a stopped tail: %v", err)
+	if err := f.feed(bindSession, 3); err != nil {
+		t.Fatalf("the resumed tail did not take a frame: %v", err)
 	}
-	if err := f.relay.Pump(context.Background(), bindTenant, bindSession); err != nil {
-		t.Fatalf("Pump: %v", err)
+	got := f.pub.to(linkA)
+	if len(got) != 2 || !strings.Contains(got[1], `"journal_seq":3`) {
+		t.Fatalf("link A received %d records (%v), want the one from before the repair and then 3 -- "+
+			"never 2, the backlog of a tail nobody was told about", len(got), got)
 	}
-	if got := f.relay.Queued(bindTenant, bindSession, linkA); got != 0 {
-		t.Errorf("the new binding queued %d records from a tail the repair abandoned, want 0", got)
-	}
-	if got := len(f.pub.to(linkA)); got != 1 {
-		t.Errorf("link A received %d records, want the 1 from before the repair -- a second one is "+
-			"the pre-repair route-queue backlog reaching a client that was never told to repair", got)
-	}
-
-	// The recovery path, which is also the control: a repair that CAN read a
-	// tip resumes the tail, and the session serves again. Without it, a relay
-	// that stopped every session forever would pass every assertion above.
-	f.tips.err = nil
-	if err := f.relay.HostLinkClosed(context.Background(), bindTenant, bindSession); err != nil {
-		t.Fatalf("the second repair: %v", err)
-	}
-	if len(f.tail.resumes) != 1 {
-		t.Fatalf("resumes = %v, want exactly one, from the repair that succeeded", f.tail.resumes)
-	}
-	if err := f.feed(bindSession, 4); err != nil {
-		t.Fatalf("the session did not resume taking frames: %v", err)
-	}
-	if last, ok := f.relay.LastContiguous(bindTenant, bindSession, linkA); !ok || last != 4 {
-		t.Errorf("the new binding's last contiguous = %d/%v, want 4", last, ok)
+	if last, ok := f.relay.LastContiguous(bindTenant, bindSession, linkA); !ok || last != 3 {
+		t.Errorf("the new binding's last contiguous = %d/%v, want 3", last, ok)
 	}
 }
 

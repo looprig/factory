@@ -306,6 +306,23 @@ func TestAResetThatCannotBeBuiltMakesEveryViewerRepair(t *testing.T) {
 	r.tips.mu.Unlock()
 	host.drop()
 	r.wait(t, "the viewers to be closed", func() bool { return r.viewers.closed(tenantA, session) >= 1 })
+
+	// AND DELIVERY RESUMES once the store answers again (v0.4.0 quality gate
+	// F1): a failed tip read closes the viewers and still re-binds, so the
+	// restored link's tail starts, its reset is sent, and a record the Host
+	// publishes after that reaches the viewers. Before the fix the route stayed
+	// held and nothing ever re-bound it.
+	r.tips.mu.Lock()
+	r.tips.err = nil
+	r.tips.tip = 4
+	r.tips.mu.Unlock()
+	channel := sessionwire.HostLinkChannel(tenantA, session)
+	r.wait(t, "the tail re-subscribed on the new connection", func() bool { return host.count("subscribe", channel) >= 2 })
+	host.publish(t, channel, enduring(t, tenantA, session, 5))
+	r.wait(t, "E5 after the failed repair", func() bool {
+		got := kinds(t, r.viewers.of(tenantA, session))
+		return len(got) > 0 && got[len(got)-1] == "E5"
+	})
 }
 
 // TestNewRefusesAnIncompleteComposition drives every refusal arm, each from a

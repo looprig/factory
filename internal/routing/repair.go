@@ -151,12 +151,16 @@ type Frame struct {
 //
 // # Locking
 //
-// One mutex, held across the tip read, the rebind and the publishes a repair
-// performs. That is Bindings' own trade at its own mu and is stated here for
-// the same reason: it makes a fan-out to thirty subscribers one pass rather
-// than thirty interleaved ones, at the price of a slow store call delaying an
-// unrelated session. The lock order is Relay.mu, then whatever Demand and
-// Bindings take beneath it; nothing in either names this type.
+// One mutex for every session, held across queue work and the publishes a pump
+// performs -- which makes a fan-out to thirty subscribers one pass rather than
+// thirty interleaved ones -- and deliberately NOT across a HostBinding repair's
+// tail stop, tip read, rebind or resume, nor Resync's tip read (see repair).
+// Those are I/O against a store and a Host, and one session's slow Host held
+// under this mutex stalled every other session's delivery (v0.4.0 quality gate
+// F3). What is still held under it is a DeliveryBinding overflow's tip read
+// (fanOutLocked), which a channel-wide publisher that never answers
+// ErrWouldBlock does not reach in composition. Nothing in Demand or Bindings
+// names this type, and no repair holds this mutex while calling them.
 type Relay struct {
 	tips      TipReader
 	rebinder  Rebinder
@@ -308,30 +312,37 @@ func (r *Relay) Close() {
 // handled, and the caller's next frame is the one that matters.
 func (r *Relay) Receive(ctx context.Context, tenant sessionwire.TenantID, session sessionwire.SessionID, frame Frame) error {
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	if r.closed {
+		r.mu.Unlock()
 		return ErrRelayClosed
 	}
 	key := sessionKey{tenant: tenant, session: session}
 	host := r.hosts[key]
 	if host == nil {
+		r.mu.Unlock()
 		return ErrNoHostBinding
 	}
 	if host.stopped {
 		// The tail this frame belonged to has been stopped for repair. Queueing
 		// it would interleave pre-repair records with post-repair ones.
+		r.mu.Unlock()
 		return nil
 	}
 	record, err := r.classify(frame)
 	if err != nil {
+		r.mu.Unlock()
 		return err
 	}
 	switch err := host.queue.Enqueue(record); {
 	case err == nil, errors.Is(err, delivery.ErrDropped):
+		r.mu.Unlock()
 		return nil
 	case errors.Is(err, delivery.ErrOverflow):
-		return r.repairHostLocked(ctx, key, host)
+		host.stopped = true
+		r.mu.Unlock()
+		return r.repair(ctx, key, host)
 	default:
+		r.mu.Unlock()
 		return err
 	}
 }
@@ -480,16 +491,19 @@ func (b *deliveryBinding) advance(record delivery.Record) {
 // differently.
 func (r *Relay) HostLinkClosed(ctx context.Context, tenant sessionwire.TenantID, session sessionwire.SessionID) error {
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	if r.closed {
+		r.mu.Unlock()
 		return ErrRelayClosed
 	}
 	key := sessionKey{tenant: tenant, session: session}
 	host := r.hosts[key]
 	if host == nil {
+		r.mu.Unlock()
 		return ErrNoHostBinding
 	}
-	return r.repairHostLocked(ctx, key, host)
+	host.stopped = true
+	r.mu.Unlock()
+	return r.repair(ctx, key, host)
 }
 
 // Resync tells every DeliveryBinding of a session where to read from, because
@@ -514,13 +528,24 @@ func (r *Relay) Resync(ctx context.Context, tenant sessionwire.TenantID, session
 		return ErrRelayClosed
 	}
 	key := sessionKey{tenant: tenant, session: session}
+	if r.hosts[key] == nil {
+		return ErrNoHostBinding
+	}
+	// The tip is read with the lock RELEASED, as repair reads it: a store
+	// call held under the relay's one mutex would stall every other session's
+	// delivery for its duration.
+	r.mu.Unlock()
+	tip, err := r.readTip(ctx, key)
+	r.mu.Lock()
+	if r.closed {
+		return ErrRelayClosed
+	}
 	host := r.hosts[key]
 	if host == nil {
 		return ErrNoHostBinding
 	}
-	tip, err := r.readTipLocked(ctx, key)
 	if err != nil {
-		// Fail closed, as repairHostLocked does: a reset naming no tip is not a
+		// Fail closed, as repair does: a reset naming no tip is not a
 		// repair instruction, and streaming on past a gap nobody was told about
 		// is the defect.
 		for _, binding := range sortedBindings(host) {
@@ -559,7 +584,7 @@ func (r *Relay) Forget(tenant sessionwire.TenantID, session sessionwire.SessionI
 	delete(r.hosts, key)
 }
 
-// repairHostLocked is runbook A7.3 step 4, in its stated order.
+// repair is runbook A7.3 step 4, in its stated order.
 //
 // Stop the live tail; capture ONE durable tip; reset every affected
 // DeliveryBinding independently from that one tip; rebind; resume after the
@@ -572,37 +597,69 @@ func (r *Relay) Forget(tenant sessionwire.TenantID, session sessionwire.SessionI
 // would read a range that a peer was already past. The reset each binding gets
 // still differs, because LastContiguous is that binding's own.
 //
-// A tip that cannot be READ closes every affected ClientLink and leaves the
-// tail stopped. That is the fail-closed direction and it is chosen knowingly: a
-// reset naming no tip is not a repair instruction, and resuming a tail after a
-// gap nobody was told about is the defect.
-func (r *Relay) repairHostLocked(ctx context.Context, key sessionKey, host *hostBinding) error {
-	host.stopped = true
+// # The relay's lock is NOT held across the tail, the tip read or the rebind
+//
+// The caller sets host.stopped under r.mu and releases it before calling this.
+// The stop, the tip read, the rebind and the resume are I/O -- an unsubscribe,
+// a store read, a bind RPC and a subscribe that waits for the Host -- and this
+// relay has ONE mutex for every session, so holding it across them made one
+// session's repair against a slow Host stall every other session's delivery on
+// the replica (v0.4.0 quality gate F3: 2.9s for an unrelated session behind a
+// 3s bind). The lock is taken only to apply the resets and to clear stopped.
+// While it is released, host.stopped keeps this session's own frames out, and
+// a Forget or Close in the meantime is noticed on re-lock and ends the repair.
+//
+// # A tip that cannot be read still rebinds
+//
+// Every affected ClientLink is closed -- a reset naming no tip is not a repair
+// instruction -- and the repair then CONTINUES: rebind, resume, and the tail
+// is started again. It used to stop there and leave the tail stopped, and that
+// was a session silent for as long as it was watched (v0.4.0 quality gate F1):
+// the route stayed held, so nothing a poll or a restored link does would ever
+// re-bind it, and a stopped HostBinding discarded every frame after. Resuming
+// is safe because nobody is left streaming past the gap: every binding that
+// had been told anything was closed, and a binding subscribing afterwards has
+// vouched for nothing. The resumed tail is resumed after sequence zero.
+func (r *Relay) repair(ctx context.Context, key sessionKey, host *hostBinding) error {
 	var failures []error
 	if err := r.tail.Stop(ctx, key.tenant, key.session); err != nil {
 		failures = append(failures, err)
 	}
-	tip, err := r.readTipLocked(ctx, key)
-	if err != nil {
+	tip, tipErr := r.readTip(ctx, key)
+
+	r.mu.Lock()
+	if r.closed || r.hosts[key] != host {
+		// Forgotten or closed mid-repair: there is nobody left to repair.
+		r.mu.Unlock()
+		return errors.Join(failures...)
+	}
+	if tipErr != nil {
 		for _, binding := range sortedBindings(host) {
 			r.closeBindingLocked(ctx, host, binding, "repair tip unavailable")
 		}
-		host.queue.Clear()
-		return errors.Join(append(failures, err)...)
-	}
-	for _, binding := range sortedBindings(host) {
-		if err := r.resetBindingLocked(ctx, key, host, binding, tip); err != nil {
-			failures = append(failures, err)
+		failures = append(failures, tipErr)
+		tip = 0
+	} else {
+		for _, binding := range sortedBindings(host) {
+			if err := r.resetBindingLocked(ctx, key, host, binding, tip); err != nil {
+				failures = append(failures, err)
+			}
 		}
 	}
 	host.queue.Clear()
+	r.mu.Unlock()
+
 	if err := r.rebinder.Rebind(ctx, key.tenant, key.session); err != nil {
 		failures = append(failures, err)
 	}
 	if err := r.tail.Resume(ctx, key.tenant, key.session, tip); err != nil {
 		failures = append(failures, err)
 	}
-	host.stopped = false
+	r.mu.Lock()
+	if r.hosts[key] == host {
+		host.stopped = false
+	}
+	r.mu.Unlock()
 	return errors.Join(failures...)
 }
 
@@ -673,6 +730,12 @@ func (r *Relay) closeBindingLocked(ctx context.Context, host *hostBinding, bindi
 // Demand's hint poll uses, so the two cannot ask the store for different things
 // when they want the same fact.
 func (r *Relay) readTipLocked(ctx context.Context, key sessionKey) (uint64, error) {
+	return r.readTip(ctx, key)
+}
+
+// readTip is readTipLocked for a caller that has released the lock. It touches
+// no relay state; the name records only where it may be called from.
+func (r *Relay) readTip(ctx context.Context, key sessionKey) (uint64, error) {
 	page, err := r.tips.ReadPublicJournal(ctx, tipRequest(key))
 	if err != nil {
 		return 0, err
