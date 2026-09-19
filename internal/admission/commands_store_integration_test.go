@@ -478,3 +478,47 @@ func TestARejectableCommandBehindMoreThanAPassOfApplyingOnesIsStillRejected(t *t
 	}
 	t.Fatal("the expired pending command behind three applying ones was never rejected across 6 passes")
 }
+
+// TestTheSweepDefersToALiveReconciliationClaim is the spec gate's S13: the
+// sweep takes the session's reconciliation claim BEFORE it rejects, so a row
+// on a session another holder is reconciling is deferred, not rejected, and
+// is rejected once that claim is gone.
+func TestTheSweepDefersToALiveReconciliationClaim(t *testing.T) {
+	lane := newCommandLane(t, sessionstore.WithControlShards(1))
+	ctx := context.Background()
+	tenant := lane.principal.Tenant()
+	created := lane.create(t, "session-claimed")
+	lane.clock.set(serviceNow.Add(2 * time.Minute))
+	if _, err := lane.store.AcquireReconciliationClaim(ctx, sessionstore.AcquireReconciliationClaimRequest{
+		TenantID: tenant, SessionID: "session-claimed", HolderID: "replica-other", ExpiresAt: lane.clock.Now().Add(time.Minute),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	sweeper, err := NewDispositionReconciler(DispositionReconcilerConfig{
+		Authorizer: &serviceAuthorizer{}, Due: lane.store, Settlement: lane.store, Claims: lane.store,
+		Clock: lane.clock, HolderID: "replica-a", ClaimTTL: 30 * time.Second, PageLimit: 10, MaxPages: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := sweeper.Sweep(ctx, sweepPrincipal(t))
+	if err != nil {
+		t.Fatalf("Sweep: %v", err)
+	}
+	state := func() sessionstore.InboxState {
+		entry, err := lane.store.GetDispositionCommand(ctx, sessionstore.GetDispositionCommandRequest{TenantID: tenant, SessionID: "session-claimed", CommandID: created.Record.Descriptor.CommandID})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return entry.Record.State
+	}
+	if result.Dispositions[DispositionDeferred] != 1 || result.Rejected != 0 || state() != sessionstore.InboxStatePending {
+		t.Fatalf("under another holder's claim: %+v, state %q; want deferred and still pending", result, state())
+	}
+	if _, err := lane.store.ReleaseReconciliationClaim(ctx, sessionstore.ReleaseReconciliationClaimRequest{TenantID: tenant, SessionID: "session-claimed", HolderID: "replica-other"}); err != nil {
+		t.Fatal(err)
+	}
+	if result, err := sweeper.Sweep(ctx, sweepPrincipal(t)); err != nil || result.Rejected != 1 || state() != sessionstore.InboxStateRejected {
+		t.Fatalf("once the claim is gone: (%+v, %v), state %q; want it rejected", result, err, state())
+	}
+}

@@ -1302,9 +1302,13 @@ type fakeClaims struct {
 	attempts     int
 	acquired     int
 	released     int
+	// requests records every acquisition asked for, so a case can read the
+	// holder and the expiry a sweep claimed with.
+	requests []sessionstore.AcquireReconciliationClaimRequest
 }
 
 func (c *fakeClaims) AcquireReconciliationClaim(_ context.Context, req sessionstore.AcquireReconciliationClaimRequest) (sessionstore.ReconciliationClaimEntry, error) {
+	c.requests = append(c.requests, req)
 	if err := c.enter("AcquireReconciliationClaim"); err != nil {
 		return sessionstore.ReconciliationClaimEntry{}, err
 	}

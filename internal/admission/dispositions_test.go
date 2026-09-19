@@ -43,8 +43,10 @@ func (d *fakeDispositionDue) ListDueDispositionCommands(_ context.Context, req s
 // fakeDispositionSettlement records every rejection it was asked for.
 type fakeDispositionSettlement struct {
 	faultInjector
-	err       error
-	replayed  bool
+	err      error
+	replayed bool
+	// failOn, when set, is the error one command's rejection answers with.
+	failOn    map[sessionwire.CommandID]error
 	reqs      []sessionstore.RejectDispositionCommandRequest
 	rejectedN int
 }
@@ -56,6 +58,9 @@ func (s *fakeDispositionSettlement) RejectDispositionCommand(_ context.Context, 
 	}
 	if s.err != nil {
 		return sessionstore.DispositionInboxEntry{}, false, s.err
+	}
+	if err := s.failOn[req.CommandID]; err != nil {
+		return sessionstore.DispositionInboxEntry{}, false, err
 	}
 	entry := sessionstore.DispositionInboxEntry{Record: sessionstore.DispositionInboxRecord{
 		Descriptor: sessionstore.DispositionCommandDescriptor{TenantID: req.TenantID, SessionID: req.SessionID, CommandID: req.CommandID},
@@ -323,6 +328,8 @@ func TestEachDispositionRejectAnswerHasOneMeaning(t *testing.T) {
 		{"a claim appeared first", &sessionstore.InboxError{Code: sessionstore.InboxErrorClaimHeld}, false, DispositionClaimLive, false},
 		{"the record moved", &sessionstore.InboxError{Code: sessionstore.InboxErrorConflict}, false, DispositionRaceLost, false},
 		{"already terminal", &sessionstore.InboxError{Code: sessionstore.InboxErrorTerminal}, false, DispositionTerminal, false},
+		{"the row is gone", &sessionstore.InboxError{Code: sessionstore.InboxErrorNotFound}, false, DispositionTerminal, false},
+		{"the row was deleted", &sessionstore.InboxError{Code: sessionstore.InboxErrorDeleted}, false, DispositionTerminal, false},
 		{"the session is gone", &sessionstore.CatalogError{Code: sessionstore.CatalogErrorNotFound}, false, DispositionTerminal, false},
 		{"a provider outage", &sessionstore.InboxError{Code: sessionstore.InboxErrorBackend}, false, 0, true},
 	} {
@@ -332,8 +339,8 @@ func TestEachDispositionRejectAnswerHasOneMeaning(t *testing.T) {
 			f.due.pages = []sessionstore.DispositionDueCommandPage{dispositionPage("", expiredDisposition("session-a", "command-a"))}
 			result, err := f.rec.Sweep(context.Background(), f.principal)
 			if test.fault {
-				if err == nil {
-					t.Fatal("a provider outage was reported as an ordinary outcome")
+				if !errors.Is(err, test.err) {
+					t.Fatalf("a provider outage = %v, want a fault wrapping the store's own error", err)
 				}
 				if f.claims.released != f.claims.acquired || f.claims.acquired != 1 {
 					t.Fatalf("claims acquired %d released %d after a fault; the claim must be given back", f.claims.acquired, f.claims.released)
@@ -464,5 +471,93 @@ func TestADispositionShardsPositionIsKeptOnlyWhileItsPassIsTruncated(t *testing.
 	if len(f.due.reqs) != 3 || f.due.reqs[0].Cursor != "cursor-4" || f.due.reqs[1].Cursor != "cursor-4" ||
 		f.due.reqs[2].Cursor != "" || f.due.reqs[2].DueAtOrBefore.IsZero() {
 		t.Fatalf("after a transient fault and a refusal, requests = %+v; want cursor-4 twice, then a fresh head read", f.due.reqs)
+	}
+}
+
+// TestASettleFaultKeepsThePositionThePageWasReadFrom is the position rule on
+// the other fault (quality gate QD1/QD2): when a rejection on a later page
+// faults, the next pass must present the cursor that page was READ FROM --
+// not the page's own continuation, which would step over the rows after the
+// fault, and not the head, which would re-walk everything already settled.
+func TestASettleFaultKeepsThePositionThePageWasReadFrom(t *testing.T) {
+	f := newDispositionFixture(t, nil)
+	f.due.shards = 1
+	f.due.pages = []sessionstore.DispositionDueCommandPage{
+		dispositionPage("cursor-1", expiredDisposition("session-a", "command-a")),
+		dispositionPage("cursor-2", expiredDisposition("session-b", "command-b")),
+	}
+	f.settlement.failOn = map[sessionwire.CommandID]error{"command-b": &sessionstore.InboxError{Code: sessionstore.InboxErrorBackend}}
+	if _, err := f.rec.Sweep(context.Background(), f.principal); err == nil {
+		t.Fatal("the settle fault was not reported")
+	}
+	f.settlement.failOn = nil
+	f.due.reqs = nil
+	result, err := f.rec.Sweep(context.Background(), f.principal)
+	if err != nil {
+		t.Fatalf("Sweep: %v", err)
+	}
+	if len(f.due.reqs) == 0 || f.due.reqs[0].Cursor != "cursor-1" || !result.Resumed {
+		t.Fatalf("after a settle fault on the page read from cursor-1, the next pass read %+v, want it resumed from cursor-1", f.due.reqs)
+	}
+}
+
+// TestTheDispositionSweepsRotorRestartsAndDropsStalePositions is the shrink
+// and regrow rule on this sweep (quality gate QD5/QD6). The rotor is now the
+// shared type the legacy sweep uses; this reads it through this sweep.
+func TestTheDispositionSweepsRotorRestartsAndDropsStalePositions(t *testing.T) {
+	f := newDispositionFixture(t, func(cfg *DispositionReconcilerConfig) { cfg.MaxPages = 1 })
+	f.due.shards = 3
+	f.due.pages = []sessionstore.DispositionDueCommandPage{
+		dispositionPage(""),   // shard 0
+		dispositionPage("c1"), // shard 1, truncated: keeps c1
+		dispositionPage("c2"), // shard 2, truncated: keeps c2
+		dispositionPage(""),   // shard 0
+		dispositionPage(""),   // shard 1 resumes from c1 and ends; rotor at 2
+	}
+	sweep := func() SweepResult {
+		t.Helper()
+		result, err := f.rec.Sweep(context.Background(), f.principal)
+		if err != nil {
+			t.Fatalf("Sweep: %v", err)
+		}
+		return result
+	}
+	for range 5 {
+		sweep()
+	}
+	f.due.shards = 2
+	if got := []int{sweep().Shard, sweep().Shard}; got[0] != 0 || got[1] != 1 {
+		t.Fatalf("after shrinking to 2 shards the sweeps visited %v, want [0 1]", got)
+	}
+	f.due.shards = 3
+	sweep()
+	sweep()
+	f.due.reqs = nil
+	if r := sweep(); r.Shard != 2 || r.Resumed || len(f.due.reqs) != 1 || f.due.reqs[0].Cursor != "" {
+		t.Fatalf("the regrown shard 2 pass = %+v reading %+v, want a fresh pass from the head", r, f.due.reqs)
+	}
+}
+
+// TestTheSweepCountsWhatItSawAndClaimsForItsTTL reads the Due counter and the
+// claim the sweep takes (quality gate QD7/QD8): the holder is this sweep's,
+// and the claim expires exactly ClaimTTL after the pass began.
+func TestTheSweepCountsWhatItSawAndClaimsForItsTTL(t *testing.T) {
+	f := newDispositionFixture(t, nil)
+	live := expiredDisposition("session-b", "command-b")
+	live.ApplyDeadline = sweepBase.Add(time.Minute)
+	f.due.pages = []sessionstore.DispositionDueCommandPage{dispositionPage("", expiredDisposition("session-a", "command-a"), live)}
+	result, err := f.rec.Sweep(context.Background(), f.principal)
+	if err != nil {
+		t.Fatalf("Sweep: %v", err)
+	}
+	if result.Due != 2 {
+		t.Fatalf("Due = %d, want both rows the page returned", result.Due)
+	}
+	if len(f.claims.requests) != 1 {
+		t.Fatalf("claims asked = %+v, want one", f.claims.requests)
+	}
+	got := f.claims.requests[0]
+	if got.HolderID != "replica-fake" || !got.ExpiresAt.Equal(sweepBase.Add(time.Minute)) || got.SessionID != "session-a" {
+		t.Fatalf("claim = %+v, want replica-fake on session-a until %v", got, sweepBase.Add(time.Minute))
 	}
 }

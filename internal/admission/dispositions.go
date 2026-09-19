@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"sync"
 	"time"
 
 	sessionwire "github.com/looprig/core/sessionwire/v1"
@@ -92,11 +91,8 @@ type DispositionReconcilerConfig struct {
 // against a fresh bound. The position is advice, like the rotor: a restarted
 // replica starts every shard at the head and loses nothing but time.
 type DispositionReconciler struct {
-	cfg DispositionReconcilerConfig
-
-	mu      sync.Mutex
-	next    int
-	cursors map[int]sessionwire.Cursor
+	cfg   DispositionReconcilerConfig
+	rotor rotor
 }
 
 // NewDispositionReconciler validates a configuration before it can reach a
@@ -124,7 +120,7 @@ func NewDispositionReconciler(cfg DispositionReconcilerConfig) (*DispositionReco
 	case cfg.MaxPages < 1:
 		return nil, fmt.Errorf("%w: MaxPages must be positive", ErrInvalidReconcilerConfig)
 	}
-	return &DispositionReconciler{cfg: cfg, cursors: map[int]sessionwire.Cursor{}}, nil
+	return &DispositionReconciler{cfg: cfg}, nil
 }
 
 func (r *DispositionReconciler) claimant() claimant {
@@ -139,52 +135,16 @@ func (r *DispositionReconciler) Sweep(ctx context.Context, principal identity.Pr
 	if err := r.cfg.Authorizer.AuthorizeServiceSweep(ctx, principal); err != nil {
 		return SweepResult{}, err
 	}
-	shard, cursor, err := r.begin()
+	shard, cursor, err := r.rotor.begin(r.cfg.Due.ControlShards())
 	if err != nil {
 		return SweepResult{}, err
 	}
 	result := SweepResult{Shard: shard, Resumed: cursor != "", Dispositions: map[Disposition]int{}}
 	held := map[sessionKey]bool{}
 	next, sweepErr := r.page(ctx, shard, cursor, &result, held)
-	r.commit(shard, next)
+	r.rotor.commit(shard, next)
 	r.claimant().release(ctx, held, &result)
 	return result, sweepErr
-}
-
-// begin advances the rotor and hands back the shard to sweep with the position
-// this sweep last reached in it. It follows the gate sweeper's begin exactly:
-// the rotor advances before the work, the count is read from the store every
-// pass, and a position for a shard that no longer exists is dropped.
-func (r *DispositionReconciler) begin() (int, sessionwire.Cursor, error) {
-	shards := r.cfg.Due.ControlShards()
-	if shards < sessionstore.MinControlShards {
-		return 0, "", fmt.Errorf("admission: the store reports %d control shards, so no shard can be swept", shards)
-	}
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if r.next >= shards {
-		r.next = 0
-	}
-	for shard := range r.cursors {
-		if shard >= shards {
-			delete(r.cursors, shard)
-		}
-	}
-	shard := r.next
-	r.next = (shard + 1) % shards
-	return shard, r.cursors[shard], nil
-}
-
-// commit keeps the position a pass reached for its shard. An empty position is
-// removed, so the next pass over that shard re-arms at the head.
-func (r *DispositionReconciler) commit(shard int, cursor sessionwire.Cursor) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if cursor == "" {
-		delete(r.cursors, shard)
-		return
-	}
-	r.cursors[shard] = cursor
 }
 
 // page reads one shard's due disposition rows from cursor, bounded by

@@ -102,11 +102,15 @@ type Reconciler struct {
 	rotor rotor
 }
 
-// rotor is the legacy sweep's round-robin shard position. The disposition sweep
-// keeps a position per shard as well; see DispositionReconciler.
+// rotor is a sweep's round-robin shard position, and -- for a sweep that
+// resumes a truncated pass -- the continuation it kept for each shard. Both
+// deadline sweeps use it: the legacy one only rotates, the disposition one
+// also keeps positions (see DispositionReconciler). One copy, so the shrink
+// and stale-position rules cannot drift between them.
 type rotor struct {
-	mu   sync.Mutex
-	next int
+	mu      sync.Mutex
+	next    int
+	cursors map[int]sessionwire.Cursor
 }
 
 // claimant takes and gives back one replica's reconciliation claims. It is the
@@ -347,6 +351,44 @@ func (r *rotor) rotate(shards int) (int, error) {
 	shard := r.next
 	r.next = (shard + 1) % shards
 	return shard, nil
+}
+
+// begin rotates and hands back the position kept for the shard it chose.
+//
+// A position kept for a shard that no longer exists is dropped on EVERY pass,
+// not only on the pass that found the rotor out of range: a count can shrink
+// while the rotor happens to be inside the new range, and a position left
+// unread would be presented again the moment its shard index existed once
+// more, to a view that has since been rebuilt. A cursor is bound to the shard
+// that issued it.
+func (r *rotor) begin(shards int) (int, sessionwire.Cursor, error) {
+	shard, err := r.rotate(shards)
+	if err != nil {
+		return 0, "", err
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for kept := range r.cursors {
+		if kept >= shards {
+			delete(r.cursors, kept)
+		}
+	}
+	return shard, r.cursors[shard], nil
+}
+
+// commit keeps the position a pass reached for its shard. An empty position
+// is removed, so the next pass over that shard re-arms at the head.
+func (r *rotor) commit(shard int, cursor sessionwire.Cursor) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if cursor == "" {
+		delete(r.cursors, shard)
+		return
+	}
+	if r.cursors == nil {
+		r.cursors = map[int]sessionwire.Cursor{}
+	}
+	r.cursors[shard] = cursor
 }
 
 // sessionKey is one session's identity, as a comparable map key. The
