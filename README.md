@@ -240,8 +240,30 @@ external process is started. The suite exercises the JSON protocol only.
 connection, split like the ClientLink: a `Pool` that decides and a
 `CentrifugeDialer` that carries. The invariant is one sentence — a session
 binding never costs a connection, and a connection is never shared between
-Hosts — and the route table is keyed by tenant AND session, because a session id
-is unique only within its tenant.
+Hosts or between tenants — and the route table is keyed by tenant AND session,
+because a session id is unique only within its tenant.
+
+**One pooled Host serves several tenants at once (Gap 1, v0.5.0).** A Host
+advertises a BASE internal endpoint and serves each tenant's HostLink at Core's
+`sessionwire.HostLinkEndpoint(base, tenant)` (`base/hostlink/<tenant>`, core
+v0.10.0, host v0.3.0); a verbatim dial of the base is answered 404. The pool
+derives every dial address in one place from the advertised base and the
+request's tenant, and keys its links by **(HostID, TenantID)**, so bind,
+attach, delivery, the live tail and placement all reach a tenant's own
+connection and nothing of one tenant's crosses another tenant's (R-1). Every
+per-link structure — capabilities, reconnect state, subscriptions — is per
+(Host, tenant). `HostLinkLimits.MaxLinks` therefore bounds (Host, tenant)
+pairs. A tenant a Host's base cannot address (`too_long`,
+`unroutable_tenant`, or a base that is not bare) is refused before any dial as
+`hostlink.ErrNoTenantEndpoint`; placement skips that candidate for that tenant
+and logs a WARN with Core's code, and a routing bind to such an owner is logged
+and left unbound. Factory makes no drain RPC: drain is the workload
+controller's, which must derive the same address.
+
+**Compatibility window.** A Host advertising a non-bare endpoint (a v0.2.x
+configuration naming `…/hostlink/<tenant>`) is refused as `base_names_tenant`
+for every tenant, so factory v0.5.0 cannot reach it until it is reconfigured to
+a bare base; a v0.3.0 Host is reachable only from factory ≥ v0.5.0.
 
 A failed command RPC is reported as `ErrCommandUndelivered`, which leaves the
 already committed inbox record pending. A Host's own answer arrives as
@@ -255,7 +277,7 @@ broker and no leader: closing one replica's pool leaves the others' connections
 and routes untouched, measured over fakes and over real sockets.
 
 **Core owns the HostLink framing contract, not only the record bodies.** Core
-v0.9.1's `sessionwire/v1` defines the bare connect codecs, reserved method
+v0.9.1's (pinned: v0.10.0) `sessionwire/v1` defines the bare connect codecs, reserved method
 names, and injective `HostLinkChannel` derivation that Factory and Host must
 share. The asynchronous `{type, data}` push envelope is the only framing still
 local to Factory; it is not a Core record or a HostLink RPC method. The Host half
@@ -403,26 +425,22 @@ unread is logged at WARN. `Commands` accordingly names the disposition admission
 retry read, payload upload, rejection and due query in place of `AdmitCommand`
 and `GetCommand`; a `*sessionstore.Store` satisfies it.
 
-**Gate responses to Host-resident sessions answer `409 gate_resolved` until
-sessionstore ≥ v0.12.0 and host ≥ v0.4.0.** A gate response is admitted only
-against a durable gate projection, and no disposition session can carry one:
-sessionstore v0.10.0 (the pinned release) and v0.11.0 refuse `OpenGate` --
-every Host-owned catalog write -- on a disposition-bound session
-(`hostEpochFence`, `catalog invalid (binding.protocol_mode)`). So the
-projection check refuses first, and the fresh-owner check behind it
-(`gate_not_resumable`) is unreachable in production. Until those releases, **a
-Host-resident agent that opens a gate stalls until its gate deadline**: no
-answer to it can be admitted.
+**The gate rollout rule is met: sessionstore is pinned at v0.12.0**, whose
+readers accept a gate page a Host wrote on a disposition session (older readers
+refuse it). `TestAHostPublishedDispositionGateIsReadByThePinnedStore` writes a
+gate the way a Host does and reads it through both of Factory's gate readers.
 
-**One gap is declared rather than worked around.** The released Host serves
-HostLink per tenant, at `/hostlink/<tenant>`, and its capacity report
-advertises ONE `internal_endpoint`; Core names no convention for deriving a
-tenant's HostLink address from a Host's. Factory dials the advertised endpoint
-as-is and keys its links by Host, so a pooled Host is reachable here for the
-tenant its advertised endpoint names, and an attach for any other tenant is
-refused by that Host (`runtime_unavailable`, foreign tenant) and placed
-elsewhere. Cross-tenant pooled placement onto one Host needs that convention in
-Core first.
+**A gate response is delivered only to a Host that can apply one, and today no
+Host can.** Admitting a gate response IS delivering it — the owner reads it from
+the durable stream — so admission asks the fresh owner, over its link for the
+session's tenant, and refuses `409 gate_not_resumable`
+(`ErrGateResponseUnsupported`) before anything is written when the answer is
+no; placement likewise withholds a gate-response wake from such a Host. The
+answer comes from ONE predicate, `hostlink.GateResponseCapable`, which refuses
+every Host until host v0.4.0 fixes its capability signal — changing that
+function body is the whole switch. Until then a Host-resident agent that opens
+a gate still stalls until its gate deadline (a v0.3.0 Host publishes no gate,
+so the answer there is `gate_resolved`, as before).
 
 ## Status
 
@@ -430,6 +448,7 @@ Core first.
 the ClientLink node (started by `Start`), the HostLink pool, the routing table
 and demand plane, placement and its sweeps, and -- since v0.4.0 -- the live
 tail (`routing.Relay` between the HostLink subscription and the ClientLink).
-Still open: the default `cmd/factory` binary (A9.2), multi-tenant pooled Hosts
-(Gap 1: links keyed by Host only), and resident gate publication (sessionstore
-v0.12.0 / host v0.4.0).
+Since v0.5.0 one pooled Host serves several tenants (Gap 1). Still open: the
+default `cmd/factory` binary (A9.2), and admitting gate responses to a Host that
+can apply them (host v0.4.0 fixes the capability signal; the predicate is
+`hostlink.GateResponseCapable`).

@@ -1210,8 +1210,10 @@ socket and the transport has nothing to choose. `factory.New` does **not**
 compose it; A9.1 owns that, along with the reaper's cadence.
 
 The invariant is one sentence: **a session binding never costs a connection, and
-a connection is never shared between Hosts.** The route table is keyed by
-tenant AND session, because a session id is unique only within its tenant. Four
+a connection is never shared between Hosts or between tenants.** The route
+table is keyed by tenant AND session, because a session id is unique only
+within its tenant, and since v0.5.0 the LINK table is keyed by (HostID,
+TenantID) — see "Gap 1" below. Four
 decisions protect that sentence, and each is a decision rather than an
 implementation detail:
 
@@ -1229,8 +1231,8 @@ implementation detail:
   answered, so the socket is good; discarding it turns one lease disagreement
   into a dial storm.
 
-`MaxLinks` bounds **Hosts**, and the check is reached only for a Host with no
-link. That distinction needs a case where the two counts differ — with a ceiling
+`MaxLinks` bounds **(Host, tenant) links** (Hosts before v0.5.0), and the
+check is reached only for a pair with no link. That distinction needs a case where the two counts differ — with a ceiling
 of one, the reuse path never reaches the check, so a pool counting sessions
 passes it. `TestSessionsAlreadyBoundDoNotConsumeTheLinkCeiling` is that case.
 
@@ -1425,6 +1427,56 @@ would still collect the link, whose binding set really is empty, and the next
 with `ErrUnknownBinding`, and `Unbind` drops an orphaned route rather than
 keeping one that would refuse every later bind as a conflict.
 
+### Gap 1 (v0.5.0): one link per (Host, tenant), at Core's derived address
+
+A Host advertises a BASE endpoint and serves each tenant's HostLink at
+`sessionwire.HostLinkEndpoint(base, tenant)`; a verbatim dial of the base is
+404. **Derivation happens in exactly one place, `tenantTarget` in `link.go`**,
+from the Target's endpoint (always the ADVERTISED BASE — nothing above the pool
+holds a derived address) and the request's tenant; the Dialer is handed the
+derived one. Bind, attach and the gate-response capability read derive; unbind,
+delivery and subscribe resolve the route's own tenant's link. So **R-1 is
+structural**: every lookup of a link by a route is `routeKey.link(host)`, which
+carries the route's tenant, and `TestEveryOperationTravelsOverItsOwnTenantsLink`
+reads every operation's link. Everything per-link (negotiated methods,
+reconnect state, subscriptions, `regMu`) is per (Host, tenant) because it
+lives inside the link. A terminal eviction drops only that tenant's link and
+its routes; `Unsubscribe` reaches only the tenant's links; the reaper collects
+per pair.
+
+**A derivation refusal is per tenant**: `*EndpointError` wraps both
+`ErrNoTenantEndpoint` and Core's `*HostLinkEndpointError` (read the code with
+`errors.As`), and is returned before any dial. `classifyAttach` maps it to
+`placement.ErrTenantUnaddressable`: placement records the candidate in
+`Result.Unaddressable`, logs a WARN with Core's code, and asks the next — the
+Host is not abandoned for any other tenant. `livetail.Plane.Bind` logs the same
+refusal on the viewing path. A base that is not bare (`base_names_tenant`,
+`base_not_bare`) refuses EVERY tenant: that is the compatibility window with a
+Host still advertising `…/hostlink/<tenant>`.
+
+### The gate_response capability gate (v0.5.0)
+
+**`hostlink.GateResponseCapable` is the ONE predicate** over a Host's connect
+reply that says "this Host can apply a gate_response command", and it answers
+**false for every reply** until host v0.4.0 fixes the signal. Do not invent a
+method name: when the signal is fixed, change that body (for a
+`hostlink_methods` entry, `reply.Supports(<method>)`) and rewrite
+`TestTheGateResponseCapabilityRefusesEveryReplyToday`; nothing else moves.
+`Pool.AcceptsGateResponses` asks it over the owner's link FOR THE SESSION'S
+TENANT (the `Negotiator` capability reads the link's current reply: a
+reconnecting link is a transient error, a terminal one is evicted, a link that
+cannot report answers false). `Config.GateResponses` injects another predicate
+so the accepting half is drivable. Two callers, one adapter
+(`gateResponders` in `compose.go`): **admission** refuses a gate response
+`gate_not_resumable` (`ErrGateResponseUnsupported`) BEFORE writing it — admitting
+IS delivering, since the owner reads the durable stream — and a nil
+`GateResponders` refuses too; a failure to ask is a fault with no public code.
+**Placement** withholds a gate-response wake (`Request.GateResponses`, filled by
+the pending sweep from the durable kind) from a Host that cannot apply it and
+counts it in `WithheldGateResponses`. The residue: a gate response admitted for
+a capable owner and later re-placed onto an incapable Host is read by that Host
+from the stream regardless; host v0.3.0 refuses the kind safely.
+
 The pool carries the control plane AND, since v0.4.0 (Gap 3), a session's
 **live tail**: `Pool.Subscribe` subscribes the session's `HostLinkChannel` on
 the link that holds its bind (see "The live tail" below). The per-binding
@@ -1520,7 +1572,7 @@ accepted.
 
 ### One gap closed by Core, one still declared
 
-**The wire carries an attachment since `core v0.8.0`, and B5 sends it.** The current pin is `core v0.9.1`. A4.2 step 2 has the
+**The wire carries an attachment since `core v0.8.0`, and B5 sends it.** The current pin is `core v0.10.0`. A4.2 step 2 has the
 selected candidate asked to acquire or attach. At `core v0.7.0` no request
 could carry that — bind and unbind refuse a zero `LeaseEpoch`, drain asks a Host
 to *give up* a session —
@@ -1565,7 +1617,10 @@ session could be created on a Host and never spoken to again.
   a fault. **No mixed-family admission remains**: `CommandStore` has no legacy
   method, and `clientlink`'s seam-shape rule refuses a method returning a
   legacy `InboxEntry`.
-- **Gate responses to Host-resident sessions answer `409 gate_resolved` until
+- **Superseded in v0.5.0** (sessionstore pinned at v0.12.0, and the gate is now
+  the capability predicate — see "The gate_response capability gate"). What
+  follows is the v0.3.0/v0.4.0 state, kept for the record. **Gate responses to
+  Host-resident sessions answered `409 gate_resolved` until
   sessionstore ≥ v0.12.0 and host ≥ v0.4.0** (B5 v0.3.0 spec gate M1). The
   reason is the store, not this module: sessionstore v0.10.0 (the pin) and
   v0.11.0 refuse `OpenGate` -- every Host-owned catalog write -- on a
@@ -1708,10 +1763,10 @@ the required-seams table; `EnsurePlacement(DesiredWorkload)` cannot identify a
 workload. The option and type remain (removal is a break) and are marked
 `Deprecated`.
 
-**Known gap, stated rather than worked around:** the released Host serves
-HostLink per tenant at `/hostlink/<tenant>` and advertises one endpoint, and
-Core names no convention for a tenant's address on a Host, so a pooled Host is
-reachable from this pool only for the tenant its advertised endpoint names.
+**Closed in v0.5.0 (Gap 1):** the gap stated here -- a pooled Host reachable
+only for the tenant its advertised endpoint named -- is gone. Core v0.10.0 names
+the convention (`HostLinkEndpoint`) and the pool derives per tenant; see "Gap 1"
+under The HostLink.
 
 **Tenant-exclusive pooled capacity is refused, not admitted.** Section 12 makes
 Factory placement the enforcer of tenant exclusivity for a pooled Host without
@@ -2304,7 +2359,7 @@ hole and takes the same repair. Every OWNER-initiated stop -- `Plane.Unbind`,
 which `Bindings.Release`/`Observe` reach when the last viewer leaves or the
 route drops, and `Tail.Stop` -- unsubscribes, because **a Host never
 unsubscribes a Factory**, not on unbind and not on `InvalidateSession`.
-`Pool.Unsubscribe` reaches every link, not the routed one, because the route may
+`Pool.Unsubscribe` reaches every link OF THE SESSION'S TENANT, not only the routed one, because the route may
 already be gone. The plane gives each subscription a generation, so a stopped
 or replaced tail's late publication never reaches the Relay.
 
@@ -2349,7 +2404,18 @@ the link believed it live. `regMu` is never taken on a callback goroutine
 inline-discard mutants hang the suite). Likewise a mailbox overflow no longer
 starts its own unsubscribe: the repair's `Tail.Stop` withdraws the tail in
 order, and an unordered withdrawal landing after the re-subscribe removed the
-new tail (both gates' F1).
+new tail (both gates' F1). **Since v0.5.0 the subscribe itself is sent under
+`regMu` after re-checking the entry is current** (regate N4): a withdrawal
+between registration and send used to leave an orphan subscription at the Host.
+Both regMu rules are held structurally by `regmu_structure_test.go`, whose
+anti-vacuity half applies the regate's mutants X2d/X2e/X2f/D1/D2/D3 verbatim to
+the live source.
+
+**`routing.Relay` requires calls for one session to be serialised by its
+caller** (regate N1). It releases its mutex across a repair's I/O, so two
+concurrent repairs of one session can publish a reset whose tip goes backwards;
+composition meets the precondition because the plane calls the Relay only from
+the session's single drainer. A new caller must do the same.
 
 **A tip read that fails during a repair closes every affected viewer and STILL
 re-binds** (quality gate F1). It used to leave the tail stopped with the route
