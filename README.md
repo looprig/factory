@@ -449,6 +449,15 @@ candidate's) link for the session's tenant:
   candidate with the token; others are skipped with a WARN, and with none the
   session waits.
 
+**A gate response is never stored by reference.** Every other command larger
+than the inbox's inline bound (`sessionstore.MaxInboxPayloadBytes`, 64 KiB of
+canonical command payload) is uploaded and admitted by reference; a NEW gate
+response over it is refused `400 invalid_request` (`ErrGateResponseTooLarge`)
+before anything is written, because host v0.4.0 blocks a session's whole
+command stream behind a by-reference gate response until its apply deadline,
+and every command admitted behind it expires with it. A retry of a gate
+response already stored still answers from its record.
+
 **Mixed fleets: do not run v0.3.0 and v0.4.0 Hosts that serve gating agents
 together.** An answer admitted under a v0.4.0 owner that is then re-placed onto
 a v0.3.0 Host — or that was already claimed there — sits `applying` until a

@@ -62,6 +62,22 @@ var ErrLegacySessionUnsupported = errors.New("admission: the session is bound to
 // a capability signal (owner ruling, 2026-09-19).
 var ErrGateResponseUnsupported = errors.New("admission: the session's owner cannot apply a gate response")
 
+// ErrGateResponseTooLarge is the cause of the invalid_request refusal a NEW
+// gate response gets when its canonical command payload is larger than
+// sessionstore.MaxInboxPayloadBytes (64 KiB), the most the disposition inbox
+// keeps inline.
+//
+// Every other kind above that size is stored by reference (runbook A3.1 step
+// 5). A gate response is not, because host v0.4.0 treats a gate response whose
+// body is held by reference as BLOCKING: the session's whole command stream
+// waits behind it until its apply deadline, and every command admitted after
+// it expires with it (host v0.4.0 spec gate C1). So it is refused before
+// anything is written. The size is the caller's own bytes, which is why the
+// code is invalid_request (400) and not a state conflict. A retry of a gate
+// response already stored -- which only an earlier Factory could have
+// admitted by reference -- still answers from its record.
+var ErrGateResponseTooLarge = errors.New("admission: a gate response larger than the inline inbox payload bound is refused")
+
 // ErrLegacyCreateUnsupported reports that Factory cannot create a session on
 // the legacy protocol. No runtime this program ships can host such a session.
 var ErrLegacyCreateUnsupported = errors.New("admission: legacy create unsupported")
@@ -281,6 +297,10 @@ func (s *Service) AdmitGateResponse(ctx context.Context, principal identity.Prin
 	}
 	if retry, handled, err := s.retry(ctx, principal.Tenant(), req.SessionID, req.CommandID, CommandGateResponse, payload); handled || err != nil {
 		return retry, false, err
+	}
+	if len(payload) > sessionstore.MaxInboxPayloadBytes {
+		return sessionstore.DispositionInboxEntry{}, false, refusal(sessionwire.ErrorCodeInvalidRequest,
+			fmt.Errorf("%w: %d bytes, the bound is %d", ErrGateResponseTooLarge, len(payload), sessionstore.MaxInboxPayloadBytes))
 	}
 	entry, err := s.existingCompatible(ctx, principal.Tenant(), req.SessionID)
 	if err != nil {

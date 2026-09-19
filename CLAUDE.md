@@ -1486,6 +1486,15 @@ successor settles it `not_applied`; the filter keeps a *pending* one off an
 incapable Host but cannot recall one in flight. Do not run v0.3.0 and v0.4.0
 Hosts serving gating agents together.
 
+**A gate response is never admitted by reference** (host v0.4.0 spec gate C1):
+above `sessionstore.MaxInboxPayloadBytes` (64 KiB, measured on the same
+canonical payload `admit` stores) a NEW gate response is refused
+`invalid_request` with `ErrGateResponseTooLarge`, after the retry read and
+before any write. A Host blocks the session's command stream behind a
+by-reference gate response until its apply deadline.
+`TestAnOversizedGateResponseIsRefusedAtTheInlineBound` holds both sides of the
+exact bound; every other kind is still stored by reference above it.
+
 The pool carries the control plane AND, since v0.4.0 (Gap 3), a session's
 **live tail**: `Pool.Subscribe` subscribes the session's `HostLinkChannel` on
 the link that holds its bind (see "The live tail" below). The per-binding

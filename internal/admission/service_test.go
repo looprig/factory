@@ -652,10 +652,8 @@ func TestAnOversizedPayloadIsStoredByReferenceForEveryKind(t *testing.T) {
 		{"input", func(f *serviceFixture) (sessionstore.DispositionInboxEntry, bool, error) {
 			return f.service.AdmitInput(context.Background(), f.principal, sessionwire.InputRequest{CommandEnvelope: envelope("big-a"), SessionID: "session-a", Blocks: []byte(`["` + big + `"]`)})
 		}},
-		{"gate response", func(f *serviceFixture) (sessionstore.DispositionInboxEntry, bool, error) {
-			return f.service.AdmitGateResponse(context.Background(), f.principal, sessionwire.GateResponseRequest{CommandEnvelope: envelope("big-a"), SessionID: "session-a", GateID: "gate-a", Action: "submit",
-				Values: map[string]json.RawMessage{"answer": json.RawMessage(`"` + big + `"`)}, ExpectedOpenEventID: "event-a"})
-		}},
+		// A gate response is the one kind NOT stored by reference: see
+		// TestAnOversizedGateResponseIsRefusedAtTheInlineBound.
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			f := newServiceFixture(t)
