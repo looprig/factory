@@ -294,48 +294,6 @@ func TestADroppedConnectionEndsTheTailAndIsNotResubscribedBehindABind(t *testing
 	}
 }
 
-// TestASubscribeWhileReconnectingIsRefusedAsTransient: a subscribe queued in
-// the connecting window would be sent on the new connection before anything was
-// re-bound there.
-func TestASubscribeWhileReconnectingIsRefusedAsTransient(t *testing.T) {
-	t.Parallel()
-
-	host := newHostServer(t, hostOptions{})
-	dialer, err := hostlink.NewCentrifugeDialer(hostlink.DialerConfig{
-		Credential: staticCredential(serviceToken),
-		Version:    buildVersion,
-		Limits: hostlink.Limits{
-			MaxLinks: 4, DialTimeout: 2 * time.Second, IdleTimeout: time.Minute,
-			ReconnectMin: 2 * time.Second, ReconnectMax: 2 * time.Second,
-		},
-	})
-	if err != nil {
-		t.Fatalf("NewCentrifugeDialer: %v", err)
-	}
-	link, err := dialer.Dial(context.Background(), host.target(), &recordingObserver{})
-	if err != nil {
-		t.Fatalf("Dial: %v", err)
-	}
-	t.Cleanup(func() { _ = link.Close(context.Background()) })
-	if err := link.Bind(context.Background(), bindRequest(hostOne, "s-1")); err != nil {
-		t.Fatalf("Bind: %v", err)
-	}
-	host.disconnectEveryone(centrifuge.Disconnect{Code: 4000, Reason: "test reconnect"})
-	channel := sessionwire.HostLinkChannel(tenant, "s-1")
-	waitUntil(t, "the link to be reconnecting", func() bool {
-		return errors.Is(link.Bind(context.Background(), bindRequest(hostOne, "s-1")), hostlink.ErrLinkReconnecting)
-	})
-	err = link.(hostlink.Subscriber).Subscribe(context.Background(), tenant, "s-1", &recordingSink{})
-	if !errors.Is(err, hostlink.ErrLinkReconnecting) {
-		t.Fatalf("Subscribe while reconnecting = %v, want ErrLinkReconnecting", err)
-	}
-	waitUntil(t, "the reconnect", func() bool { return len(host.connects()) >= 2 })
-	time.Sleep(200 * time.Millisecond)
-	if n := host.subscribes(channel); n != 0 {
-		t.Fatalf("the refused subscribe reached the Host %d times after the reconnect", n)
-	}
-}
-
 // TestAServerSideUnsubscribeEndsTheTail covers both codes a Host could use. A
 // code below 2500 unsubscribes; a code at or above it makes the transport
 // resubscribe ON ITS OWN, which this link may not allow -- so both end the
@@ -402,12 +360,20 @@ func TestABindOnATerminalLinkEvictsIt(t *testing.T) {
 
 	host := newHostServer(t, hostOptions{})
 	pool := boundPool(t, host)
+	sink := &recordingSink{}
+	if err := pool.Subscribe(context.Background(), tenant, "s-1", sink); err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
 	host.disconnectEveryone(centrifuge.Disconnect{Code: 3500, Reason: "terminal"})
-	waitUntil(t, "the terminal close to reach the link", func() bool {
-		var disconnect *hostlink.HostDisconnect
-		err := pool.Bind(context.Background(), host.target(), bindRequest(hostOne, "s-1"))
-		return errors.As(err, &disconnect)
-	})
+	// Wait on the tail's Ended -- which the link reports from the same
+	// terminal callback that marks it dead -- and NOT by polling Bind: an RPC
+	// racing the transport's own close trips centrifuge-go v0.12.0's data race
+	// (client.go:2187 against :457), the suite's known third-party flake.
+	waitUntil(t, "the terminal close to reach the link", func() bool { return sink.count("ended") == 1 })
+	var disconnect *hostlink.HostDisconnect
+	if err := pool.Bind(context.Background(), host.target(), bindRequest(hostOne, "s-1")); !errors.As(err, &disconnect) {
+		t.Fatalf("a bind on the terminal link = %v, want its *HostDisconnect", err)
+	}
 	if got := pool.Links(); got != 0 {
 		t.Fatalf("the pool kept %d links after a bind met a terminal one", got)
 	}

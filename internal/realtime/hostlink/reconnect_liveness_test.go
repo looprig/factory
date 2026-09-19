@@ -422,6 +422,7 @@ type livenessHost struct {
 	reconnected chan struct{}
 	connects    atomic.Int32
 	rpcCalls    atomic.Int32
+	subscribes  atomic.Int32
 	closeOnce   sync.Once
 	mu          sync.Mutex
 	negotiation string
@@ -504,6 +505,10 @@ func newLivenessHost(t *testing.T) *livenessHost {
 			}
 			// Empty RPC data is the legitimate success shape.
 			cb(centrifuge.RPCReply{}, nil)
+		})
+		client.OnSubscribe(func(_ centrifuge.SubscribeEvent, cb centrifuge.SubscribeCallback) {
+			host.subscribes.Add(1)
+			cb(centrifuge.SubscribeReply{}, nil)
 		})
 	})
 	if err := node.Run(); err != nil {
@@ -698,3 +703,46 @@ func TestAnAttachInTheConnectingWindowIsRefusedAsReconnectingNotUnsupported(t *t
 		t.Fatalf("Attach in the Connecting window reported a transient as a capability fact: %v", err)
 	}
 }
+
+// TestASubscribeInTheConnectingWindowIsRefusedAsTransientAndNeverSent: a
+// subscribe issued between a dropped connection and the next reply would be
+// QUEUED by the transport and sent on the new connection before anything was
+// re-bound there. It is refused locally with ErrLinkReconnecting, and the Host
+// receives no subscribe once the link is back.
+//
+// The window is found by the client's own state, not by polling an RPC: an
+// RPC racing the close trips centrifuge-go's known data race.
+func TestASubscribeInTheConnectingWindowIsRefusedAsTransientAndNeverSent(t *testing.T) {
+	t.Parallel()
+
+	host := newLivenessHost(t)
+	link := dialLiveness(t, host, 300*time.Millisecond)
+	serverClient := <-host.connected
+
+	serverClient.Disconnect(centrifuge.Disconnect{Code: 4000, Reason: "test reconnect"})
+	waitForState(t, link.client, centrifugego.StateConnecting)
+	time.Sleep(20 * time.Millisecond)
+	if got := link.client.State(); got != centrifugego.StateConnecting {
+		t.Fatalf("left the Connecting window early: %s", got)
+	}
+	err := link.Subscribe(context.Background(), "tenant-a", "s-1", nopSink{})
+	if !errors.Is(err, ErrLinkReconnecting) {
+		t.Fatalf("Subscribe in the Connecting window = %v, want ErrLinkReconnecting", err)
+	}
+	select {
+	case <-host.reconnected:
+	case <-time.After(3 * time.Second):
+		t.Fatal("reconnect did not complete")
+	}
+	time.Sleep(200 * time.Millisecond)
+	if got := host.subscribes.Load(); got != 0 {
+		t.Fatalf("the Host received %d subscribes: the refused one was queued and sent", got)
+	}
+}
+
+type nopSink struct{}
+
+func (nopSink) Subscribed()        {}
+func (nopSink) Publication([]byte) {}
+func (nopSink) Ended()             {}
+func (nopSink) Restored()          {}
