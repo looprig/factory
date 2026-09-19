@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -235,6 +236,12 @@ func TestAMailboxOverflowIsRepairedNotBufferedWithoutBound(t *testing.T) {
 	r.watch(t, tenantA, session)
 	channel := sessionwire.HostLinkChannel(tenantA, session)
 	gate := make(chan struct{})
+	var release sync.Once
+	open := func() { release.Do(func() { close(gate) }) }
+	// Registered BEFORE the rig's own cleanup runs (cleanups run last-in
+	// first-out), so a failing case releases the blocked drainer rather than
+	// wedging the Relay's lock under the rig's Close.
+	t.Cleanup(open)
 	r.viewers.mu.Lock()
 	r.viewers.gate = gate
 	r.viewers.mu.Unlock()
@@ -246,7 +253,7 @@ func TestAMailboxOverflowIsRepairedNotBufferedWithoutBound(t *testing.T) {
 	r.viewers.mu.Lock()
 	r.viewers.gate = nil
 	r.viewers.mu.Unlock()
-	close(gate)
+	open()
 	eventually(t, "a reset", func() bool {
 		for _, k := range kinds(t, r.viewers.of(tenantA, session)) {
 			if strings.HasPrefix(k, "R") && strings.HasSuffix(k, "/10") {

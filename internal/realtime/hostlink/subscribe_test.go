@@ -129,6 +129,18 @@ func TestASubscribeWithNoBindIsRefused(t *testing.T) {
 		t.Fatalf("pool Subscribe with no route = %v, want ErrUnknownBinding", err)
 	}
 
+	// A route for ANOTHER session on a live link is no route for this one: the
+	// pool must refuse locally rather than send a subscribe the Host refuses.
+	if err := pool.Bind(context.Background(), host.target(), bindRequest(hostOne, "s-2")); err != nil {
+		t.Fatalf("Bind s-2: %v", err)
+	}
+	if err := pool.Subscribe(context.Background(), tenant, "s-1", &recordingSink{}); !errors.Is(err, hostlink.ErrUnknownBinding) {
+		t.Fatalf("pool Subscribe for an unrouted session on a live link = %v, want ErrUnknownBinding", err)
+	}
+	if n := host.subscribes(sessionwire.HostLinkChannel(tenant, "s-1")); n != 0 {
+		t.Fatalf("the unrouted subscribe reached the Host %d times", n)
+	}
+
 	link := mustDial(t, host).(hostlink.Subscriber)
 	sink := &recordingSink{}
 	err := link.Subscribe(context.Background(), tenant, "s-1", sink)

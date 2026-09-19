@@ -106,50 +106,18 @@ func composeComponents(cfg config, credentials *internalidentity.Authenticator) 
 		return nil, &OptionError{Option: "WithHostLinkLimits", Err: err}
 	}
 
-	// Gap 3: the live-tail plane. It is the routing table's Binder -- a bind
-	// is followed by a subscribe on the same HostLink connection, which is
-	// the order a Host requires -- and it publishes to the ClientLink node,
-	// which does not exist until Start, so the node is supplied late.
+	// Gap 3: the live-tail plane and the routing it drives. The ClientLink it
+	// publishes through does not exist until Start, so it is supplied late.
 	c := &components{}
-	live, err := livetail.New(livetail.Config{
-		Links: pool,
-		Viewers: func() livetail.Viewers {
-			if handler := c.clientLink(); handler != nil {
-				return handler
-			}
-			return nil
-		},
-		// The inbound bound is the Relay's own HostBinding queue: one
-		// session's undelivered tail, before anything fans out.
-		MailboxLimit: routing.DefaultRepairLimits().HostBindingQueue,
-		EventTimeout: cfg.client.DemandTimeout,
-		Logger:       logger(cfg),
+	live, bindings, demand, err := composeLive(cfg, pool, func() livetail.Viewers {
+		if handler := c.clientLink(); handler != nil {
+			return handler
+		}
+		return nil
 	})
 	if err != nil {
-		return nil, &OptionError{Option: "WithClientLinkLimits", Err: err}
+		return nil, err
 	}
-	bindings, err := routing.NewBindings(cfg.directory, live)
-	if err != nil {
-		return nil, &OptionError{Option: "WithDirectory", Err: err}
-	}
-	// The hint publisher is the same ClientLink channel the live tail uses:
-	// an unbound watched session's viewers are told the durable tip.
-	demand, err := routing.NewDemand(bindings, cfg.reads, live, cfg.clock, routing.DemandLimits{
-		OwnershipPollInterval: cfg.client.DemandReleaseDebounce + cfg.reconcile.Interval,
-		PollTimeout:           cfg.client.DemandTimeout,
-	})
-	if err != nil {
-		return nil, &OptionError{Option: "WithClientLinkLimits", Err: err}
-	}
-	demand.SetWatcher(live)
-	// routing.Relay, complete since A7.3 and constructed here for the first
-	// time. Its Rebinder is the demand plane, its Tail and Publisher the live
-	// plane, and its tip reads the same durable read the hints use.
-	relay, err := routing.NewRelay(cfg.reads, demand, live, live, routing.DefaultRepairLimits())
-	if err != nil {
-		return nil, &OptionError{Option: "WithSessionReader", Err: err}
-	}
-	live.Attach(relay, demand)
 
 	commandSweeper, err := admission.NewReconciler(admission.ReconcilerConfig{
 		Authorizer: cfg.authorizer,
@@ -282,6 +250,54 @@ func (c *components) clientLink() *clientlink.Handler {
 	c.realtimeMu.RLock()
 	defer c.realtimeMu.RUnlock()
 	return c.realtime
+}
+
+// composeLive builds Gap 3's live-tail plane, the routing table and demand
+// plane it is the Binder, Hinter and Watcher of, and the routing.Relay it
+// drives -- constructed here for the first time since A7.3 built it.
+//
+// It is its own function so the WIRING is testable without a Host or a
+// ClientLink: which seam each component was handed is not observable from the
+// outside, and a composition that handed the demand plane some other Hinter,
+// or the routing table the bare pool, would bind and poll exactly as before
+// while no viewer ever saw anything.
+func composeLive(cfg config, pool *hostlink.Pool, viewers func() livetail.Viewers) (*livetail.Plane, *routing.Bindings, *routing.Demand, error) {
+	live, err := livetail.New(livetail.Config{
+		Links:   pool,
+		Viewers: viewers,
+		// The inbound bound is the Relay's own HostBinding queue: one
+		// session's undelivered tail, before anything fans out.
+		MailboxLimit: routing.DefaultRepairLimits().HostBindingQueue,
+		EventTimeout: cfg.client.DemandTimeout,
+		Logger:       logger(cfg),
+	})
+	if err != nil {
+		return nil, nil, nil, &OptionError{Option: "WithClientLinkLimits", Err: err}
+	}
+	// The routing table's Binder is the plane: a bind is followed by a
+	// subscribe on the same HostLink connection, the order a Host requires.
+	bindings, err := routing.NewBindings(cfg.directory, live)
+	if err != nil {
+		return nil, nil, nil, &OptionError{Option: "WithDirectory", Err: err}
+	}
+	// The hint publisher is the same ClientLink channel the live tail uses:
+	// an unbound watched session's viewers are told the durable tip.
+	demand, err := routing.NewDemand(bindings, cfg.reads, live, cfg.clock, routing.DemandLimits{
+		OwnershipPollInterval: cfg.client.DemandReleaseDebounce + cfg.reconcile.Interval,
+		PollTimeout:           cfg.client.DemandTimeout,
+	})
+	if err != nil {
+		return nil, nil, nil, &OptionError{Option: "WithClientLinkLimits", Err: err}
+	}
+	demand.SetWatcher(live)
+	// Its Rebinder is the demand plane, its Tail and Publisher the live plane,
+	// and its tip reads the same durable read the hints use.
+	relay, err := routing.NewRelay(cfg.reads, demand, live, live, routing.DefaultRepairLimits())
+	if err != nil {
+		return nil, nil, nil, &OptionError{Option: "WithSessionReader", Err: err}
+	}
+	live.Attach(relay, demand)
+	return live, bindings, demand, nil
 }
 
 // startRealtime builds and RUNS the ClientLink node.

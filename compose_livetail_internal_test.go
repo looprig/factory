@@ -3,6 +3,7 @@ package factory
 import (
 	"context"
 	"errors"
+	"sync"
 	"testing"
 	"time"
 
@@ -43,5 +44,50 @@ func TestTheLiveTailIsComposedAndPublishesThroughTheRunningClientLink(t *testing
 	}
 	if err := live.PublishJournalTip(context.Background(), hint); !errors.Is(err, livetail.ErrNoViewers) {
 		t.Fatalf("a hint after Stop = %v, want livetail.ErrNoViewers", err)
+	}
+}
+
+// recordingViewers is the ClientLink side of composeLive, recorded.
+type recordingViewers struct {
+	mu        sync.Mutex
+	published []string
+}
+
+func (v *recordingViewers) PublishSession(tenant sessionwire.TenantID, session sessionwire.SessionID, encoded []byte) error {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	v.published = append(v.published, string(tenant)+"/"+string(session)+" "+string(encoded))
+	return nil
+}
+
+func (v *recordingViewers) CloseSession(sessionwire.TenantID, sessionwire.SessionID) {}
+
+// TestTheDemandPlanesHintIsPublishedToTheSessionsViewers holds composeLive's
+// wiring of the Hinter: a watched session with no owner has its durable tip
+// published to that session's viewers through the live plane. Before Gap 3 the
+// composition held a named refusal here and the hint went nowhere.
+func TestTheDemandPlanesHintIsPublishedToTheSessionsViewers(t *testing.T) {
+	t.Parallel()
+
+	server, err := New(RequiredOptions()...)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	viewers := &recordingViewers{}
+	live, _, demand, err := composeLive(server.cfg, server.components.pool, func() livetail.Viewers { return viewers })
+	if err != nil {
+		t.Fatalf("composeLive: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = demand.Close(context.Background())
+		_ = live.Close(context.Background())
+	})
+	if err := demand.Acquire(context.Background(), "tenant-a", "s-unowned"); err != nil {
+		t.Fatalf("Acquire: %v", err)
+	}
+	viewers.mu.Lock()
+	defer viewers.mu.Unlock()
+	if len(viewers.published) != 1 || viewers.published[0] != `tenant-a/s-unowned {"journal_tip":0,"session_id":"s-unowned","tenant_id":"tenant-a","type":"journal_tip"}` {
+		t.Fatalf("the viewers were sent %v, want the unbound session's journal_tip hint", viewers.published)
 	}
 }
