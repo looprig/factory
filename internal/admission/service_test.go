@@ -310,6 +310,27 @@ func (d *serviceDirectory) Owner(_ context.Context, tenant sessionwire.TenantID,
 	return d.owner, d.ok, d.err
 }
 
+// serviceGateResponders answers the gate_response capability question. The
+// FIXTURE's default is "accepts", so every pre-existing gate-response case
+// still drives the rest of the admission path; the production default -- a nil
+// seam, and a pool whose predicate answers false -- is held by the cases that
+// name it.
+type serviceGateResponders struct {
+	faultInjector
+	refuse    bool
+	calls     int
+	lastOwner sessionwire.HostLinkRegistryObservation
+}
+
+func (g *serviceGateResponders) AcceptsGateResponses(_ context.Context, owner sessionwire.HostLinkRegistryObservation) (bool, error) {
+	g.calls++
+	g.lastOwner = owner
+	if err := g.enter("AcceptsGateResponses"); err != nil {
+		return false, err
+	}
+	return !g.refuse, nil
+}
+
 type serviceClock struct{ now time.Time }
 
 func (c serviceClock) Now() time.Time { return c.now }
@@ -340,6 +361,7 @@ type serviceFixture struct {
 	ids       *serviceIDs
 	creates   *servicePublicCreates
 	principal identity.Principal
+	gates     *serviceGateResponders
 }
 
 // configureCreates supplies the deployment-configuration half a V1 create
@@ -359,8 +381,9 @@ func (f *serviceFixture) configureCreates(t *testing.T) {
 func (f *serviceFixture) rebuildConfigured() {
 	cfg := Config{Authorizer: f.auth, Targets: f.targets, Catalog: f.catalog, Commands: f.commands,
 		Directory: f.directory, Clock: serviceClock{serviceNow}, IDs: f.ids, PublicCreates: f.creates,
-		Binding:       SessionBindingTemplate{StorageBindingID: "storage-a", BindingVersion: "v1"},
-		ApplyDeadline: time.Minute}
+		GateResponders: f.gates,
+		Binding:        SessionBindingTemplate{StorageBindingID: "storage-a", BindingVersion: "v1"},
+		ApplyDeadline:  time.Minute}
 	if svc, err := NewService(cfg); err == nil {
 		f.service = svc
 	}
@@ -372,7 +395,7 @@ func (f *serviceFixture) rebuild(t *testing.T, adjust func(*Config)) {
 	t.Helper()
 	cfg := Config{Authorizer: f.auth, Targets: f.targets, Catalog: f.catalog, Commands: f.commands,
 		Directory: f.directory, Clock: serviceClock{serviceNow}, IDs: f.ids,
-		PublicCreates: f.creates, ApplyDeadline: time.Minute}
+		PublicCreates: f.creates, GateResponders: f.gates, ApplyDeadline: time.Minute}
 	adjust(&cfg)
 	svc, err := NewService(cfg)
 	if err != nil {
@@ -396,17 +419,18 @@ func newServiceFixture(t *testing.T) *serviceFixture {
 	directory := &serviceDirectory{}
 	ids := &serviceIDs{}
 	creates := newServicePublicCreates()
+	gates := &serviceGateResponders{}
 	// The base fixture supplies the public-create STORE but NOT the binding
 	// configuration, so AdmitCreate refuses here and configureCreates is what
 	// turns a create on. Both halves are required and neither implies the
 	// other; see Config.createsServed.
 	svc, err := NewService(Config{Authorizer: auth, Targets: targets, Catalog: catalog, Commands: commands,
 		Directory: directory, Clock: serviceClock{serviceNow}, IDs: ids,
-		PublicCreates: creates, ApplyDeadline: time.Minute})
+		PublicCreates: creates, GateResponders: gates, ApplyDeadline: time.Minute})
 	if err != nil {
 		t.Fatalf("NewService: %v", err)
 	}
-	return &serviceFixture{svc, auth, targets, catalog, commands, directory, ids, creates, p}
+	return &serviceFixture{svc, auth, targets, catalog, commands, directory, ids, creates, p, gates}
 }
 
 func envelope(id string) sessionwire.CommandEnvelope {
@@ -1161,6 +1185,8 @@ func armFault(f *serviceFixture, dependency, method string) (*faultInjector, boo
 		injector = &f.ids.faultInjector
 	case "PublicCreates":
 		injector = &f.creates.faultInjector
+	case "GateResponders":
+		injector = &f.gates.faultInjector
 	default:
 		return nil, false
 	}
@@ -2320,6 +2346,7 @@ func TestARefusedCommandStopsAtItsGuardAndTouchesNothingFurther(t *testing.T) {
 		for _, injector := range []*faultInjector{
 			&f.auth.faultInjector, &f.targets.faultInjector, &f.catalog.faultInjector,
 			&f.commands.faultInjector, &f.directory.faultInjector, &f.ids.faultInjector,
+			&f.gates.faultInjector,
 		} {
 			for method := range injector.called {
 				out = append(out, method)
@@ -2358,7 +2385,18 @@ func TestARefusedCommandStopsAtItsGuardAndTouchesNothingFurther(t *testing.T) {
 					Values: map[string]json.RawMessage{"answer": json.RawMessage(`"yes"`)}, ExpectedOpenEventID: "event-a"})
 				return err
 			},
-			want: []string{"AdmitDispositionCommand", "AuthorizeControl", "GetCatalogEntry", "GetDispositionCommand", "IsKnown", "NewUUID", "Owner"},
+			want: []string{"AcceptsGateResponses", "AdmitDispositionCommand", "AuthorizeControl", "GetCatalogEntry", "GetDispositionCommand", "IsKnown", "NewUUID", "Owner"},
+		},
+		{
+			name:      "an owner that cannot apply a gate response stops before the inbox",
+			configure: func(f *serviceFixture) { f.gates.refuse = true },
+			call: func(f *serviceFixture) error {
+				_, _, err := f.service.AdmitGateResponse(context.Background(), f.principal, sessionwire.GateResponseRequest{
+					CommandEnvelope: envelope("command-a"), SessionID: "session-a", GateID: "gate-a", Action: "submit",
+					Values: map[string]json.RawMessage{"answer": json.RawMessage(`"yes"`)}, ExpectedOpenEventID: "event-a"})
+				return err
+			},
+			want: []string{"AcceptsGateResponses", "AuthorizeControl", "GetCatalogEntry", "GetDispositionCommand", "IsKnown", "Owner"},
 		},
 		{
 			name:      "an unknown runtime stops before the inbox",

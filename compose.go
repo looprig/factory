@@ -66,6 +66,23 @@ type components struct {
 // states separately. Every rejection is attributed to the option carrying the
 // offending value, for the reason composeRouter's are.
 func composeComponents(cfg config, credentials *internalidentity.Authenticator) (*components, error) {
+	dialer, err := hostlink.NewCentrifugeDialer(hostlink.DialerConfig{
+		Credential: cfg.hostCredential,
+		Version:    cfg.version,
+		Limits:     hostlink.Limits(cfg.host),
+	})
+	if err != nil {
+		return nil, &OptionError{Option: "WithHostLinkCredential", Err: err}
+	}
+	pool, err := hostlink.NewPool(hostlink.Config{
+		Dialer: dialer,
+		Limits: hostlink.Limits(cfg.host),
+		Now:    cfg.clock.Now,
+	})
+	if err != nil {
+		return nil, &OptionError{Option: "WithHostLinkLimits", Err: err}
+	}
+
 	service, err := admission.NewService(admission.Config{
 		Authorizer: cfg.authorizer,
 		Targets:    departmentTargets(cfg.department),
@@ -84,26 +101,15 @@ func composeComponents(cfg config, credentials *internalidentity.Authenticator) 
 		// the sweeper settles against. Two values here would be a command
 		// rejected before it was due, or one the sweeper never reached.
 		ApplyDeadline: cfg.reconcile.ApplyDeadline,
+		// The gate_response capability gate: a gate response is admitted
+		// only for an owner that can apply one, asked of the owner's link
+		// for the session's tenant and decided by
+		// hostlink.GateResponseCapable. Until host v0.4.0 fixes the signal
+		// that predicate refuses every Host.
+		GateResponders: gateResponders{pool: pool},
 	})
 	if err != nil {
 		return nil, &OptionError{Option: "WithReconcileLimits", Err: err}
-	}
-
-	dialer, err := hostlink.NewCentrifugeDialer(hostlink.DialerConfig{
-		Credential: cfg.hostCredential,
-		Version:    cfg.version,
-		Limits:     hostlink.Limits(cfg.host),
-	})
-	if err != nil {
-		return nil, &OptionError{Option: "WithHostLinkCredential", Err: err}
-	}
-	pool, err := hostlink.NewPool(hostlink.Config{
-		Dialer: dialer,
-		Limits: hostlink.Limits(cfg.host),
-		Now:    cfg.clock.Now,
-	})
-	if err != nil {
-		return nil, &OptionError{Option: "WithHostLinkLimits", Err: err}
 	}
 
 	// Gap 3: the live-tail plane and the routing it drives. The ClientLink it
@@ -417,6 +423,21 @@ func (l placementLinks) DeliverCommand(ctx context.Context, tenant sessionwire.T
 
 func (l placementLinks) RouteFor(tenant sessionwire.TenantID, session sessionwire.SessionID) (sessionwire.HostID, bool) {
 	return l.pool.RouteFor(tenant, session)
+}
+
+func (l placementLinks) AcceptsGateResponses(ctx context.Context, owner sessionwire.HostLinkRegistryObservation) (bool, error) {
+	return gateResponders(l).AcceptsGateResponses(ctx, owner)
+}
+
+// gateResponders is the gate_response capability question asked of the pool:
+// the owner's link FOR THE SESSION'S TENANT, at the address derived from the
+// owner's advertised base, answered by hostlink.GateResponseCapable. Admission
+// asks it before writing a gate response; placement asks it before delivering
+// one as a wake.
+type gateResponders struct{ pool *hostlink.Pool }
+
+func (g gateResponders) AcceptsGateResponses(ctx context.Context, owner sessionwire.HostLinkRegistryObservation) (bool, error) {
+	return g.pool.AcceptsGateResponses(ctx, hostlink.Target{Host: owner.HostID, Endpoint: owner.InternalEndpoint}, owner.TenantID)
 }
 
 // classifyAttach maps a pool attach failure onto placement's vocabulary. See

@@ -124,6 +124,11 @@ type HostLinks interface {
 	// RouteFor reports whether this replica already routes the session, and
 	// to which Host. Placement leaves a route it did not create in place.
 	RouteFor(tenant sessionwire.TenantID, session sessionwire.SessionID) (sessionwire.HostID, bool)
+	// AcceptsGateResponses reports whether the Host an observation names can
+	// apply a gate_response command, asked of that tenant's link and decided
+	// by the one capability predicate (hostlink.GateResponseCapable). An error
+	// means it could not be asked, and is never read as "can".
+	AcceptsGateResponses(ctx context.Context, owner sessionwire.HostLinkRegistryObservation) (bool, error)
 }
 
 // CandidateRefusal is one candidate a placement asked and was refused by.
@@ -473,7 +478,25 @@ func (r *Reconciler) bindAndDeliver(ctx context.Context, req Request, observatio
 		return result, err
 	}
 	result.Bound = true
+	gate := gateResponseWake(req)
+	var (
+		asked    bool
+		capable  bool
+		askedErr error
+	)
 	for _, command := range req.Wake {
+		if _, isGate := gate[command]; isGate {
+			// Asked once, lazily, of the Host this route was just bound to:
+			// a wake with no gate response costs no capability read.
+			if !asked {
+				capable, askedErr = r.cfg.Links.AcceptsGateResponses(ctx, observation)
+				asked = true
+			}
+			if askedErr != nil || !capable {
+				result.WithheldGateResponses++
+				continue
+			}
+		}
 		if err := r.cfg.Links.DeliverCommand(ctx, req.TenantID, req.SessionID, sessionwire.HostLinkCommandDelivery{CommandID: command}); err != nil {
 			result.DeliveryFailures++
 			continue
@@ -486,6 +509,18 @@ func (r *Reconciler) bindAndDeliver(ctx context.Context, req Request, observatio
 		_ = r.cfg.Links.Unbind(ctx, unbindRequestFor(bind))
 	}
 	return result, nil
+}
+
+// gateResponseWake is the set of wake commands that are gate responses.
+func gateResponseWake(req Request) map[sessionwire.CommandID]struct{} {
+	if len(req.GateResponses) == 0 {
+		return nil
+	}
+	set := make(map[sessionwire.CommandID]struct{}, len(req.GateResponses))
+	for _, command := range req.GateResponses {
+		set[command] = struct{}{}
+	}
+	return set
 }
 
 // attachMode is the mode an attach states, read from the catalog record.

@@ -187,6 +187,13 @@ type Request struct {
 	// carries only the retry-stable public CommandID -- so an empty Wake still
 	// places, and a failed delivery is counted, not returned.
 	Wake []sessionwire.CommandID
+
+	// GateResponses names the commands in Wake that are gate responses. A
+	// gate response is delivered only to a Host that can apply one
+	// (HostLinks.AcceptsGateResponses, answered by the one capability
+	// predicate); for any other Host it is WITHHELD and counted, never sent. A
+	// command not named here is delivered as before.
+	GateResponses []sessionwire.CommandID
 }
 
 // Result is what one reconciliation did.
@@ -229,8 +236,11 @@ type Result struct {
 	Bound bool
 
 	// Delivered and DeliveryFailures count the Wake deliveries.
-	Delivered        int
-	DeliveryFailures int
+	// WithheldGateResponses counts the gate responses in Wake NOT delivered
+	// because the bound Host cannot apply one, or could not be asked.
+	Delivered             int
+	DeliveryFailures      int
+	WithheldGateResponses int
 
 	// Excluded names the admissible candidates skipped because they do not
 	// advertise hostlink.attach; Unreachable those this replica could not ask;

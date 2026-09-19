@@ -44,6 +44,23 @@ const (
 // request can change the answer.
 var ErrLegacySessionUnsupported = errors.New("admission: the session is bound to the legacy protocol, which no Host can take residency on")
 
+// ErrGateResponseUnsupported is the cause of the gate_not_resumable refusal a
+// gate response gets when the session's live owner cannot APPLY one.
+//
+// A gate response is a durable command the owning Host reads from the
+// session's disposition stream, so admitting it IS delivering it: once it is
+// in the inbox, the Host consumes it. A Host that cannot apply the kind would
+// refuse it (host v0.3.0) or, worse, one that predates the refusal would hold
+// it -- so the question is asked BEFORE anything is written, of the owner the
+// fresh-owner check just accepted, and answered by the one capability
+// predicate (hostlink.GateResponseCapable, through GateResponders).
+//
+// Until host v0.4.0 fixes the capability signal that predicate answers "no"
+// for every Host, so every gate response to a Host-resident session is refused
+// here -- which is today's behaviour kept, since no released Host publishes a
+// gate a response could answer.
+var ErrGateResponseUnsupported = errors.New("admission: the session's owner cannot apply a gate response")
+
 // ErrLegacyCreateUnsupported reports that Factory cannot create a session on
 // the legacy protocol. No runtime this program ships can host such a session.
 var ErrLegacyCreateUnsupported = errors.New("admission: legacy create unsupported")
@@ -120,6 +137,18 @@ type OwnerDirectory interface {
 	Owner(context.Context, sessionwire.TenantID, sessionwire.SessionID) (sessionwire.HostLinkRegistryObservation, bool, error)
 }
 
+// GateResponders answers whether a session's live owner can apply a
+// gate_response command. The composition implements it over the HostLink
+// pool, asking the owner's link for the session's tenant and deciding with
+// hostlink.GateResponseCapable -- the one predicate. See
+// ErrGateResponseUnsupported.
+type GateResponders interface {
+	// AcceptsGateResponses reports whether owner can apply a gate response.
+	// (false, nil) is a decision about the Host; an error is a fault -- the
+	// Host could not be asked -- and is never read as "cannot".
+	AcceptsGateResponses(ctx context.Context, owner sessionwire.HostLinkRegistryObservation) (bool, error)
+}
+
 // Target is the configured immutable launch identity selected for a create.
 // It is configuration, not current Host capacity and not an ownership claim.
 type Target struct {
@@ -140,6 +169,12 @@ type Config struct {
 	Directory  OwnerDirectory
 	Clock      Clock
 	IDs        UUIDSource
+
+	// GateResponders decides whether a gate response may be admitted for the
+	// owner that would apply it. OPTIONAL, and nil REFUSES every gate response
+	// with gate_not_resumable (ErrGateResponseUnsupported): the safe default is
+	// the one that never hands a Host a command it cannot apply.
+	GateResponders GateResponders
 
 	// PublicCreates is the durable public-create plane a V1 create admits
 	// into. It is OPTIONAL, and its absence is a supported composition rather
@@ -261,7 +296,28 @@ func (s *Service) AdmitGateResponse(ctx context.Context, principal identity.Prin
 	if !ok || !freshMatchingOwner(owner, entry.Record, now) {
 		return sessionstore.DispositionInboxEntry{}, false, refusal(sessionwire.ErrorCodeGateNotResumable, nil)
 	}
+	if err := s.ownerAppliesGateResponses(ctx, owner); err != nil {
+		return sessionstore.DispositionInboxEntry{}, false, err
+	}
 	return s.admit(ctx, principal.Tenant(), req.SessionID, req.CommandID, CommandGateResponse, entry.Record.Binding, payload)
+}
+
+// ownerAppliesGateResponses is the gate_response capability gate: nil when the
+// owner can apply one, a gate_not_resumable refusal when it cannot or when no
+// GateResponders is composed, and a FAULT -- no public code -- when the owner
+// could not be asked, for resolveTargetFault's reason.
+func (s *Service) ownerAppliesGateResponses(ctx context.Context, owner sessionwire.HostLinkRegistryObservation) error {
+	if s.cfg.GateResponders == nil {
+		return refusal(sessionwire.ErrorCodeGateNotResumable, ErrGateResponseUnsupported)
+	}
+	accepts, err := s.cfg.GateResponders.AcceptsGateResponses(ctx, owner)
+	if err != nil {
+		return fmt.Errorf("admission: ask the owner whether it applies gate responses: %w", err)
+	}
+	if !accepts {
+		return refusal(sessionwire.ErrorCodeGateNotResumable, ErrGateResponseUnsupported)
+	}
+	return nil
 }
 
 func (s *Service) admitExisting(ctx context.Context, principal identity.Principal, session sessionwire.SessionID, command sessionwire.CommandID, kind sessionstore.CommandKind, request any) (sessionstore.DispositionInboxEntry, bool, error) {

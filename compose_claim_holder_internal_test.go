@@ -57,6 +57,9 @@ func (duringAttach) Unbind(context.Context, sessionwire.HostLinkUnbindRequest) e
 func (duringAttach) DeliverCommand(context.Context, sessionwire.TenantID, sessionwire.SessionID, sessionwire.HostLinkCommandDelivery) error {
 	return nil
 }
+func (duringAttach) AcceptsGateResponses(context.Context, sessionwire.HostLinkRegistryObservation) (bool, error) {
+	return false, nil
+}
 func (duringAttach) RouteFor(sessionwire.TenantID, sessionwire.SessionID) (sessionwire.HostID, bool) {
 	return "", false
 }

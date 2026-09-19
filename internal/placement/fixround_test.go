@@ -79,6 +79,9 @@ func (l realPoolLinks) Unbind(ctx context.Context, req sessionwire.HostLinkUnbin
 func (l realPoolLinks) DeliverCommand(ctx context.Context, tenant sessionwire.TenantID, session sessionwire.SessionID, d sessionwire.HostLinkCommandDelivery) error {
 	return l.pool.DeliverCommand(ctx, tenant, session, d)
 }
+func (l realPoolLinks) AcceptsGateResponses(ctx context.Context, owner sessionwire.HostLinkRegistryObservation) (bool, error) {
+	return l.pool.AcceptsGateResponses(ctx, hostlink.Target{Host: owner.HostID, Endpoint: owner.InternalEndpoint}, owner.TenantID)
+}
 func (l realPoolLinks) RouteFor(tenant sessionwire.TenantID, session sessionwire.SessionID) (sessionwire.HostID, bool) {
 	return l.pool.RouteFor(tenant, session)
 }

@@ -10,6 +10,7 @@ import (
 
 	sessionwire "github.com/looprig/core/sessionwire/v1"
 	"github.com/looprig/factory/identity"
+	"github.com/looprig/factory/internal/command"
 	"github.com/looprig/sessionstore"
 	"github.com/looprig/storage"
 )
@@ -168,6 +169,9 @@ type openSession struct {
 	// be resident: one still inside its deadline, or one APPLYING, which only a
 	// successor runtime can settle whatever the deadline says.
 	needsHost bool
+	// gates is the subset of wake that is gate responses, which placement
+	// delivers only to a Host that can apply one.
+	gates []sessionwire.CommandID
 }
 
 // Sweep places every session with open work in the next control shard.
@@ -191,7 +195,7 @@ func (s *PendingSweeper) Sweep(ctx context.Context, principal identity.Principal
 			continue
 		}
 		result.Sessions++
-		placed, err := s.cfg.Placer.Reconcile(ctx, Request{TenantID: session.tenant, SessionID: session.id, Wake: session.wake})
+		placed, err := s.cfg.Placer.Reconcile(ctx, Request{TenantID: session.tenant, SessionID: session.id, Wake: session.wake, GateResponses: session.gates})
 		if errors.Is(err, ErrNoWorkloadController) {
 			// A dedicated session reaching a replica composed with no
 			// workload controller is a composition fact, not a failure of
@@ -266,6 +270,9 @@ func (s *PendingSweeper) collect(ctx context.Context, shard int, cursor sessionw
 			case sessionstore.InboxStatePending:
 				if live {
 					session.wake = append(session.wake, descriptor.CommandID)
+					if descriptor.Kind == command.KindGateResponse {
+						session.gates = append(session.gates, descriptor.CommandID)
+					}
 					session.needsHost = true
 				}
 			case sessionstore.InboxStateClaimed:

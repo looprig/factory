@@ -221,6 +221,12 @@ type Config struct {
 	// time.Now. It is a seam so the reaper's boundary can be measured at an
 	// exact instant rather than waited for.
 	Now func() time.Time
+	// GateResponses decides, from a Host's connect reply, whether that Host
+	// can apply a gate_response command. A nil value takes
+	// GateResponseCapable, which is what every production composition uses;
+	// the field exists so the mechanism's ACCEPTING half can be driven before
+	// any Host advertises the capability.
+	GateResponses func(sessionwire.VersionNegotiationResponse) bool
 }
 
 // Pool holds at most one physical HostLink per (Host, tenant).
@@ -251,6 +257,9 @@ type Pool struct {
 	observer Observer
 	limits   Limits
 	now      func() time.Time
+	// gateResponses is the gate_response capability predicate; see
+	// AcceptsGateResponses.
+	gateResponses func(sessionwire.VersionNegotiationResponse) bool
 
 	// mu guards everything below, INCLUDING across the dial. A dial holds the
 	// lock so that thirty-two subscribers arriving at once for one Host open
@@ -330,13 +339,18 @@ func NewPool(cfg Config) (*Pool, error) {
 	if now == nil {
 		now = time.Now
 	}
+	gateResponses := cfg.GateResponses
+	if gateResponses == nil {
+		gateResponses = GateResponseCapable
+	}
 	return &Pool{
-		dialer:   cfg.Dialer,
-		observer: observer,
-		limits:   limits,
-		now:      now,
-		links:    map[linkKey]*pooledLink{},
-		routes:   map[routeKey]sessionwire.HostID{},
+		dialer:        cfg.Dialer,
+		observer:      observer,
+		limits:        limits,
+		now:           now,
+		gateResponses: gateResponses,
+		links:         map[linkKey]*pooledLink{},
+		routes:        map[routeKey]sessionwire.HostID{},
 	}, nil
 }
 

@@ -54,6 +54,11 @@ type scriptedLinks struct {
 	// anySession admits a delivery for any session; the pending sweep places
 	// several.
 	anySession bool
+	// gateCapable, gateErr and gateAsks script and record the
+	// gate_response capability question.
+	gateCapable bool
+	gateErr     error
+	gateAsks    []sessionwire.HostID
 }
 
 func newScriptedLinks() *scriptedLinks {
@@ -116,6 +121,15 @@ func (l *scriptedLinks) DeliverCommand(_ context.Context, tenant sessionwire.Ten
 	}
 	l.delivered = append(l.delivered, delivery.CommandID)
 	return nil
+}
+
+// AcceptsGateResponses answers the capability question. The zero value
+// refuses, as production does until host v0.4.0 fixes the signal.
+func (l *scriptedLinks) AcceptsGateResponses(_ context.Context, owner sessionwire.HostLinkRegistryObservation) (bool, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.gateAsks = append(l.gateAsks, owner.HostID)
+	return l.gateCapable, l.gateErr
 }
 
 func (l *scriptedLinks) RouteFor(sessionwire.TenantID, sessionwire.SessionID) (sessionwire.HostID, bool) {
