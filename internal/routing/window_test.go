@@ -99,7 +99,18 @@ func TestARepairEndsWithoutARebindWhenTheRelayIsClosedOrTheSessionForgottenInsid
 			done := make(chan error, 1)
 			go func() { done <- f.relay.HostLinkClosed(context.Background(), bindTenant, bindSession) }()
 			waitClosed(t, "the repair to reach its tip read", in)
-			interrupt(f.relay)
+			// Bounded, so a lock held across the tip read (X3b) is an
+			// assertion here rather than a hang: the interrupt must not wait
+			// for the store call.
+			interrupted := make(chan struct{})
+			go func() { interrupt(f.relay); close(interrupted) }()
+			select {
+			case <-interrupted:
+			case <-time.After(2 * time.Second):
+				close(gate)
+				<-interrupted
+				t.Fatalf("a %s interrupt waited behind a repair's tip read: the relay's lock is held across the store call", name)
+			}
 			close(gate)
 			select {
 			case <-done:
