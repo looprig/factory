@@ -50,6 +50,36 @@ func (e *HostDisconnect) Error() string {
 // cares that the connection is unusable does not have to enumerate the codes.
 func (e *HostDisconnect) Unwrap() error { return ErrDialFailed }
 
+// ErrHostFailed is the class of every HostFailure.
+var ErrHostFailed = errors.New("hostlink: the host answered with a failure carrying no Core code")
+
+// HostFailure is a Host's own ANSWER to an RPC that carried no Core record: a
+// transport-level error reply, such as centrifuge's ErrorInternal (code 100).
+//
+// It is kept apart from every other RPC failure because it is not ambiguous.
+// A cancelled context, a lost connection or an unanswered request may have
+// reached a Host that then acted; a HostFailure is the Host having answered,
+// and host v0.2.1 answers a failed attach this way only after undoing its own
+// partial work (hostlink/attach.go errAttachFailed). A caller may therefore
+// treat it as that Host's final word on this request, which is what lets
+// placement try the next candidate instead of stopping. It is still not a
+// *HostRefusal: it names no reason a caller may branch on.
+type HostFailure struct {
+	// Method is the RPC method the Host answered.
+	Method string
+	// Code and Message are the transport error the Host replied with. They are
+	// diagnostics only.
+	Code    uint32
+	Message string
+}
+
+func (e *HostFailure) Error() string {
+	return fmt.Sprintf("hostlink: %s: host answered %d %s", e.Method, e.Code, e.Message)
+}
+
+// Unwrap puts every HostFailure in the ErrHostFailed class.
+func (e *HostFailure) Unwrap() error { return ErrHostFailed }
+
 // ClientName is the connection label this replica presents to a Host.
 //
 // It is a DIAGNOSTIC and carries no authority: the Host authenticates the
@@ -470,6 +500,14 @@ func (l *centrifugeLink) exchange(ctx context.Context, method string, request an
 	defer release()
 	reply, err := l.rpc(rpcCtx, method, body)
 	if err != nil {
+		// centrifuge-go returns *Error ONLY for an error reply the server sent
+		// (client.go:437, errorFromProto); every client-side condition --
+		// timeout, disconnect, a closed client -- is a plain error. So this arm
+		// is exactly "the Host answered", and nothing ambiguous reaches it.
+		var answered *centrifugego.Error
+		if errors.As(err, &answered) {
+			return nil, &HostFailure{Method: method, Code: answered.Code, Message: answered.Message}
+		}
 		return nil, fmt.Errorf("hostlink: %s: %w", method, err)
 	}
 	return reply.Data, nil

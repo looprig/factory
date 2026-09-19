@@ -3,7 +3,10 @@ package factory
 import (
 	"errors"
 	"fmt"
+	"io"
+	"log/slog"
 	"testing"
+	"time"
 
 	sessionwire "github.com/looprig/core/sessionwire/v1"
 	"github.com/looprig/factory/internal/placement"
@@ -24,6 +27,7 @@ func TestEveryAttachFailureIsClassifiedOntoPlacementsVocabulary(t *testing.T) {
 		refused arm = iota
 		unsupported
 		unreachable
+		failed
 		abort
 	)
 	refusal := sessionwire.HostLinkError{Code: sessionwire.HostLinkErrorEpochMismatch, CurrentLeaseEpoch: 93}
@@ -31,12 +35,17 @@ func TestEveryAttachFailureIsClassifiedOntoPlacementsVocabulary(t *testing.T) {
 		err  error
 		want arm
 	}{
-		"host refusal":             {fmt.Errorf("attach: %w", &hostlink.HostRefusal{HostLinkError: refusal}), refused},
-		"not advertised":           {&hostlink.UnsupportedMethodError{Method: sessionwire.HostLinkMethodAttach}, unsupported},
-		"dial failed":              {fmt.Errorf("%w: host-a: refused", hostlink.ErrDialFailed), unreachable},
-		"terminal disconnect":      {&hostlink.HostDisconnect{Host: "host-a", Code: 3500}, unreachable},
-		"between connections":      {fmt.Errorf("hostlink: attach: %w", hostlink.ErrLinkReconnecting), unreachable},
-		"link ceiling":             {fmt.Errorf("%w: 256 links", hostlink.ErrLinkLimit), unreachable},
+		"host refusal":        {fmt.Errorf("attach: %w", &hostlink.HostRefusal{HostLinkError: refusal}), refused},
+		"not advertised":      {&hostlink.UnsupportedMethodError{Method: sessionwire.HostLinkMethodAttach}, unsupported},
+		"dial failed":         {fmt.Errorf("%w: host-a: refused", hostlink.ErrDialFailed), unreachable},
+		"terminal disconnect": {&hostlink.HostDisconnect{Host: "host-a", Code: 3500}, unreachable},
+		"between connections": {fmt.Errorf("hostlink: attach: %w", hostlink.ErrLinkReconnecting), unreachable},
+		"link ceiling":        {fmt.Errorf("%w: 256 links", hostlink.ErrLinkLimit), unreachable},
+		// B5 quality gate Q2: a link made terminal by a wire-version change
+		// refuses BEFORE sending, so the Host is unreachable, not ambiguous.
+		"wire version": {fmt.Errorf("hostlink: hostlink.attach: %w: host selected 2", hostlink.ErrUnsupportedProtocol), unreachable},
+		// B5 quality gate Q1: the Host's own code-less answer.
+		"host failure":             {&hostlink.HostFailure{Method: sessionwire.HostLinkMethodAttach, Code: 100, Message: "internal server error"}, failed},
 		"pool closed":              {hostlink.ErrPoolClosed, abort},
 		"malformed reply":          {fmt.Errorf("%w: empty", hostlink.ErrMalformedAttachReply), abort},
 		"observation of elsewhere": {fmt.Errorf("%w: generation", hostlink.ErrAttachMismatch), abort},
@@ -47,6 +56,10 @@ func TestEveryAttachFailureIsClassifiedOntoPlacementsVocabulary(t *testing.T) {
 		isRefusal := errors.As(got, &asRefusal)
 		isUnsupported := errors.Is(got, placement.ErrAttachUnsupported)
 		isUnreachable := errors.Is(got, placement.ErrHostUnreachable)
+		isFailed := errors.Is(got, placement.ErrAttachFailed)
+		if isFailed != (row.want == failed) {
+			t.Errorf("%s: classifyAttach = %v, ErrAttachFailed = %t", name, got, isFailed)
+		}
 		switch row.want {
 		case refused:
 			if !isRefusal || asRefusal.HostLinkError != refusal {
@@ -60,8 +73,12 @@ func TestEveryAttachFailureIsClassifiedOntoPlacementsVocabulary(t *testing.T) {
 			if !isUnreachable || isUnsupported || isRefusal {
 				t.Errorf("%s: classifyAttach = %v, want ErrHostUnreachable alone", name, got)
 			}
+		case failed:
+			if isUnreachable || isUnsupported || isRefusal {
+				t.Errorf("%s: classifyAttach = %v, want ErrAttachFailed alone", name, got)
+			}
 		case abort:
-			if isRefusal || isUnsupported || isUnreachable || !errors.Is(got, row.err) {
+			if isRefusal || isUnsupported || isUnreachable || isFailed || !errors.Is(got, row.err) {
 				t.Errorf("%s: classifyAttach = %v, want the error itself, unclassified", name, got)
 			}
 		}
@@ -71,5 +88,36 @@ func TestEveryAttachFailureIsClassifiedOntoPlacementsVocabulary(t *testing.T) {
 	}
 	if classifyAttach(nil) != nil {
 		t.Error("classifyAttach(nil) is not nil")
+	}
+}
+
+// TestThePlacementPathIsComposedWithTheReplicasLoggerActorAndHorizon holds three
+// composition facts no in-tree test read (B5 spec gate X4, Q2, S3): the
+// reconciler and the placement sweep write to the composed logger, an attach
+// names the service identity as its actor, and the sweep's horizon is the
+// apply deadline every admitted command is given -- set here to a value
+// distinct from every other limit, so a horizon taken from any other field
+// fails.
+func TestThePlacementPathIsComposedWithTheReplicasLoggerActorAndHorizon(t *testing.T) {
+	t.Parallel()
+
+	logger := slog.New(slog.NewJSONHandler(io.Discard, nil))
+	limits := DefaultReconcileLimits()
+	limits.ApplyDeadline = 7*time.Minute + 13*time.Second
+	options := append(RequiredOptions(),
+		WithReconcileLimits(limits), WithLogger(logger), WithPendingCommands(FakeSeams{}))
+	server, err := New(options...)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	reconciler, sweeper := server.components.placement, server.components.pending
+	if got, want := reconciler.ActorID(), FakeServiceIdentity().Subject(); got != want || got == "" {
+		t.Errorf("the attach actor is %q, want the service identity %q", got, want)
+	}
+	if reconciler.Logger() != logger || sweeper.Logger() != logger {
+		t.Errorf("placement logs to %p/%p, want the composed logger %p", reconciler.Logger(), sweeper.Logger(), logger)
+	}
+	if got := sweeper.Horizon(); got != limits.ApplyDeadline {
+		t.Errorf("the placement horizon is %v, want the apply deadline %v", got, limits.ApplyDeadline)
 	}
 }

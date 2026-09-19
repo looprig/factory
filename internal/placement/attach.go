@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math/rand/v2"
 	"strconv"
 	"time"
 
@@ -47,18 +48,35 @@ var ErrAttachUnsupported = errors.New("placement: host did not advertise hostlin
 // sweep retries under the same idempotency key.
 var ErrHostUnreachable = errors.New("placement: host could not be reached")
 
+// ErrAttachFailed classifies a candidate that ANSWERED the attach with a
+// failure carrying no Core code -- a transport error reply such as
+// centrifuge's ErrorInternal. A HostLinks implementation wraps it.
+//
+// It moves placement on to the next candidate, like a coded refusal and unlike
+// the ambiguous failures that abort. The difference from an abort is that the
+// Host answered: host v0.2.1 sends this only after undoing its own partial
+// work (a launch that failed, a store it could not reach), so there is no
+// attach in flight for a second candidate to race. Aborting on it instead let
+// one Host whose launches always fail -- and which therefore never loses
+// capacity and is ranked first on every pass -- block placement for every
+// session of its agent and runtime (B5 quality gate Q1).
+var ErrAttachFailed = errors.New("placement: host answered the attach with a failure")
+
 // ErrRegistryStale reports that every re-placement this call was allowed ended
 // in epoch_mismatch: the session's lease is held elsewhere and the registry has
 // not caught up. The work is left for the next sweep, which re-reads the
 // registry from the start.
 var ErrRegistryStale = errors.New("placement: the session lease is held elsewhere and the registry did not show the holder")
 
-// ErrBindAfterAttach reports an attach the Host accepted followed by a bind it
-// did not. The session IS resident; what failed is this replica's route to it.
+// ErrBindAfterAttach reports an attach the Host accepted followed by a bind
+// that failed -- refused by the Host, or refused LOCALLY by this replica's pool
+// because it still routes the session to a different Host (a binding
+// conflict). The session IS resident; what failed is this replica's route to
+// it.
 // It is reported rather than retried here because the attach is done and the
 // next thing that needs a route -- a viewer, a delivery, the next sweep -- asks
 // the registry, which now names the owner.
-var ErrBindAfterAttach = errors.New("placement: the host attached the session but refused the bind")
+var ErrBindAfterAttach = errors.New("placement: the host attached the session but the bind that followed failed")
 
 // AttachRefusal is a Host's own coded answer to an attach. A HostLinks
 // implementation returns it for a Host's HostLinkError.
@@ -103,6 +121,16 @@ type CandidateRefusal struct {
 const (
 	defaultReplaceAttempts = 3
 	defaultReplaceBackoff  = 200 * time.Millisecond
+
+	// maxReplaceAttempts bounds a configured ReplaceAttempts. Every attempt
+	// runs inside one reconciliation claim and one sweep pass, so a bound in
+	// the tens would already outlive both; this one refuses a configuration
+	// that could only ever be cut short by them.
+	maxReplaceAttempts = 10
+	// maxReplaceBackoff caps one wait. Doubling from the base would otherwise
+	// overflow time.Duration to a NEGATIVE wait at about 35 attempts with a
+	// one-second base (B5 quality gate Q8); the cap is reached long before.
+	maxReplaceBackoff = 5 * time.Second
 )
 
 // attachConfigError reports why a configuration that composes Links cannot
@@ -115,10 +143,10 @@ func (cfg Config) attachConfigError() error {
 	switch {
 	case cfg.ActorID == "":
 		return fmt.Errorf("%w: ActorID must name the requesting service when Links is set", ErrInvalidConfig)
-	case cfg.ReplaceAttempts < 0:
-		return fmt.Errorf("%w: ReplaceAttempts must not be negative", ErrInvalidConfig)
-	case cfg.ReplaceBackoff < 0:
-		return fmt.Errorf("%w: ReplaceBackoff must not be negative", ErrInvalidConfig)
+	case cfg.ReplaceAttempts < 0 || cfg.ReplaceAttempts > maxReplaceAttempts:
+		return fmt.Errorf("%w: ReplaceAttempts must be between 0 and %d", ErrInvalidConfig, maxReplaceAttempts)
+	case cfg.ReplaceBackoff < 0 || cfg.ReplaceBackoff > maxReplaceBackoff:
+		return fmt.Errorf("%w: ReplaceBackoff must be between 0 and %v", ErrInvalidConfig, maxReplaceBackoff)
 	}
 	return nil
 }
@@ -130,21 +158,39 @@ func (r *Reconciler) replaceAttempts() int {
 	return r.cfg.ReplaceAttempts
 }
 
-// backoff is the wait before re-placement number n (n >= 1): the base,
-// doubled per further attempt.
+// backoff is the NOMINAL wait before re-placement number n (n >= 1): the
+// base, doubled per further attempt, capped at maxReplaceBackoff. It doubles
+// by multiplication against the cap rather than by shifting, so no n can
+// overflow it.
 func (r *Reconciler) backoff(n int) time.Duration {
-	base := r.cfg.ReplaceBackoff
-	if base == 0 {
-		base = defaultReplaceBackoff
+	d := r.cfg.ReplaceBackoff
+	if d == 0 {
+		d = defaultReplaceBackoff
 	}
-	return base << (n - 1)
+	for i := 1; i < n && d < maxReplaceBackoff; i++ {
+		d *= 2
+	}
+	return min(d, maxReplaceBackoff)
+}
+
+// jittered is the wait actually slept for a nominal backoff d: uniformly in
+// [d/2, d]. Two replicas that met the same epoch_mismatch at the same instant
+// -- which the claim makes rare but a lapsed claim allows -- then do not retry
+// in lockstep. The Wait seam receives the NOMINAL duration, so a test states
+// the schedule rather than a random draw.
+func jittered(d time.Duration) time.Duration {
+	half := d / 2
+	if half <= 0 {
+		return d
+	}
+	return half + rand.N(d-half+1) // #nosec G404 -- retry jitter, not a secret
 }
 
 func (r *Reconciler) wait(ctx context.Context, d time.Duration) error {
 	if r.cfg.Wait != nil {
 		return r.cfg.Wait(ctx, d)
 	}
-	timer := time.NewTimer(d)
+	timer := time.NewTimer(jittered(d))
 	defer timer.Stop()
 	select {
 	case <-timer.C:
@@ -185,6 +231,7 @@ func (r *Reconciler) logger() *slog.Logger {
 //     backoff (section 15 step 5: refresh and retry through the same key).
 //   - any other code: this candidate refused; try the next.
 //   - unsupported or unreachable before the request left: exclude, try next.
+//   - the Host answered with a code-less failure (ErrAttachFailed): try next.
 //   - anything else: the Host may have acted, so stop and let the next sweep
 //     retry under the same key rather than put a second attach in flight.
 func (r *Reconciler) placePooled(ctx context.Context, req Request, writes int) (Result, error) {
@@ -260,6 +307,14 @@ func (r *Reconciler) placePooled(ctx context.Context, req Request, writes int) (
 					slog.String("session_id", string(req.SessionID)))
 			case answerUnreachable:
 				result.Unreachable = append(result.Unreachable, candidate.HostID)
+			case answerFailed:
+				result.Failed = append(result.Failed, candidate.HostID)
+				r.logger().WarnContext(ctx, "placement: a pooled candidate failed the attach; trying the next",
+					slog.String("host_id", string(candidate.HostID)),
+					slog.Uint64("host_generation", candidate.HostGeneration),
+					slog.String("tenant_id", string(req.TenantID)),
+					slog.String("session_id", string(req.SessionID)),
+					slog.String("error", err.Error()))
 			default:
 				return result, fmt.Errorf("placement: attach to %q: %w", candidate.HostID, err)
 			}
@@ -285,6 +340,7 @@ const (
 	answerRefused
 	answerUnsupported
 	answerUnreachable
+	answerFailed
 )
 
 // attachAnswer classifies one attach outcome. It is total over the error, and
@@ -312,6 +368,9 @@ func attachAnswer(err error) (answer, sessionwire.HostLinkErrorCode) {
 	}
 	if errors.Is(err, ErrHostUnreachable) {
 		return answerUnreachable, ""
+	}
+	if errors.Is(err, ErrAttachFailed) {
+		return answerFailed, ""
 	}
 	return answerAbort, ""
 }
@@ -486,3 +545,12 @@ func framedKey(domain string, fields ...string) string {
 	}
 	return hex.EncodeToString(digest.Sum(nil))
 }
+
+// ActorID and Logger report what this reconciler was composed with. They exist
+// for the composition's own tests: the actor an attach names and the logger an
+// exclusion is written to are both decided by the root package, and neither is
+// observable from outside a real Host exchange otherwise (B5 spec gate X4, Q2).
+func (r *Reconciler) ActorID() string { return r.cfg.ActorID }
+
+// Logger reports the configured logger, nil when none was composed.
+func (r *Reconciler) Logger() *slog.Logger { return r.cfg.Logger }

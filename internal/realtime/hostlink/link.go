@@ -387,11 +387,18 @@ func (p *Pool) Bind(ctx context.Context, target Target, req sessionwire.HostLink
 // needs the ordering the lock gives Bind: an attach records no route, so there
 // is no route table entry for a concurrent operation to race.
 //
-// What that costs is stated: a link that the reaper collects between the
-// acquisition and the RPC fails the RPC as a transport error, which the caller
-// sees as an attempt that did not complete and retries under the same
-// idempotency key. A freshly dialled link is never reapable, because its idle
-// window starts at the dial.
+// What that costs is stated: an attach records no binding, so the link it runs
+// on can be collected by the reaper at ANY point from the acquisition to the
+// end of the RPC -- before the request is sent, or while the Host is working on
+// it. Either way the RPC fails as a transport error, which the caller sees as
+// an attempt that did not complete and retries under the same idempotency key;
+// a Host that had already attached keeps the residency, and the next pass
+// finds the owner. Only the attach that DIALLED the link is safe from it at the
+// start, because a link's idle window starts at the dial.
+//
+// A link that turns out to be TERMINAL -- another wire version, or a close the
+// transport will not reconnect from -- is evicted here, so the next attach to
+// that Host dials afresh instead of being refused by a dead link forever.
 //
 // An accepted observation is checked against the request before it is
 // returned. The Host is required to answer for the session and incarnation it
@@ -424,12 +431,57 @@ func (p *Pool) Attach(ctx context.Context, target Target, req sessionwire.HostLi
 
 	observation, err := link.Attach(ctx, req)
 	if err != nil {
+		if terminalLinkError(err) {
+			p.evict(target.Host, pooled)
+		}
 		return sessionwire.HostLinkRegistryObservation{}, err
 	}
 	if err := attachAnswers(req, observation); err != nil {
 		return sessionwire.HostLinkRegistryObservation{}, err
 	}
 	return observation, nil
+}
+
+// terminalLinkError reports an error from a link that will never answer again:
+// the Host speaks another wire version (ErrUnsupportedProtocol), or closed the
+// connection with a code the transport will not reconnect from
+// (*HostDisconnect). A link is marked terminal by either, and every later call
+// on it returns the same error BEFORE anything is sent.
+func terminalLinkError(err error) bool {
+	var disconnect *HostDisconnect
+	return errors.Is(err, ErrUnsupportedProtocol) || errors.As(err, &disconnect)
+}
+
+// evict drops a dead link from the pool, with every route that names its Host,
+// and closes it.
+//
+// A terminal link kept in the table would be handed to every later caller for
+// that Host, each of which would be refused before sending anything -- so a
+// Host restarted at another wire version, or one that closed this replica out,
+// would never be dialled again until the idle reaper collected a link that a
+// viewer's route could pin forever. Dropping it lets the next caller dial
+// afresh. The routes go with it because a route naming no link fails closed
+// on its next use (see Unbind), and a route to a dead link is already one that
+// can deliver nothing; the routing plane's repair rebinds a subscriber's.
+//
+// It removes the entry only if it is still the one the caller used: a racing
+// caller may already have evicted it and dialled a replacement, which must not
+// be closed on this caller's evidence.
+func (p *Pool) evict(host sessionwire.HostID, stale *pooledLink) {
+	p.mu.Lock()
+	current, ok := p.links[host]
+	if !ok || current != stale {
+		p.mu.Unlock()
+		return
+	}
+	delete(p.links, host)
+	for key, routed := range p.routes {
+		if routed == host {
+			delete(p.routes, key)
+		}
+	}
+	p.mu.Unlock()
+	_ = stale.link.Close(context.Background())
 }
 
 // attachAnswers reports whether an accepted observation is about what the

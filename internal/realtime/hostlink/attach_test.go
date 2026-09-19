@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -245,6 +246,163 @@ func TestAnAttachFailureWithNoCodeIsNotAHostRefusal(t *testing.T) {
 	}
 	if errors.Is(err, hostlink.ErrMalformedAttachReply) {
 		t.Errorf("a transport failure was reported as a malformed reply: %v", err)
+	}
+	// It IS the Host's answer, and says so: placement moves on from it rather
+	// than aborting (B5 quality gate Q1).
+	var failure *hostlink.HostFailure
+	if !errors.As(err, &failure) || !errors.Is(err, hostlink.ErrHostFailed) || failure.Code != 100 || failure.Method != sessionwire.HostLinkMethodAttach {
+		t.Errorf("a Host's code-less answer = %#v, want *HostFailure code 100 on hostlink.attach", err)
+	}
+}
+
+// TestAnUnansweredAttachIsNotAHostFailure is the control for the row above: an
+// attach the Host never answered -- the caller gave up -- may have reached a
+// Host that acted, and must not be reported as the Host's final word.
+func TestAnUnansweredAttachIsNotAHostFailure(t *testing.T) {
+	t.Parallel()
+
+	release := make(chan struct{})
+	defer close(release)
+	host := newHostServer(t, hostOptions{
+		methods: attachMethods(),
+		rpc: func(string, []byte) ([]byte, error) {
+			<-release
+			return nil, nil
+		},
+	})
+	link := mustDial(t, host)
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	_, err := link.Attach(ctx, attachRequest(hostOne, "s-1"))
+	if err == nil || errors.Is(err, hostlink.ErrHostFailed) {
+		t.Fatalf("an unanswered attach = %v, want a failure that is not ErrHostFailed", err)
+	}
+}
+
+// TestAPooledAttachValidatesBeforeAnyDial holds Pool.Attach's documented
+// "validated before anything is dialled" (quality gate QM5/QM6) for the
+// target and for the request.
+func TestAPooledAttachValidatesBeforeAnyDial(t *testing.T) {
+	t.Parallel()
+
+	for name, call := range map[string]func(*hostlink.Pool) error{
+		"target with no endpoint": func(p *hostlink.Pool) error {
+			_, err := p.Attach(context.Background(), target(hostOne, ""), attachRequest(hostOne, "s-1"))
+			return err
+		},
+		"request with no session": func(p *hostlink.Pool) error {
+			req := attachRequest(hostOne, "s-1")
+			req.SessionID = ""
+			_, err := p.Attach(context.Background(), target(hostOne, endpoint1), req)
+			return err
+		},
+		"request with no host fence": func(p *hostlink.Pool) error {
+			req := attachRequest(hostOne, "s-1")
+			req.HostGeneration = 0
+			_, err := p.Attach(context.Background(), target(hostOne, endpoint1), req)
+			return err
+		},
+	} {
+		dialer := newRecordingDialer()
+		pool := newPool(t, dialer, hostlink.Limits{})
+		if err := call(pool); err == nil {
+			t.Errorf("%s: Attach accepted it", name)
+		}
+		if got := dialer.dials(); got != 0 {
+			t.Errorf("%s: dials = %d, want 0", name, got)
+		}
+	}
+}
+
+// TestATerminalLinkIsEvictedSoTheNextAttachDialsAfresh is quality gate Q2's
+// pool half: a link made terminal -- another wire version, or a close the
+// transport will not reconnect from -- refuses every later call before
+// sending, so the pool must not keep handing it out. A non-terminal failure
+// keeps the link, and a route to the evicted Host goes with it.
+func TestATerminalLinkIsEvictedSoTheNextAttachDialsAfresh(t *testing.T) {
+	t.Parallel()
+
+	for name, test := range map[string]struct {
+		err   error
+		evict bool
+	}{
+		"wire version":        {fmt.Errorf("%w: host selected version 2", hostlink.ErrUnsupportedProtocol), true},
+		"terminal disconnect": {&hostlink.HostDisconnect{Host: hostOne, Code: 3500}, true},
+		"transient failure":   {errors.New("hostlink: hostlink.attach: context deadline exceeded"), false},
+		"host failure":        {&hostlink.HostFailure{Method: sessionwire.HostLinkMethodAttach, Code: 100}, false},
+	} {
+		dialer := newRecordingDialer()
+		dialer.onDial = func(link *fakeLink) {
+			link.attachReply = func(sessionwire.HostLinkAttachRequest) (sessionwire.HostLinkRegistryObservation, error) {
+				return sessionwire.HostLinkRegistryObservation{}, test.err
+			}
+		}
+		pool := newPool(t, dialer, hostlink.Limits{})
+		mustBind(t, pool, target(hostOne, endpoint1), bindRequest(hostOne, "s-viewer"))
+		first := dialer.link(hostOne)
+		if _, err := pool.Attach(context.Background(), target(hostOne, endpoint1), attachRequest(hostOne, "s-1")); !errors.Is(err, test.err) {
+			t.Fatalf("%s: Attach = %v, want the link's error", name, err)
+		}
+		_, routed := pool.RouteFor(tenant, "s-viewer")
+		_, _ = pool.Attach(context.Background(), target(hostOne, endpoint1), attachRequest(hostOne, "s-1"))
+		if test.evict {
+			if dialer.dials() != 2 || first.closes() != 1 || routed {
+				t.Errorf("%s: dials=%d closes=%d viewer routed=%t, want the dead link evicted, closed, its route dropped and a fresh dial", name, dialer.dials(), first.closes(), routed)
+			}
+		} else if dialer.dials() != 1 || first.closes() != 0 || !routed {
+			t.Errorf("%s: dials=%d closes=%d viewer routed=%t, want the live link kept", name, dialer.dials(), first.closes(), routed)
+		}
+	}
+}
+
+// TestALinkReapedDuringAnInFlightAttachFailsOnlyThatAttach is the quality
+// gate's I-1 over the pool: an attach holds no binding, so the reaper may
+// collect its link while the Host is working. The fake used to hold its lock
+// across the reply, which made this interleaving a deadlock rather than a case.
+func TestALinkReapedDuringAnInFlightAttachFailsOnlyThatAttach(t *testing.T) {
+	t.Parallel()
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	dialer := newRecordingDialer()
+	dialer.onDial = func(link *fakeLink) {
+		link.attachReply = func(req sessionwire.HostLinkAttachRequest) (sessionwire.HostLinkRegistryObservation, error) {
+			close(entered)
+			<-release
+			return sessionwire.HostLinkRegistryObservation{}, context.Canceled
+		}
+	}
+	clock := &fakeClock{now: time.Date(2026, 9, 18, 12, 0, 0, 0, time.UTC)}
+	limits := defaultLimits()
+	limits.IdleTimeout = time.Minute
+	pool := newPoolWithClock(t, dialer, limits, clock)
+	done := make(chan error, 1)
+	go func() {
+		_, err := pool.Attach(context.Background(), target(hostOne, endpoint1), attachRequest(hostOne, "s-1"))
+		done <- err
+	}()
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the attach never reached the link")
+	}
+	clock.advance(time.Minute)
+	reaped := make(chan int, 1)
+	go func() { reaped <- pool.ReapIdle() }()
+	select {
+	case n := <-reaped:
+		if n != 1 {
+			t.Fatalf("ReapIdle during the attach = %d, want 1", n)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("ReapIdle deadlocked against an in-flight attach")
+	}
+	close(release)
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("the reaped attach = %v, want its transport failure", err)
+	}
+	if got := dialer.link(hostOne).closes(); got != 1 {
+		t.Fatalf("closes = %d, want the reaped link closed once", got)
 	}
 }
 

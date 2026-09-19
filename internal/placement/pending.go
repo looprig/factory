@@ -340,3 +340,12 @@ type sessionKey struct {
 	tenant  sessionwire.TenantID
 	session sessionwire.SessionID
 }
+
+// Horizon and Logger report what this sweeper was composed with, for the
+// composition's own tests (B5 spec gate S3): the horizon must be the apply
+// deadline admission gives every command, or a command accepted up to now
+// falls outside the due read.
+func (s *PendingSweeper) Horizon() time.Duration { return s.cfg.Horizon }
+
+// Logger reports the configured logger, nil when none was composed.
+func (s *PendingSweeper) Logger() *slog.Logger { return s.cfg.Logger }

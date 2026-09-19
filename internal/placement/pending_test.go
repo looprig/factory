@@ -527,3 +527,159 @@ func TestAShardsPositionIsKeptOnlyWhileItsPassIsTruncated(t *testing.T) {
 		t.Fatalf("after a transient fault and a refusal, requests = %+v; want cursor-4 twice, then a fresh head read", pending.requests)
 	}
 }
+
+// TestACommandAtExactlyItsDeadlineIsNoLongerLive pins the deadline instant
+// (spec gate S4): the apply deadline is half-open, so a pending command whose
+// deadline is exactly now is neither woken nor a reason to place.
+func TestACommandAtExactlyItsDeadlineIsNoLongerLive(t *testing.T) {
+	t.Parallel()
+
+	clock := &movableClock{now: reconcileNow}
+	pending := &fakePending{shards: 1, pages: []sessionstore.DispositionDueCommandPage{{
+		Commands: []sessionstore.DispositionInboxEntry{
+			open("s-edge", "c-edge", sessionstore.InboxStatePending, clock.now),
+			open("s-live", "c-live", sessionstore.InboxStatePending, clock.now.Add(time.Nanosecond)),
+		},
+	}}}
+	placer := &recordingPlacer{}
+	if _, err := newFakeSweeper(t, pending, placer, clock, &allowSweeps{}).Sweep(context.Background(), servicePrincipal(t)); err != nil {
+		t.Fatalf("Sweep: %v", err)
+	}
+	if len(placer.requests) != 1 || placer.requests[0].SessionID != "s-live" {
+		t.Fatalf("reconciled %+v, want only the command one nanosecond inside its deadline", placer.requests)
+	}
+}
+
+// scriptedPlacer answers each session with a chosen Result, and can cancel the
+// pass from inside a reconcile.
+type scriptedPlacer struct {
+	mu       sync.Mutex
+	results  map[sessionwire.SessionID]Result
+	onCall   func(sessionwire.SessionID) error
+	requests []sessionwire.SessionID
+}
+
+func (p *scriptedPlacer) Reconcile(_ context.Context, req Request) (Result, error) {
+	p.mu.Lock()
+	p.requests = append(p.requests, req.SessionID)
+	p.mu.Unlock()
+	if p.onCall != nil {
+		if err := p.onCall(req.SessionID); err != nil {
+			return Result{}, err
+		}
+	}
+	return p.results[req.SessionID], nil
+}
+
+// TestAttachedCountsOnlyAttachesAndNotOwnerWakes holds PendingSweepResult's
+// Attached to its meaning (quality gate QM11): a session woken on its existing
+// owner is bound, and is not an attach.
+func TestAttachedCountsOnlyAttachesAndNotOwnerWakes(t *testing.T) {
+	t.Parallel()
+
+	clock := &movableClock{now: reconcileNow}
+	live := clock.now.Add(time.Minute)
+	pending := &fakePending{shards: 1, pages: []sessionstore.DispositionDueCommandPage{{
+		Commands: []sessionstore.DispositionInboxEntry{
+			open("s-attached", "c-1", sessionstore.InboxStatePending, live),
+			open("s-woken", "c-2", sessionstore.InboxStatePending, live),
+		},
+	}}}
+	placer := &scriptedPlacer{results: map[sessionwire.SessionID]Result{
+		"s-attached": {Decision: Decision{Outcome: OutcomeAttachPooled}, Bound: true, Attached: sessionwire.HostLinkRegistryObservation{HostID: "host-a", LeaseEpoch: 1}},
+		"s-woken":    {Decision: Decision{Outcome: OutcomeReuseOwner}, Bound: true},
+	}}
+	sweeper := newFakeSweeper(t, pending, placer, clock, &allowSweeps{})
+	result, err := sweeper.Sweep(context.Background(), servicePrincipal(t))
+	if err != nil {
+		t.Fatalf("Sweep: %v", err)
+	}
+	if result.Sessions != 2 || result.Attached != 1 || result.Outcomes[OutcomeReuseOwner] != 1 || result.Outcomes[OutcomeAttachPooled] != 1 {
+		t.Fatalf("result = %+v, want 2 sessions, 1 attached, 1 owner reused", result)
+	}
+}
+
+// TestACancelledPassStopsReconciling is the sweep's early return (quality gate
+// QM10): once the pass context ends, a failing reconcile ends the pass rather
+// than going on to every remaining session.
+func TestACancelledPassStopsReconciling(t *testing.T) {
+	t.Parallel()
+
+	clock := &movableClock{now: reconcileNow}
+	live := clock.now.Add(time.Minute)
+	pending := &fakePending{shards: 1, pages: []sessionstore.DispositionDueCommandPage{{
+		Commands: []sessionstore.DispositionInboxEntry{
+			open("s-1", "c-1", sessionstore.InboxStatePending, live),
+			open("s-2", "c-2", sessionstore.InboxStatePending, live),
+			open("s-3", "c-3", sessionstore.InboxStatePending, live),
+		},
+	}}}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	placer := &scriptedPlacer{onCall: func(sessionwire.SessionID) error {
+		cancel()
+		return context.Canceled
+	}}
+	sweeper := newFakeSweeper(t, pending, placer, clock, &allowSweeps{})
+	result, err := sweeper.Sweep(ctx, servicePrincipal(t))
+	if !errors.Is(err, context.Canceled) || len(placer.requests) != 1 || result.Failures != 1 {
+		t.Fatalf("Sweep = (%+v, %v) after %v, want it to stop at the first cancelled session", result, err, placer.requests)
+	}
+}
+
+// shrinkingPending reports a shard count a test can change between passes.
+type shrinkingPending struct {
+	*fakePending
+	count int
+}
+
+func (p *shrinkingPending) ControlShards() int { return p.count }
+
+// TestAShrunkShardCountRestartsTheRotorAndDropsStalePositions is the rotor
+// reset (quality gate QM14): a replica whose rotor is past the new count
+// sweeps shard 0 next, and a position kept for a shard that no longer exists
+// is never presented.
+func TestAShrunkShardCountRestartsTheRotorAndDropsStalePositions(t *testing.T) {
+	t.Parallel()
+
+	clock := &movableClock{now: reconcileNow}
+	pending := &shrinkingPending{fakePending: &fakePending{shards: 3, pages: []sessionstore.DispositionDueCommandPage{
+		{},                                         // pass 1: shard 0
+		{NextCursor: "c1-a"}, {NextCursor: "c1-b"}, // pass 2: shard 1, truncated at c1-b
+		{NextCursor: "c2-a"}, {NextCursor: "c2-b"}, // pass 3: shard 2, truncated at c2-b
+		{}, // pass 4: shard 0
+		{}, // pass 5: shard 1 resumes from c1-b and ends; the rotor now points at 2
+	}}, count: 3}
+	sweeper := newFakeSweeper(t, pending, &recordingPlacer{}, clock, &allowSweeps{})
+	sweep := func() PendingSweepResult {
+		t.Helper()
+		result, err := sweeper.Sweep(context.Background(), servicePrincipal(t))
+		if err != nil {
+			t.Fatalf("Sweep: %v", err)
+		}
+		return result
+	}
+	for range 5 {
+		sweep()
+	}
+	pending.count = 2
+	pending.requests = nil
+	shards := []int{sweep().Shard, sweep().Shard}
+	if !slices.Equal(shards, []int{0, 1}) {
+		t.Fatalf("after shrinking to 2 shards the sweeps visited %v, want [0 1]", shards)
+	}
+	// Grow back: shard 2 exists again, and its old position must not be
+	// presented to the view that has since been rebuilt.
+	pending.count = 3
+	sweep()
+	sweep()
+	pending.requests = nil
+	if r := sweep(); r.Shard != 2 || r.Resumed {
+		t.Fatalf("the regrown shard 2 pass = %+v, want a fresh pass", r)
+	}
+	for _, req := range pending.requests {
+		if req.Cursor != "" {
+			t.Fatalf("a position kept for a shard that had ceased to exist was presented: %+v", req)
+		}
+	}
+}

@@ -1151,12 +1151,18 @@ func (l *fakeLink) Unbind(_ context.Context, req sessionwire.HostLinkUnbindReque
 	return nil
 }
 
+// Attach releases the fake's mutex BEFORE the reply hook runs, as the real
+// link holds nothing across its RPC: a hook that blocks -- the in-flight
+// attach a reap or a close must be able to interleave with -- would otherwise
+// hold the mutex Close takes, and deadlock under the pool's lock (B5 quality
+// gate Q6).
 func (l *fakeLink) Attach(_ context.Context, req sessionwire.HostLinkAttachRequest) (sessionwire.HostLinkRegistryObservation, error) {
 	l.mu.Lock()
-	defer l.mu.Unlock()
 	l.attachRecs = append(l.attachRecs, req)
-	if l.attachReply != nil {
-		return l.attachReply(req)
+	reply := l.attachReply
+	l.mu.Unlock()
+	if reply != nil {
+		return reply(req)
 	}
 	return observationFor(req, 7), nil
 }

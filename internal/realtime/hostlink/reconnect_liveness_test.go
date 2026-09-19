@@ -663,3 +663,38 @@ func (g *doneGate) Done() <-chan struct{} {
 func (g *doneGate) Release() {
 	g.releaseOnce.Do(func() { close(g.release) })
 }
+
+// TestAnAttachInTheConnectingWindowIsRefusedAsReconnectingNotUnsupported is
+// the bind case's rule for attach (B5 spec gate G3). Between a dropped
+// connection and the next reply there is no capability set, so an attach is
+// refused with the transient ErrLinkReconnecting -- which placement treats as
+// unreachable -- and never as a Host that "does not advertise attach", which
+// placement would log and exclude as a capability fact.
+func TestAnAttachInTheConnectingWindowIsRefusedAsReconnectingNotUnsupported(t *testing.T) {
+	t.Parallel()
+
+	host := newLivenessHost(t)
+	link := dialLiveness(t, host, 300*time.Millisecond)
+	serverClient := <-host.connected
+
+	host.setNegotiation(`{"version":1}`)
+	serverClient.Disconnect(centrifuge.Disconnect{Code: 4000, Reason: "test capability change"})
+	waitForState(t, link.client, centrifugego.StateConnecting)
+	time.Sleep(20 * time.Millisecond)
+	if got := link.client.State(); got != centrifugego.StateConnecting {
+		t.Fatalf("left the Connecting window early: %s", got)
+	}
+
+	_, err := link.Attach(context.Background(), sessionwire.HostLinkAttachRequest{
+		Version: sessionwire.CurrentWireVersion, TenantID: "tenant-a", SessionID: "s-1",
+		HostID: host.target.Host, HostGeneration: 7, AgentID: "agent-1", RuntimeCompatibilityID: "runtime-1",
+		Mode: sessionwire.HostLinkAttachModeCreate, ActorID: "factory-service", IdempotencyKey: "attach-s-1",
+	})
+	if !errors.Is(err, ErrLinkReconnecting) {
+		t.Fatalf("Attach in the Connecting window = %v, want ErrLinkReconnecting", err)
+	}
+	var unsupported *UnsupportedMethodError
+	if errors.As(err, &unsupported) || errors.Is(err, ErrUnsupportedMethod) {
+		t.Fatalf("Attach in the Connecting window reported a transient as a capability fact: %v", err)
+	}
+}

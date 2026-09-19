@@ -44,7 +44,13 @@ type scriptedLinks struct {
 	bindErr   error
 	unbinds   []sessionwire.HostLinkUnbindRequest
 	delivered []sessionwire.CommandID
-	routed    bool
+	// route is this replica's current route for the session, as the real
+	// pool keeps it: a bind sets it, an unbind clears it, and a bind to a
+	// DIFFERENT Host than the current route is refused as a conflict, which
+	// is what hostlink.Pool answers (ErrBindingConflict). RouteFor reads it,
+	// so a placement that asked for the route AFTER its own bind sees its own
+	// route, as it would in production (B5 quality gate QM24).
+	route sessionwire.HostID
 	// anySession admits a delivery for any session; the pending sweep places
 	// several.
 	anySession bool
@@ -82,13 +88,23 @@ func (l *scriptedLinks) Bind(_ context.Context, endpoint sessionwire.InternalEnd
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	l.binds = append(l.binds, boundRoute{endpoint: endpoint, req: req})
-	return l.bindErr
+	if l.bindErr != nil {
+		return l.bindErr
+	}
+	if l.route != "" && l.route != req.HostID {
+		return fmt.Errorf("scripted pool: session is bound to %q, bind names %q: binding conflict", l.route, req.HostID)
+	}
+	l.route = req.HostID
+	return nil
 }
 
 func (l *scriptedLinks) Unbind(_ context.Context, req sessionwire.HostLinkUnbindRequest) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	l.unbinds = append(l.unbinds, req)
+	if l.route == req.HostID {
+		l.route = ""
+	}
 	return nil
 }
 
@@ -105,10 +121,7 @@ func (l *scriptedLinks) DeliverCommand(_ context.Context, tenant sessionwire.Ten
 func (l *scriptedLinks) RouteFor(sessionwire.TenantID, sessionwire.SessionID) (sessionwire.HostID, bool) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	if l.routed {
-		return "host-viewer", true
-	}
-	return "", false
+	return l.route, l.route != ""
 }
 
 func (l *scriptedLinks) attachedHosts() []sessionwire.HostID {
@@ -503,13 +516,40 @@ func TestATenantExclusivePooledCandidateIsNeverAskedToAttach(t *testing.T) {
 func TestARouteThisCallDidNotCreateIsLeftInPlace(t *testing.T) {
 	t.Parallel()
 
+	// A viewer's route to the SAME Host the attach lands on: the only
+	// pre-existing route the real pool lets a placement bind over. (It used
+	// to be a route to another Host, which the real pool refuses; that case
+	// is TestAStaleRouteToAnotherHostIsReportedAsABindAfterAttach.)
 	f := newAttachFixture(t, nil)
 	f.publishTarget(t, "host-a", 9, sessionwire.HostIsolationClassCrossTenantIsolated)
-	f.links.routed = true
+	f.links.route = "host-a"
 
 	result := f.mustPlace(t, "cmd-1")
 	if !result.Bound || len(f.links.unbinds) != 0 {
 		t.Fatalf("Bound=%t unbinds=%+v, want the existing route left alone", result.Bound, f.links.unbinds)
+	}
+	if host, routed := f.links.RouteFor(testTenant, testSession); !routed || host != "host-a" {
+		t.Fatalf("the viewer's route is %q/%t after placement, want it kept", host, routed)
+	}
+}
+
+// TestAStaleRouteToAnotherHostIsReportedAsABindAfterAttach is the reachable
+// conflict: a route this replica still holds to a DIFFERENT Host when the
+// attach lands elsewhere. The pool refuses the bind locally, placement reports
+// the attachment, and the stale route is not touched.
+func TestAStaleRouteToAnotherHostIsReportedAsABindAfterAttach(t *testing.T) {
+	t.Parallel()
+
+	f := newAttachFixture(t, nil)
+	f.publishTarget(t, "host-a", 9, sessionwire.HostIsolationClassCrossTenantIsolated)
+	f.links.route = "host-viewer"
+
+	result, err := f.place(t, "cmd-1")
+	if !errors.Is(err, ErrBindAfterAttach) || result.Attached.HostID != "host-a" || result.Bound {
+		t.Fatalf("Reconcile = (%+v, %v), want ErrBindAfterAttach with the attachment reported", result, err)
+	}
+	if len(f.links.unbinds) != 0 || f.links.route != "host-viewer" {
+		t.Fatalf("unbinds=%+v route=%q, want the other route untouched", f.links.unbinds, f.links.route)
 	}
 }
 

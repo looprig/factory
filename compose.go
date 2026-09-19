@@ -318,10 +318,16 @@ func (b poolBinder) DeliverCommand(ctx context.Context, tenant sessionwire.Tenan
 //     fleet exclude a Host that predates attach rather than read its
 //     runtime_unavailable as a refusal.
 //   - A failure BEFORE the request left this process -- a dial that failed, a
-//     link between connections, a pool at its link ceiling -- becomes
-//     ErrHostUnreachable, the one transport failure placement moves past.
-//   - Everything else is returned as itself, and placement ABORTS on it: the
-//     request may have reached the Host, and the Host may have acted.
+//     link between connections, a pool at its link ceiling, a link made
+//     terminal by a wire-version change (ErrUnsupportedProtocol, which the
+//     pool also evicts) -- becomes ErrHostUnreachable.
+//   - The Host's own code-less ANSWER (hostlink.ErrHostFailed, a transport
+//     error reply such as centrifuge's ErrorInternal) becomes
+//     ErrAttachFailed: the Host answered, and host v0.2.1 undoes its partial
+//     work before answering so, so placement asks the next candidate.
+//   - Everything else is returned as itself, and placement ABORTS on it: a
+//     cancelled or timed-out request, or a lost connection, may have reached
+//     the Host, and the Host may have acted.
 type placementLinks struct{ pool *hostlink.Pool }
 
 func (l placementLinks) Attach(ctx context.Context, endpoint sessionwire.InternalEndpoint, req sessionwire.HostLinkAttachRequest) (sessionwire.HostLinkRegistryObservation, error) {
@@ -358,8 +364,12 @@ func classifyAttach(err error) error {
 	if errors.Is(err, hostlink.ErrUnsupportedMethod) {
 		return fmt.Errorf("%w: %w", placement.ErrAttachUnsupported, err)
 	}
-	if errors.Is(err, hostlink.ErrDialFailed) || errors.Is(err, hostlink.ErrLinkReconnecting) || errors.Is(err, hostlink.ErrLinkLimit) {
+	if errors.Is(err, hostlink.ErrDialFailed) || errors.Is(err, hostlink.ErrLinkReconnecting) ||
+		errors.Is(err, hostlink.ErrLinkLimit) || errors.Is(err, hostlink.ErrUnsupportedProtocol) {
 		return fmt.Errorf("%w: %w", placement.ErrHostUnreachable, err)
+	}
+	if errors.Is(err, hostlink.ErrHostFailed) {
+		return fmt.Errorf("%w: %w", placement.ErrAttachFailed, err)
 	}
 	return err
 }
