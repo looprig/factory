@@ -1144,6 +1144,11 @@ var pinnedHostLinkTypes = []string{
 	"HostLinkDrainObservation",
 	"HostLinkDrainRequest",
 	"HostLinkDrainState",
+	// core v0.10.0: the per-tenant address derivation's typed refusal. It is
+	// not a record, but it is what a pooled attach's dial now depends on: the
+	// pool derives every address with HostLinkEndpoint(base, tenant).
+	"HostLinkEndpointCode",
+	"HostLinkEndpointError",
 	"HostLinkError",
 	"HostLinkErrorCode",
 	"HostLinkRegistryObservation",
@@ -1156,7 +1161,7 @@ var pinnedHostLinkTypes = []string{
 // "the sessionwire on disk" and "the sessionwire this build resolves" are not
 // the same directory, and a premise checked against the wrong one is the stale
 // citation this test exists to prevent.
-const pinnedCoreVersion = "v0.9.1"
+const pinnedCoreVersion = "v0.10.0"
 
 const pinnedCoreModule = "github.com/looprig/core"
 
