@@ -2,6 +2,8 @@ package factory
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -136,10 +138,16 @@ func composeComponents(cfg config, credentials *internalidentity.Authenticator) 
 		Settlement: cfg.commands,
 		Claims:     cfg.commands,
 		Clock:      cfg.clock,
-		HolderID:   cfg.replicaID,
-		ClaimTTL:   cfg.reconcile.ClaimTTL,
-		PageLimit:  cfg.reconcile.MaxDuePerSweep,
-		MaxPages:   cfg.reconcile.MaxConcurrent,
+		// Its OWN holder, not the replica's. The store treats an acquire by
+		// the claim's current holder as an EXTENSION, so under the shared
+		// replica id this sweep would "acquire" the claim placement holds
+		// mid-attach, reject, and then RELEASE it -- letting another replica
+		// attach the same session concurrently (B5 quality gate N1). Under
+		// its own holder it meets placement's live claim as held and defers.
+		HolderID:  dispositionHolder(cfg.replicaID),
+		ClaimTTL:  cfg.reconcile.ClaimTTL,
+		PageLimit: cfg.reconcile.MaxDuePerSweep,
+		MaxPages:  cfg.reconcile.MaxConcurrent,
 	})
 	if err != nil {
 		return nil, &OptionError{Option: "WithReconcileLimits", Err: err}
@@ -323,8 +331,15 @@ func (b poolBinder) DeliverCommand(ctx context.Context, tenant sessionwire.Tenan
 //     pool also evicts) -- becomes ErrHostUnreachable.
 //   - The Host's own code-less ANSWER (hostlink.ErrHostFailed, a transport
 //     error reply such as centrifuge's ErrorInternal) becomes
-//     ErrAttachFailed: the Host answered, and host v0.2.1 undoes its partial
-//     work before answering so, so placement asks the next candidate.
+//     ErrAttachFailed, and placement asks the next candidate. That is NOT
+//     because the Host rolled back: host v0.2.1 also answers this way when
+//     its rollback was incomplete, and when the session IS resident but the
+//     observation could not be published. It is safe because the session
+//     LEASE guards residency: a Host still holding it makes the next
+//     candidate refuse epoch_mismatch, so no second residency can form, and
+//     placement converges on the owner. host v0.2.1's own comment asks a
+//     Factory to treat this as no placement outcome but a retry; moving on
+//     IS that retry, against the next candidate.
 //   - Everything else is returned as itself, and placement ABORTS on it: a
 //     cancelled or timed-out request, or a lost connection, may have reached
 //     the Host, and the Host may have acted.
@@ -540,4 +555,22 @@ func (c *components) stopRealtime(ctx context.Context) error {
 		return nil
 	}
 	return handler.Shutdown(ctx)
+}
+
+// dispositionHolder is the reconciliation-claim holder the disposition deadline
+// sweep claims under: the replica's id, scoped to the sweep, so the sweep and
+// this replica's placement never mistake each other's claim for their own.
+//
+// A holder is a bounded opaque id in the store (at most sessionwire.MaxIDBytes),
+// and WithReplicaID bounds nothing, so a replica id too long to carry the
+// suffix is replaced by its SHA-256 before the suffix is added: still stable
+// for the process, still distinct from the replica's own id, and never refused
+// by the store on every pass.
+func dispositionHolder(replicaID string) string {
+	const suffix = "/dispositions"
+	if len(replicaID)+len(suffix) <= sessionwire.MaxIDBytes {
+		return replicaID + suffix
+	}
+	sum := sha256.Sum256([]byte(replicaID))
+	return hex.EncodeToString(sum[:]) + suffix
 }
