@@ -228,10 +228,13 @@ type Result struct {
 
 	// Excluded names the admissible candidates skipped because they do not
 	// advertise hostlink.attach; Unreachable those this replica could not ask;
-	// Refused those that answered with a HostLinkError, in the order asked.
+	// Refused those that answered with a HostLinkError; Failed those that
+	// answered with a failure carrying no code (ErrAttachFailed). Each is in
+	// the order asked.
 	Excluded    []sessionwire.HostID
 	Unreachable []sessionwire.HostID
 	Refused     []CandidateRefusal
+	Failed      []sessionwire.HostID
 
 	// Replacements counts the times placement re-ran after an epoch_mismatch.
 	Replacements int
@@ -292,6 +295,21 @@ func (r *Reconciler) Reconcile(ctx context.Context, req Request) (Result, error)
 			TenantID: req.TenantID, SessionID: req.SessionID, HolderID: r.cfg.HolderID,
 		})
 	}()
+
+	// THE RECORD IS RE-READ UNDER THE CLAIM before anything is decided from
+	// it. The read above was taken before this replica held anything, and a
+	// racer may have written a new desired generation and released its claim
+	// in between; the dedicated arm below hands the record's intent to
+	// EnsureWorkload, and an intent from the pre-claim read is an OBSOLETE
+	// generation a controller may create over the current one (B5 spec gate
+	// F2). The pre-claim read is used for the owned fast path only, which
+	// takes no claim; placePooled re-reads again for its own reason.
+	entry, err = r.cfg.Catalog.GetCatalogEntry(ctx, sessionstore.GetCatalogEntryRequest{
+		TenantID: req.TenantID, SessionID: req.SessionID,
+	})
+	if err != nil {
+		return Result{}, err
+	}
 
 	writes := 0
 	if req.Desired != nil {
