@@ -345,11 +345,27 @@ a channel and answers `runtime_unavailable`, indistinguishable from a genuine
 refusal. `epoch_mismatch` means the registry was stale: placement re-reads it
 and retries, bounded with backoff, and never binds with the refusal's
 `current_lease_epoch` (the other holder's). Every other coded refusal moves on
-to the next candidate; a failure after the request may have reached the Host
-aborts the attempt so no second attach is put in flight. A `tenant_exclusive`
+to the next candidate, and so does a Host's own code-less failure reply (a
+transport error answer such as centrifuge's `ErrorInternal`, which host v0.2.1
+sends only after undoing its partial work) -- so one Host whose launches
+always fail cannot block placement on the healthy ones. A candidate that
+cannot be asked at all -- a failed dial, a link between connections, a pool at
+its link ceiling, or a link made terminal by a wire-version change, which the
+pool also evicts -- is skipped. Only an AMBIGUOUS failure aborts the attempt: a
+cancelled or timed-out request, a lost connection, a malformed or mismatched
+reply, or a closed pool, where the request may have reached the Host and a
+second attach would be put in flight for nothing; the next sweep retries under
+the same idempotency key. Re-placement waits are capped at 5s each and
+jittered, and `ReplaceAttempts` is capped at 10. A `tenant_exclusive`
 pooled advertisement is still never selected, because Factory cannot see which
 tenants a Host serves and refusing is the only enforcement of specification
 section 12 available to it.
+
+**A replica that places nothing says so at Start.** Without
+`WithPendingCommands` no session is ever attached to a Host, so `Start` logs a
+WARN naming that -- an ERROR when `WithPublicCreates` is also composed, because
+that replica admits creates it will never place. Requiring the option there,
+or deriving it from the create plane, is booked for a later minor.
 
 **Every command is a disposition command (Gap 2).** Input, interrupt,
 restore and gate response are admitted into the same DISPOSITION inbox a create

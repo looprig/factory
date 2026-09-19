@@ -1615,12 +1615,45 @@ candidate, which is what every pre-B5 test drives.
   from the owner read (bounded by `ReplaceAttempts`, `ErrRegistryStale` after);
   any other code, `runtime_unavailable` included → this candidate refused, try
   the next; `ErrAttachUnsupported` → exclude and **log by Host id**;
-  `ErrHostUnreachable` → skip; anything else → **abort**, because the request
-  may have reached the Host. `current_lease_epoch` is never read.
+  `ErrHostUnreachable` → skip; `ErrAttachFailed` → this candidate failed, log
+  it and try the next; anything else → **abort**, because the request may have
+  reached the Host. `current_lease_epoch` is never read.
 - **Classification lives in the composition's adapter** (`classifyAttach` in
   `compose.go`), because this package names no transport type for routing's
-  reason. Only failures before the request left the process become
-  `ErrHostUnreachable`.
+  reason. Failures before the request left the process -- including
+  `hostlink.ErrUnsupportedProtocol`, a link made terminal by a wire-version
+  change -- become `ErrHostUnreachable`. A Host's own code-less ANSWER, which
+  `hostlink` now surfaces as `*HostFailure` (centrifuge-go returns `*Error`
+  only for a reply the server sent), becomes `ErrAttachFailed`: host v0.2.1
+  sends it only after undoing its partial work, so moving on puts no second
+  attach in flight. Aborting on it let one Host whose launches always fail --
+  never losing capacity, so ranked first every pass -- block placement for its
+  whole agent and runtime (B5 quality gate Q1). No per-candidate backoff is
+  kept: the reconciler holds no state across passes, a failed attach is one
+  fast RPC, and a Host that cannot launch is the Host's to stop advertising.
+- **The pool evicts a terminal link.** `Pool.Attach` drops a link whose error
+  is `ErrUnsupportedProtocol` or a terminal `*HostDisconnect`, with every route
+  naming its Host, and closes it, so the next caller dials afresh instead of
+  being refused by a dead link until the reaper -- which a viewer route could
+  pin forever -- collected it (B5 quality gate Q2).
+- **The record is re-read under the claim in `Reconcile` too.** The dedicated
+  arm handed `EnsureWorkload` the intent from the PRE-claim read, so a racer's
+  newer desired generation could be answered with an obsolete workload (B5
+  spec gate F2); `TestTheDedicatedArmDecidesFromTheRecordReadUnderTheClaim` is
+  the gate's probe. `placePooled` still re-reads for its own window
+  (`TestAPlacementChangedDuringThePooledArmIsUndecided`).
+- **Backoff:** defaults 3 attempts from 200ms, doubling, each wait capped at 5s
+  (the old shift overflowed negative near 35 attempts), `ReplaceAttempts` at
+  most 10, and the default wait sleeps uniformly in `[d/2, d]`. The `Wait`
+  seam receives the nominal duration.
+- **Placement runs over the real pool in a test.** The scripted links'
+  `RouteFor` now follows binds and unbinds and refuses a cross-Host rebind as
+  the pool does; `TestPlacementOverTheRealPoolGivesBackItsTransientRoute`
+  drives `hostlink.Pool` itself, because a flag-answered `RouteFor` let a
+  route-leaking reorder survive the whole package (quality gate QM24).
+- **A replica that places nothing says so.** `Start` logs a WARN when
+  `WithPendingCommands` is absent, ERROR when `WithPublicCreates` is composed
+  too (B5 spec gate F1); requiring or deriving the option is a later minor.
 - **The owner and the record are re-read under the claim.** The pre-claim read
   is what lets an owned session skip the claim; acting on it after the claim
   would widen the window between the read and the claim into the whole
