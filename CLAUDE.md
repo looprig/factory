@@ -1003,20 +1003,23 @@ public-create plane: every command is admitted into the disposition family
 `runtime_unavailable`.
 
 **`A3.3-retryable` is settled, and the answer is 422.** `runtime_unavailable`
-does **not** map to 503. The set was **enumerated at the pin**: six `refusal()`
-sites in `internal/admission/service.go` carrying **four distinct conditions** —
-a create's `AgentID` naming no configured target (`:184`, `:358`), the create
-reservation this composition cannot author (`:186`), an **existing** session's
-pinned target no longer being configured (`:272`), and — since Gap 2 replaced
-the oversized-payload refusal, which the disposition family stores by reference
-instead — a session bound to the **legacy** protocol
-(`ErrLegacySessionUnsupported`, classified in `commandRefusal`). **Every one is permanent** until the
+does **not** map to 503. The set was **enumerated at the pin**, and re-enumerated
+at v0.3.0: five `runtime_unavailable` `refusal()` sites in
+`internal/admission/service.go` carrying **five distinct conditions** — a
+create's `AgentID` naming no configured target (`:202`), the create binding
+this composition was not configured with (`:205`), an **existing** session's
+pinned target no longer being configured (`:306`), a session bound to the
+**legacy** protocol (`:384`, `ErrLegacySessionUnsupported` in `commandRefusal`
+— since Gap 2, which replaced the oversized-payload refusal because the
+disposition family stores a large payload by reference), and the refused legacy
+create (`:418`, `ErrLegacyCreateUnsupported`). **Every one is permanent** until the
 deployment's configuration or the request itself changes, and that — not any
 inability to tell a transient member apart — is the argument: `retryable:true`
-promises that repeating the identical bytes could succeed, and none of the four
+promises that repeating the identical bytes could succeed, and none of the five
 can. A failed target-directory read is **not** in the set; it is returned as a
-plain wrapped fault carrying no public code (`service.go:115`, `:269`), a fold
-an earlier task already removed (`service.go:91-114`). `reconciler.go:446`
+plain wrapped fault carrying no public code (`resolveTargetFault` at
+`service.go:95`, called at `:199`, and the `IsKnown` fault at `:303`), a fold
+an earlier task already removed. `reconciler.go:522` (`expiredCommandRejection`)
 mints the same code into a durable `Record.Rejection`, which reaches a client
 through `StatusFor` inside a **2xx** body, never through this table. 503 would
 also make the identical refusal `retryable:true` over REST and `false` on the
@@ -1560,13 +1563,30 @@ session could be created on a Host and never spoken to again.
   a fault. **No mixed-family admission remains**: `CommandStore` has no legacy
   method, and `clientlink`'s seam-shape rule refuses a method returning a
   legacy `InboxEntry`.
+- **Gate responses to Host-resident sessions answer `409 gate_resolved` until
+  sessionstore ≥ v0.12.0 and host ≥ v0.4.0** (B5 v0.3.0 spec gate M1). The
+  reason is the store, not this module: sessionstore v0.10.0 (the pin) and
+  v0.11.0 refuse `OpenGate` -- every Host-owned catalog write -- on a
+  disposition-bound session (`hostEpochFence`, `catalog invalid
+  (binding.protocol_mode)`), so no disposition session can carry a gate
+  projection, A3.1 step 4's projection check refuses first, and its
+  fresh-owner check (`gate_not_resumable`) is unreachable in production.
+  Until those releases, **a Host-resident agent that opens a gate stalls until
+  its gate deadline.** The admission path is already disposition, so nothing
+  here changes when they ship.
 - **The deadline sweep.** A Host never rejects on its own clock — it declares no
   seam for `RejectDispositionCommand` and leaves the deadline to Factory — so
   `admission.DispositionReconciler` (`dispositions.go`, the "dispositions"
   sweep, composed unconditionally) pages one control shard per pass bounded at
   **now**, and rejects with a zero residency only a command that is `pending`,
   or `claimed` under a lapsed claim, past its deadline and carrying **no
-  attempt**. An `applying` command is never asked about: there is no
+  attempt**. It claims under its OWN holder, `<replica id>/dispositions`
+  (`dispositionHolder`): under the shared replica id the store treated its
+  acquire as an EXTENSION of placement's live claim and its release freed
+  that claim mid-attach for another replica (B5 v0.3.0 quality gate N1;
+  `TestTheDispositionSweepDefersToThisReplicasPlacementClaim`). Its rotor and
+  kept positions are the `rotor` type the legacy sweep uses, one copy.
+  An `applying` command is never asked about: there is no
   caller-authored rejection once an attempt exists. The legacy `Reconciler` still
   runs, for legacy rows a store may already hold.
 - **Neither sweep starves (the B5 spec gate's F3).** The due view is
@@ -1624,9 +1644,14 @@ candidate, which is what every pre-B5 test drives.
   `hostlink.ErrUnsupportedProtocol`, a link made terminal by a wire-version
   change -- become `ErrHostUnreachable`. A Host's own code-less ANSWER, which
   `hostlink` now surfaces as `*HostFailure` (centrifuge-go returns `*Error`
-  only for a reply the server sent), becomes `ErrAttachFailed`: host v0.2.1
-  sends it only after undoing its partial work, so moving on puts no second
-  attach in flight. Aborting on it let one Host whose launches always fail --
+  only for a reply the server sent), becomes `ErrAttachFailed`, and placement
+  tries the next candidate. That reply is NOT a promise the Host rolled back:
+  host v0.2.1 also sends it after an incomplete rollback, and when the session
+  IS resident but its observation could not be published. Moving on is safe
+  because the session LEASE guards residency: while that Host holds it, the
+  next candidate refuses `epoch_mismatch` and placement converges on the
+  owner, so no second residency forms (B5 v0.3.0 gates N2/C1). Aborting on it
+  let one Host whose launches always fail --
   never losing capacity, so ranked first every pass -- block placement for its
   whole agent and runtime (B5 quality gate Q1). No per-candidate backoff is
   kept: the reconciler holds no state across passes, a failed attach is one

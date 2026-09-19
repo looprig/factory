@@ -346,9 +346,13 @@ refusal. `epoch_mismatch` means the registry was stale: placement re-reads it
 and retries, bounded with backoff, and never binds with the refusal's
 `current_lease_epoch` (the other holder's). Every other coded refusal moves on
 to the next candidate, and so does a Host's own code-less failure reply (a
-transport error answer such as centrifuge's `ErrorInternal`, which host v0.2.1
-sends only after undoing its partial work) -- so one Host whose launches
-always fail cannot block placement on the healthy ones. A candidate that
+transport error answer such as centrifuge's `ErrorInternal`) -- so one Host
+whose launches always fail cannot block placement on the healthy ones. That
+reply does not mean the Host rolled back (host v0.2.1 also sends it after an
+incomplete rollback, or when the session is resident but its observation
+could not be published); moving on is safe because the session lease makes
+any other candidate refuse `epoch_mismatch` while that Host still holds it,
+so no second residency can form. A candidate that
 cannot be asked at all -- a failed dial, a link between connections, a pool at
 its link ceiling, or a link made terminal by a wire-version change, which the
 pool also evicts -- is skipped. Only an AMBIGUOUS failure aborts the attempt: a
@@ -383,6 +387,17 @@ they must skip is still reached, and a pass that ends with a shard's backlog
 unread is logged at WARN. `Commands` accordingly names the disposition admission,
 retry read, payload upload, rejection and due query in place of `AdmitCommand`
 and `GetCommand`; a `*sessionstore.Store` satisfies it.
+
+**Gate responses to Host-resident sessions answer `409 gate_resolved` until
+sessionstore ≥ v0.12.0 and host ≥ v0.4.0.** A gate response is admitted only
+against a durable gate projection, and no disposition session can carry one:
+sessionstore v0.10.0 (the pinned release) and v0.11.0 refuse `OpenGate` --
+every Host-owned catalog write -- on a disposition-bound session
+(`hostEpochFence`, `catalog invalid (binding.protocol_mode)`). So the
+projection check refuses first, and the fresh-owner check behind it
+(`gate_not_resumable`) is unreachable in production. Until those releases, **a
+Host-resident agent that opens a gate stalls until its gate deadline**: no
+answer to it can be admitted.
 
 **One gap is declared rather than worked around.** The released Host serves
 HostLink per tenant, at `/hostlink/<tenant>`, and its capacity report
