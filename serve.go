@@ -282,6 +282,7 @@ func (s *Server) Start(ctx context.Context) error {
 	s.done = done
 	s.mu.Unlock()
 
+	warnPlacementUncomposed(ctx, s.cfg)
 	sweeps := s.components.sweeps(s.cfg)
 	var wg sync.WaitGroup
 	for _, pass := range sweeps {
@@ -426,4 +427,37 @@ func (s *Server) Stop(ctx context.Context) error {
 		firstErr = err
 	}
 	return firstErr
+}
+
+// The two startup warnings a composition without WithPendingCommands logs.
+// They are constants so a test can hold the exact line.
+const (
+	warnNoPlacement            = "factory: WithPendingCommands is not composed, so this replica places no session on a Host"
+	warnNoPlacementWithCreates = "factory: WithPublicCreates is composed but WithPendingCommands is not, so this replica admits creates it will never place on a Host"
+)
+
+// warnPlacementUncomposed says, once at Start, that this replica will place
+// nothing (B5 spec gate F1).
+//
+// WithPendingCommands is what composes the placement sweep, and it is
+// optional -- so a composition that omits it starts, serves, admits and
+// sweeps, and never attaches a single session, with nothing anywhere saying
+// so. That is a supported configuration (a read-only replica, a replica
+// another one places for) and so it is a warning rather than a refusal; but it
+// is the one silent failure a deployment that meant to place could not see.
+// It is STRONGER when WithPublicCreates is composed, because that replica
+// admits disposition creates -- durable promises that a session will exist --
+// and will not itself make one resident. Requiring the option there, or
+// deriving it from a PublicCreates value that also implements
+// PendingCommands, is booked for a later minor: either changes what a
+// composition that compiles today does.
+func warnPlacementUncomposed(ctx context.Context, cfg config) {
+	if cfg.pending != nil {
+		return
+	}
+	if cfg.publicCreates != nil {
+		logger(cfg).ErrorContext(ctx, warnNoPlacementWithCreates)
+		return
+	}
+	logger(cfg).WarnContext(ctx, warnNoPlacement)
 }

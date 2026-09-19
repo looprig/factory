@@ -461,7 +461,7 @@ func WithPendingCommands(p PendingCommands) Option {
 func WithLogger(l *slog.Logger) Option {
 	return option("WithLogger", func(cfg *config) error {
 		if l == nil {
-			return &OptionError{Option: "WithLogger", Err: ErrNilDependency}
+			return nilDependency("WithLogger")
 		}
 		cfg.logger = l
 		return nil
