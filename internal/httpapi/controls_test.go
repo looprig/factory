@@ -583,6 +583,21 @@ func TestARuntimeUnavailableRefusalIsNotTheRetryable503(t *testing.T) {
 	}
 }
 
+func TestQuiescedAdmissionIsRetryable503(t *testing.T) {
+	admitter := newFakeAdmitter()
+	admitter.err = admission.ErrAdmissionQuiesced
+	f := newFixture(t, withAdmitter(admitter))
+	probe := controlProbes(fixtureSession)[0]
+	recorder := postJSON(f, probe.target, probe.body)
+	if recorder.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503", recorder.Code)
+	}
+	envelope := decodeEnvelope(t, recorder)
+	if envelope.Error.Code != ErrorCodeUnavailable || !envelope.Error.Retryable {
+		t.Fatalf("response = %+v, want retryable unavailable", envelope.Error)
+	}
+}
+
 // TestARefusalCarryingNoCodeIsAFault holds the authority's second return at
 // this edge. (*admission.Error).Error() explicitly contemplates Code == "", so
 // a zero-valued refusal from any present or future admission path arrives here,

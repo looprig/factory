@@ -505,6 +505,9 @@ func admissionFailure(err error) apiError {
 			message: "the session's owner could not be reached at the moment",
 		}
 	}
+	if errors.Is(err, admission.ErrAdmissionQuiesced) {
+		return controlUnavailable()
+	}
 	return internalFailure()
 }
 

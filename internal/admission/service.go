@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 
 	sessionwire "github.com/looprig/core/sessionwire/v1"
@@ -101,6 +102,10 @@ var ErrGateResponseTooLarge = errors.New("admission: a gate response larger than
 // ErrLegacyCreateUnsupported reports that Factory cannot create a session on
 // the legacy protocol. No runtime this program ships can host such a session.
 var ErrLegacyCreateUnsupported = errors.New("admission: legacy create unsupported")
+
+// ErrAdmissionQuiesced is a transient local shutdown condition. It is a fault,
+// not a durable command refusal: the caller may retry on another replica.
+var ErrAdmissionQuiesced = errors.New("admission: this replica is quiescing")
 
 type Error struct {
 	Code  sessionwire.ErrorCode
@@ -232,7 +237,62 @@ type Config struct {
 // store has nowhere to put it.
 func (c Config) createsServed() bool { return c.PublicCreates != nil && c.Binding.configured() }
 
-type Service struct{ cfg Config }
+type Service struct {
+	cfg        Config
+	gateMu     sync.Mutex
+	gateClosed bool
+	active     int
+	drained    chan struct{}
+}
+
+// FenceAdmissions permanently refuses new commands and returns a signal that
+// closes after every command already inside the service has returned. It does
+// not wait, so the Server can serialize the fence with Start and then release
+// its lifecycle lock before joining active calls.
+func (s *Service) FenceAdmissions() <-chan struct{} {
+	s.gateMu.Lock()
+	if !s.gateClosed {
+		s.gateClosed = true
+		if s.drained == nil {
+			s.drained = make(chan struct{})
+		}
+		if s.active == 0 {
+			close(s.drained)
+		}
+	}
+	done := s.drained
+	s.gateMu.Unlock()
+	return done
+}
+
+// Quiesce fences admission and waits for the preboundary calls to return.
+// A canceled waiter may call again; the fence and active calls keep running.
+func (s *Service) Quiesce(ctx context.Context) error {
+	done := s.FenceAdmissions()
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (s *Service) beginAdmission() (func(), error) {
+	s.gateMu.Lock()
+	defer s.gateMu.Unlock()
+	if s.gateClosed {
+		return nil, ErrAdmissionQuiesced
+	}
+	s.active++
+	return func() {
+		s.gateMu.Lock()
+		defer s.gateMu.Unlock()
+		s.active--
+		if s.gateClosed && s.active == 0 {
+			close(s.drained)
+		}
+	}, nil
+}
 
 func NewService(cfg Config) (*Service, error) {
 	if cfg.Authorizer == nil || cfg.Targets == nil || cfg.Catalog == nil || cfg.Commands == nil || cfg.Directory == nil || cfg.Clock == nil || cfg.IDs == nil {
@@ -256,6 +316,11 @@ func NewService(cfg Config) (*Service, error) {
 // An oversized create is stored by reference instead of refused. That is step
 // 5, and admit applies the same rule to the other four kinds.
 func (s *Service) AdmitCreate(ctx context.Context, principal identity.Principal, req sessionwire.CreateRequest) (sessionstore.DispositionInboxEntry, bool, error) {
+	end, gateErr := s.beginAdmission()
+	if gateErr != nil {
+		return sessionstore.DispositionInboxEntry{}, false, gateErr
+	}
+	defer end()
 	if err := req.Validate(); err != nil {
 		return sessionstore.DispositionInboxEntry{}, false, refusal(sessionwire.ErrorCodeInvalidRequest, err)
 	}
@@ -280,6 +345,11 @@ func (s *Service) AdmitCreate(ctx context.Context, principal identity.Principal,
 }
 
 func (s *Service) AdmitInput(ctx context.Context, principal identity.Principal, req sessionwire.InputRequest) (sessionstore.DispositionInboxEntry, bool, error) {
+	end, gateErr := s.beginAdmission()
+	if gateErr != nil {
+		return sessionstore.DispositionInboxEntry{}, false, gateErr
+	}
+	defer end()
 	if err := req.Validate(); err != nil {
 		return sessionstore.DispositionInboxEntry{}, false, refusal(sessionwire.ErrorCodeInvalidRequest, err)
 	}
@@ -287,6 +357,11 @@ func (s *Service) AdmitInput(ctx context.Context, principal identity.Principal, 
 }
 
 func (s *Service) AdmitInterrupt(ctx context.Context, principal identity.Principal, req sessionwire.InterruptRequest) (sessionstore.DispositionInboxEntry, bool, error) {
+	end, gateErr := s.beginAdmission()
+	if gateErr != nil {
+		return sessionstore.DispositionInboxEntry{}, false, gateErr
+	}
+	defer end()
 	if err := req.Validate(); err != nil {
 		return sessionstore.DispositionInboxEntry{}, false, refusal(sessionwire.ErrorCodeInvalidRequest, err)
 	}
@@ -294,6 +369,11 @@ func (s *Service) AdmitInterrupt(ctx context.Context, principal identity.Princip
 }
 
 func (s *Service) AdmitRestore(ctx context.Context, principal identity.Principal, req sessionwire.RestoreRequest) (sessionstore.DispositionInboxEntry, bool, error) {
+	end, gateErr := s.beginAdmission()
+	if gateErr != nil {
+		return sessionstore.DispositionInboxEntry{}, false, gateErr
+	}
+	defer end()
 	if err := req.Validate(); err != nil {
 		return sessionstore.DispositionInboxEntry{}, false, refusal(sessionwire.ErrorCodeInvalidRequest, err)
 	}
@@ -305,6 +385,11 @@ func (s *Service) AdmitRestore(ctx context.Context, principal identity.Principal
 // gate_not_resumable before anything is written. Moving the command into the
 // disposition family changed where it is written and nothing about that rule.
 func (s *Service) AdmitGateResponse(ctx context.Context, principal identity.Principal, req sessionwire.GateResponseRequest) (sessionstore.DispositionInboxEntry, bool, error) {
+	end, gateErr := s.beginAdmission()
+	if gateErr != nil {
+		return sessionstore.DispositionInboxEntry{}, false, gateErr
+	}
+	defer end()
 	if err := req.Validate(); err != nil {
 		return sessionstore.DispositionInboxEntry{}, false, refusal(sessionwire.ErrorCodeInvalidRequest, err)
 	}
@@ -512,6 +597,11 @@ type LegacyCreateResult struct {
 }
 
 func (s *Service) AdmitLegacyCreate(ctx context.Context, principal identity.Principal, req LegacyCreateRequest) (LegacyCreateResult, error) {
+	end, gateErr := s.beginAdmission()
+	if gateErr != nil {
+		return LegacyCreateResult{}, gateErr
+	}
+	defer end()
 	return LegacyCreateResult{}, refusal(sessionwire.ErrorCodeRuntimeUnavailable, ErrLegacyCreateUnsupported)
 }
 

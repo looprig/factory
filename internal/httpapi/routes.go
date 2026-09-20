@@ -13,6 +13,7 @@ import (
 	"path"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	sessionwire "github.com/looprig/core/sessionwire/v1"
@@ -229,6 +230,7 @@ type RouterConfig struct {
 
 // Router is Factory's public HTTP surface.
 type Router struct {
+	quiesced           atomic.Bool
 	credentials        *internalidentity.Authenticator
 	authorizer         Authorizer
 	reads              SessionReader
@@ -396,6 +398,10 @@ func (rt *Router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	defer recoverPanic(writer)
 	rt.stampRequestID(writer)
 	setNeutralSecurityHeaders(writer.Header())
+	if rt.quiesced.Load() {
+		writeAPIError(writer, controlUnavailable())
+		return
+	}
 	if rt.protectedUI != nil && !isAPIRequest(r) && isUIRouteRequest(r) {
 		if cleanRequestPath(r.URL.Path) != r.URL.Path {
 			writeAPIError(writer, routeNotFound())
@@ -411,6 +417,11 @@ func (rt *Router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	rt.own.ServeHTTP(writer, r)
 }
+
+// Quiesce refuses new public HTTP requests, including ClientLink upgrades.
+// Requests that already passed this edge finish under the shared admission
+// service's separate fence.
+func (rt *Router) Quiesce() { rt.quiesced.Store(true) }
 
 func isUIRouteRequest(r *http.Request) bool {
 	return strings.HasPrefix(r.URL.Path, "/ui/") || strings.HasPrefix(cleanRequestPath(r.URL.Path), "/ui/")

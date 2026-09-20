@@ -1293,7 +1293,10 @@ func faultSites(t *testing.T) []faultSite {
 // command entry points, with the reason. An entry is a claim: the check below
 // fails if one of these is ever driven, so a stale record cannot survive.
 func nonEntryPointServiceMethods() map[string]string {
-	return map[string]string{}
+	return map[string]string{
+		"Quiesce":         "lifecycle wait, not a command admission entry point",
+		"FenceAdmissions": "lifecycle fence, not a command admission entry point",
+	}
 }
 
 // admissionEntryPoints is the cross-product's second axis, held to *Service's

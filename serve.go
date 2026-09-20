@@ -29,6 +29,8 @@ var (
 	// started once, because starting them twice would run two sweep loops per
 	// pass and two ClientLink nodes on one composition.
 	ErrAlreadyStarted = errors.New("factory: server is already started")
+	// ErrServerQuiesced reports a Start or Serve after public admission closed.
+	ErrServerQuiesced = errors.New("factory: server is quiesced")
 )
 
 // HTTPLimits bounds the connections Serve accepts.
@@ -174,6 +176,10 @@ func (s *Server) Serve(ln net.Listener) error {
 		s.mu.Unlock()
 		return ErrServerStopped
 	}
+	if s.quiescing {
+		s.mu.Unlock()
+		return ErrServerQuiesced
+	}
 	s.state = stateServing
 	s.http = &http.Server{
 		Handler:           s.router,
@@ -195,7 +201,7 @@ func (s *Server) Serve(ln net.Listener) error {
 	// an error has no way to know whether it was ever accepted on.
 	switch err := s.Start(context.Background()); {
 	case err == nil, errors.Is(err, ErrAlreadyStarted):
-	case errors.Is(err, ErrServerStopped):
+	case errors.Is(err, ErrServerStopped), errors.Is(err, ErrServerQuiesced):
 		// A Stop overtook this call and has already torn everything down.
 		// That is the ordinary ending, reported as success for the reason
 		// stated above -- and the listener is closed HERE rather than left to
@@ -259,6 +265,10 @@ func (s *Server) Start(ctx context.Context) error {
 	if s.state == stateStopped {
 		s.mu.Unlock()
 		return ErrServerStopped
+	}
+	if s.quiescing {
+		s.mu.Unlock()
+		return ErrServerQuiesced
 	}
 	if s.started {
 		s.mu.Unlock()
@@ -339,10 +349,9 @@ func (s *Server) runOnce(ctx context.Context, pass sweep) {
 // Stop shuts the Server down in a fixed order and does not return until each
 // component it stopped has stopped.
 //
-// The order is the one the runbook states: PUBLIC ADMISSION first -- the
-// listener, the in-flight requests it accepted, and the ClientLink node -- and
-// then the background components, so nothing new is admitted while they are
-// being torn down.
+// Quiesce first fences durable command admission and closes ClientLinks while
+// leaving sweeps and HostLinks live. Stop then closes the listener and the
+// remaining background components.
 //
 // There are THREE phases and four components, and each phase is labelled at
 // the code below rather than only here. (This comment said "today there is
@@ -357,6 +366,25 @@ func (s *Server) runOnce(ctx context.Context, pass sweep) {
 // It is idempotent, because a signal handler and a deferred stop reach it
 // together, and it is safe to call on a Server that never served.
 func (s *Server) Stop(ctx context.Context) error {
+	quiesceErr := s.Quiesce(ctx)
+	if quiesceErr != nil {
+		s.mu.Lock()
+		done := s.quiesceDone
+		s.mu.Unlock()
+		select {
+		case <-done:
+			// The admission boundary completed; retain a ClientLink shutdown
+			// diagnostic while still closing the remaining owned planes.
+			s.mu.Lock()
+			completedErr := s.quiesceErr
+			s.mu.Unlock()
+			if !errors.Is(quiesceErr, completedErr) && completedErr != nil {
+				quiesceErr = errors.Join(quiesceErr, completedErr)
+			}
+		default:
+			return quiesceErr
+		}
+	}
 	// See Start for why these two are serialized. A Stop that arrives while a
 	// Start is half done waits for it and then tears down everything, rather
 	// than tearing down what happened to exist when it looked.
@@ -378,17 +406,17 @@ func (s *Server) Stop(ctx context.Context) error {
 	// the ordinary case for a library embedding: it holds Handler and owns its
 	// own http.Server. Marking the state above is what such a Stop is FOR --
 	// it refuses a later Serve.
-	// (1) PUBLIC ADMISSION. The listener and the requests it already accepted,
-	// then the ClientLink node. Both are closed before anything below, so no
-	// new command can be admitted into planes that are being torn down.
-	var firstErr error
+	// (1) THE PUBLIC LISTENER. Quiesce already fenced command admission and
+	// stopped the ClientLink node. An embedder owns its own listener and must
+	// close it separately; Handler still refuses new requests.
+	firstErr := quiesceErr
 	if server != nil {
 		if err := server.Shutdown(ctx); err != nil {
-			firstErr = err
+			firstErr = errors.Join(firstErr, err)
 		}
 	}
-	if err := s.components.stopRealtime(ctx); err != nil && firstErr == nil {
-		firstErr = err
+	if err := s.components.stopRealtime(ctx); err != nil {
+		firstErr = errors.Join(firstErr, err)
 	}
 
 	// (2) THE PERIODIC SWEEPS. Cancelled and then WAITED for, so a returned
@@ -402,9 +430,7 @@ func (s *Server) Stop(ctx context.Context) error {
 		select {
 		case <-done:
 		case <-ctx.Done():
-			if firstErr == nil {
-				firstErr = ctx.Err()
-			}
+			firstErr = errors.Join(firstErr, ctx.Err())
 		}
 	}
 
@@ -417,22 +443,77 @@ func (s *Server) Stop(ctx context.Context) error {
 	// because a deployment restarted a front end. What closes here is this
 	// replica's connections and its local table, and the Host sees a peer go
 	// away -- which is the same thing it sees when a replica crashes.
-	if err := s.components.demand.Close(ctx); err != nil && firstErr == nil {
-		firstErr = err
+	if err := s.components.demand.Close(ctx); err != nil {
+		firstErr = errors.Join(firstErr, err)
 	}
-	if err := s.components.bindings.Close(ctx); err != nil && firstErr == nil {
-		firstErr = err
+	if err := s.components.bindings.Close(ctx); err != nil {
+		firstErr = errors.Join(firstErr, err)
 	}
 	// The live-tail plane after the routing state that fed it and before the
 	// links its tails ran over: every tail was stopped by the unbinds above,
 	// so what is left is its drainers, which it waits for.
-	if err := s.components.live.Close(ctx); err != nil && firstErr == nil {
-		firstErr = err
+	if err := s.components.live.Close(ctx); err != nil {
+		firstErr = errors.Join(firstErr, err)
 	}
-	if err := s.components.pool.Close(ctx); err != nil && firstErr == nil {
-		firstErr = err
+	if err := s.components.pool.Close(ctx); err != nil {
+		firstErr = errors.Join(firstErr, err)
 	}
 	return firstErr
+}
+
+// Quiesce permanently closes public admission and waits for every command
+// admission already inside the shared service to return. Sweeps and HostLinks
+// continue running until Stop. Canceling ctx only ends this caller's wait.
+func (s *Server) Quiesce(ctx context.Context) error {
+	s.mu.Lock()
+	if !s.quiescing {
+		s.quiescing = true
+		s.quiesceDone = make(chan struct{})
+		s.router.Quiesce()
+		go s.finishQuiesce(context.WithoutCancel(ctx))
+	}
+	done := s.quiesceDone
+	s.mu.Unlock()
+	// Prefer the stable completed result if ctx is canceled at the same time.
+	select {
+	case <-done:
+		s.mu.Lock()
+		err := s.quiesceErr
+		s.mu.Unlock()
+		return err
+	default:
+	}
+	select {
+	case <-done:
+		s.mu.Lock()
+		err := s.quiesceErr
+		s.mu.Unlock()
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (s *Server) finishQuiesce(ctx context.Context) {
+	// A concurrent Start may already be constructing its ClientLink node.
+	// Wait for its publication, then fence admission under the same lifecycle
+	// lock Start uses. Release it before waiting for active calls or shutdown.
+	s.lifecycle.Lock()
+	drained := s.components.admissions.FenceAdmissions()
+	s.lifecycle.Unlock()
+	var err error
+	select {
+	case <-drained:
+	case <-ctx.Done():
+		err = ctx.Err()
+	}
+	if err == nil {
+		err = s.components.stopRealtime(ctx)
+	}
+	s.mu.Lock()
+	s.quiesceErr = err
+	close(s.quiesceDone)
+	s.mu.Unlock()
 }
 
 // The two startup warnings a composition without WithPendingCommands logs.

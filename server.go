@@ -194,10 +194,13 @@ type Server struct {
 	// mutex is needed rather than a wider hold of mu.
 	lifecycle sync.Mutex
 
-	mu      sync.Mutex
-	state   serverState
-	started bool
-	http    *http.Server
+	mu          sync.Mutex
+	state       serverState
+	quiescing   bool
+	quiesceDone chan struct{}
+	quiesceErr  error
+	started     bool
+	http        *http.Server
 	// stop cancels the sweep loops; done is closed when every one of them has
 	// returned. Stop WAITS on it, so "Stop returned" means no sweep is still
 	// touching a store.

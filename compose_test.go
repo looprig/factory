@@ -608,6 +608,23 @@ func TestASecondStartIsRefused(t *testing.T) {
 	}
 }
 
+func TestQuiesceLeavesReconciliationRunning(t *testing.T) {
+	p := &probe{}
+	server := composed(t, p)
+	if err := server.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	eventually(t, "first command sweep", func() bool { n, _, _ := p.counts(); return n > 0 })
+	if err := server.Quiesce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	before, _, _ := p.counts()
+	eventually(t, "sweep after Quiesce", func() bool { n, _, _ := p.counts(); return n > before })
+	if err := server.Stop(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}
+
 // TestServeStartsTheBackgroundComponents is why a deployment that owns the
 // socket through this module does not have to call Start.
 //

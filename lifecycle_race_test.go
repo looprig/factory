@@ -157,6 +157,26 @@ func TestServeClosesTheListenerWhenStartRefusesIsTheOtherRouteOut(t *testing.T) 
 	assertListenerClosed(t, listener)
 }
 
+func TestServeClosesListenerWhenQuiesceOvertakesStart(t *testing.T) {
+	server := raceServer(t)
+	listener := localListener(t)
+	release := pinStart(server)
+	defer release()
+	served := make(chan error, 1)
+	go func() { served <- server.Serve(listener) }()
+	waitForServing(t, server)
+	server.mu.Lock()
+	server.quiescing = true
+	server.quiesceDone = make(chan struct{})
+	close(server.quiesceDone)
+	server.mu.Unlock()
+	release()
+	if err := await(t, "Serve", served); err != nil {
+		t.Fatalf("Serve = %v", err)
+	}
+	assertListenerClosed(t, listener)
+}
+
 // TestServeClosesTheListenerWhenStartReallyFails is the THIRD route out of
 // Serve past the claim, and the last one.
 //
@@ -281,6 +301,70 @@ func TestStopClosesEveryLocalPlaneItComposed(t *testing.T) {
 		if err := plane.probe(ctx); !errors.Is(err, plane.closed) {
 			t.Errorf("after Stop, %s answered %v, want %v -- Stop did not close it", plane.name, err, plane.closed)
 		}
+	}
+}
+
+func TestQuiesceLeavesRoutingAndHostLinksOpen(t *testing.T) {
+	server := raceServer(t)
+	if err := server.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := server.Quiesce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	assertPlanesOpen(t, server)
+	if err := server.Stop(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestStopContinuesAfterCompletedQuiesceDiagnostic(t *testing.T) {
+	server := raceServer(t)
+	if err := server.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	assertPlanesOpen(t, server)
+	shutdownErr := errors.New("ClientLink shutdown failed")
+	server.mu.Lock()
+	server.quiescing = true
+	server.quiesceDone = make(chan struct{})
+	server.quiesceErr = shutdownErr
+	close(server.quiesceDone)
+	server.mu.Unlock()
+	if err := server.Stop(context.Background()); !errors.Is(err, shutdownErr) {
+		t.Fatalf("Stop = %v, want shutdown diagnostic", err)
+	}
+	for _, plane := range closedPlanes(server) {
+		if err := plane.probe(context.Background()); !errors.Is(err, plane.closed) {
+			t.Errorf("%s after Stop = %v, want closed", plane.name, err)
+		}
+	}
+	// The fixture's cleanup expects a clean idempotent Stop; the injected
+	// diagnostic belongs only to this assertion.
+	server.mu.Lock()
+	server.quiesceErr = nil
+	server.mu.Unlock()
+}
+
+func TestCanceledQuiesceWaiterDoesNotBlockOnStart(t *testing.T) {
+	server := raceServer(t)
+	release := pinStart(server)
+	defer release()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	done := make(chan error, 1)
+	go func() { done <- server.Quiesce(ctx) }()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("Quiesce = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("canceled Quiesce blocked on Start")
+	}
+	release()
+	if err := server.Quiesce(context.Background()); err != nil {
+		t.Fatalf("retry Quiesce = %v", err)
 	}
 }
 
