@@ -26,12 +26,16 @@ type Config struct {
 	KMSKeyID         string
 }
 
-// Open owns the PostgreSQL pool and the SessionStore. Close the SessionStore
-// before the returned PostgreSQL pool after Factory and Host have stopped.
-// Open calls require a bounded context; the caller should use a startup timeout.
+// Open owns the PostgreSQL pool and the SessionStore. The returned Store has a
+// lifetime independent of ctx: a startup timeout must not stop live sessions.
+// After Factory and Host stop, the caller must Close the SessionStore before
+// closing the PostgreSQL pool. Open requires a bounded startup context.
 func Open(ctx context.Context, cfg Config) (*sessionstore.Store, *pgstore.Store, error) {
 	if _, ok := ctx.Deadline(); !ok {
 		return nil, nil, fmt.Errorf("deployment wiring: startup context needs a deadline")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, nil, err
 	}
 	pg, err := pgstore.Open(ctx, pgstore.Options{
 		DSN:              cfg.PostgresDSN,
@@ -62,12 +66,30 @@ func Open(ctx context.Context, cfg Config) (*sessionstore.Store, *pgstore.Store,
 		pg.Close()
 		return nil, nil, fmt.Errorf("compose storage: %w", err)
 	}
-	store, err := sessionstore.Open(ctx, backend)
+	store, err := openSessionStore(ctx, backend)
 	if err != nil {
 		pg.Close()
 		return nil, nil, fmt.Errorf("open session store: %w", err)
 	}
 	return store, pg, nil
+}
+
+// SessionStore retains Open's context as its lifecycle parent. Check the
+// startup deadline on both sides of Open, but give the Store a context whose
+// lifetime is controlled by Store.Close rather than by startup completion.
+func openSessionStore(ctx context.Context, backend *storage.Composite) (*sessionstore.Store, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	store, err := sessionstore.Open(context.WithoutCancel(ctx), backend)
+	if err != nil {
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
+		_ = store.Close(context.Background())
+		return nil, err
+	}
+	return store, nil
 }
 
 // ClientLimits is the explicit per-replica admission/queue policy.

@@ -57,6 +57,9 @@ bucket policy, IAM, key access and backup/restore separately against the live
 provider. `DeploymentPrefix` is a canonical shared deployment namespace (for
 example `deployments/production`), **not** a per-replica or per-tenant path.
 Factory and Host must agree on that namespace and the SessionStore layout.
+Pass a bounded startup context to `wiring.Open`; the returned SessionStore
+has its own lifetime and remains usable after that startup context ends.
+After Factory and Host stop, close SessionStore and then the PostgreSQL pool.
 
 Run `python3 examples/deploy/validate.py` (requires PyYAML) and
 `cd examples/deploy/wiring && GOWORK=off go test ./...` before publishing a
