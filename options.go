@@ -1,6 +1,7 @@
 package factory
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -146,8 +147,10 @@ type config struct {
 	pending        PendingCommands
 	logger         *slog.Logger
 
-	ui   http.Handler
-	uiFS fs.FS
+	ui               http.Handler
+	uiFS             fs.FS
+	uiRoutes         http.Handler
+	uiRouteAuthorize UIRouteAuthorizer
 }
 
 func option(name string, apply func(*config) error) Option {
@@ -315,6 +318,25 @@ func WithUIHandler(h http.Handler) Option {
 			return nilDependency("WithUIHandler")
 		}
 		c.ui = h
+		return nil
+	})
+}
+
+// UIRouteAuthorizer decides access to one request under /ui/. A nil error
+// grants access; identity.ErrUnauthorized denies it, and other errors are faults.
+// Factory authenticates and applies its origin/CSRF guard before calling it.
+type UIRouteAuthorizer func(context.Context, identity.Principal, string, string) error
+
+// WithUIRoutes mounts application-owned /ui/ routes behind Factory's
+// authentication, origin/CSRF guard, and a required per-request authorizer.
+// The ordinary UI handler remains a public asset and SPA fallback.
+func WithUIRoutes(h http.Handler, authorize UIRouteAuthorizer) Option {
+	return option("WithUIRoutes", func(c *config) error {
+		if h == nil || authorize == nil {
+			return nilDependency("WithUIRoutes")
+		}
+		c.uiRoutes = h
+		c.uiRouteAuthorize = authorize
 		return nil
 	})
 }

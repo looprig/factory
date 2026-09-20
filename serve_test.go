@@ -166,6 +166,106 @@ func TestTheInjectedUIServesEverythingOutsideTheAPISegment(t *testing.T) {
 	}
 }
 
+func TestUIRoutesRequireFactoryAuthenticationGuardAndAuthorization(t *testing.T) {
+	t.Parallel()
+	var calls int
+	var decision error = identity.ErrUnauthorized
+	routes := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls++
+		_, _ = w.Write([]byte("product-route"))
+	})
+	authorize := func(_ context.Context, principal identity.Principal, method, path string) error {
+		if principal.Tenant() != factory.FakeTenant || method != http.MethodGet || path != "/ui/live" {
+			return fmt.Errorf("unexpected UI authorization input: %v %s %s", principal, method, path)
+		}
+		return decision
+	}
+	server, err := factory.New(append(factory.RequiredOptions(), factory.WithUIHandler(spaFallback()), factory.WithUIRoutes(routes, authorize))...)
+	if err != nil {
+		t.Fatalf("New() = %v", err)
+	}
+	for _, tc := range []struct {
+		name string
+		req  *http.Request
+		want int
+	}{
+		{"anonymous", httptest.NewRequest(http.MethodGet, trustedBase+"/ui/live", nil), http.StatusUnauthorized},
+		{"untrusted origin", apiRequest(t, http.MethodGet, "/ui/live"), http.StatusForbidden},
+		{"authorization denied", apiRequest(t, http.MethodGet, "/ui/live"), http.StatusForbidden},
+	} {
+		if tc.name == "untrusted origin" {
+			tc.req.Header.Set("Origin", "https://evil.example")
+		}
+		recorder := serveHandler(t, server.Handler(), tc.req)
+		if recorder.Code != tc.want {
+			t.Errorf("%s = %d, want %d; body %q", tc.name, recorder.Code, tc.want, recorder.Body)
+		}
+	}
+	if calls != 0 {
+		t.Errorf("product handler called %d times after refusals", calls)
+	}
+	decision = errors.New("authorization service unavailable")
+	fault := serveHandler(t, server.Handler(), apiRequest(t, http.MethodGet, "/ui/live"))
+	if fault.Code != http.StatusInternalServerError || calls != 0 {
+		t.Errorf("authorization fault = %d, handler calls %d; want 500 and zero calls", fault.Code, calls)
+	}
+	decision = nil
+	allowed := serveHandler(t, server.Handler(), apiRequest(t, http.MethodGet, "/ui/live"))
+	if allowed.Code != http.StatusOK || allowed.Body.String() != "product-route" || calls != 1 {
+		t.Errorf("authorized UI route = %d/%q, handler calls %d", allowed.Code, allowed.Body, calls)
+	}
+	csrf := httptest.NewRequest(http.MethodPost, trustedBase+"/ui/live", nil)
+	csrf.AddCookie(&http.Cookie{Name: "factory_session", Value: factory.FakeCredentialValue})
+	csrf.Header.Set("Origin", trustedBase)
+	blocked := serveHandler(t, server.Handler(), csrf)
+	if blocked.Code != http.StatusForbidden || calls != 1 {
+		t.Errorf("ambient POST without CSRF = %d, handler calls %d; want 403 and one call", blocked.Code, calls)
+	}
+	for _, path := range []string{"/ui/../app.js", "/v1/../ui/live", "//ui/live"} {
+		response := serveHandler(t, server.Handler(), apiRequest(t, http.MethodGet, path))
+		if response.Code != http.StatusNotFound || calls != 1 {
+			t.Errorf("unclean %s = %d, handler calls %d; want 404 and one call", path, response.Code, calls)
+		}
+	}
+	if body := serve(t, server.Handler(), "/app.js"); !strings.Contains(body, spaMarker) {
+		t.Errorf("public SPA = %q, want marker %q", body, spaMarker)
+	}
+}
+
+func TestUIRoutesWorkWithoutPublicUI(t *testing.T) {
+	t.Parallel()
+	server, err := factory.New(append(factory.RequiredOptions(), factory.WithUIRoutes(
+		http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte("route")) }),
+		func(context.Context, identity.Principal, string, string) error { return nil },
+	))...)
+	if err != nil {
+		t.Fatalf("New() = %v", err)
+	}
+	if _, mounted := server.UI(); mounted {
+		t.Fatal("protected routes made the public UI appear mounted")
+	}
+	route := serveHandler(t, server.Handler(), apiRequest(t, http.MethodGet, "/ui/live"))
+	if route.Code != http.StatusOK || route.Body.String() != "route" {
+		t.Errorf("protected route = %d/%q", route.Code, route.Body)
+	}
+	other := serveHandler(t, server.Handler(), apiRequest(t, http.MethodGet, "/other"))
+	if other.Code != http.StatusNotFound {
+		t.Errorf("non-UI path = %d, want 404", other.Code)
+	}
+}
+
+func TestUIRoutesRequireHandlerAndAuthorizerTogether(t *testing.T) {
+	t.Parallel()
+	for _, option := range []factory.Option{
+		factory.WithUIRoutes(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}), nil),
+		factory.WithUIRoutes(nil, func(context.Context, identity.Principal, string, string) error { return nil }),
+	} {
+		if _, err := factory.New(append(factory.RequiredOptions(), option)...); err == nil {
+			t.Error("New accepted a half-configured protected UI route")
+		}
+	}
+}
+
 // TestAnAlternateStaticUIIsTheOneServed is runbook step 2's alternate-static-UI
 // case. A second, different bundle must be the one a second Server serves, so
 // the mounted UI cannot be a constant hidden behind the option.

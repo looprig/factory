@@ -218,6 +218,10 @@ type RouterConfig struct {
 	// stays mutable until WriteHeader, so a UI that must be embedded in a
 	// parent application can Set or Del X-Frame-Options itself.
 	UI http.Handler
+	// UIRoutes serves application-owned /ui/ paths after authentication,
+	// origin/CSRF checks and AuthorizeUIRoute. It does not handle public assets.
+	UIRoutes         http.Handler
+	AuthorizeUIRoute func(context.Context, identity.Principal, string, string) error
 
 	// Limits bounds bodies and work. Its zero value takes DefaultRouteLimits.
 	Limits RouteLimits
@@ -246,7 +250,8 @@ type Router struct {
 	// The guard is INSIDE authentication because its tokens are
 	// principal-bound, and AROUND the mux so a rejected origin cannot learn
 	// which routes exist by comparing a 403 with a 404.
-	own http.Handler
+	own         http.Handler
+	protectedUI http.Handler
 }
 
 // NewRouter validates a composition and returns the router. A rejection returns
@@ -275,6 +280,9 @@ func NewRouter(cfg RouterConfig) (*Router, error) {
 	}
 	if cfg.IDs == nil {
 		return nil, fmt.Errorf("%w: IDs is required", ErrInvalidRouterConfig)
+	}
+	if (cfg.UIRoutes == nil) != (cfg.AuthorizeUIRoute == nil) {
+		return nil, fmt.Errorf("%w: UIRoutes and AuthorizeUIRoute must be supplied together", ErrInvalidRouterConfig)
 	}
 	if cfg.Limits == (RouteLimits{}) {
 		cfg.Limits = DefaultRouteLimits()
@@ -322,14 +330,35 @@ func NewRouter(cfg RouterConfig) (*Router, error) {
 	}))
 
 	router.own = apiSecurityHeaders(router.dispatch(router.authenticate(cfg.Guard.Wrap(mux))))
+	if cfg.UIRoutes != nil {
+		protected := router.authenticate(cfg.Guard.Wrap(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			operation, ok := internalidentity.OperationContextFrom(r.Context())
+			if !ok {
+				writeAPIError(w, authenticationFailure(identity.ErrUnauthenticated))
+				return
+			}
+			if err := cfg.AuthorizeUIRoute(r.Context(), operation.Principal, r.Method, r.URL.Path); err != nil {
+				writeAPIError(w, authorizationFailure(err))
+				return
+			}
+			cfg.UIRoutes.ServeHTTP(w, r)
+		})))
+		router.protectedUI = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Cache-Control", "no-store")
+			protected.ServeHTTP(w, r)
+		})
+	}
 	return router, nil
 }
 
-// ServeHTTP splits the API surface from the optional single-page application.
+// ServeHTTP splits the API surface, protected /ui/ application routes, and
+// the optional single-page application.
 //
 // The split is by path and it is made HERE, before authentication, because the
-// SPA's assets are public and the API's routes are not. Everything under the
-// version segment goes through the API chain; errors are JSON, and authorized
+// SPA's assets are public and the API's routes are not. A configured /ui/
+// route also goes through authentication and the guard, then its own explicit
+// authorizer. Everything under the version segment goes through the API chain;
+// errors are JSON, and authorized
 // object bodies are bounded binary responses;
 // everything else is the SPA's, or a JSON route failure when no SPA is mounted.
 //
@@ -359,12 +388,24 @@ func (rt *Router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	defer recoverPanic(writer)
 	rt.stampRequestID(writer)
 	setNeutralSecurityHeaders(writer.Header())
+	if rt.protectedUI != nil && !isAPIRequest(r) && isUIRouteRequest(r) {
+		if cleanRequestPath(r.URL.Path) != r.URL.Path {
+			writeAPIError(writer, routeNotFound())
+			return
+		}
+		rt.protectedUI.ServeHTTP(writer, r)
+		return
+	}
 
 	if rt.ui != nil && !isAPIRequest(r) {
 		rt.ui.ServeHTTP(writer, r)
 		return
 	}
 	rt.own.ServeHTTP(writer, r)
+}
+
+func isUIRouteRequest(r *http.Request) bool {
+	return strings.HasPrefix(r.URL.Path, "/ui/") || strings.HasPrefix(cleanRequestPath(r.URL.Path), "/ui/")
 }
 
 // isAPIRequest reports whether r addresses the API surface under either

@@ -396,13 +396,15 @@ func composeRouter(cfg config, credentials *internalidentity.Authenticator, part
 	// failure and never the application shell. A composition that consulted the
 	// UI first would serve index.html with status 200 there.
 	router, err := httpapi.NewRouter(httpapi.RouterConfig{
-		Credentials: credentials,
-		Authorizer:  cfg.authorizer,
-		Reads:       cfg.reads,
-		Directory:   cfg.directory,
-		Guard:       guard,
-		IDs:         cfg.uuids,
-		UI:          cfg.ui,
+		Credentials:      credentials,
+		Authorizer:       cfg.authorizer,
+		Reads:            cfg.reads,
+		Directory:        cfg.directory,
+		Guard:            guard,
+		IDs:              cfg.uuids,
+		UI:               cfg.ui,
+		UIRoutes:         cfg.uiRoutes,
+		AuthorizeUIRoute: cfg.uiRouteAuthorize,
 		// The four control routes admit into the composed service, so a
 		// deployed binary answers them for real instead of 503.
 		Admissions: parts.admissions,
@@ -432,8 +434,9 @@ func composeRouter(cfg config, credentials *internalidentity.Authenticator, part
 	return router, nil
 }
 
-// Handler is Factory's public HTTP surface: the API under /v1, and the injected
-// user interface everywhere else when one was supplied.
+// Handler is Factory's public HTTP surface: the API under /v1, protected
+// application routes under /ui/ when supplied, and the injected user interface
+// on other paths when supplied.
 //
 // It is what a LIBRARY embedding uses. Factory does not own the socket in that
 // shape -- the embedder supplies the http.Server, and MaxHeaderBytes with it --

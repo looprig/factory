@@ -78,11 +78,16 @@ UI is optional in both shapes: `WithUIHandler` for a handler and `WithUIFS` for
 a static bundle, mutually exclusive, and **a composition with neither is valid
 and is exercised as such** -- the default binary mounts the Vite bundle, and an
 embedder that mounts its own or none composes the same `Server`.
+Application-owned `/ui/` routes can be mounted with `WithUIRoutes`. Factory
+authenticates each request, applies its origin and CSRF guard, and calls the
+required route authorizer before the handler. These routes are independent of
+the public bundle, so a deployment can provide either, both, or neither.
 
 ## Serving
 
-`Server.Handler` is Factory's public HTTP surface: the API under `/v1`, and the
-injected user interface everywhere else. The injected UI is handed to the router
+`Server.Handler` is Factory's public HTTP surface: the API under `/v1`, protected
+application routes under `/ui/` when supplied, and the injected user interface
+on other paths. The injected UI is handed to the router
 as its fallback rather than mounted above or beside it, which is what makes
 **API routes take precedence over the SPA**: the router splits by path before
 authentication, so `/v1/unknown` is a JSON `route_not_found`, never
