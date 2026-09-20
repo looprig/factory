@@ -697,10 +697,12 @@ func writeGoFixture(t *testing.T, root, relative, content string) {
 // ---------------------------------------------------------------------------
 
 // allowedNestedBoundaries maps a module-relative directory to the reason it is
-// allowed to be a nested module or repository. It is empty, and an entry is not
-// a hole: every allowed boundary is SCANNED IN ITS OWN RIGHT by the assertion
-// below, so admitting one buys an extra scan rather than an exemption.
-var allowedNestedBoundaries = map[string]string{}
+// allowed to be a nested module or repository. An entry is not a hole: every
+// allowed boundary is SCANNED IN ITS OWN RIGHT by the assertion below, so
+// admitting one buys an extra scan rather than an exemption.
+var allowedNestedBoundaries = map[string]string{
+	"examples/deploy/wiring": "standalone deployment wiring example module",
+}
 
 // The kinds of invisibility, which are the reasons the module-owned walk
 // declines to show a path to the import rules.
