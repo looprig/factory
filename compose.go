@@ -43,7 +43,12 @@ type components struct {
 	// realtime is nil until Start, and the router reads it through a supplier
 	// on every request rather than holding it. See RouterConfig.Realtime.
 	realtimeMu sync.RWMutex
-	realtime   *clientlink.Handler
+	realtime   realtimeNode
+	// A shutdown is one owned attempt. Demand.Release may consume its counted
+	// local release even when remote unbind reports failure, so a second call
+	// cannot safely repeat it. Waiters join the result instead.
+	realtimeDone chan struct{}
+	realtimeErr  error
 
 	commandSweeper *admission.Reconciler
 	// dispositionSweeper rejects the disposition commands no Host applied
@@ -57,6 +62,12 @@ type components struct {
 	// pending is nil unless WithPendingCommands supplied the durable query
 	// that triggers placement; see sweeps.
 	pending *placement.PendingSweeper
+}
+
+type realtimeNode interface {
+	http.Handler
+	livetail.Viewers
+	Shutdown(context.Context) error
 }
 
 // composeComponents builds the component graph from a validated composition.
@@ -256,9 +267,12 @@ func composeComponents(cfg config, credentials *internalidentity.Authenticator) 
 
 // clientLink is the running ClientLink node, or nil before Start and after
 // Stop. The live plane publishes through it.
-func (c *components) clientLink() *clientlink.Handler {
+func (c *components) clientLink() livetail.Viewers {
 	c.realtimeMu.RLock()
 	defer c.realtimeMu.RUnlock()
+	if c.realtimeDone != nil {
+		return nil
+	}
 	return c.realtime
 }
 
@@ -358,7 +372,7 @@ func (c *components) startRealtime(cfg config, credentials *internalidentity.Aut
 func (c *components) realtimeHandler() http.Handler {
 	c.realtimeMu.RLock()
 	defer c.realtimeMu.RUnlock()
-	if c.realtime == nil {
+	if c.realtime == nil || c.realtimeDone != nil {
 		return nil
 	}
 	return c.realtime
@@ -640,18 +654,42 @@ func resolveObjectStore(r ObjectStoreResolver) func(context.Context, sessionstor
 	}
 }
 
-// stopRealtime shuts the ClientLink node down and forgets it, so the router's
-// supplier answers nil and a request arriving during shutdown is answered 503
-// rather than handed to a node that is closing.
+// stopRealtime owns one shutdown attempt. It hides the node from new requests
+// immediately, retains the handle on failure, and replays that result to every
+// later caller. Repeating Demand.Release would be unsafe: its local count may
+// have been consumed even when a remote unbind failed.
 func (c *components) stopRealtime(ctx context.Context) error {
 	c.realtimeMu.Lock()
+	if c.realtimeDone != nil {
+		done := c.realtimeDone
+		c.realtimeMu.Unlock()
+		select {
+		case <-done:
+			c.realtimeMu.RLock()
+			err := c.realtimeErr
+			c.realtimeMu.RUnlock()
+			return err
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
 	handler := c.realtime
-	c.realtime = nil
-	c.realtimeMu.Unlock()
 	if handler == nil {
+		c.realtimeMu.Unlock()
 		return nil
 	}
-	return handler.Shutdown(ctx)
+	done := make(chan struct{})
+	c.realtimeDone = done
+	c.realtimeMu.Unlock()
+	err := handler.Shutdown(ctx)
+	c.realtimeMu.Lock()
+	c.realtimeErr = err
+	if err == nil {
+		c.realtime = nil
+	}
+	close(done)
+	c.realtimeMu.Unlock()
+	return err
 }
 
 // dispositionHolder is the reconciliation-claim holder the disposition deadline

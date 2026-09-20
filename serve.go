@@ -508,12 +508,25 @@ func (s *Server) finishQuiesce(ctx context.Context) {
 		err = ctx.Err()
 	}
 	if err == nil {
-		err = s.components.stopRealtime(ctx)
+		// Node shutdown can wait for an in-flight RPC, then demand release can
+		// wait for routing. Bound the whole owned attempt independently of the
+		// Quiesce caller, whose cancellation ends only that caller's wait.
+		shutdownCtx, cancel := context.WithTimeout(ctx, quiesceShutdownBound(s.cfg.client))
+		err = s.components.stopRealtime(shutdownCtx)
+		cancel()
 	}
 	s.mu.Lock()
 	s.quiesceErr = err
 	close(s.quiesceDone)
 	s.mu.Unlock()
+}
+
+func quiesceShutdownBound(l ClientLinkLimits) time.Duration {
+	const maxDuration = time.Duration(1<<63 - 1)
+	if l.CommandTimeout > maxDuration-l.DemandTimeout {
+		return maxDuration
+	}
+	return l.CommandTimeout + l.DemandTimeout
 }
 
 // The two startup warnings a composition without WithPendingCommands logs.
