@@ -427,7 +427,8 @@ func (r *Reconciler) deferToHolder(
 	if err != nil {
 		return Result{}, err
 	}
-	if decision := Decide(entry.Record, owner, observed, nil, r.cfg.Clock.Now()); decision.Outcome == OutcomeReuseOwner {
+	if decision := Decide(entry.Record, owner, observed, nil, r.cfg.Clock.Now()); decision.Outcome == OutcomeReuseOwner &&
+		(entry.Record.DesiredPlacement != sessionwire.HostPlacementDedicated || owner.HostGeneration == entry.Record.DesiredGeneration) {
 		return Result{Decision: decision}, nil
 	}
 	return Result{Deferred: true, ClaimExpiresAt: held.ExpiresAt}, nil

@@ -33,6 +33,24 @@ func TestDedicatedOwnerFromAnotherGenerationIsNotReused(t *testing.T) {
 	}
 }
 
+func TestDedicatedClaimLoserDoesNotReuseAnotherGeneration(t *testing.T) {
+	t.Parallel()
+	f := newFixture(t, sessionwire.HostPlacementDedicated, "factory-2")
+	if _, err := f.store.AcquireReconciliationClaim(context.Background(), sessionstore.AcquireReconciliationClaimRequest{
+		TenantID: testTenant, SessionID: testSession, HolderID: "factory-1", ExpiresAt: f.clock.now.Add(time.Minute),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	f.putOwner(t, sessionwire.HostPlacementDedicated) // generation 2, while the desire is generation 1.
+	result, err := f.reconciler.Reconcile(context.Background(), Request{TenantID: testTenant, SessionID: testSession})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.Deferred || result.Decision.Outcome == OutcomeReuseOwner || len(f.controller.intents) != 0 {
+		t.Fatalf("claim loser reused wrong-generation owner: result=%+v, ensures=%d", result, len(f.controller.intents))
+	}
+}
+
 func TestDedicatedAttachWaitsForReadyEndpointAndRejectsWrongFence(t *testing.T) {
 	t.Parallel()
 	for _, tc := range []struct {
