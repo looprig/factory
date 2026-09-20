@@ -319,6 +319,27 @@ func withLimits(limits RouteLimits) fixtureOption {
 	}
 }
 
+func TestProtectedUIAuthorizationUsesRequestDeadline(t *testing.T) {
+	t.Parallel()
+	var reached bool
+	f := newFixture(t, withLimits(RouteLimits{MaxRequestBytes: 1 << 20, RequestTimeout: 5 * time.Millisecond}),
+		func(cfg *RouterConfig, _ *fixture) {
+			cfg.UIRoutes = http.HandlerFunc(func(http.ResponseWriter, *http.Request) { reached = true })
+			cfg.AuthorizeUIRoute = func(ctx context.Context, _ factoryidentity.Principal, _, _ string) error {
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				case <-time.After(100 * time.Millisecond):
+					return errors.New("authorization had no bounded context")
+				}
+			}
+		})
+	recorder := f.serve(request(http.MethodGet, "/ui/live", nil))
+	if recorder.Code != http.StatusGatewayTimeout || reached {
+		t.Fatalf("bounded UI authorization = %d, handler reached %t; want 504 and no handler", recorder.Code, reached)
+	}
+}
+
 func withSessions(sessions ...storedSession) fixtureOption {
 	return func(cfg *RouterConfig, f *fixture) {
 		f.reads = newFakeReader(sessions...)

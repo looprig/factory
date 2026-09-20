@@ -337,8 +337,16 @@ func NewRouter(cfg RouterConfig) (*Router, error) {
 				writeAPIError(w, authenticationFailure(identity.ErrUnauthenticated))
 				return
 			}
-			if err := cfg.AuthorizeUIRoute(r.Context(), operation.Principal, r.Method, r.URL.Path); err != nil {
-				writeAPIError(w, authorizationFailure(err))
+			authCtx, cancel := context.WithTimeout(r.Context(), router.limits.RequestTimeout)
+			err := cfg.AuthorizeUIRoute(authCtx, operation.Principal, r.Method, r.URL.Path)
+			ended := authCtx.Err()
+			cancel()
+			if err != nil || ended != nil {
+				if failure, ok := contextFailure(ended); ok {
+					writeAPIError(w, failure)
+				} else {
+					writeAPIError(w, authorizationFailure(err))
+				}
 				return
 			}
 			cfg.UIRoutes.ServeHTTP(w, r)

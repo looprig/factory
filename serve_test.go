@@ -172,6 +172,7 @@ func TestUIRoutesRequireFactoryAuthenticationGuardAndAuthorization(t *testing.T)
 	var decision error = identity.ErrUnauthorized
 	var handlerPrincipal identity.Principal
 	var authorizedPrincipal identity.Principal
+	var authorizationCalls int
 	routes := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		calls++
 		var ok bool
@@ -182,6 +183,7 @@ func TestUIRoutesRequireFactoryAuthenticationGuardAndAuthorization(t *testing.T)
 		_, _ = w.Write([]byte("product-route"))
 	})
 	authorize := func(_ context.Context, principal identity.Principal, method, path string) error {
+		authorizationCalls++
 		authorizedPrincipal = principal
 		if principal.Tenant() != factory.FakeTenant || method != http.MethodGet || path != "/ui/live" {
 			return fmt.Errorf("unexpected UI authorization input: %v %s %s", principal, method, path)
@@ -193,20 +195,21 @@ func TestUIRoutesRequireFactoryAuthenticationGuardAndAuthorization(t *testing.T)
 		t.Fatalf("New() = %v", err)
 	}
 	for _, tc := range []struct {
-		name string
-		req  *http.Request
-		want int
+		name          string
+		req           *http.Request
+		want          int
+		wantAuthCalls int
 	}{
-		{"anonymous", httptest.NewRequest(http.MethodGet, trustedBase+"/ui/live", nil), http.StatusUnauthorized},
-		{"untrusted origin", apiRequest(t, http.MethodGet, "/ui/live"), http.StatusForbidden},
-		{"authorization denied", apiRequest(t, http.MethodGet, "/ui/live"), http.StatusForbidden},
+		{"anonymous", httptest.NewRequest(http.MethodGet, trustedBase+"/ui/live", nil), http.StatusUnauthorized, 0},
+		{"untrusted origin", apiRequest(t, http.MethodGet, "/ui/live"), http.StatusForbidden, 0},
+		{"authorization denied", apiRequest(t, http.MethodGet, "/ui/live"), http.StatusForbidden, 1},
 	} {
 		if tc.name == "untrusted origin" {
 			tc.req.Header.Set("Origin", "https://evil.example")
 		}
 		recorder := serveHandler(t, server.Handler(), tc.req)
-		if recorder.Code != tc.want {
-			t.Errorf("%s = %d, want %d; body %q", tc.name, recorder.Code, tc.want, recorder.Body)
+		if recorder.Code != tc.want || authorizationCalls != tc.wantAuthCalls {
+			t.Errorf("%s = %d, authorization calls %d; want %d and %d; body %q", tc.name, recorder.Code, authorizationCalls, tc.want, tc.wantAuthCalls, recorder.Body)
 		}
 	}
 	if calls != 0 {
