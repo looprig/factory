@@ -170,11 +170,19 @@ func TestUIRoutesRequireFactoryAuthenticationGuardAndAuthorization(t *testing.T)
 	t.Parallel()
 	var calls int
 	var decision error = identity.ErrUnauthorized
-	routes := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	var handlerPrincipal identity.Principal
+	var authorizedPrincipal identity.Principal
+	routes := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		calls++
+		var ok bool
+		handlerPrincipal, ok = factory.UIRoutePrincipal(r)
+		if !ok {
+			t.Error("protected handler received no verified principal")
+		}
 		_, _ = w.Write([]byte("product-route"))
 	})
 	authorize := func(_ context.Context, principal identity.Principal, method, path string) error {
+		authorizedPrincipal = principal
 		if principal.Tenant() != factory.FakeTenant || method != http.MethodGet || path != "/ui/live" {
 			return fmt.Errorf("unexpected UI authorization input: %v %s %s", principal, method, path)
 		}
@@ -213,6 +221,12 @@ func TestUIRoutesRequireFactoryAuthenticationGuardAndAuthorization(t *testing.T)
 	allowed := serveHandler(t, server.Handler(), apiRequest(t, http.MethodGet, "/ui/live"))
 	if allowed.Code != http.StatusOK || allowed.Body.String() != "product-route" || calls != 1 {
 		t.Errorf("authorized UI route = %d/%q, handler calls %d", allowed.Code, allowed.Body, calls)
+	}
+	if handlerPrincipal != authorizedPrincipal || handlerPrincipal.Tenant() != factory.FakeTenant {
+		t.Errorf("protected handler principal = %+v, authorization principal = %+v", handlerPrincipal, authorizedPrincipal)
+	}
+	if _, ok := factory.UIRoutePrincipal(httptest.NewRequest(http.MethodGet, trustedBase+"/ui/live", nil)); ok {
+		t.Error("raw request claimed a verified UI principal")
 	}
 	csrf := httptest.NewRequest(http.MethodPost, trustedBase+"/ui/live", nil)
 	csrf.AddCookie(&http.Cookie{Name: "factory_session", Value: factory.FakeCredentialValue})

@@ -329,7 +329,8 @@ type UIRouteAuthorizer func(context.Context, identity.Principal, string, string)
 
 // WithUIRoutes mounts application-owned /ui/ routes behind Factory's
 // authentication, origin/CSRF guard, and a required per-request authorizer.
-// The ordinary UI handler remains a public asset and SPA fallback.
+// The handler can read the verified principal with UIRoutePrincipal. The
+// ordinary UI handler remains a public asset and SPA fallback.
 func WithUIRoutes(h http.Handler, authorize UIRouteAuthorizer) Option {
 	return option("WithUIRoutes", func(c *config) error {
 		if h == nil || authorize == nil {

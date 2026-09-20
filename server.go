@@ -447,6 +447,21 @@ func composeRouter(cfg config, credentials *internalidentity.Authenticator, part
 // use.
 func (s *Server) Handler() http.Handler { return s.router }
 
+// UIRoutePrincipal returns the verified principal Factory placed on a request
+// before invoking a protected /ui/ route. The principal is a read-only value;
+// it does not expose the credential source or a reusable authorization grant.
+// A request outside Factory's authenticated handler has no such principal.
+func UIRoutePrincipal(r *http.Request) (identity.Principal, bool) {
+	if r == nil {
+		return identity.Principal{}, false
+	}
+	operation, ok := internalidentity.OperationContextFrom(r.Context())
+	if !ok {
+		return identity.Principal{}, false
+	}
+	return operation.Principal, true
+}
+
 // UI reports the optional user interface handler.
 //
 // The second result is false for a library composition that serves no UI,

@@ -82,6 +82,8 @@ Application-owned `/ui/` routes can be mounted with `WithUIRoutes`. Factory
 authenticates each request, applies its origin and CSRF guard, and calls the
 required route authorizer before the handler. These routes are independent of
 the public bundle, so a deployment can provide either, both, or neither.
+The protected handler reads the same verified principal passed to authorization
+through `UIRoutePrincipal(request)`.
 
 ## Serving
 
