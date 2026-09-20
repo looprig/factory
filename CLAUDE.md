@@ -2472,53 +2472,18 @@ trusted the routing table's own binding and never did (spec gate C1). (5)
 `Demand`'s mutex across a bind means one slow Host delays other sessions' binds
 and polls, not their delivery (above).
 
-## Not implemented yet
+## Current composition boundary
 
-A2.4 implements `/objects/{oid}` and `/objects/{oid}/metadata` in the internal
-router. The metadata response is Core's immutable index projection, not proof
-that the blob still exists. Byte GET accepts one explicit inclusive Range and
-returns exact 206/Content-Range only after whole-object EOF, digest/size checks
-and Close succeed. Full GET is supported only up to one page. Defaults and hard
-ceilings are 1 MiB retained page and 64 MiB verification, using a 32 KiB buffer
-and the existing 30-second request deadline. Range requests reread the entire
-object; larger objects require another protocol. Invalid/multipart/open/suffix
-ranges are 400; an end outside the object is 416 without clipping.
+`factory.New` composes the public router, admission, ClientLink, HostLink pool,
+placement sweeps, disposition reconciliation and live tail. `Start` runs their
+background work. `WithPendingCommands` is required for pooled placement; without
+it the replica reports that it will place no sessions. `cmd/factory` is a
+separately published nested module. `internal/placement/kubernetes` is absent
+from this root module.
 
-`ObjectPolicy` must establish committed-reference permission and trusted kind;
-index existence and the tenant-only default Authorizer cannot do that. The
-resolver consumes the exact catalog binding, including runtime identity and
-protocol mode. Only a canonical unbound legacy record may use the existing
-reader; all explicit bindings require a resolver. Requests retain authenticated
-tenant and canonical session scope; runtime namespace translation is the trusted
-adapter's responsibility. Tests exercise two real independent stores, but A9
-still owes production policy, frozen configuration resolution and public server
-composition. This does not activate independent-store Host execution.
-
-Composition seams (A0.2), identity derivation (A1.1), the route and error
-foundation (A2.1), the agent and session reads (A2.2), the cold session
-reads — status, journal and gates (A2.3) — and the browser identity bootstrap
-are done; the remaining read,
-control, admission, routing, placement and realtime handlers are later tasks in
-runbook 05. Every method in `httpapi.routeTable` carries the runbook
-task that fills its body in, and answers 501 until it does;
-`TestTheUnimplementedMethodsAreExactlyTheOnesLaterTasksOwn` holds the two sets
-equal. `httpapi.Directory` has no production implementation yet — **A4.1 owns
-it**, and until then `/v1/agents` reports every pooled target as unadvertised
-under any composition that supplies a directory answering empty pages. `factory.New` composes the authenticator, the guard and the `Router`, and
-`Server.Handler` serves them; A9.1 stage 1 did that over the seams that exist.
-`Serve`/`Stop` are optional and own an `http.Server` but not the listener, which
-is where `httpapi.RouteLimits`' deferred socket bounds landed as `HTTPLimits`.
-What it does NOT compose is ClientLink, HostLink, placement or the reconcilers,
-and the router it builds carries an empty launch `Department`, a nil
-`ObjectPolicy` and no object-store resolver -- each fails closed. There is no
-default verifier option, because a deployment supplies the `Verifier` and there
-is no credible default for one. `internal/realtime` holds the ClientLink engine
-(A6.1), the HostLink pool and dialer (A7.1), the bounded delivery queue (A7.3)
-and the pinned transport spike (A5.1); none of the four is composed by
-`factory.New` -- except that, since v0.4.0, the HostLink pool, the ClientLink,
-`routing.Relay` and the live tail ARE composed (see "The live tail"). `cmd/factory` and `internal/placement/kubernetes` do not
-exist; their exemptions grant nothing today and `TestBoundaryScopesAreNotStale`
-will fail if one of those directories appears without a Go file in it. Do not
-add a placeholder Go file to satisfy it: that would permanently satisfy a live
-tripwire, trading a guard that fires the day a directory appears unearned for a
-directory that is always "earned" by a file that means nothing.
+The service exports no Prometheus metrics handler. Do not invent backlog,
+resident-wait, queue, reconciliation or drain series in an operations example.
+The placement seam does not implement dedicated drain-before-delete; that is
+owned by the workload controller. A cold AskUser answer/resume remains
+unsupported. SessionStore's legacy object-first `PutObject` does not imply a
+Host disposition `SessionObjectStore`.

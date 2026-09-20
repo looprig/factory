@@ -102,19 +102,28 @@ which network, whether a supervisor passed the descriptor in, whether TLS is
 terminated here -- and gets the wire-level bounds `HTTPLimits` carries:
 `ReadHeaderTimeout`, `IdleTimeout` and `MaxHeaderBytes`. There is deliberately
 no `ReadTimeout` and no `WriteTimeout`; both are absolute per-connection
-deadlines, and this surface streams object bodies and will carry a WebSocket.
+deadlines, and this surface streams object bodies and carries a WebSocket.
 `Stop` is idempotent, does not return until what it stopped has stopped, and
 stops **public admission first** so nothing new is admitted while the background
-components -- when they exist -- are torn down. It never touches a Host runtime:
+components are torn down. It never touches a Host runtime:
 a session outlives every Factory replica.
 
-What `New` composes today is that surface and nothing else -- the authenticator
-built from the deployer's verifier, the origin and CSRF guard, the router and
-the optional UI. Command admission, placement, the ClientLink and HostLink
-engines and the multi-replica reconcilers are separate tasks; the seams they
-will use are validated at composition and then held unread. The router is built
-with an empty launch `Department`, a nil object policy and no object-store
-resolver, each of which fails closed.
+For a shared Factory and Host process, shut down in this order:
+`Server.Quiesce(ctx)` fences new command admission, waits for admissions already
+inside to return, and closes ClientLinks. Requests already past the router,
+including durable reads, may finish; new public requests receive 503. The HTTP
+listener, sweeps and HostLinks remain live. Observe bounded durable command
+settlement directly in the store, then drain Host while those links are live.
+Call `Server.Stop(ctx)`
+before closing the shared storage backend. Canceling a Quiesce caller's context
+ends only that caller's wait; the quiescence attempt continues. A Factory-only
+replica may call `Stop` directly, which invokes Quiesce itself.
+
+`New` also composes command admission, the ClientLink node, the HostLink pool,
+the routing and live-tail planes, and the placement and disposition sweeps.
+`Start` runs the background components. Pooled placement requires
+`WithPendingCommands`; without it the replica logs a warning and places no
+session (an error-level log if public creates are also composed).
 
 Each public seam is the union of the narrow interfaces the packages that CALL
 it declare for themselves, in `internal/httpapi`, `internal/admission`,
@@ -240,6 +249,42 @@ extension; this deliberately adds no direct `gorilla/websocket` dependency. The
 Redis and NATS brokers and standalone Centrifugo are **absent rather than
 asserted-refused** -- the node keeps its in-process memory broker and no
 external process is started. The suite exercises the JSON protocol only.
+
+## Deployment and recovery
+
+Factory's listener is public; the caller supplies it to `Serve` and owns TLS
+termination. `Handler` embedders must configure their own HTTP server limits.
+`WithCSRF` is required and has no default trusted origin or shared key.
+Factory verifies bearer, cookie or ClientLink credentials with the deployer's
+verifier; authorization and the origin/CSRF guard apply at the public edge.
+
+Keep one application-scoped ClientLink per browser and subscribe to session
+channels on it (`MaxChannelsPerConnection` defaults to 256). After a lost tail
+or `session.reset`, read the durable session journal through the HTTP read
+plane. Centrifuge history and recovery are disabled; a reconnect may land on
+another replica. This composition needs no sticky routing, notifier, cache,
+Redis or NATS broker. NATS may separately be selected as a Storage backend.
+
+Pooled and dedicated describe placement, not durability. Durable recovery
+requires a shared SessionStore backend, its leases and the Harness journal;
+object bytes require the selected object store. SessionStore's legacy
+`PutObject` and object-first write order do not provide a Host disposition
+`SessionObjectStore` by themselves. A dedicated workload is controlled by its
+workload controller, including drain and termination; Factory does not issue a
+HostLink drain or implement drain-before-delete in its placement seam.
+
+Factory exports no Prometheus `/metrics` handler or `factory_` series. It
+publishes no direct backlog, resident wait, delivery queue, reconciliation or
+drain metric. Durable records and the owning Host/controller provide only
+partial operational visibility until Factory metrics are implemented. `Stop` stops public admission and background work;
+it does not stop a resident Host runtime.
+
+Gate responses require a Host that advertises
+`hostlink.command.gate_response` (host v0.4.0 or later), with Factory pinned to
+sessionstore v0.12.0 or later before any Host publishes a gate. Keep Factory
+v0.5.0 or later paired with Host v0.3.0 or later and a bare advertised HostLink
+base. A cold AskUser answer/resume is unsupported; the gate path is for a
+resident session.
 
 ## The HostLink
 
@@ -506,4 +551,4 @@ and demand plane, placement and its sweeps, and -- since v0.4.0 -- the live
 tail (`routing.Relay` between the HostLink subscription and the ClientLink).
 Since v0.5.0 one pooled Host serves several tenants (Gap 1), and a gate
 response reaches a Host that advertises `hostlink.command.gate_response`
-(host ≥ v0.4.0). Still open: the default `cmd/factory` binary (A9.2).
+(host ≥ v0.4.0). The default `cmd/factory` binary lives in a separate nested module.
