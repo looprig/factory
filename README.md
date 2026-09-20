@@ -366,14 +366,15 @@ supplemented by optional `WorkloadEndpointDiscovery` for the first attach:
 the first Host address. After ensuring a dedicated workload, Factory asks this
 method for the ready Host's identity, generation and bare internal endpoint,
 then attaches through HostLink and binds from the Host's successful residency
-reply. An older controller lacking discovery yields
+reply. An older controller lacking discovery yields the internal diagnostic
 `placement.ErrWorkloadEndpointUnsupported`; the separate controller module must
 implement discovery before it can place new dedicated sessions. The endpoint
 alone proves neither capacity nor residency.
-The workload seam remains
-composition-only here: no scheduled reconciliation driver is built in this
-module. H5 keeps the Kubernetes adapter out of this module entirely: it lives in
-the separate repository `looprig/controller` (owner ruling 2026-09-18), which
+
+The workload seam remains composition-only here: no scheduled reconciliation
+driver is built in this module. H5 keeps the Kubernetes adapter out of this
+module entirely: it lives in the separate repository `looprig/controller`
+(owner ruling 2026-09-18), which
 consumes Factory only as a published module, so no Factory consumer inherits the
 Kubernetes client graph;
 `cmd/factory` supplies no workload create/delete RBAC, so a nil controller is a
@@ -462,14 +463,16 @@ candidate's) link for the session's tenant:
   before anything is written.
 - **The wake.** A gate-response wake is withheld from a bound Host without the
   token and counted (`WithheldGateResponses`).
-- **Placement (pooled only).** A session with a pending gate response is placed
-  only on a candidate with the token; the others are skipped and reported in
-  one WARN per pass, at most once per session every 5 minutes. **With none, the
-  WHOLE session waits** — its inputs and interrupts included — for at most the
-  pending answer's apply deadline (`ReconcileLimits.ApplyDeadline`, default
-  5 minutes). The expiry sweep then rejects the answer and the session places
-  normally; a command admitted behind it may expire in that window. A dedicated
-  placement hands the record to the workload controller unfiltered.
+- **Placement.** A session with a pending gate response attaches only to a Host
+  with the token. Pooled placement skips incapable candidates and reports them
+  in one WARN per pass, at most once per session every 5 minutes. Dedicated
+  placement may ensure its workload first, then probes the ready endpoint's
+  capability before attach; an incapable or unreachable endpoint stays
+  unattached. **With no capable Host, the WHOLE session waits** — its inputs
+  and interrupts included — for at most the pending answer's apply deadline
+  (`ReconcileLimits.ApplyDeadline`, default 5 minutes). The expiry sweep then
+  rejects the answer and the session places normally; a command admitted behind
+  it may expire in that window.
 - **Staleness.** A capability read uses the link's latest reply and is not
   fenced to the owner's generation, so it can be one reply stale across a Host
   restart the link has not yet noticed.

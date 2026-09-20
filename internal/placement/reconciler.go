@@ -228,8 +228,9 @@ type Result struct {
 	// the caller can act on, is how much work this call did.
 	DesiredWrites int
 
-	// Intent is the stored desired state handed to the controller, populated
-	// only for OutcomeReconcileDedicated.
+	// Intent is the stored desired state handed to EnsureWorkload. It remains
+	// populated if a later read changes the decision to OutcomeUndecided or a
+	// matching owner is reused; the decision, not Intent, describes the result.
 	Intent sessionstore.PlacementIntent
 
 	// Attached is the Host's observation of the residency an attach made by
@@ -258,8 +259,8 @@ type Result struct {
 	Unreachable   []sessionwire.HostID
 	Unaddressable []sessionwire.HostID
 	// Incapable names the candidates skipped because the session has a
-	// pending gate response and the candidate cannot apply one (or could not
-	// be asked).
+	// pending gate response and the candidate answered that it cannot apply one.
+	// A candidate that could not be asked is Unreachable or an error.
 	Incapable []sessionwire.HostID
 	Refused   []CandidateRefusal
 	Failed    []sessionwire.HostID

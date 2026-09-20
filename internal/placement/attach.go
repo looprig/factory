@@ -540,10 +540,11 @@ const (
 // appliesGateResponses is the capable-only placement filter: a session with a
 // PENDING gate response is placed only on a Host whose connect reply carries
 // Core's gate_response capability token (hostlink.GateResponseCapable, asked
-// through the same Links seam the wake uses). A candidate that cannot -- or
-// could not be asked -- is skipped (Result.Incapable), and if none can, the
-// session waits (OutcomeNoCapacity) for a capable Host rather than being
-// placed where its answer would be refused or left applying.
+// through the same Links seam the wake uses). A candidate that answers no is
+// skipped as Incapable; a transiently unreachable candidate is Unreachable,
+// and an unclassified read error aborts this pass. If none can apply the
+// response, the session waits (OutcomeNoCapacity) rather than being placed
+// where its answer would be refused or left applying.
 //
 // A candidate whose base cannot address the tenant is NOT "incapable": the
 // question could not even be addressed, and it is recorded and logged as
