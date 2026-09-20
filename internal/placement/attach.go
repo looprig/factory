@@ -97,6 +97,14 @@ var ErrRegistryStale = errors.New("placement: the session lease is held elsewher
 // the registry, which now names the owner.
 var ErrBindAfterAttach = errors.New("placement: the host attached the session but the bind that followed failed")
 
+// ErrDedicatedEndpointInvalid reports a ready endpoint that does not describe
+// the generation Factory just ensured, or cannot be dialled for this tenant.
+var ErrDedicatedEndpointInvalid = errors.New("placement: dedicated workload endpoint is invalid")
+
+// ErrDedicatedObservationInvalid reports a post-attach registry observation
+// for the wrong intent. It must not be used as an attach target or bind source.
+var ErrDedicatedObservationInvalid = errors.New("placement: dedicated workload observation does not match the intent")
+
 // AttachRefusal is a Host's own coded answer to an attach. A HostLinks
 // implementation returns it for a Host's HostLinkError.
 //
@@ -129,6 +137,134 @@ type HostLinks interface {
 	// by the one capability predicate (hostlink.GateResponseCapable). An error
 	// means it could not be asked, and is never read as "can".
 	AcceptsGateResponses(ctx context.Context, owner sessionwire.HostLinkRegistryObservation) (bool, error)
+}
+
+// placeDedicated discovers the Host created for the claimed intent. The
+// controller's endpoint only tells us where to ask; the Host's attach reply is
+// the first evidence of residency and the only source of a new bind epoch.
+func (r *Reconciler) placeDedicated(ctx context.Context, req Request, result Result) (Result, error) {
+	intent := result.Intent
+	observed, found, err := r.cfg.Workloads.ObserveWorkload(ctx, intent)
+	if err != nil {
+		return result, err
+	}
+	entry, err := r.cfg.Catalog.GetCatalogEntry(ctx, sessionstore.GetCatalogEntryRequest{TenantID: req.TenantID, SessionID: req.SessionID})
+	if err != nil {
+		return result, err
+	}
+	if entry.Record.DesiredPlacement != sessionwire.HostPlacementDedicated || entry.Record.DesiredGeneration != intent.Generation {
+		result.Decision = Decision{Outcome: OutcomeUndecided}
+		return result, nil
+	}
+	owner, hasOwner, err := r.cfg.Directory.Owner(ctx, req.TenantID, req.SessionID)
+	if err != nil {
+		return result, err
+	}
+	if hasOwner && ReusableOwner(owner, entry.Record, r.cfg.Clock.Now()) && owner.HostGeneration == intent.Generation {
+		result.Decision = Decision{Outcome: OutcomeReuseOwner, Owner: owner}
+		return r.wake(ctx, req, owner, result)
+	}
+	if found {
+		if err := observed.Validate(); err != nil || !ReusableOwner(observed, entry.Record, r.cfg.Clock.Now()) || observed.HostGeneration != intent.Generation {
+			return result, fmt.Errorf("%w: observed route conflicts with intended workload", ErrDedicatedObservationInvalid)
+		}
+		result.Decision = Decision{Outcome: OutcomeReuseOwner, Owner: observed}
+		return r.wake(ctx, req, observed, result)
+	}
+	if r.cfg.Links == nil {
+		return result, nil
+	}
+	discovery, ok := r.cfg.Workloads.(WorkloadEndpointDiscovery)
+	if !ok {
+		return result, ErrWorkloadEndpointUnsupported
+	}
+	hostID, generation, base, ready, err := discovery.WorkloadEndpoint(ctx, intent)
+	if err != nil || !ready {
+		return result, err
+	}
+	endpoint := DedicatedEndpoint{HostID: hostID, HostGeneration: generation, InternalEndpoint: base}
+	if err := endpoint.HostID.Validate(); err != nil || endpoint.HostGeneration != intent.Generation {
+		return result, fmt.Errorf("%w: host identity or generation", ErrDedicatedEndpointInvalid)
+	}
+	if _, err := sessionwire.HostLinkEndpoint(endpoint.InternalEndpoint, intent.TenantID); err != nil {
+		return result, fmt.Errorf("%w: %w", ErrDedicatedEndpointInvalid, err)
+	}
+	// Endpoint discovery may block while a new desire is committed. The claim
+	// suppresses duplicate scaling; it does not fence the catalog writer.
+	entry, err = r.cfg.Catalog.GetCatalogEntry(ctx, sessionstore.GetCatalogEntryRequest{TenantID: req.TenantID, SessionID: req.SessionID})
+	if err != nil {
+		return result, err
+	}
+	if entry.Record.DesiredPlacement != sessionwire.HostPlacementDedicated || entry.Record.DesiredGeneration != intent.Generation {
+		result.Decision = Decision{Outcome: OutcomeUndecided}
+		return result, nil
+	}
+	if len(req.GateResponses) > 0 {
+		capable, err := r.cfg.Links.AcceptsGateResponses(ctx, sessionwire.HostLinkRegistryObservation{
+			TenantID: req.TenantID, SessionID: req.SessionID, HostID: endpoint.HostID,
+			HostGeneration: endpoint.HostGeneration, InternalEndpoint: endpoint.InternalEndpoint,
+		})
+		switch verdict, err := classifyGateCapability(capable, err); verdict {
+		case gateUnaddressable:
+			result.Unaddressable = append(result.Unaddressable, endpoint.HostID)
+			return result, nil
+		case gateUnreachable:
+			result.Unreachable = append(result.Unreachable, endpoint.HostID)
+			return result, nil
+		case gateAbort:
+			return result, err
+		case gateIncapable:
+			result.Incapable = append(result.Incapable, endpoint.HostID)
+			return result, nil
+		}
+		entry, err = r.cfg.Catalog.GetCatalogEntry(ctx, sessionstore.GetCatalogEntryRequest{TenantID: req.TenantID, SessionID: req.SessionID})
+		if err != nil {
+			return result, err
+		}
+		if entry.Record.DesiredPlacement != sessionwire.HostPlacementDedicated || entry.Record.DesiredGeneration != intent.Generation {
+			result.Decision = Decision{Outcome: OutcomeUndecided}
+			return result, nil
+		}
+	}
+	candidate := sessionwire.HostLinkCapacityReport{HostID: endpoint.HostID, HostGeneration: endpoint.HostGeneration}
+	observation, err := r.cfg.Links.Attach(ctx, endpoint.InternalEndpoint, attachRequest(entry.Record, candidate, attachMode(entry.Record), r.cfg.ActorID))
+	switch answer, code := attachAnswer(err); answer {
+	case answerAccepted:
+		if err := observation.Validate(); err != nil || !ReusableOwner(observation, entry.Record, r.cfg.Clock.Now()) ||
+			observation.HostID != endpoint.HostID || observation.HostGeneration != endpoint.HostGeneration || observation.InternalEndpoint != endpoint.InternalEndpoint {
+			return result, fmt.Errorf("%w: attach reply conflicts with intended workload", ErrDedicatedObservationInvalid)
+		}
+		result.Attached = observation
+		return r.bindAttached(ctx, req, observation, result)
+	case answerStale:
+		result.Refused = append(result.Refused, CandidateRefusal{HostID: endpoint.HostID, HostGeneration: endpoint.HostGeneration, Code: code})
+		current, found, readErr := r.cfg.Directory.Owner(ctx, req.TenantID, req.SessionID)
+		if readErr != nil {
+			return result, readErr
+		}
+		if found && ReusableOwner(current, entry.Record, r.cfg.Clock.Now()) && current.HostGeneration == intent.Generation {
+			result.Decision = Decision{Outcome: OutcomeReuseOwner, Owner: current}
+			return r.wake(ctx, req, current, result)
+		}
+		return result, ErrRegistryStale
+	case answerRefused:
+		result.Refused = append(result.Refused, CandidateRefusal{HostID: endpoint.HostID, HostGeneration: endpoint.HostGeneration, Code: code})
+		return result, nil
+	case answerUnsupported:
+		result.Excluded = append(result.Excluded, endpoint.HostID)
+		return result, ErrAttachUnsupported
+	case answerUnreachable:
+		result.Unreachable = append(result.Unreachable, endpoint.HostID)
+		return result, nil
+	case answerUnaddressable:
+		result.Unaddressable = append(result.Unaddressable, endpoint.HostID)
+		return result, nil
+	case answerFailed:
+		result.Failed = append(result.Failed, endpoint.HostID)
+		return result, nil
+	default:
+		return result, err
+	}
 }
 
 // CandidateRefusal is one candidate a placement asked and was refused by.

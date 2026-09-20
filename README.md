@@ -361,6 +361,16 @@ SessionStore checks the key before the revision.
 `WorkloadController` names no platform type and exposes the four domain
 lifecycle operations `EnsureWorkload`, `ObserveWorkload`, `RequestDrain`, and
 `DeleteWorkload`, all over Core and SessionStore records. The seam is
+supplemented by optional `WorkloadEndpointDiscovery` for the first attach:
+`ObserveWorkload` reads a post-attach registry observation and cannot discover
+the first Host address. After ensuring a dedicated workload, Factory asks this
+method for the ready Host's identity, generation and bare internal endpoint,
+then attaches through HostLink and binds from the Host's successful residency
+reply. An older controller lacking discovery yields
+`placement.ErrWorkloadEndpointUnsupported`; the separate controller module must
+implement discovery before it can place new dedicated sessions. The endpoint
+alone proves neither capacity nor residency.
+The workload seam remains
 composition-only here: no scheduled reconciliation driver is built in this
 module. H5 keeps the Kubernetes adapter out of this module entirely: it lives in
 the separate repository `looprig/controller` (owner ruling 2026-09-18), which

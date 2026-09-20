@@ -140,6 +140,21 @@ type WorkloadController interface {
 	DeleteWorkload(ctx context.Context, intent sessionstore.PlacementIntent) error
 }
 
+// WorkloadEndpointDiscovery is the optional pre-attach half of a dedicated
+// workload controller. It returns the Host ID, desired generation and bare
+// internal endpoint only once the intended workload is ready. The endpoint is
+// a dial target, not a registry observation or proof of residency. Factory
+// checks the generation and Core's bare-base rules; the controller must verify
+// that the Host ID and endpoint belong to the exact intent and that its
+// workload is ready before returning true. HostLink Attach then checks agent,
+// runtime compatibility, session and the Host fence under the Host lease.
+// Factory refuses a dedicated attach when a controller lacks this method; older
+// controllers remain usable for lifecycle operations but cannot place a new
+// dedicated session.
+type WorkloadEndpointDiscovery interface {
+	WorkloadEndpoint(ctx context.Context, intent sessionstore.PlacementIntent) (sessionwire.HostID, uint64, sessionwire.InternalEndpoint, bool, error)
+}
+
 // Clock is the time seam.
 type Clock interface {
 	Now() time.Time

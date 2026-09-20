@@ -5,10 +5,32 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
+	"errors"
 
 	sessionwire "github.com/looprig/core/sessionwire/v1"
 	"github.com/looprig/sessionstore"
 )
+
+// ErrWorkloadEndpointUnsupported means a dedicated workload controller has no
+// pre-attach endpoint discovery seam. Its post-attach registry observation
+// cannot be used to discover the first endpoint.
+var ErrWorkloadEndpointUnsupported = errors.New("placement: workload controller cannot discover a pre-attach endpoint")
+
+// DedicatedEndpoint identifies the ready Host process created for one intent.
+// It is an address and a fence, not evidence of session residency or capacity.
+type DedicatedEndpoint struct {
+	HostID           sessionwire.HostID
+	HostGeneration   uint64
+	InternalEndpoint sessionwire.InternalEndpoint
+}
+
+// WorkloadEndpointDiscovery is an optional pre-attach seam. Its signature
+// names only Core and SessionStore types, so a separately released controller
+// can implement it without importing Factory's internal package. A false
+// ready answer leaves placement pending.
+type WorkloadEndpointDiscovery interface {
+	WorkloadEndpoint(context.Context, sessionstore.PlacementIntent) (sessionwire.HostID, uint64, sessionwire.InternalEndpoint, bool, error)
+}
 
 // WorkloadController is the consumer-owned domain seam for a dedicated
 // workload's lifecycle.

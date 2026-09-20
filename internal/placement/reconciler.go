@@ -302,7 +302,8 @@ func (r *Reconciler) Reconcile(ctx context.Context, req Request) (Result, error)
 		return Result{}, err
 	}
 	now := r.cfg.Clock.Now()
-	if decision := Decide(entry.Record, owner, observed, nil, now); decision.Outcome == OutcomeReuseOwner {
+	if decision := Decide(entry.Record, owner, observed, nil, now); decision.Outcome == OutcomeReuseOwner &&
+		(entry.Record.DesiredPlacement != sessionwire.HostPlacementDedicated || owner.HostGeneration == entry.Record.DesiredGeneration) {
 		return r.wake(ctx, req, owner, Result{Decision: decision})
 	}
 
@@ -372,11 +373,12 @@ func (r *Reconciler) Reconcile(ctx context.Context, req Request) (Result, error)
 		if err := r.cfg.Workloads.EnsureWorkload(ctx, intent); err != nil {
 			return Result{}, err
 		}
-		return Result{
+		result := Result{
 			Decision:      Decision{Outcome: OutcomeReconcileDedicated},
 			DesiredWrites: writes,
 			Intent:        intent,
-		}, nil
+		}
+		return r.placeDedicated(ctx, req, result)
 	}
 	return Result{Decision: decision, DesiredWrites: writes}, nil
 }
