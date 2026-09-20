@@ -59,6 +59,7 @@ type scriptedLinks struct {
 	gateCapable bool
 	gateErr     error
 	gateAsks    []sessionwire.HostID
+	gateHook    func()
 	// gateCapableHosts, when set, answers per Host instead of gateCapable.
 	gateCapableHosts map[sessionwire.HostID]bool
 }
@@ -129,12 +130,17 @@ func (l *scriptedLinks) DeliverCommand(_ context.Context, tenant sessionwire.Ten
 // refuses, as production does for a Host whose reply lacks Core's token.
 func (l *scriptedLinks) AcceptsGateResponses(_ context.Context, owner sessionwire.HostLinkRegistryObservation) (bool, error) {
 	l.mu.Lock()
-	defer l.mu.Unlock()
 	l.gateAsks = append(l.gateAsks, owner.HostID)
+	hook := l.gateHook
+	capable, err := l.gateCapable, l.gateErr
 	if l.gateCapableHosts != nil {
-		return l.gateCapableHosts[owner.HostID], l.gateErr
+		capable = l.gateCapableHosts[owner.HostID]
 	}
-	return l.gateCapable, l.gateErr
+	l.mu.Unlock()
+	if hook != nil {
+		hook()
+	}
+	return capable, err
 }
 
 func (l *scriptedLinks) RouteFor(sessionwire.TenantID, sessionwire.SessionID) (sessionwire.HostID, bool) {
@@ -161,6 +167,19 @@ func acceptedObservation(req sessionwire.HostLinkAttachRequest, epoch uint64) se
 		InternalEndpoint: sessionwire.InternalEndpoint("wss://attached." + string(req.HostID) + ".internal"),
 		Residency:        sessionwire.SessionResidencyResident, Accepting: true, LeaseEpoch: epoch,
 		ObservedAt: reconcileNow, ExpiresAt: reconcileNow.Add(time.Minute),
+	}
+}
+
+func TestPooledGateProbeTransportFailureIsNotIncapability(t *testing.T) {
+	t.Parallel()
+	f := newAttachFixture(t, nil)
+	f.publishTarget(t, "host-a", 1, sessionwire.HostIsolationClassCrossTenantIsolated)
+	f.links.gateErr = ErrHostUnreachable
+	result, err := f.reconciler.Reconcile(context.Background(), Request{
+		TenantID: testTenant, SessionID: testSession, GateResponses: []sessionwire.CommandID{"gate-command"},
+	})
+	if err != nil || len(result.Unreachable) != 1 || len(result.Incapable) != 0 || len(f.links.attaches) != 0 {
+		t.Fatalf("transient gate probe = result %+v, error %v, attaches %d", result, err, len(f.links.attaches))
 	}
 }
 

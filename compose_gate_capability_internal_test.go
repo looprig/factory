@@ -16,6 +16,27 @@ type advertisingDialer struct {
 	dialled []hostlink.Target
 }
 
+type failingCapabilityDialer struct{}
+
+func (failingCapabilityDialer) Dial(context.Context, hostlink.Target, hostlink.Observer) (hostlink.Link, error) {
+	return nil, hostlink.ErrLinkReconnecting
+}
+
+func TestPlacementCapabilityAdapterKeepsTransientCause(t *testing.T) {
+	t.Parallel()
+	pool, err := hostlink.NewPool(hostlink.Config{Dialer: failingCapabilityDialer{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = pool.Close(context.Background()) })
+	_, err = placementLinks{pool: pool}.AcceptsGateResponses(context.Background(), sessionwire.HostLinkRegistryObservation{
+		TenantID: "tenant-a", SessionID: "session-a", HostID: "host-a", InternalEndpoint: "ws://host-a.internal",
+	})
+	if !errors.Is(err, placement.ErrHostUnreachable) || !errors.Is(err, hostlink.ErrLinkReconnecting) {
+		t.Fatalf("placement capability read = %v; want transient classification and cause", err)
+	}
+}
+
 func (d *advertisingDialer) Dial(_ context.Context, target hostlink.Target, _ hostlink.Observer) (hostlink.Link, error) {
 	d.dialled = append(d.dialled, target)
 	return advertisingLink{host: target.Host, methods: d.methods[target.Host]}, nil

@@ -437,6 +437,9 @@ func (l placementLinks) AcceptsGateResponses(ctx context.Context, owner sessionw
 		// gate N4) rather than as a Host that cannot apply gate responses.
 		return false, fmt.Errorf("%w: %w", placement.ErrTenantUnaddressable, err)
 	}
+	if errors.Is(err, admission.ErrGateResponderUnavailable) {
+		return false, fmt.Errorf("%w: %w", placement.ErrHostUnreachable, err)
+	}
 	return capable, err
 }
 

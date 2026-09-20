@@ -141,14 +141,14 @@ func TestASessionWithAPendingGateResponseIsPlacedOnlyOnACapableHost(t *testing.T
 		t.Fatalf("with no capable Host = (%+v, %v) attaches=%v, want no capacity and no attach", result, err, none.links.attachedHosts())
 	}
 
-	// A Host that could not be asked is not capable, whatever else came back.
+	// A Host that could not be asked is transiently unreachable, not incapable.
 	unasked := newAttachFixture(t, nil)
 	unasked.publishTarget(t, "host-new", 2, sessionwire.HostIsolationClassCrossTenantIsolated)
 	unasked.links.gateCapableHosts = map[sessionwire.HostID]bool{"host-new": true}
-	unasked.links.gateErr = errors.New("reconnecting")
+	unasked.links.gateErr = ErrHostUnreachable
 	result, err = gateWake(unasked)
-	if err != nil || result.Decision.Outcome != OutcomeNoCapacity || len(unasked.links.attachedHosts()) != 0 {
-		t.Fatalf("with a Host that could not be asked = (%+v, %v) attaches=%v, want the session to wait", result, err, unasked.links.attachedHosts())
+	if err != nil || result.Decision.Outcome != OutcomeNoCapacity || len(result.Unreachable) != 1 || len(result.Incapable) != 0 || len(unasked.links.attachedHosts()) != 0 {
+		t.Fatalf("with a Host that could not be asked = (%+v, %v) attaches=%v, want transient unreachability", result, err, unasked.links.attachedHosts())
 	}
 }
 

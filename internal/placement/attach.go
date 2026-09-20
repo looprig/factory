@@ -335,6 +335,11 @@ func (r *Reconciler) placePooled(ctx context.Context, req Request, writes int) (
 						incapableWhy[candidate.HostID] = err.Error()
 					}
 					continue
+				case gateUnreachable:
+					result.Unreachable = append(result.Unreachable, candidate.HostID)
+					continue
+				case gateAbort:
+					return result, err
 				}
 			}
 			observation, err := r.cfg.Links.Attach(ctx, candidate.InternalEndpoint, attachRequest(record, candidate, mode, r.cfg.ActorID))
@@ -392,6 +397,8 @@ const (
 	gateCapable gateCapability = iota
 	gateIncapable
 	gateUnaddressable
+	gateUnreachable
+	gateAbort
 )
 
 // appliesGateResponses is the capable-only placement filter: a session with a
@@ -412,13 +419,21 @@ func (r *Reconciler) appliesGateResponses(ctx context.Context, req Request, cand
 		HostID: candidate.HostID, HostGeneration: candidate.HostGeneration,
 		InternalEndpoint: candidate.InternalEndpoint,
 	})
+	return classifyGateCapability(capable, err)
+}
+
+func classifyGateCapability(capable bool, err error) (gateCapability, error) {
 	switch {
 	case err == nil && capable:
 		return gateCapable, nil
+	case err == nil:
+		return gateIncapable, nil
 	case errors.Is(err, ErrTenantUnaddressable):
 		return gateUnaddressable, err
+	case errors.Is(err, ErrHostUnreachable):
+		return gateUnreachable, err
 	default:
-		return gateIncapable, err
+		return gateAbort, err
 	}
 }
 
