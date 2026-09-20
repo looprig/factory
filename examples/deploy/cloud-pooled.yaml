@@ -1,0 +1,43 @@
+# Template for a product composition root. Replace the image and probe paths
+# with the product's actual binary and readiness contract before applying.
+# Factory itself ships no stock command or environment parser.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: product-factory
+  labels: {app: product-factory}
+spec:
+  replicas: 2
+  selector:
+    matchLabels: {app: product-factory}
+  template:
+    metadata:
+      labels: {app: product-factory}
+    spec:
+      terminationGracePeriodSeconds: 120
+      containers:
+        - name: factory
+          image: registry.example.invalid/product/factory:REPLACE_WITH_DIGEST
+          ports:
+            - {name: public, containerPort: 8080}
+          resources:
+            requests: {cpu: "500m", memory: 4Gi}
+            limits: {cpu: "2", memory: 8Gi}
+          # The product must load scoped credentials from its own secret provider.
+          # No Factory environment variable names are implied by this template.
+          readinessProbe:
+            httpGet: {path: /REPLACE_WITH_PRODUCT_READINESS, port: public}
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: {path: /REPLACE_WITH_PRODUCT_LIVENESS, port: public}
+            periodSeconds: 20
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: product-factory-public
+spec:
+  type: ClusterIP
+  selector: {app: product-factory}
+  ports:
+    - {name: http, port: 8080, targetPort: public}
