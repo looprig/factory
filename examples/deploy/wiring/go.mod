@@ -6,8 +6,8 @@ require (
 	github.com/looprig/factory v0.7.0
 	github.com/looprig/pgstore v0.1.1
 	github.com/looprig/s3store v0.1.1
-	github.com/looprig/sessionstore v0.12.0
 	github.com/looprig/storage v0.6.1
+	go.yaml.in/yaml/v2 v2.4.2
 )
 
 require (
@@ -47,6 +47,7 @@ require (
 	github.com/josharian/intern v1.0.0 // indirect
 	github.com/jpillora/backoff v1.0.0 // indirect
 	github.com/looprig/core v0.11.0 // indirect
+	github.com/looprig/sessionstore v0.12.0 // indirect
 	github.com/mailru/easyjson v0.9.2 // indirect
 	github.com/maypok86/otter v1.2.4 // indirect
 	github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822 // indirect
@@ -61,7 +62,6 @@ require (
 	github.com/segmentio/encoding v0.5.4 // indirect
 	github.com/shadowspore/fossil-delta v0.0.0-20241213113458-1d797d70cbe3 // indirect
 	github.com/valyala/bytebufferpool v1.0.0 // indirect
-	go.yaml.in/yaml/v2 v2.4.2 // indirect
 	golang.org/x/sync v0.22.0 // indirect
 	golang.org/x/sys v0.47.0 // indirect
 	golang.org/x/text v0.41.0 // indirect

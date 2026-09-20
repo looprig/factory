@@ -46,7 +46,9 @@ is local to each replica, so two fully loaded replicas can admit 10,000 links.
 ## Structured and object storage
 
 `wiring.Open` composes PostgreSQL's Ledger, Leaser, KV and OrderedIndex with
-S3's Blobs and opens SessionStore. Supply a TLS-verifying PostgreSQL DSN (for
+S3's Blobs and returns a `storage.Composite` plus its owned PostgreSQL pool.
+The product initializes SessionStore separately with its own service lifetime
+context and provider operation deadlines. Supply a TLS-verifying PostgreSQL DSN (for
 example `sslmode=verify-full` with a trusted CA) and an HTTPS S3 endpoint.
 Use `MigrationValidate` on both Factory replicas; run migrations once as a
 separate owner before rollout. The product injects credentials from a scoped
@@ -57,11 +59,10 @@ bucket policy, IAM, key access and backup/restore separately against the live
 provider. `DeploymentPrefix` is a canonical shared deployment namespace (for
 example `deployments/production`), **not** a per-replica or per-tenant path.
 Factory and Host must agree on that namespace and the SessionStore layout.
-Pass a bounded startup context to `wiring.Open`; the returned SessionStore
-has its own lifetime and remains usable after that startup context ends.
-After Factory and Host stop, close SessionStore and then the PostgreSQL pool.
+Pass a bounded startup context to `wiring.Open`. After Factory and Host stop,
+close the product's SessionStore and then the PostgreSQL pool.
 
-Run `python3 examples/deploy/validate.py` (requires PyYAML) and
-`cd examples/deploy/wiring && GOWORK=off go test ./...` before publishing a
+Run `cd examples/deploy/wiring && GOWORK=off go test ./...` and
+`GOWORK=off go run ./cmd/validate ../cloud-pooled.yaml wiring.go` before publishing a
 product adaptation. The validator checks these templates; review product
 rendered manifests and network policy as part of deployment.
