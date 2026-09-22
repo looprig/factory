@@ -49,8 +49,10 @@ string table is one `go mod tidy` away from being dropped.
   list to drift.
 - **The scan fails loudly at zero files.** A guard that walks nothing is
   indistinguishable from a clean tree.
-- **Scopes that do not exist yet are still proven.** None of the three scoped
-  directories is built at scaffold time, so `TestScanReachesEveryRuleScope`
+- **Scopes that do not exist are still proven.** Of the two scoped rules, only
+  `internal/realtime/` is built; `internal/placement/kubernetes` is not, and the
+  Kubernetes adapter ships in the separate `looprig/controller` repository
+  instead. So `TestScanReachesEveryRuleScope`
   constructs a fixture module containing a file at each scope, one directly
   outside it, and one at the root, drives the live enumerator and the live scan
   over it, and requires the in-scope files to pass and the others to be
@@ -1591,8 +1593,12 @@ that succeeds without applying anything.
 
 ### What H5 decided, and where each part of it shows up
 
-The Kubernetes adapter is **internal**, built as **two binaries from the one
-`factory` module**, with **no leader election**.
+H5 decided the Kubernetes adapter would be internal, built as two binaries from
+the one `factory` module, with **no leader election**. **The packaging half is
+superseded** (owner ruling 2026-09-18): the adapter and its executable ship as
+the separate **`looprig/controller`** repository, Factory ships **no binary**,
+and no Kubernetes library enters this module's graph. The no-leader-election
+half still holds.
 
 - `WorkloadController` therefore names no platform type.
   `sessionstore.PlacementIntent` is the whole currency: Factory-authored desire

@@ -44,11 +44,15 @@ type boundaryRule struct {
 // because a substring ban over source is defeated by a line break, a rename or
 // a package alias, and cannot tell an import from a comment that mentions one.
 //
-// The three scoped rules bound their exemption STRUCTURALLY, by the subtree the
-// change itself must create, rather than by a hand-kept list of package names
-// beside the guard. Adding a second package under internal/realtime is inside
-// the grant on purpose; adding a second binary beside cmd/factory is not, and
-// TestBoundaryRulesClassifyEveryCase drives both of those readings.
+// The two scoped rules (centrifuge and kubernetes) bound their exemption
+// STRUCTURALLY, by the subtree the change itself must create, rather than by a
+// hand-kept list of package names beside the guard. Adding a second package
+// under internal/realtime is inside the grant on purpose; a package merely
+// NAMED kubernetes outside internal/placement/kubernetes is not, and
+// TestBoundaryRulesClassifyEveryCase drives both of those readings. Every other
+// rule is forbidden everywhere. Factory ships no binary: the cmd/factory
+// directories in the case table are hypothetical probes, and the Kubernetes
+// adapter itself ships in the separate looprig/controller repository.
 var boundaryRules = []boundaryRule{
 	{
 		// Factory never links Host. Everything they exchange is a Core or
