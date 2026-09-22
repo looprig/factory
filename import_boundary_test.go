@@ -76,11 +76,13 @@ var boundaryRules = []boundaryRule{
 		matches:  importUnder("github.com/centrifugal"),
 	},
 	{
-		// The web UI is composed by the binary. A library embedding of Factory
-		// takes an http.Handler and must not drag a UI bundle in with it.
+		// Factory ships no UI and no binary (owner ruling 2026-09-22). A
+		// library embedding of Factory takes an http.Handler through
+		// WithUIHandler/WithUIFS/WithUIRoutes; it must never import a UI
+		// bundle itself.
 		name:     "wui",
 		docToken: "github.com/looprig/wui",
-		scope:    "cmd/factory",
+		scope:    "",
 		matches:  importUnder("github.com/looprig/wui"),
 	},
 	{
@@ -178,13 +180,14 @@ func boundaryCases() []boundaryCase {
 		{name: "a sibling directory whose name merely starts with realtime is out of scope", rule: "centrifuge", dir: "internal/realtimefanout", importPath: "github.com/centrifugal/centrifuge", want: "centrifuge"},
 		{name: "a realtime directory somewhere else is out of scope", rule: "centrifuge", dir: "cmd/factory/internal/realtime", importPath: "github.com/centrifugal/centrifuge", want: "centrifuge"},
 
-		// Rule 4: WUI — permitted only under cmd/factory.
+		// Rule 4: WUI — forbidden everywhere (owner ruling 2026-09-22: Factory
+		// ships no UI and no binary; a product mounts its own UI through the
+		// WithUIHandler/WithUIFS/WithUIRoutes seams).
 		{name: "wui at root", rule: "wui", dir: ".", importPath: "github.com/looprig/wui", want: "wui"},
 		{name: "wui in an internal package", rule: "wui", dir: "internal/httpapi", importPath: "github.com/looprig/wui", want: "wui"},
-		{name: "wui in cmd/factory", rule: "wui", dir: "cmd/factory", importPath: "github.com/looprig/wui", want: ""},
-		{name: "wui subpackage in cmd/factory", rule: "wui", dir: "cmd/factory", importPath: "github.com/looprig/wui/contract", want: ""},
-		{name: "wui below cmd/factory", rule: "wui", dir: "cmd/factory/internal/ui", importPath: "github.com/looprig/wui", want: ""},
-		{name: "wui in a second binary beside cmd/factory", rule: "wui", dir: "cmd/factoryctl", importPath: "github.com/looprig/wui", want: "wui"},
+		{name: "wui in a hypothetical cmd directory", rule: "wui", dir: "cmd/factory", importPath: "github.com/looprig/wui", want: "wui"},
+		{name: "wui subpackage in a hypothetical cmd directory", rule: "wui", dir: "cmd/factory", importPath: "github.com/looprig/wui/contract", want: "wui"},
+		{name: "wui in the realtime tree", rule: "wui", dir: "internal/realtime", importPath: "github.com/looprig/wui", want: "wui"},
 		{name: "wui in cmd itself", rule: "wui", dir: "cmd", importPath: "github.com/looprig/wui", want: "wui"},
 
 		// Rule 5: Kubernetes SDK — permitted only in the placement adapter.

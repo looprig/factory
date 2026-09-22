@@ -27,6 +27,7 @@ var releasedLooprigVersions = map[string]string{
 var forbiddenModules = map[string]string{
 	"github.com/looprig/host":    "Factory and Host exchange Core and SessionStore records, never code",
 	"github.com/looprig/harness": "Harness is Host's runtime; Factory reads the durable projections of a session, never the runtime",
+	"github.com/looprig/wui":     "Factory ships no UI and no binary (owner ruling 2026-09-22); a product mounts its own UI through WithUIHandler/WithUIFS/WithUIRoutes",
 }
 
 // factoryModulePath is what go.mod must declare.
