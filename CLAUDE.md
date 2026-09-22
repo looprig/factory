@@ -1067,6 +1067,24 @@ interrupt and restore, **202** for the gate response, measured in
 is still a command that was durably admitted, and Core's `status` member is what
 a client branches on.
 
+**The Host wake runs after the answer, off the request (v0.7.1).** A control
+route's local delivery (`CommandDelivery`, runbook A3.3 step 3) used to run on
+the request's context *before* the answer, so against a Host that dropped the
+delivery reply every admitted POST waited out the HostLink RPC bound — I1.2
+measured 5.004–5.006 s — for a command already committed. The answer never
+depended on it (it is built from the durable record, and the wake's error is
+discarded), so there is no `applied` fast path to preserve and no short bounded
+wait was kept. `internal/httpapi`'s `wakes` owns the attempt: the route's own
+`RequestTimeout` bounds each one, at most `maxConcurrentWakes` (64) run at once
+and a further one is **dropped** (the sweeps own eventual application), a panic
+in the seam is contained, and **`Server.Stop` — not `Quiesce`, which leaves
+HostLinks running — cancels them and waits**, before the routing table they call
+into closes. A caller hanging up no longer cancels its command's wake. The
+ClientLink RPC path makes no delivery attempt and the create is served by the
+same handler, so neither had the latency. `routing.Bindings.Deliver` still holds
+the table's mutex across the Host RPC, so wakes to a silent Host serialise
+behind each other and delay other sessions' binds; that is booked, not fixed.
+
 **`A9.1-notfound` is settled too.** `internal/admission`'s `catalogNotFound` read
 two of the store's four spellings of absence while `internal/httpapi` read four,
 so a deleted or identity-mismatched session answered a READ 404 and a COMMAND
