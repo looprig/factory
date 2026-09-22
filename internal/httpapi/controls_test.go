@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -120,20 +121,57 @@ type deliveredCommand struct {
 }
 
 type fakeDelivery struct {
+	mu    sync.Mutex
 	calls []deliveredCommand
 	err   error
 }
 
 // Deliver captures the CONTEXT as well as the arguments, because the seam's
 // contract includes which context the attempt runs on and nothing else could
-// see it. See TestTheDeliveryAttemptRunsOnTheRequestsOwnContext.
+// see it. See TestTheDeliveryAttemptIsBoundedAndOutlivesItsCaller.
+//
+// It is called on a wake goroutine, after the answer, so it is locked and read
+// through settled.
 func (f *fakeDelivery) Deliver(ctx context.Context, tenant sessionwire.TenantID, session sessionwire.SessionID, delivery sessionwire.HostLinkCommandDelivery) error {
 	deadline, hasDeadline := ctx.Deadline()
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.calls = append(f.calls, deliveredCommand{
 		deadline: deadline, hasDeadline: hasDeadline, errAtCall: ctx.Err(),
 		tenant: tenant, session: session, delivery: delivery,
 	})
 	return f.err
+}
+
+// settled waits for want deliveries to be made, then for every wake the
+// fixture's router started to RETURN, and reports what was delivered.
+//
+// The first wait is a bounded poll, because a wake runs after the answer on a
+// goroutine of its own. It must come first: StopWakes CANCELS the wakes'
+// context, so a wake that had not yet reached Deliver would record a
+// cancelled context the production path never hands it. The second wait is
+// StopWakes, which is exact rather than a poll: it returns only when no wake
+// is running, so the count read after it is final -- a delivery beyond want
+// that was going to happen has happened, and with want zero, one that never
+// started never will.
+//
+// Once settled, the fixture's router makes no further wake.
+func (f *fakeDelivery) settled(t *testing.T, fx *fixture, want int) []deliveredCommand {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		f.mu.Lock()
+		made := len(f.calls)
+		f.mu.Unlock()
+		if made >= want || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	stopWakes(t, fx)
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]deliveredCommand(nil), f.calls...)
 }
 
 func withAdmitter(admitter ControlAdmitter) fixtureOption {
@@ -805,10 +843,11 @@ func TestAnAdmittedCommandIsDeliveredBestEffort(t *testing.T) {
 			if got := decodeCommandStatus(t, recorder).State; got != sessionwire.CommandStateAccepted {
 				t.Errorf("answered state %q, want %q", got, sessionwire.CommandStateAccepted)
 			}
-			if len(delivery.calls) != 1 {
-				t.Fatalf("delivery was attempted %d times, want once", len(delivery.calls))
+			calls := delivery.settled(t, f, 1)
+			if len(calls) != 1 {
+				t.Fatalf("delivery was attempted %d times, want once", len(calls))
 			}
-			got := delivery.calls[0]
+			got := calls[0]
 			if got.tenant != fixtureTenant || got.session != fixtureSession {
 				t.Errorf("delivered to %q/%q, want the authenticated tenant's own session", got.tenant, got.session)
 			}
@@ -835,8 +874,8 @@ func TestARefusedCommandIsNeverDelivered(t *testing.T) {
 	if recorder := postJSON(f, probe.target, probe.body); recorder.Code == probe.success {
 		t.Fatalf("the refused command answered %d, which is the success status", recorder.Code)
 	}
-	if len(refused.calls) != 0 {
-		t.Errorf("a refused command was delivered: %+v", refused.calls)
+	if calls := refused.settled(t, f, 0); len(calls) != 0 {
+		t.Errorf("a refused command was delivered: %+v", calls)
 	}
 
 	accepted := &fakeDelivery{}
@@ -844,7 +883,7 @@ func TestARefusedCommandIsNeverDelivered(t *testing.T) {
 	if recorder := postJSON(control, probe.target, probe.body); recorder.Code != probe.success {
 		t.Fatalf("the control answered %d (%s), want %d", recorder.Code, recorder.Body, probe.success)
 	}
-	if len(accepted.calls) != 1 {
+	if calls := accepted.settled(t, control, 1); len(calls) != 1 {
 		t.Fatal("the control delivered nothing, so the assertion above is vacuous")
 	}
 }
@@ -996,54 +1035,43 @@ func TestARecordCoreWillNotMarshalIsAFault(t *testing.T) {
 	}
 }
 
-// TestTheDeliveryAttemptRunsOnTheRequestsOwnContext is the reader for an
-// invariant that was ARGUED and unread.
+// TestTheDeliveryAttemptIsBoundedAndOutlivesItsCaller holds the two halves of
+// the wake's context contract, and it REPLACES a test that asserted the
+// opposite of its second half.
 //
-// deliverAdmitted's doc makes "on the request's own context" and "'Schedule' is
-// not read as 'detach'" load-bearing, and cites A6.2's measurement of what an
-// unbounded admission does to a link. Nothing checked it: substituting
-// context.Background() at the call site **survived the whole module suite**,
-// restoring exactly the unbounded-attempt shape the comment says A6.2 measured,
-// with make check green.
+// Through v0.7.0 the attempt ran on the request's own context, before the
+// answer, and a test required a caller that went away to cancel it. I1.2
+// measured the cost: every admitted POST waited out the HostLink RPC bound
+// against a Host that dropped the delivery reply. The wake now runs after the
+// answer on a context the ROUTER owns (see wakes), so:
 //
-// Why nothing caught it is worth stating, because it is a limit of the method
-// rather than an oversight: the per-comparison sweep enumerates COMPARISONS,
-// and a context argument is not one. It is an ARGUMENT, so it was never in the
-// sweep's domain. A comparison-derived sweep finds unguarded BRANCHES; it does
-// not find unguarded CLAIMS.
+//   - It is still bounded: the attempt carries a deadline no longer than the
+//     route's own RequestTimeout. Deleting the wake's WithTimeout fails here.
+//   - It is NOT the caller's: a request whose caller has already gone away
+//     still reaches the seam with a live context, because the command was
+//     committed and waking its Host is still correct.
 //
-// # Two rows, because the first is a weaker property than the comment states
-//
-// A bounded context is not a DERIVED one. The first row requires a deadline no
-// longer than the router's own, which kills the detached Background. It does
-// not kill a mutant that builds context.WithDeadline(context.Background(), <the
-// same deadline>) -- measured, that survived -- because such a context is
-// bounded identically and differs only in that the CALLER cannot stop it.
-//
-// The second row is that difference, driven: a request whose caller has already
-// gone away must reach the delivery seam with a context that reports the
-// cancellation AT THE CALL. It is read at the call rather than afterwards
-// because deliverAdmitted's own deferred cancel would cancel a locally-built
-// context too, which is exactly how the weaker probe was fooled.
-func TestTheDeliveryAttemptRunsOnTheRequestsOwnContext(t *testing.T) {
+// What stops a wake is StopWakes, and that is
+// TestStopWakesCancelsARunningWakeAndRefusesLaterOnes's subject.
+func TestTheDeliveryAttemptIsBoundedAndOutlivesItsCaller(t *testing.T) {
 	t.Parallel()
 
 	probe := controlProbes(fixtureSession)[0]
 
-	t.Run("it carries the request's own bound", func(t *testing.T) {
+	t.Run("it carries the route's own bound", func(t *testing.T) {
 		delivery := &fakeDelivery{}
 		f := newFixture(t, withAdmitter(newFakeAdmitter()), withDelivery(delivery))
 
 		if recorder := postJSON(f, probe.target, probe.body); recorder.Code != probe.success {
 			t.Fatalf("answered %d (%s), want %d", recorder.Code, recorder.Body, probe.success)
 		}
-		if len(delivery.calls) != 1 {
-			t.Fatalf("delivery was attempted %d times, want once", len(delivery.calls))
+		calls := delivery.settled(t, f, 1)
+		if len(calls) != 1 {
+			t.Fatalf("delivery was attempted %d times, want once", len(calls))
 		}
-		call := delivery.calls[0]
+		call := calls[0]
 		if !call.hasDeadline {
-			t.Fatal("the delivery attempt carries no deadline, so a wedged delivery plane is bounded by " +
-				"nothing; this is the detached shape deliverAdmitted's doc says it is not")
+			t.Fatal("the delivery attempt carries no deadline, so a wedged delivery plane is bounded by nothing")
 		}
 		if remaining := time.Until(call.deadline); remaining > f.limits.RequestTimeout {
 			t.Errorf("the delivery attempt's deadline is %v away, longer than the router's own %v bound",
@@ -1054,7 +1082,7 @@ func TestTheDeliveryAttemptRunsOnTheRequestsOwnContext(t *testing.T) {
 		}
 	})
 
-	t.Run("a caller that went away stops it", func(t *testing.T) {
+	t.Run("a caller that went away does not stop it", func(t *testing.T) {
 		delivery := &fakeDelivery{}
 		f := newFixture(t, withAdmitter(newFakeAdmitter()), withDelivery(delivery))
 		ctx, cancel := context.WithCancel(context.Background())
@@ -1063,14 +1091,15 @@ func TestTheDeliveryAttemptRunsOnTheRequestsOwnContext(t *testing.T) {
 
 		f.serve(r)
 
-		if len(delivery.calls) != 1 {
+		calls := delivery.settled(t, f, 1)
+		if len(calls) != 1 {
 			t.Fatalf("delivery was attempted %d times, want once: this row cannot see the property "+
-				"unless the attempt is made", len(delivery.calls))
+				"unless the attempt is made", len(calls))
 		}
-		if !errors.Is(delivery.calls[0].errAtCall, context.Canceled) {
+		if err := calls[0].errAtCall; err != nil {
 			t.Errorf("the caller was gone and the delivery attempt's context reported %v at the call; "+
-				"the attempt is bounded by a deadline of its own rather than derived from the request's, "+
-				"so nothing the caller does can stop it", delivery.calls[0].errAtCall)
+				"the wake is derived from the request again, so a committed command's Host is not woken "+
+				"when its caller hangs up", err)
 		}
 	})
 }
@@ -1098,10 +1127,11 @@ func TestAnAdmittedCreateIsDeliveredToTheSessionItsBodyNamed(t *testing.T) {
 	if recorder.Code != http.StatusCreated {
 		t.Fatalf("the create answered %d (%s), want 201", recorder.Code, recorder.Body)
 	}
-	if len(delivery.calls) != 1 {
-		t.Fatalf("delivery was attempted %d times, want once", len(delivery.calls))
+	calls := delivery.settled(t, f, 1)
+	if len(calls) != 1 {
+		t.Fatalf("delivery was attempted %d times, want once", len(calls))
 	}
-	got := delivery.calls[0]
+	got := calls[0]
 	if got.session != created {
 		t.Errorf("delivered to session %q, want the body's %q; the create's path carries no session, "+
 			"so a handler reading the URL delivers to nothing", got.session, created)

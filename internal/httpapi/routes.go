@@ -157,7 +157,8 @@ type RouterConfig struct {
 	//
 	// Nil means no attempt is made, which changes NO response: the durable
 	// record is the acknowledgement and delivery is best effort either way.
-	// See Router.deliverAdmitted.
+	// An attempt runs AFTER the answer, off the request, and is owned by the
+	// router until StopWakes. See Router.deliverAdmitted and wakes.
 	Delivery CommandDelivery
 
 	// Department is the launch targets this deployment is configured to offer.
@@ -242,7 +243,7 @@ type Router struct {
 	limits             RouteLimits
 	admissions         ControlAdmitter
 	realtime           func() http.Handler
-	delivery           CommandDelivery
+	wakes              *wakes
 	objectPolicy       ObjectPolicy
 	resolveObjectStore func(context.Context, sessionstore.SessionBinding) (ObjectReader, error)
 	objectLimits       ObjectLimits
@@ -314,7 +315,7 @@ func NewRouter(cfg RouterConfig) (*Router, error) {
 		limits:             cfg.Limits,
 		admissions:         cfg.Admissions,
 		realtime:           cfg.Realtime,
-		delivery:           cfg.Delivery,
+		wakes:              newWakes(cfg.Delivery, cfg.Limits.RequestTimeout, maxConcurrentWakes),
 		objectPolicy:       cfg.ObjectPolicy,
 		resolveObjectStore: cfg.ResolveObjectStore,
 		objectLimits:       cfg.ObjectLimits,

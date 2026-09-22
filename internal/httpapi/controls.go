@@ -404,8 +404,11 @@ func (rt *Router) serveControl(kind sessionstore.CommandKind) http.Handler {
 		if result.session != "" {
 			target = result.session
 		}
-		rt.deliverAdmitted(r.Context(), operation.Principal.Tenant(), target, result.command)
+		// The answer FIRST, then the wake. Commit before acknowledge (A3.2) is
+		// satisfied by the admission above; nothing about the Host is owed
+		// before the caller learns its command is durable.
 		writeJSONBytes(w, spec.success, payload)
+		rt.deliverAdmitted(operation.Principal.Tenant(), target, result.command)
 	})
 }
 
@@ -428,24 +431,19 @@ func (rt *Router) serveControl(kind sessionstore.CommandKind) http.Handler {
 // arrives over REST and every viewer over a ClientLink is exactly the shape
 // where this attempt usually finds no route and the durable path always works.
 //
-// It is called BEFORE the response is written and on the request's own context,
-// so the attempt is bounded by the same deadline everything else on this
-// request is, and so a test can observe it without a goroutine to synchronise
-// on. "Schedule" is not read as "detach": a detached attempt would outlive the
-// request's context, and A6.2 measured what an unbounded admission does to a
-// link.
+// # "Schedule" now means detach, bounded and owned
+//
+// It is called AFTER the response is written and it returns at once: the
+// attempt runs on a goroutine the router owns (see wakes), under the route's
+// own RequestTimeout, at most maxConcurrentWakes at a time, cancelled and
+// waited for by StopWakes. Through factory v0.7.0 it ran on the request's
+// context BEFORE the answer, which made every admitted command wait out the
+// HostLink RPC bound against a Host that dropped the delivery reply (I1.2:
+// 5.004-5.006 s per POST) although nothing in the answer depended on it.
 //
 // A nil seam makes no attempt and changes no response.
-func (rt *Router) deliverAdmitted(ctx context.Context, tenant sessionwire.TenantID, session sessionwire.SessionID, command sessionwire.CommandID) {
-	if rt.delivery == nil {
-		return
-	}
-	// The PUBLIC CommandID, which is the retry-stable identity both sides of
-	// the HostLink agree on. The proposed runtime identity is the store's own
-	// and means nothing to a Host that did not win the admission.
-	_ = rt.delivery.Deliver(ctx, tenant, session, sessionwire.HostLinkCommandDelivery{
-		CommandID: command,
-	})
+func (rt *Router) deliverAdmitted(tenant sessionwire.TenantID, session sessionwire.SessionID, command sessionwire.CommandID) {
+	rt.wakes.schedule(tenant, session, command)
 }
 
 // admissionFailure maps everything the admission plane can return onto a public

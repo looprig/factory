@@ -418,6 +418,14 @@ func (s *Server) Stop(ctx context.Context) error {
 	if err := s.components.stopRealtime(ctx); err != nil {
 		firstErr = errors.Join(firstErr, err)
 	}
+	// The Host wakes admitted commands scheduled after their acknowledgement.
+	// After the listener, so no handler is left to schedule one, and before
+	// phase (3), because a wake calls into the routing table that closes
+	// there. Cancelled and WAITED for, bounded by the caller's context, so a
+	// returned Stop leaves no wake goroutine behind.
+	if err := s.router.StopWakes(ctx); err != nil {
+		firstErr = errors.Join(firstErr, err)
+	}
 
 	// (2) THE PERIODIC SWEEPS. Cancelled and then WAITED for, so a returned
 	// Stop means no sweep is still writing to a store. The wait is bounded by
