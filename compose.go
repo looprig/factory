@@ -195,8 +195,8 @@ func composeComponents(cfg config, credentials *internalidentity.Authenticator) 
 		Catalog:   cfg.catalog,
 		Claims:    cfg.commands,
 		// Workloads is deliberately nil. H5 (answered 2026-09-04) puts the
-		// Kubernetes adapter in a SEPARATE controller binary, so cmd/factory
-		// ships with a ServiceAccount holding no workload RBAC and must reach
+		// Kubernetes adapter in the SEPARATE looprig/controller repository, so a
+		// Factory process runs with a ServiceAccount holding no workload RBAC and must reach
 		// no Kubernetes client package. A dedicated placement here therefore
 		// fails with placement.ErrNoWorkloadController, which is the refusal
 		// that keeps the split honest; see WithWorkloadController, which only

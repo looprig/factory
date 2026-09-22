@@ -126,7 +126,7 @@ type PendingCommands interface {
 //
 // It is OPTIONAL and only the controller binary supplies it. H5 (answered
 // 2026-09-04) puts the platform adapter in a separate controller, so
-// cmd/factory composes none and a dedicated placement there fails with a named
+// a Factory process composes none and a dedicated placement there fails with a named
 // refusal rather than silently doing nothing.
 //
 // The intent is the whole currency: Factory-authored desire, carrying its own

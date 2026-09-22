@@ -23,11 +23,11 @@ var ErrInvalidConfig = errors.New("placement: invalid reconciler configuration")
 // ErrNoWorkloadController reports a dedicated session reaching a replica that
 // creates no workloads.
 //
-// It is H5's two-binary split made a runtime rule rather than a convention.
-// The decision of 2026-09-04 puts the Kubernetes adapter in
-// internal/placement/kubernetes and links it into cmd/controller ALONE:
-// cmd/factory ships with a different ServiceAccount holding no workload
-// create/delete RBAC, so it composes no controller and its import graph reaches
+// It is H5's two-process split made a runtime rule rather than a convention.
+// The decision of 2026-09-04 puts the Kubernetes adapter in the separate
+// looprig/controller repository ALONE: a Factory process runs with a different
+// ServiceAccount holding no workload create/delete RBAC, so it composes no
+// controller and its import graph reaches
 // no Kubernetes client package. A dedicated session that reaches that binary
 // has therefore arrived somewhere that cannot serve it, and saying so by name
 // is the only honest answer -- reporting it as "no capacity" would send a
@@ -72,7 +72,8 @@ type Config struct {
 	Claims    Claims
 
 	// Workloads is OPTIONAL, and its absence is a supported deployment rather
-	// than a degraded one: H5's cmd/factory composes exactly this. See
+	// than a degraded one: a Factory process without a controller composes exactly
+	// this. See
 	// ErrNoWorkloadController.
 	Workloads WorkloadController
 

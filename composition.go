@@ -290,8 +290,8 @@ func WithDepartment(templates ...LaunchTemplate) Option {
 // WithWorkloadController supplies the platform adapter a DEDICATED session's
 // workload is created through. Optional, and deliberately so.
 //
-// cmd/factory composes none: H5 puts the platform adapter in a separate
-// controller binary, whose ServiceAccount holds the workload RBAC that the
+// A Factory process composes none by default: H5 puts the platform adapter in
+// the separate looprig/controller repository, whose ServiceAccount holds the workload RBAC that the
 // Factory's does not. A placement reconciler composed without one refuses a
 // dedicated session with a named error instead of reporting success for work
 // nothing did, which is what keeps the split from being a convention.
