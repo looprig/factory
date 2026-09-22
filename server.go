@@ -431,6 +431,7 @@ func composeRouter(cfg config, credentials *internalidentity.Authenticator, part
 		// does not open a route, so a session this replica holds no demand for
 		// is a no-op here and the durable record is still the acknowledgement.
 		Delivery: parts.bindings,
+		Logger:   logger(cfg),
 		Realtime: parts.realtimeHandler,
 		Department: func() []httpapi.LaunchTemplate {
 			published := make([]httpapi.LaunchTemplate, len(cfg.department))

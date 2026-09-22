@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"mime"
 	"net"
 	"net/http"
@@ -160,6 +161,11 @@ type RouterConfig struct {
 	// An attempt runs AFTER the answer, off the request, and is owned by the
 	// router until StopWakes. See Router.deliverAdmitted and wakes.
 	Delivery CommandDelivery
+
+	// Logger receives what the router recovers from and has no response to
+	// carry it in: today, a delivery seam that panicked inside a wake. Nil
+	// takes slog.Default.
+	Logger *slog.Logger
 
 	// Department is the launch targets this deployment is configured to offer.
 	//
@@ -315,7 +321,7 @@ func NewRouter(cfg RouterConfig) (*Router, error) {
 		limits:             cfg.Limits,
 		admissions:         cfg.Admissions,
 		realtime:           cfg.Realtime,
-		wakes:              newWakes(cfg.Delivery, cfg.Limits.RequestTimeout, maxConcurrentWakes),
+		wakes:              newWakes(cfg.Delivery, cfg.Limits.RequestTimeout, maxConcurrentWakes).withLogger(cfg.Logger),
 		objectPolicy:       cfg.ObjectPolicy,
 		resolveObjectStore: cfg.ResolveObjectStore,
 		objectLimits:       cfg.ObjectLimits,

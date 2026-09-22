@@ -1079,7 +1079,7 @@ discarded), so there is no `applied` fast path to preserve and no short bounded
 wait was kept. `internal/httpapi`'s `wakes` owns the attempt: the route's own
 `RequestTimeout` bounds each one, at most `maxConcurrentWakes` (64) run at once
 and a further one is **dropped** (the sweeps own eventual application), a panic
-in the seam is contained, and **`Server.Stop` — not `Quiesce`, which leaves
+in the seam is contained and logged at ERROR through the composition's logger, and **`Server.Stop` — not `Quiesce`, which leaves
 HostLinks running — cancels them and waits**, before the routing table they call
 into closes. A caller hanging up no longer cancels its command's wake. The
 ClientLink RPC path makes no delivery attempt and the create is served by the

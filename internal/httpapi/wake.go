@@ -2,6 +2,7 @@ package httpapi
 
 import (
 	"context"
+	"log/slog"
 	"sync"
 	"time"
 
@@ -67,6 +68,8 @@ const maxConcurrentWakes = 64
 type wakes struct {
 	delivery CommandDelivery
 	timeout  time.Duration
+	// log receives a recovered delivery panic; see run.
+	log *slog.Logger
 
 	// slots is the concurrency bound: a send takes one, the wake's return
 	// gives it back.
@@ -91,7 +94,17 @@ func newWakes(delivery CommandDelivery, timeout time.Duration, limit int) *wakes
 		slots:    make(chan struct{}, limit),
 		ctx:      ctx,
 		cancel:   cancel,
+		log:      slog.Default(),
 	}
+}
+
+// withLogger sets where a recovered delivery panic is reported. Nil keeps
+// slog.Default.
+func (w *wakes) withLogger(log *slog.Logger) *wakes {
+	if log != nil {
+		w.log = log
+	}
+	return w
 }
 
 // schedule starts one wake and returns at once. It reports whether a wake was
@@ -121,8 +134,18 @@ func (w *wakes) run(tenant sessionwire.TenantID, session sessionwire.SessionID, 
 	defer func() { <-w.slots }()
 	// A wake is off the request's goroutine, so the handler's recoverPanic no
 	// longer covers it; a panicking delivery seam must not take the process
-	// down over a best-effort wake.
-	defer func() { _ = recover() }()
+	// down over a best-effort wake. It is LOGGED rather than swallowed (v0.7.1
+	// gate L3): the command is committed and the sweeps still deliver it, so
+	// nothing is lost, but a seam that panics is a defect somebody must see.
+	defer func() {
+		if value := recover(); value != nil {
+			w.log.Error("factory: a Host wake's delivery seam panicked; recovered, the command stays committed for the sweeps",
+				slog.String("tenant_id", string(tenant)),
+				slog.String("session_id", string(session)),
+				slog.String("command_id", string(command)),
+				slog.Any("panic", value))
+		}
+	}()
 	ctx, cancel := context.WithTimeout(w.ctx, w.timeout)
 	defer cancel()
 	// The PUBLIC CommandID, which is the retry-stable identity both sides of

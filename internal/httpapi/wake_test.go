@@ -3,6 +3,7 @@ package httpapi
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"net/http"
 	"strings"
 	"sync"
@@ -278,7 +279,8 @@ func TestTheProductionLimitIsTheDocumentedOne(t *testing.T) {
 func TestAPanickingDeliveryDoesNotEscapeTheWake(t *testing.T) {
 	t.Parallel()
 
-	w := newWakes(deliveryFunc(func(context.Context) { panic("delivery seam") }), time.Minute, 1)
+	w := newWakes(deliveryFunc(func(context.Context) { panic("delivery seam") }), time.Minute, 1).
+		withLogger(slog.New(slog.DiscardHandler))
 	for i := range 3 {
 		if !w.schedule(fixtureTenant, fixtureSession, "command-a") {
 			t.Fatalf("wake %d was refused: a panicking wake did not give its slot back", i)
