@@ -144,6 +144,10 @@ type Bindings struct {
 	// the bound on it is the caller's context. Sharding the table by session
 	// is a composition decision A9.1 can take if the cost is measured to
 	// matter; it cannot be taken here, where nothing runs.
+	//
+	// It is NOT held across a command delivery. Delivery coalesces nothing,
+	// and holding the lock across that RPC let one silent Host stall the whole
+	// replica (v0.7.1 gate finding S1); see Deliver.
 	mu       sync.Mutex
 	closed   bool
 	sessions map[sessionKey]*sessionRoute
@@ -261,22 +265,58 @@ func (b *Bindings) Release(ctx context.Context, tenant sessionwire.TenantID, ses
 // cannot tell a lost connection from a Host's refusal, and dropping the route
 // on either would turn one failure into a rebind storm without having
 // delivered anything. Per-binding repair is Relay's, above the transport.
+//
+// # Deliver and the lock
+//
+// The route is resolved -- and, if invalidated, rebound -- under the table's
+// lock, so the bind coalescing mu's doc argues for still holds. The Host RPC
+// then runs WITHOUT the lock. What can change after the unlock, and why each
+// is safe:
+//
+//   - The route is dropped or rebound (Observe, Release, a concurrent
+//     Deliver's rebind). The delivery names only (tenant, session, command);
+//     it carries no Host, generation or epoch of this table's, so it cannot
+//     re-assert a stale tuple. The Binder resolves the route it goes over AT
+//     CALL TIME under its own lock (the HostLink pool's DeliverCommand), so
+//     the hint reaches the pool's current route or is refused
+//     ErrUnknownBinding. That was already true with the lock held: the pool
+//     is shared with placement, which binds and unbinds through it directly.
+//   - The table closes. Close no longer waits for a delivery in flight; the
+//     delivery then meets the pool's own closed check or the unbound route,
+//     and its failure is reported. Nothing a stale delivery does writes to
+//     this table, so it cannot re-open a route on a closed one.
+//   - The link closes under it. That is the pool's and the link's concern;
+//     either reports an error.
+//
+// None of this bypasses fencing, because fencing was never here: a delivery
+// is a wake hint for an already committed record, and the Host applies what
+// it reads from its own lease-fenced command stream.
 func (b *Bindings) Deliver(ctx context.Context, tenant sessionwire.TenantID, session sessionwire.SessionID, delivery sessionwire.HostLinkCommandDelivery) error {
 	key := sessionKey{tenant: tenant, session: session}
 
 	b.mu.Lock()
-	defer b.mu.Unlock()
 	if b.closed {
+		b.mu.Unlock()
 		return ErrBindingsClosed
 	}
 	if route := b.sessions[key]; route == nil || route.demand == 0 {
+		b.mu.Unlock()
 		return ErrNoBinding
 	}
 	route, err := b.routeLocked(ctx, key)
 	if err != nil {
+		b.mu.Unlock()
 		return err
 	}
-	return b.binder.DeliverCommand(ctx, route.binding.Key.TenantID, route.binding.Key.SessionID, delivery)
+	target := route.binding.Key
+	b.mu.Unlock()
+
+	// The RPC runs OUTSIDE the lock (v0.7.1 gate finding S1). Held across it,
+	// one Host that was alive but dropped delivery replies stalled every
+	// Acquire, Release, Observe and delivery on this replica, for every
+	// session, for the RPC bound -- and queued wakes stretched that to
+	// RequestTimeout. See the "Deliver and the lock" paragraph above.
+	return b.binder.DeliverCommand(ctx, target.TenantID, target.SessionID, delivery)
 }
 
 // Observe applies a registry observation to the table and reports whether it

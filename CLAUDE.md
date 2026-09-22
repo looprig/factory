@@ -1081,9 +1081,15 @@ in the seam is contained, and **`Server.Stop` — not `Quiesce`, which leaves
 HostLinks running — cancels them and waits**, before the routing table they call
 into closes. A caller hanging up no longer cancels its command's wake. The
 ClientLink RPC path makes no delivery attempt and the create is served by the
-same handler, so neither had the latency. `routing.Bindings.Deliver` still holds
-the table's mutex across the Host RPC, so wakes to a silent Host serialise
-behind each other and delay other sessions' binds; that is booked, not fixed.
+same handler, so neither had the latency. **`routing.Bindings.Deliver` no longer
+holds the table's mutex across the Host RPC** (v0.7.1 gate S1): it resolves (and,
+if invalidated, rebinds) the route under the lock, captures the tenant and
+session, unlocks, then calls the Binder. Held across the RPC, one silent Host
+stalled every `Acquire`/`Release`/`Observe`/delivery on the replica — ClientLink
+subscribes included — for about `RequestTimeout`, since queued wakes each waited
+out the lock. A route that moves or a table that closes after the unlock costs
+only the hint: the delivery names no Host or epoch, the pool re-resolves the
+route under its own lock at call time, and the Host fences on its lease.
 
 **`A9.1-notfound` is settled too.** `internal/admission`'s `catalogNotFound` read
 two of the store's four spellings of absence while `internal/httpapi` read four,

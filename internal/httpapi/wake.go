@@ -16,10 +16,11 @@ import (
 // acknowledgement, the owning Host reads its command stream when it next
 // consumes, and the placement and redelivery sweeps are what guarantee a
 // command nobody woke for is applied. What a full set of slots means is that
-// this many wakes are already waiting on Hosts that have not answered; a
-// further one would wait behind the same condition (routing.Bindings.Deliver
-// serialises on the table's lock), so queueing it would buy nothing but
-// memory.
+// this many wakes are already waiting on Hosts that have not answered, and
+// queueing a further one would buy nothing but memory: the sweeps deliver it
+// anyway. (routing.Bindings.Deliver no longer holds the routing table's lock
+// across the Host RPC, so a wake to a silent Host costs only its own slot, not
+// every other session's wake or bind.)
 //
 // Sixty-four is a ceiling on goroutines, not a throughput target: each slot is
 // one goroutine bounded by the route's RequestTimeout, so the worst case this
