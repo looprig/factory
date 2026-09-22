@@ -483,9 +483,10 @@ func UIRoutePrincipal(r *http.Request) (identity.Principal, bool) {
 // UI reports the optional user interface handler.
 //
 // The second result is false for a library composition that serves no UI,
-// which is a supported configuration rather than a degraded one: the default
-// binary mounts the Vite bundle, and an embedder that mounts its own or none
-// at all composes the same Server.
+// which is a supported configuration rather than a degraded one: Factory ships
+// no UI and no binary, so a product mounts its own bundle or handler through
+// WithUIHandler/WithUIFS, and an embedder that mounts none at all composes the
+// same Server.
 func (s *Server) UI() (http.Handler, bool) {
 	return s.cfg.ui, s.cfg.ui != nil
 }

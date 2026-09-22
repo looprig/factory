@@ -26,17 +26,18 @@ test — and applies five rules:
 | `github.com/looprig/host` | nowhere |
 | `github.com/looprig/harness` | nowhere |
 | `github.com/centrifugal/...` | `internal/realtime/...` |
-| `github.com/looprig/wui` | `cmd/factory/...` |
+| `github.com/looprig/wui` | nowhere |
 | `k8s.io/...`, `sigs.k8s.io/...` | `internal/placement/kubernetes/...` |
 <!-- boundary-rules:end -->
 
 The rules are functions over PARSED import paths; nothing matches against source
 text, and containment is compared by whole path segments, so
-`internal/realtimefanout` is not inside `internal/realtime` and a second binary
-beside `cmd/factory` does not inherit its exemption. The scan fails as vacuous
-if it finds no files, and `TestScanReachesEveryRuleScope` builds a fixture module
-containing each scope so an exemption whose directory does not exist yet is still
-proven reachable and still proven to reject the location just outside it.
+`internal/realtimefanout` is not inside `internal/realtime` and a second package
+beside `internal/placement/kubernetes` does not inherit its exemption. The scan
+fails as vacuous if it finds no files, and `TestScanReachesEveryRuleScope` builds
+a fixture module containing each scope so an exemption whose directory does not
+exist yet is still proven reachable and still proven to reject the location just
+outside it.
 
 Two companion guards keep that scan honest. `TestModuleHasNoUndeclaredNestedBoundary`
 fails on any nested `go.mod`, `.git` or `vendor` below the root — including the
@@ -76,8 +77,12 @@ which credential authenticated a request must have one answer and a second one
 is an origin guard that skips its CSRF rules silently. The
 UI is optional in both shapes: `WithUIHandler` for a handler and `WithUIFS` for
 a static bundle, mutually exclusive, and **a composition with neither is valid
-and is exercised as such** -- the default binary mounts the Vite bundle, and an
-embedder that mounts its own or none composes the same `Server`.
+and is exercised as such** -- Factory ships no UI of its own and no `cmd/factory`
+binary exists or is planned. Users bring their own UI: a product supplies its
+bundle or handler through these seams, and Factory mounts it behind its own
+auth, origin and CSRF guards. Carbon, for example, supplies `wui.Assets()` to
+`WithUIHandler`; an embedder that mounts its own bundle or none composes the
+same `Server`.
 Application-owned `/ui/` routes can be mounted with `WithUIRoutes`. Factory
 authenticates each request, applies its origin and CSRF guard, and calls the
 required route authorizer before the handler. These routes are independent of
@@ -286,6 +291,13 @@ v0.5.0 or later paired with Host v0.3.0 or later and a bare advertised HostLink
 base. A cold AskUser answer/resume is unsupported; the gate path is for a
 resident session.
 
+Dedicated placement's first-attach path additionally requires Factory ≥ v0.6.0
+paired with a workload controller implementing `WorkloadEndpointDiscovery`
+(e.g. `looprig/controller` ≥ v0.2.0), which lets Factory discover a ready
+dedicated Host's pre-attach endpoint before any resident session exists.
+Factory v0.5.0 remains storage-compatible but cannot discover that endpoint, so
+it cannot place a new dedicated session against a controller of that shape.
+
 ## The HostLink
 
 `internal/realtime/hostlink` is Factory's client side of the Factory-Host
@@ -422,10 +434,11 @@ module entirely: it lives in the separate repository `looprig/controller`
 (owner ruling 2026-09-18), which
 consumes Factory only as a published module, so no Factory consumer inherits the
 Kubernetes client graph;
-`cmd/factory` supplies no workload create/delete RBAC, so a nil controller is a
-supported configuration and a dedicated session reaching the tenant-facing
-replica is refused by name. Widening this exported method set is a source
-compatibility break for external implementations. **While this module is pre-1.0
+Factory ships no binary and grants itself no workload create/delete RBAC, so a
+nil controller is a supported configuration and a dedicated session reaching a
+replica composed without one is refused by name. Widening this exported method
+set is a source compatibility break for external implementations. **While this
+module is pre-1.0
 (owner ruling 2026-09-18), such a widening ships as a MINOR bump** — the `v0.x`
 contract every module in this workspace is released under — and the widening that
 added `ObserveWorkload`, `RequestDrain`, and `DeleteWorkload` as `EnsureWorkload`'s
@@ -551,4 +564,5 @@ and demand plane, placement and its sweeps, and -- since v0.4.0 -- the live
 tail (`routing.Relay` between the HostLink subscription and the ClientLink).
 Since v0.5.0 one pooled Host serves several tenants (Gap 1), and a gate
 response reaches a Host that advertises `hostlink.command.gate_response`
-(host ≥ v0.4.0). The default `cmd/factory` binary lives in a separate nested module.
+(host ≥ v0.4.0). Factory ships no UI and no binary; a product mounts its own
+UI through `WithUIHandler`, `WithUIFS` and `WithUIRoutes`.

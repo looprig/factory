@@ -14,7 +14,7 @@ rules, applied to every Go file in the module, production and test alike:
 - `github.com/looprig/host` — forbidden **everywhere**.
 - `github.com/looprig/harness` — forbidden **everywhere**.
 - `github.com/centrifugal/...` — only under `internal/realtime`.
-- `github.com/looprig/wui` — only under `cmd/factory`.
+- `github.com/looprig/wui` — forbidden **everywhere**.
 - `k8s.io/...` and `sigs.k8s.io/...` — only under `internal/placement/kubernetes`.
 <!-- boundary-rules:end -->
 
@@ -40,12 +40,13 @@ string table is one `go mod tidy` away from being dropped.
 - **Containment compares whole segments.** `pathHasPrefix` is used for both
   import paths and directory scopes, so `internal/realtimefanout` is not inside
   `internal/realtime`, `github.com/looprig/hostage` is not inside
-  `github.com/looprig/host`, and `cmd/factoryctl` does not inherit
-  `cmd/factory`'s grant. It is differentially fuzzed against an independent
-  segment-splitting oracle.
+  `github.com/looprig/host`, and `internal/placement/kubernetesx` does not
+  inherit `internal/placement/kubernetes`'s grant. It is differentially fuzzed
+  against an independent segment-splitting oracle.
 - **Scopes are subtrees, not lists.** A second package under
-  `internal/realtime/` is inside the grant by design; a second binary beside
-  `cmd/factory` is not. There is no hand-maintained package list to drift.
+  `internal/realtime/` is inside the grant by design; a second package beside
+  `internal/placement/kubernetes` is not. There is no hand-maintained package
+  list to drift.
 - **The scan fails loudly at zero files.** A guard that walks nothing is
   indistinguishable from a clean tree.
 - **Scopes that do not exist yet are still proven.** None of the three scoped
@@ -1585,11 +1586,11 @@ The Kubernetes adapter is **internal**, built as **two binaries from the one
   external implementations; **while this module is pre-1.0 it ships as a MINOR
   bump** (owner ruling 2026-09-18), and becomes a major release only after
   `v1.0.0`. D2.2 supplies the drain protocol those operations depend on.
-- A **nil controller is a valid configuration**, because `cmd/factory` holds no
-  workload create/delete RBAC and composes none. A dedicated session reaching
-  that replica is refused by name with `ErrNoWorkloadController`; reporting it as
-  "no capacity" would send a caller into a retry loop waiting for an autoscaler
-  that never runs.
+- A **nil controller is a valid configuration**, because Factory ships no binary
+  and grants itself no workload create/delete RBAC. A dedicated session reaching
+  a replica composed without one is refused by name with
+  `ErrNoWorkloadController`; reporting it as "no capacity" would send a caller
+  into a retry loop waiting for an autoscaler that never runs.
 - Replicas are safe with no leader through the derived key and the content
   comparison above, not through the claim, which suppresses duplicate scaling
   only.
@@ -2477,9 +2478,10 @@ and polls, not their delivery (above).
 `factory.New` composes the public router, admission, ClientLink, HostLink pool,
 placement sweeps, disposition reconciliation and live tail. `Start` runs their
 background work. `WithPendingCommands` is required for pooled placement; without
-it the replica reports that it will place no sessions. `cmd/factory` is a
-separately published nested module. `internal/placement/kubernetes` is absent
-from this root module.
+it the replica reports that it will place no sessions. Factory ships no UI and
+no binary; a product mounts its own UI through `WithUIHandler`, `WithUIFS` and
+`WithUIRoutes`. `internal/placement/kubernetes` is absent from this root
+module.
 
 The service exports no Prometheus metrics handler. Do not invent backlog,
 resident-wait, queue, reconciliation or drain series in an operations example.
