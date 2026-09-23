@@ -496,14 +496,20 @@ func TestAWrappedCursorIsBoundToItsSessionAndBinding(t *testing.T) {
 	}
 	other := binding
 	other.RuntimeSessionID = "00000000-0000-4000-8000-0000000000cc"
+	otherStorage := binding
+	otherStorage.StorageBindingID = "storage-b"
+	otherVersion := binding
+	otherVersion.BindingVersion = "v2"
 	for name, row := range map[string]struct {
 		tenant  sessionwire.TenantID
 		session sessionwire.SessionID
 		binding sessionstore.SessionBinding
 	}{
-		"another session": {FakeTenant, "session-other", binding},
-		"another tenant":  {"tenant-b", journalSession, binding},
-		"another binding": {FakeTenant, journalSession, other},
+		"another session":         {FakeTenant, "session-other", binding},
+		"another tenant":          {"tenant-b", journalSession, binding},
+		"another binding":         {FakeTenant, journalSession, other},
+		"another storage binding": {FakeTenant, journalSession, otherStorage},
+		"another binding version": {FakeTenant, journalSession, otherVersion},
 	} {
 		var journal *sessionstore.JournalError
 		if _, err := unwrapJournalCursor(token, row.tenant, row.session, row.binding); !errors.As(err, &journal) || journal.Code != sessionstore.JournalErrorCursor {
