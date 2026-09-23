@@ -748,6 +748,99 @@ func TestCloseClosesEveryLinkAndRefusesFurtherWork(t *testing.T) {
 	}
 }
 
+// TestAReapBlockedInALinksCloseDoesNotStallAnotherHostsBind is the v0.7.2
+// gate's F1: a link's Close may wait out its bound behind a wedged RPC, and a
+// reaper that closed it under the pool's lock held every bind on every Host
+// behind it (measured at 1.95s).
+func TestAReapBlockedInALinksCloseDoesNotStallAnotherHostsBind(t *testing.T) {
+	t.Parallel()
+
+	dialer := newRecordingDialer()
+	limits := defaultLimits()
+	limits.IdleTimeout = 30 * time.Second
+	clock := &fakeClock{now: time.Unix(1_700_000_000, 0)}
+	pool := newPoolWithClock(t, dialer, limits, clock)
+
+	mustBind(t, pool, target(hostOne, endpoint1), bindRequest(hostOne, "s-1"))
+	if err := pool.Unbind(context.Background(), unbindRequest(hostOne, "s-1")); err != nil {
+		t.Fatalf("Unbind: %v", err)
+	}
+	release := make(chan struct{})
+	releaseClose := sync.OnceFunc(func() { close(release) })
+	defer releaseClose()
+	dialer.link(hostOne).holdClose(release)
+	clock.advance(limits.IdleTimeout)
+
+	reaped := make(chan int, 1)
+	go func() { reaped <- pool.ReapIdle() }()
+	waitUntil(t, "the reaper to be inside the link's Close", func() bool { return dialer.link(hostOne).closes() == 1 })
+
+	// The Bind runs on its own goroutine so a pool that still closed under its
+	// lock fails this case instead of hanging it: the deferred release frees
+	// the reaper, and with it the Bind.
+	bound := make(chan error, 1)
+	go func() {
+		bound <- pool.Bind(context.Background(), target(hostTwo, endpoint2), bindRequest(hostTwo, "s-2"))
+	}()
+	select {
+	case err := <-bound:
+		if err != nil {
+			t.Fatalf("Bind: %v", err)
+		}
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("an unrelated Host's Bind waited over 100ms behind a reap blocked in a link's Close")
+	}
+	select {
+	case n := <-reaped:
+		t.Fatalf("ReapIdle returned %d before the link's Close did", n)
+	default:
+	}
+
+	releaseClose()
+	select {
+	case n := <-reaped:
+		if n != 1 {
+			t.Fatalf("ReapIdle = %d, want 1", n)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("ReapIdle did not return after the link's Close did")
+	}
+}
+
+// TestPoolCloseClosesLinksConcurrently is the v0.7.2 gate's S3: every link's
+// Close may take its whole bound, so closing them one after another would make
+// Stop take one bound per link.
+func TestPoolCloseClosesLinksConcurrently(t *testing.T) {
+	t.Parallel()
+
+	dialer := newRecordingDialer()
+	pool := newPool(t, dialer, hostlink.Limits{})
+	mustBind(t, pool, target(hostOne, endpoint1), bindRequest(hostOne, "s-1"))
+	mustBind(t, pool, target(hostTwo, endpoint2), bindRequest(hostTwo, "s-2"))
+	release := make(chan struct{})
+	releaseClose := sync.OnceFunc(func() { close(release) })
+	defer releaseClose()
+	dialer.link(hostOne).holdClose(release)
+	dialer.link(hostTwo).holdClose(release)
+
+	closed := make(chan error, 1)
+	go func() { closed <- pool.Close(context.Background()) }()
+	// Both are inside Close at once, with neither released: sequential closing
+	// would never reach the second while the first is held.
+	waitUntil(t, "both links to be closing at once", func() bool {
+		return dialer.link(hostOne).closes() == 1 && dialer.link(hostTwo).closes() == 1
+	})
+	releaseClose()
+	select {
+	case err := <-closed:
+		if err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Pool.Close did not return after its links' Close did")
+	}
+}
+
 // TestCloseReportsEveryLinkFailureAndStillClosesTheRest keeps one wedged
 // connection from stranding the others.
 func TestCloseReportsEveryLinkFailureAndStillClosesTheRest(t *testing.T) {
@@ -1128,6 +1221,7 @@ type fakeLink struct {
 	unbindErr   error
 	commandErr  error
 	closeErr    error
+	closeHold   chan struct{}
 }
 
 func (l *fakeLink) Host() sessionwire.HostID { return l.host }
@@ -1205,11 +1299,25 @@ func (l *fakeLink) routes() []deliveredRoute {
 	return append([]deliveredRoute(nil), l.commandRoutes...)
 }
 
+// Close counts first and then, when a hold is set, waits for it with the
+// fake's mutex RELEASED -- the stand-in for a real link sitting out its close
+// bound behind a wedged RPC.
 func (l *fakeLink) Close(context.Context) error {
 	l.mu.Lock()
-	defer l.mu.Unlock()
 	l.closeCount++
-	return l.closeErr
+	err, hold := l.closeErr, l.closeHold
+	l.mu.Unlock()
+	if hold != nil {
+		<-hold
+	}
+	return err
+}
+
+// holdClose makes every later Close wait until release closes.
+func (l *fakeLink) holdClose(release chan struct{}) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.closeHold = release
 }
 
 func (l *fakeLink) binds() []sessionwire.HostLinkBindRequest {

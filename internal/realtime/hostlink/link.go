@@ -762,9 +762,19 @@ func (p *Pool) DeliverCommand(ctx context.Context, tenantID sessionwire.TenantID
 func (p *Pool) ReapIdle() int {
 	deadline := p.now().Add(-p.limits.IdleTimeout)
 
+	// Reaped links are closed AFTER the pool's lock is released, as Bind and
+	// evict close theirs: a link's Close waits for its RPCs in flight, up to
+	// its bound, and one held behind a wedged RPC would otherwise stall every
+	// bind, unbind and delivery on every Host for that long (v0.7.2 gate F1,
+	// measured at 1.95s).
+	var reaped []*pooledLink
+	defer func() {
+		// Close is best effort: the link is gone from the pool either way, and
+		// a reaper that reported an error would have nobody to report it to.
+		_ = closeLinks(context.Background(), reaped)
+	}()
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	reaped := 0
 	for linked, pooled := range p.links {
 		if len(pooled.bindings) > 0 {
 			continue
@@ -777,12 +787,28 @@ func (p *Pool) ReapIdle() int {
 			continue
 		}
 		delete(p.links, linked)
-		// Close is best effort: the link is gone from the pool either way, and
-		// a reaper that reported an error would have nobody to report it to.
-		_ = pooled.link.Close(context.Background())
-		reaped++
+		reaped = append(reaped, pooled)
 	}
-	return reaped
+	return len(reaped)
+}
+
+// closeLinks closes every link CONCURRENTLY and reports every failure. Each
+// link's Close is bounded by ctx and its own cap, so closing them side by side
+// bounds the whole call by one cap rather than one per link; the number of
+// goroutines is at most the pool's MaxLinks. It must be called with no pool
+// lock held.
+func closeLinks(ctx context.Context, links []*pooledLink) error {
+	errs := make([]error, len(links))
+	var wg sync.WaitGroup
+	for i, pooled := range links {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			errs[i] = pooled.link.Close(ctx)
+		}()
+	}
+	wg.Wait()
+	return errors.Join(errs...)
 }
 
 // Close closes every link and refuses further work.
@@ -807,13 +833,9 @@ func (p *Pool) Close(ctx context.Context) error {
 	p.routes = map[routeKey]sessionwire.HostID{}
 	p.mu.Unlock()
 
-	var errs []error
-	for _, pooled := range links {
-		if err := pooled.link.Close(ctx); err != nil {
-			errs = append(errs, err)
-		}
-	}
-	return errors.Join(errs...)
+	// Concurrently (v0.7.2 gate S3): each Close may wait out its cap behind a
+	// wedged RPC, and N of them in turn would make Stop take N caps.
+	return closeLinks(ctx, links)
 }
 
 // acquireLocked returns the pooled link for one (Host, tenant), dialling dial
