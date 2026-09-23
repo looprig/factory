@@ -9,6 +9,8 @@ import (
 
 	sessionwire "github.com/looprig/core/sessionwire/v1"
 	"github.com/looprig/factory/internal/realtime/delivery"
+	"github.com/looprig/sessionstore"
+	"github.com/looprig/storage"
 )
 
 // ErrRelayClosed reports work asked of a closed relay.
@@ -215,6 +217,17 @@ type hostBinding struct {
 	// records from before the repair in front of records from after it.
 	stopped    bool
 	deliveries map[LinkID]*deliveryBinding
+
+	// tailSeq is the greatest sequence this session's viewers are known to be
+	// able to hold contiguously from the live tail plus the journal: the tip
+	// a tail start anchored (Anchor), the tip the last reset sent every
+	// binding to (Resync, repair), raised by every enduring record received
+	// since. tailKnown says whether there is one. While it is known, a record
+	// past tailSeq+1 is PROBED (Receive): the tail skipped positions, and
+	// whether a public record is among them is the journal's to say (I3.1
+	// D2).
+	tailSeq   uint64
+	tailKnown bool
 }
 
 // deliveryBinding is one ClientLink's outbound queue for one session.
@@ -368,6 +381,31 @@ func (r *Relay) Receive(ctx context.Context, tenant sessionwire.TenantID, sessio
 		}
 		r.mu.Unlock()
 		return err
+	}
+	if record.Class == delivery.ClassEnduring {
+		if host.tailKnown && record.Seq > host.tailSeq+1 {
+			// The lock is released for the probe, as for every store read
+			// here; this session's calls are serialised by its caller.
+			last := host.tailSeq
+			r.mu.Unlock()
+			hole, tip, probeErr := r.probeGap(ctx, key, last, record.Seq)
+			r.mu.Lock()
+			if r.closed {
+				r.mu.Unlock()
+				return ErrRelayClosed
+			}
+			if r.hosts[key] != host || host.stopped {
+				// Forgotten, or a repair began meanwhile: its reset covers this.
+				r.mu.Unlock()
+				return nil
+			}
+			if hole {
+				r.resetForGapLocked(ctx, key, host, record.Seq, tip, probeErr)
+			}
+		}
+		if !host.tailKnown || record.Seq > host.tailSeq {
+			host.tailSeq = record.Seq
+		}
 	}
 	switch err := host.queue.Enqueue(record); {
 	case err == nil, errors.Is(err, delivery.ErrDropped):
@@ -624,6 +662,7 @@ func (r *Relay) Resync(ctx context.Context, tenant sessionwire.TenantID, session
 		}
 	}
 	host.queue.Clear()
+	host.anchorLocked(tip)
 	return errors.Join(failures...)
 }
 
@@ -708,6 +747,7 @@ func (r *Relay) repair(ctx context.Context, key sessionKey, host *hostBinding) e
 				failures = append(failures, err)
 			}
 		}
+		host.anchorLocked(tip)
 	}
 	host.queue.Clear()
 	r.mu.Unlock()
@@ -773,6 +813,112 @@ func (r *Relay) resetBindingLocked(ctx context.Context, key sessionKey, host *ho
 		return err
 	}
 	return nil
+}
+
+// Anchor records the durable tip a session's viewers are known to reach, as
+// the point the live tail must continue: the caller calls it when a tail has
+// gone live INSIDE the first viewer's subscribe (the start Gap 3 owes no
+// reset), whose durable read comes after the tail was live and so reaches at
+// least this tip. From then on a record past the tail's last position is
+// probed (Receive) rather than assumed to continue it (I3.1 D2).
+//
+// The tip is read with the lock RELEASED, as Resync reads it. A tip that
+// cannot be read anchors nothing and is returned; the session keeps the
+// original rule, which is the state before this method existed.
+func (r *Relay) Anchor(ctx context.Context, tenant sessionwire.TenantID, session sessionwire.SessionID) error {
+	key := sessionKey{tenant: tenant, session: session}
+	r.mu.Lock()
+	if r.closed {
+		r.mu.Unlock()
+		return ErrRelayClosed
+	}
+	if r.hosts[key] == nil {
+		r.mu.Unlock()
+		return ErrNoHostBinding
+	}
+	r.mu.Unlock()
+	tip, err := r.readTip(ctx, key)
+	if err != nil {
+		return err
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	host := r.hosts[key]
+	if r.closed || host == nil {
+		return ErrRelayClosed
+	}
+	host.anchorLocked(tip)
+	return nil
+}
+
+// anchorLocked makes tip the tail's known position.
+func (h *hostBinding) anchorLocked(tip uint64) {
+	h.tailSeq, h.tailKnown = tip, true
+}
+
+// probeGap asks the journal whether any PUBLIC record lies strictly between
+// the tail's last position and seq, the record that skipped past it.
+//
+// A Host publishes only public records, so a sparse tail is ordinary: a
+// private record (a runtime control frame, a disposition) occupies a position
+// and is never relayed. What is NOT ordinary is a public record the tail never
+// carried -- a Host that committed it after it stopped relaying, as a warm
+// release commits SessionResidencyReleased, before a re-placed session's new
+// tail arrived on the same subscription. The probe is one bounded page:
+// FromSeq just past the tail, one event, and a scan no longer than the gap. A
+// hole is an event below seq, or a page that could not cover the gap (a scan
+// or byte bound stopped it) -- unknown is answered as a hole, because a reset
+// the viewer did not need costs a journal read and a skipped record costs the
+// record. The page's captured tip is returned for the reset.
+func (r *Relay) probeGap(ctx context.Context, key sessionKey, last, seq uint64) (hole bool, tip uint64, err error) {
+	scan := seq - last - 1
+	if scan > maxGapProbe {
+		scan = maxGapProbe
+	}
+	page, err := r.tips.ReadPublicJournal(ctx, sessionstore.ReadPublicJournalRequest{
+		TenantID: key.tenant, SessionID: key.session, FromSeq: last + 1, Limit: 1, ScanLimit: int(scan),
+	})
+	if err != nil {
+		return true, 0, err
+	}
+	if len(page.Events) > 0 {
+		return page.Events[0].JournalSeq < seq, page.CapturedTip, nil
+	}
+	return page.CoveredThrough+1 < seq, page.CapturedTip, nil
+}
+
+// maxGapProbe bounds the records one gap probe examines. It is
+// storage.MaxOrderedPageLimit, SessionStore's ceiling for ScanLimit; a gap
+// wider than it is answered as a hole.
+const maxGapProbe = storage.MaxOrderedPageLimit
+
+// resetForGapLocked tells every binding of a session where to read from,
+// because the live tail skipped a public record: each is reset to tip, the
+// probe's captured tip, which must reach the skipping record's predecessor. A
+// tip that does not -- or a probe that failed and whose follow-up tip read
+// fails too -- cannot describe the hole, so every binding is closed instead:
+// the fail-closed arm every other repair here takes. The skipping record is
+// then queued as usual, behind the reset.
+func (r *Relay) resetForGapLocked(ctx context.Context, key sessionKey, host *hostBinding, seq, tip uint64, probeErr error) {
+	if probeErr != nil {
+		read, err := r.readTipLocked(ctx, key)
+		if err != nil {
+			tip = 0
+		} else {
+			tip = read
+		}
+	}
+	if tip+1 < seq {
+		for _, binding := range sortedBindings(host) {
+			r.closeBindingLocked(ctx, host, binding, "a gap in the tail cannot be repaired from the journal tip")
+		}
+		host.tailKnown = false
+		return
+	}
+	for _, binding := range sortedBindings(host) {
+		_ = r.resetBindingLocked(ctx, key, host, binding, tip)
+	}
+	host.anchorLocked(tip)
 }
 
 // closeBindingLocked closes ONE ClientLink and removes its binding. Peer

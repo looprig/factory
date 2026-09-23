@@ -29,6 +29,9 @@ func TestTheFirstViewersTailIsBoundThenSubscribedAndDeliveredInOrder(t *testing.
 	host := newStandIn(t, "host-1")
 	r := newRig(t, rigOptions{})
 	r.dir.put(host.observation(tenantA, session, 3))
+	// The journal the viewer's own read reaches: the tail continues it at 4
+	// (a first record past it is preceded by a reset -- I3.1 D2).
+	r.tips.set(3)
 	r.watch(t, tenantA, session)
 
 	channel := sessionwire.HostLinkChannel(tenantA, session)
@@ -60,6 +63,8 @@ func TestAViewerOfAnotherTenantReceivesNothing(t *testing.T) {
 	r := newRig(t, rigOptions{})
 	r.dir.put(host.observation(tenantA, session, 3))
 	r.dir.put(host.observation(tenantB, session, 3))
+	// One tip for both tenants' reads: B's tail continues at 9, A's from 1.
+	r.tips.set(8)
 	r.watch(t, tenantA, session)
 	r.watch(t, tenantB, session)
 

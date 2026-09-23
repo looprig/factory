@@ -43,6 +43,14 @@ const (
 // sequences the three events were committed at.
 func hostSessionWorld(t *testing.T) (control, runtime *sessionstore.Store, seqs []uint64) {
 	t.Helper()
+	control, runtime, seqs, _ = hostSessionWorldWriter(t)
+	return control, runtime, seqs
+}
+
+// hostSessionWorldWriter is hostSessionWorld with the runtime journal's writer,
+// for a case that commits more records to it.
+func hostSessionWorldWriter(t *testing.T) (control, runtime *sessionstore.Store, seqs []uint64, writer *sessionstore.JournalWriter) {
+	t.Helper()
 	ctx := context.Background()
 	control, err := sessionstore.Open(ctx, memstore.New())
 	if err != nil {
@@ -72,7 +80,7 @@ func hostSessionWorld(t *testing.T) (control, runtime *sessionstore.Store, seqs 
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = runtime.Close(context.Background()) })
-	writer, err := runtime.OpenJournal(ctx, sessionstore.OpenJournalRequest{TenantID: FakeTenant, SessionID: journalRuntime})
+	writer, err = runtime.OpenJournal(ctx, sessionstore.OpenJournalRequest{TenantID: FakeTenant, SessionID: journalRuntime})
 	if err != nil {
 		t.Fatalf("OpenJournal: %v", err)
 	}
@@ -92,7 +100,7 @@ func hostSessionWorld(t *testing.T) (control, runtime *sessionstore.Store, seqs 
 	for _, event := range page.Events {
 		seqs = append(seqs, event.JournalSeq)
 	}
-	return control, runtime, seqs
+	return control, runtime, seqs, writer
 }
 
 // runtimeJournals resolves the one binding this deployment knows to the
@@ -143,11 +151,15 @@ func (v *closingViewers) snapshot() ([]json.RawMessage, int) {
 	return append([]json.RawMessage(nil), v.published...), v.closes
 }
 
-// dropAfterDelivery composes the live plane over server's own configuration,
-// has one viewer watch the Host session, delivers the three runtime records
-// over the HostLink tail, then drops the HostLink subscription. It returns what
-// the viewer saw after the drop settled.
-func dropAfterDelivery(t *testing.T, server *Server, seqs []uint64) (resets []sessionwire.SessionReset, closes int) {
+// watchedHostSession is the live plane composed over a Server's own
+// configuration, one viewer watching the Host session, and the HostLink sink
+// the test speaks for the Host through.
+type watchedHostSession struct {
+	*closingViewers
+	sink hostlink.SessionSink
+}
+
+func watchHostSession(t *testing.T, server *Server) watchedHostSession {
 	t.Helper()
 	link := &wireLink{}
 	pool, err := hostlink.NewPool(hostlink.Config{Dialer: wireDialer{link: link}})
@@ -181,15 +193,31 @@ func dropAfterDelivery(t *testing.T, server *Server, seqs []uint64) (resets []se
 	link.mu.Lock()
 	sink := link.sinks[0]
 	link.mu.Unlock()
+	return watchedHostSession{closingViewers: viewers, sink: sink}
+}
+
+// enduringAt is the Host's publication of runtime event i+1 at seq.
+func enduringAt(t *testing.T, i int, seq uint64) []byte {
+	t.Helper()
+	record, err := sessionwire.EnduringPublication{
+		TenantID: FakeTenant, SessionID: journalSession, EventID: sessionwire.EventID(fmt.Sprintf("event-%d", i+1)),
+		JournalSeq: seq, CoveredThrough: seq, Body: json.RawMessage(fmt.Sprintf(`{"n":%d}`, i+1)),
+	}.MarshalJSON()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return record
+}
+
+// dropAfterDelivery has one viewer watch the Host session, delivers the three
+// runtime records over the HostLink tail, then drops the HostLink
+// subscription. It returns what the viewer saw after the drop settled.
+func dropAfterDelivery(t *testing.T, server *Server, seqs []uint64) (resets []sessionwire.SessionReset, closes int) {
+	t.Helper()
+	watched := watchHostSession(t, server)
+	viewers, sink := watched.closingViewers, watched.sink
 	for i, seq := range seqs {
-		record, err := sessionwire.EnduringPublication{
-			TenantID: FakeTenant, SessionID: journalSession, EventID: sessionwire.EventID(fmt.Sprintf("event-%d", i+1)),
-			JournalSeq: seq, CoveredThrough: seq, Body: json.RawMessage(fmt.Sprintf(`{"n":%d}`, i+1)),
-		}.MarshalJSON()
-		if err != nil {
-			t.Fatal(err)
-		}
-		sink.Publication(record)
+		sink.Publication(enduringAt(t, i, seq))
 	}
 	waitFor(t, "the three records reach the viewer", func() bool {
 		published, _ := viewers.snapshot()
@@ -276,21 +304,32 @@ func TestAHostSessionsViewerIsResetNotClosedAcrossAHostLinkDrop(t *testing.T) {
 
 // TestWithoutAResolverAHostSessionsViewerIsClosed is the defect itself, kept
 // as the control: the same world read through WithSessionReader alone has tip
-// 0, so the repair is incoherent and the relay closes the viewer. It pins that
-// the resolver, and nothing else in this file, is what turns the close into a
-// reset -- and that the relay's fail-closed arm is left alone.
+// 0. Since v0.9.0's D2 fix the viewer's binding is anchored at that tip, so
+// the FIRST record (at 2, past 0+1) is a gap no reset can describe and the
+// viewer is closed before anything reaches it -- the relay's fail-closed arm,
+// left alone. It pins that the resolver, and nothing else in this file, is
+// what lets a Host session's viewer be served at all.
 func TestWithoutAResolverAHostSessionsViewerIsClosed(t *testing.T) {
 	t.Parallel()
 
 	control, _, seqs := hostSessionWorld(t)
 	server := composedJournalServer(t, control)
-	resets, closes := dropAfterDelivery(t, server, seqs)
-	if closes == 0 {
-		t.Fatalf("resets %+v closes %d, want the viewer closed", resets, closes)
+	viewers := watchHostSession(t, server)
+	for i, seq := range seqs {
+		viewers.sink.Publication(enduringAt(t, i, seq))
 	}
-	for _, reset := range resets {
-		if reset.LastContiguous != 0 {
-			t.Fatalf("resets %+v, want none vouching for the delivered records", resets)
+	waitFor(t, "the viewer is closed", func() bool {
+		_, closes := viewers.snapshot()
+		return closes > 0
+	})
+	// The record past the unrepairable gap never reached the viewers it was
+	// closed for. (Later records go to a fresh channel binding, which has
+	// nobody on it: every viewer was unsubscribed.)
+	published, _ := viewers.snapshot()
+	first := string(enduringAt(t, 0, seqs[0]))
+	for _, raw := range published {
+		if string(raw) == first {
+			t.Fatalf("the record at %d reached a viewer the read plane cannot repair", seqs[0])
 		}
 	}
 }

@@ -108,6 +108,7 @@ type Relay interface {
 	Pump(ctx context.Context, tenant sessionwire.TenantID, session sessionwire.SessionID) error
 	HostLinkClosed(ctx context.Context, tenant sessionwire.TenantID, session sessionwire.SessionID) error
 	Resync(ctx context.Context, tenant sessionwire.TenantID, session sessionwire.SessionID) error
+	Anchor(ctx context.Context, tenant sessionwire.TenantID, session sessionwire.SessionID) error
 	Forget(tenant sessionwire.TenantID, session sessionwire.SessionID)
 	Close()
 }
@@ -639,6 +640,13 @@ func (p *Plane) handle(relay Relay, rebinder routing.Rebinder, key sessionKey, e
 			if err := relay.Resync(ctx, tenant, session); err != nil {
 				p.warn(ctx, "the reset owed to a restarted tail could not be built", key, err)
 			}
+		} else if err := relay.Anchor(ctx, tenant, session); err != nil {
+			// The first viewer's tail is owed no reset, but its first record
+			// is still checked against the tip the viewer's own read reaches
+			// (I3.1 D2): a Host can commit a record it never relays, and a
+			// re-placed session's new tail can arrive on this subscription.
+			// Unanchored, the binding falls back to the original rule.
+			p.warn(ctx, "the first tail's journal tip could not be read", key, err)
 		}
 	case evFrame:
 		frame := routing.Frame{

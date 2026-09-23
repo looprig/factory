@@ -85,6 +85,9 @@ func (r *recordingRelay) HostLinkClosed(context.Context, sessionwire.TenantID, s
 func (r *recordingRelay) Resync(context.Context, sessionwire.TenantID, sessionwire.SessionID) error {
 	return nil
 }
+func (r *recordingRelay) Anchor(context.Context, sessionwire.TenantID, sessionwire.SessionID) error {
+	return nil
+}
 func (r *recordingRelay) Forget(sessionwire.TenantID, sessionwire.SessionID) { r.op("forget") }
 func (r *recordingRelay) Close()                                             {}
 
