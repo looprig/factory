@@ -120,16 +120,50 @@ func TestAGateCapabilityReadOfAHostThatMovedReplacesItsLink(t *testing.T) {
 	dialer := newRecordingDialer()
 	pool := newPool(t, dialer, hostlink.Limits{})
 	mustBind(t, pool, target(hostOne, endpoint1), bindAt(hostOne, "s-1", 7))
+	predecessor := dialer.link(hostOne)
 	if _, err := pool.AcceptsGateResponses(context.Background(), hostlink.Target{Host: hostOne, Endpoint: movedEndpoint, Generation: 8}, tenant); err != nil {
 		t.Fatalf("AcceptsGateResponses: %v", err)
 	}
 	if got := dialer.dials(); got != 2 {
 		t.Fatalf("dialled %d times, want the moved Host dialled", got)
 	}
+	if got := predecessor.closes(); got != 1 {
+		t.Fatalf("the replaced link was closed %d times, want exactly 1", got)
+	}
 	if _, err := pool.AcceptsGateResponses(context.Background(), hostlink.Target{Host: hostOne, Endpoint: endpoint1, Generation: 7}, tenant); err != nil {
 		t.Fatalf("AcceptsGateResponses: %v", err)
 	}
 	if got := dialer.dials(); got != 2 {
 		t.Fatalf("dialled %d times, want an older observation answered from the current link", got)
+	}
+}
+
+// TestAMovedLinkIsClosedEvenWhenItsReplacementFailsTerminally (v0.9.0 regate
+// RG1): a bind at a moved address replaces the old link, and the NEW link's
+// bind then fails terminally. Both links leave the pool, and both must be
+// closed: the replaced one is no longer pooled, so a Close skipped here is a
+// link redialling the predecessor's dead address for the life of the process.
+func TestAMovedLinkIsClosedEvenWhenItsReplacementFailsTerminally(t *testing.T) {
+	t.Parallel()
+
+	dialer := newRecordingDialer()
+	pool := newPool(t, dialer, hostlink.Limits{})
+	mustBind(t, pool, target(hostOne, endpoint1), bindAt(hostOne, "s-old", 7))
+	predecessor := dialer.link(hostOne)
+	dialer.onDial = func(link *fakeLink) {
+		link.failBind(&hostlink.HostDisconnect{Host: hostOne, Code: 3500})
+	}
+	if err := pool.Bind(context.Background(), target(hostOne, movedEndpoint), bindAt(hostOne, "s-new", 8)); err == nil {
+		t.Fatal("a bind on a terminal replacement succeeded")
+	}
+	successor := dialer.link(hostOne)
+	if got := predecessor.closes(); got != 1 {
+		t.Fatalf("the replaced link was closed %d times, want exactly 1", got)
+	}
+	if got := successor.closes(); got != 1 {
+		t.Fatalf("the terminal replacement was closed %d times, want exactly 1", got)
+	}
+	if got := pool.TenantLinks(hostOne); got != 0 {
+		t.Fatalf("TenantLinks = %d, want both links gone", got)
 	}
 }

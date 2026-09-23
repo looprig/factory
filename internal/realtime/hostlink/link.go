@@ -470,10 +470,18 @@ func (p *Pool) Bind(ctx context.Context, target Target, req sessionwire.HostLink
 	// released, as evict does: Client.Close waits for the link's callback
 	// queue to drain, and a pool lock held across that is a deadlock the day
 	// any callback reaches the pool. Deferred first, so it runs last.
-	var dead Link
+	//
+	// A link this bind REPLACED (moved, a Host restarted under its HostID) is a
+	// second, independent close: the replacement may itself turn out terminal,
+	// and both have then left the pool -- a replaced link nobody closes keeps
+	// redialling its dead address for the life of the process (v0.9.0 regate
+	// RG1).
+	var dead, moved Link
 	defer func() {
-		if dead != nil {
-			_ = dead.Close(context.Background())
+		for _, link := range []Link{moved, dead} {
+			if link != nil {
+				_ = link.Close(context.Background())
+			}
 		}
 	}()
 	p.mu.Lock()
@@ -489,9 +497,7 @@ func (p *Pool) Bind(ctx context.Context, target Target, req sessionwire.HostLink
 	if err != nil {
 		return err
 	}
-	if replaced != nil {
-		dead = replaced
-	}
+	moved = replaced
 	if err := pooled.link.Bind(ctx, req); err != nil {
 		// The BINDING is not recorded, because the Host does not have it. The
 		// LINK is kept: the Host answered, so the connection is good, and
