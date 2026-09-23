@@ -1841,17 +1841,44 @@ pooled placement at all until the directory carries a tenant dimension, which is
 H8's per-tenant Department and a specification section 7 change that is not this
 repository's to book.
 
-### A released dedicated session is placed again (D3.1 F2)
+### A released dedicated session is placed again ONLY on a restore (D3.1 F2)
 
-Deletion desire is a dedicated placement naming **no** workload. Before this, a
+Deletion desire is a dedicated placement naming **no** workload, written after
+creation (`released`: generation above the create's first). Before v0.8.0 a
 later command for such a session was admitted and never placed: the dedicated
 arm handed the controller the released intent every pass, and controller
-v0.2.0's adapter refuses an empty payload (`unsupported workload payload
-version`). Now `Request.OpenWork` (set by `PendingSweeper` for every session it
-reconciles) licenses `reviveReleased`: the record is re-expressed as a **new
-desired generation** carrying `CatalogRecord.PublicCreate.InitialWorkload` —
-the template the session was **created** with, SessionStore's immutable
-provenance — and only then ensured. Rules:
+v0.2.0's adapter refuses an empty payload.
+
+**The licence is a live pending `restore` command, and nothing else** (owner
+ruling, v0.8.0 gate B-F1). `PendingSweeper` sets `Request.RestoreRequested`
+only when the session has a `restore` that is pending and inside its deadline
+(`POST /v1/sessions/{sid}/restore` or ClientLink `session.restore`). Then
+`reviveReleased` writes a **new desired generation** carrying
+`CatalogRecord.PublicCreate.InitialWorkload` -- the template the session was
+**created** with -- and the arm ensures it. An input, interrupt, gate
+response, leftover create, or a claimed or **applying** command does NOT
+license it: each may be work the product abandoned by deleting, and an
+applying command never expires (only a successor settles it), so licensing on
+it would make deleting a busy session a guaranteed resurrection that runs the
+abandoned turn. `TestPendingInputAloneDoesNotReviveAReleasedSession`,
+`TestAnApplyingCommandAloneDoesNotReviveAReleasedSession` and
+`TestAnExpiredRestoreDoesNotReviveAReleasedSession` pin which states license
+it.
+
+**A released session nobody asked to restore is skipped quietly.** The arm
+returns `ErrSessionReleased` before any controller call; the sweep counts it in
+`PendingSweepResult.Released`, not as a failure with a WARN. Its leftovers are
+settled by what already exists: a **pending** input (or any unattempted
+command) is rejected by the disposition deadline sweep at its apply deadline --
+that sweep never reads desire -- and the product sees the command's status
+`rejected / runtime_unavailable`
+(`TestInputLeftOnAReleasedDedicatedSessionIsRejectedAtItsDeadline`). An
+**applying** one stays applying until a later restore brings a successor, which
+closes it `not_applied`. A live pending input admitted before a restore that
+lands inside its deadline IS applied after the revival: the restore is the
+user's intent to continue.
+
+Mechanics:
 
 - It runs **before** the `Workloads == nil` check: desire is Factory-authored
   and the controller driver never writes it, so a controller-less replica (H5's
@@ -1864,12 +1891,21 @@ provenance — and only then ensured. Rules:
   release gets a key of its own (SessionStore compares only the current key).
 - No provenance (a `CreateCatalogEntry` session) or an empty `InitialWorkload`
   is `ErrNoLaunchTemplate`, by name, with nothing written. The configured
-  `LaunchTemplate` is deliberately **not** consulted: a returning session's
-  workload must not depend on configuration drift since it was created.
-- **Open work wins over a release.** A command still open when a product writes
-  deletion desire re-expresses the workload; a product that means "gone for
-  good" must let its open commands settle or expire first (the reviver does
-  not read session state; the controller driver ignores a `stopped` session).
+  `LaunchTemplate` is deliberately **not** consulted.
+
+**Operator obligations.** A revived session runs its **create-time**
+workload. Keep every create-time image digest pullable for as long as a
+session may be restored. A deployment's image upgrade never reaches a released
+session, and if a product rewrote a session's workload to a newer image during
+its life, a revival **rolls it back** to the create image -- which breaks the
+one-way upgrades (host >= v0.4.0 / harness >= v0.35.0 once a `gate_response`
+is applied; harness >= v0.36.0 once a create or restore frame exists), so the
+restored runtime could not replay its own journal. **A product that changed a
+session's image must write new desire itself before any restore.** And a
+Factory composed with the controller adapter (`WithWorkloadController`)
+**requires the controller driver to run too**: while the older generation's
+Pod exists the adapter answers `GenerationConflictError` each pass, and only
+the driver tears that Pod down.
 
 Not built here: drain-before-delete of D2.2, and the authorship of a dedicated workload's
 payload — `Desired` is an INPUT, because what a launch template should contain
