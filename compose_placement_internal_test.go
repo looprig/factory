@@ -1,6 +1,7 @@
 package factory
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -50,6 +51,11 @@ func TestEveryAttachFailureIsClassifiedOntoPlacementsVocabulary(t *testing.T) {
 		// Gap 1: the candidate's base cannot carry this tenant's address.
 		"tenant unaddressable": {&hostlink.EndpointError{Host: "host-a", Tenant: "tenant-a",
 			Cause: &sessionwire.HostLinkEndpointError{Code: sessionwire.HostLinkEndpointCodeTooLong}}, unaddressable},
+		// v0.7.2 gate S2: a link this replica closed refuses before sending,
+		// so the Host never saw the attach and the next candidate may be tried.
+		"link closed": {fmt.Errorf("hostlink: hostlink.attach: %w: host-a", hostlink.ErrLinkClosed), unreachable},
+		// ...but an attach a close CANCELLED in flight may have left: abort.
+		"cancelled by a close":     {fmt.Errorf("hostlink: hostlink.attach: %w", context.Canceled), abort},
 		"pool closed":              {hostlink.ErrPoolClosed, abort},
 		"malformed reply":          {fmt.Errorf("%w: empty", hostlink.ErrMalformedAttachReply), abort},
 		"observation of elsewhere": {fmt.Errorf("%w: generation", hostlink.ErrAttachMismatch), abort},

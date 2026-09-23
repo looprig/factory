@@ -481,7 +481,7 @@ func classifyCapabilityRead(err error) error {
 		return nil
 	}
 	for _, transient := range []error{hostlink.ErrLinkReconnecting, hostlink.ErrLinkLimit, hostlink.ErrDialFailed,
-		hostlink.ErrUnsupportedProtocol, hostlink.ErrPoolClosed} {
+		hostlink.ErrUnsupportedProtocol, hostlink.ErrPoolClosed, hostlink.ErrLinkClosed} {
 		if errors.Is(err, transient) {
 			return fmt.Errorf("%w: %w", admission.ErrGateResponderUnavailable, err)
 		}
@@ -505,8 +505,14 @@ func classifyAttach(err error) error {
 	if errors.Is(err, hostlink.ErrUnsupportedMethod) {
 		return fmt.Errorf("%w: %w", placement.ErrAttachUnsupported, err)
 	}
+	// ErrLinkClosed is refused BEFORE anything is sent (a link this replica
+	// closed -- reaped or evicted -- under a caller that already held it), so
+	// the Host never saw the attach. An RPC a close CANCELLED in flight is
+	// not this: it surfaces as context.Canceled and stays an abort, because
+	// the request may have left.
 	if errors.Is(err, hostlink.ErrDialFailed) || errors.Is(err, hostlink.ErrLinkReconnecting) ||
-		errors.Is(err, hostlink.ErrLinkLimit) || errors.Is(err, hostlink.ErrUnsupportedProtocol) {
+		errors.Is(err, hostlink.ErrLinkLimit) || errors.Is(err, hostlink.ErrUnsupportedProtocol) ||
+		errors.Is(err, hostlink.ErrLinkClosed) {
 		return fmt.Errorf("%w: %w", placement.ErrHostUnreachable, err)
 	}
 	if errors.Is(err, hostlink.ErrHostFailed) {

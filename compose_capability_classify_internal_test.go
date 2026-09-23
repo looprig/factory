@@ -26,6 +26,9 @@ func TestOnlyATransientCapabilityReadIsClassifiedUnavailable(t *testing.T) {
 		"terminal close": {&hostlink.HostDisconnect{Host: "host-a", Code: 3500}, true},
 		"wire version":   {fmt.Errorf("%w: host selected 2", hostlink.ErrUnsupportedProtocol), true},
 		"pool closed":    {hostlink.ErrPoolClosed, true},
+		// v0.7.2 gate S2: a read racing a reap or eviction of the link. The
+		// pool evicts it, so a retry redials.
+		"link closed": {fmt.Errorf("%w: host-a", hostlink.ErrLinkClosed), true},
 		"tenant unaddressable": {&hostlink.EndpointError{Host: "host-a", Tenant: "tenant-a",
 			Cause: &sessionwire.HostLinkEndpointError{Code: sessionwire.HostLinkEndpointCodeTooLong}}, false},
 		"anything else": {errors.New("boom"), false},
