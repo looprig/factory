@@ -20,8 +20,10 @@ import (
 // lane's F2 found that a later command for that session was admitted and then
 // never placed: the reconciler handed the controller the released intent on
 // every pass, and a real adapter refuses an empty workload. These cases hold
-// the fix -- open work re-expresses the session's launch template as a NEW
-// desired generation -- and its bounds.
+// the fix -- a live pending RESTORE re-expresses the session's launch template
+// as a NEW desired generation -- and its bounds: no other open work (a
+// leftover create or input, an applying command) brings a deleted session
+// back, because it may be exactly the work the product abandoned by deleting.
 
 var releasedTemplate = sessionstore.DesiredWorkload{
 	PayloadVersion: "workload/v1",
@@ -56,8 +58,9 @@ type releasedFixture struct {
 
 // newReleasedFixture creates a dedicated session through the public create
 // path (so its catalog keeps the create's InitialWorkload as immutable
-// provenance), leaves its create command pending as open work, and then
-// releases it with deletion desire. The record is at generation 2 afterwards.
+// provenance), leaves its create command pending as LEFTOVER open work (not a
+// restore), and then releases it with deletion desire. The record is at
+// generation 2 afterwards.
 func newReleasedFixture(t *testing.T) *releasedFixture {
 	t.Helper()
 
@@ -171,6 +174,7 @@ func (f *releasedFixture) sweepAll(t *testing.T) PendingSweepResult {
 		}
 		total.Sessions += result.Sessions
 		total.Failures += result.Failures
+		total.Released += result.Released
 		for outcome, n := range result.Outcomes {
 			total.Outcomes[outcome] += n
 		}
@@ -178,15 +182,34 @@ func (f *releasedFixture) sweepAll(t *testing.T) PendingSweepResult {
 	return total
 }
 
-// TestAReleasedDedicatedSessionWithOpenWorkIsPlacedAgain is F2's repro. Before
-// the fix the sweep failed this session on every pass with the adapter's
-// refusal and no intent the controller could create was ever handed over.
-func TestAReleasedDedicatedSessionWithOpenWorkIsPlacedAgain(t *testing.T) {
+// admit files one disposition command for the fixture session under the
+// catalog's own binding, with an apply deadline one minute past the clock.
+func (f *releasedFixture) admit(t *testing.T, kind sessionstore.CommandKind, id sessionwire.CommandID) sessionstore.DispositionInboxEntry {
+	t.Helper()
+
+	binding := catalogRecord(t, f.store).Binding
+	entry, _, err := f.store.AdmitDispositionCommand(context.Background(), sessionstore.AdmitDispositionCommandRequest{
+		TenantID: testTenant, SessionID: testSession, CommandID: id, Binding: binding,
+		ProposedRuntimeCommandID: sessionstore.RuntimeCommandID("runtime-" + string(id)), Kind: kind,
+		Payload: []byte(`{}`), AcceptedAt: f.clock.now, ApplyDeadline: f.clock.now.Add(time.Minute),
+	})
+	if err != nil {
+		t.Fatalf("AdmitDispositionCommand(%s): %v", kind, err)
+	}
+	return entry
+}
+
+// TestAReleasedDedicatedSessionWithAPendingRestoreIsPlacedAgain is F2's repro
+// (D3.1 POST /restore). Before the fix the sweep failed this session on every
+// pass with the adapter's refusal and no intent the controller could create
+// was ever handed over.
+func TestAReleasedDedicatedSessionWithAPendingRestoreIsPlacedAgain(t *testing.T) {
 	t.Parallel()
 
 	f := newReleasedFixture(t)
+	f.admit(t, "restore", "restore-1")
 	result := f.sweepAll(t)
-	if result.Sessions != 1 || result.Failures != 0 || result.Outcomes[OutcomeReconcileDedicated] != 1 {
+	if result.Sessions != 1 || result.Failures != 0 || result.Released != 0 || result.Outcomes[OutcomeReconcileDedicated] != 1 {
 		t.Fatalf("sweep = %+v, want one session reconciled dedicated without failure", result)
 	}
 	record := catalogRecord(t, f.store)
@@ -215,21 +238,99 @@ func TestAReleasedDedicatedSessionWithOpenWorkIsPlacedAgain(t *testing.T) {
 	}
 }
 
-func (f *releasedFixture) reconcileOpen(t *testing.T, openWork bool) (Result, error) {
+// assertStillReleased is the not-revived outcome, asserted whole: counted as
+// Released (not a Failure, so no WARN every pass), no desired write, and
+// nothing handed to the controller.
+func (f *releasedFixture) assertStillReleased(t *testing.T, result PendingSweepResult) {
 	t.Helper()
-	return f.reconciler.Reconcile(context.Background(), Request{TenantID: testTenant, SessionID: testSession, OpenWork: openWork})
+
+	if result.Sessions != 1 || result.Released != 1 || result.Failures != 0 {
+		t.Fatalf("sweep = %+v, want the one session counted Released without failure", result)
+	}
+	if record := catalogRecord(t, f.store); record.DesiredGeneration != 2 || !emptyWorkload(record.DesiredWorkload) {
+		t.Fatalf("record = generation %d workload %+v, want the release untouched", record.DesiredGeneration, record.DesiredWorkload)
+	}
+	if len(f.controller.intents) != 0 {
+		t.Fatalf("controller intents = %+v, want none", f.controller.intents)
+	}
 }
 
-// TestWithoutOpenWorkAReleasedSessionIsNotRedesired is the licence's other
-// half: a reconciliation nobody asked for on behalf of open work writes no
-// desire, so a released session stays released.
-func TestWithoutOpenWorkAReleasedSessionIsNotRedesired(t *testing.T) {
+// TestPendingInputAloneDoesNotReviveAReleasedSession: deleting a session with
+// queued input must not bring it back to run that input (review B-F1). The
+// leftover create is pending too, so this also covers "any live pending".
+func TestPendingInputAloneDoesNotReviveAReleasedSession(t *testing.T) {
+	t.Parallel()
+
+	f := newReleasedFixture(t)
+	f.admit(t, "input", "input-1")
+	f.assertStillReleased(t, f.sweepAll(t))
+}
+
+// TestAnApplyingCommandAloneDoesNotReviveAReleasedSession: an applying
+// command never expires -- only a successor settles it -- so if it licensed a
+// revival, deleting a session mid-turn would guarantee a resurrection.
+func TestAnApplyingCommandAloneDoesNotReviveAReleasedSession(t *testing.T) {
+	t.Parallel()
+
+	f := newReleasedFixture(t)
+	ctx := context.Background()
+	create, err := f.store.GetDispositionCommand(ctx, sessionstore.GetDispositionCommandRequest{TenantID: testTenant, SessionID: testSession, CommandID: "create-dedicated"})
+	if err != nil {
+		t.Fatalf("GetDispositionCommand: %v", err)
+	}
+	grant, err := f.store.AcquireResidency(ctx, sessionstore.AcquireResidencyRequest{TenantID: testTenant, SessionID: testSession})
+	if err != nil {
+		t.Fatalf("AcquireResidency: %v", err)
+	}
+	t.Cleanup(func() { _ = grant.Release(context.Background()) })
+	claimed, _, err := f.store.ClaimDispositionCommand(ctx, sessionstore.ClaimDispositionCommandRequest{
+		TenantID: testTenant, SessionID: testSession, CommandID: "create-dedicated",
+		ExpectedRevision: create.Revision, Residency: grant, ClaimExpiresAt: f.clock.now.Add(30 * time.Second),
+	})
+	if err != nil {
+		t.Fatalf("ClaimDispositionCommand: %v", err)
+	}
+	applying, err := f.store.BeginDispositionAttempt(ctx, sessionstore.BeginDispositionAttemptRequest{
+		TenantID: testTenant, SessionID: testSession, CommandID: "create-dedicated",
+		ExpectedRevision: claimed.Revision, AttemptID: "attempt-1", JournalEpoch: 1,
+		ResidencyEpoch: claimed.Record.Claim.ResidencyEpoch, StartedAt: f.clock.now,
+	})
+	if err != nil || applying.Record.State != sessionstore.InboxStateApplying {
+		t.Fatalf("BeginDispositionAttempt = %q, %v; the premise is an applying command", applying.Record.State, err)
+	}
+	// Past its deadline: applying still makes the session need a Host.
+	f.clock.now = f.clock.now.Add(2 * time.Minute)
+	f.assertStillReleased(t, f.sweepAll(t))
+}
+
+// TestAnExpiredRestoreDoesNotReviveAReleasedSession: the licence is a LIVE
+// restore. One at or past its deadline is the deadline sweep's to reject, even
+// when a live input keeps the session in the sweep.
+func TestAnExpiredRestoreDoesNotReviveAReleasedSession(t *testing.T) {
+	t.Parallel()
+
+	f := newReleasedFixture(t)
+	f.admit(t, "restore", "restore-1")
+	f.clock.now = f.clock.now.Add(time.Minute)
+	f.admit(t, "input", "input-1")
+	f.assertStillReleased(t, f.sweepAll(t))
+}
+
+func (f *releasedFixture) reconcileOpen(t *testing.T, restore bool) (Result, error) {
+	t.Helper()
+	return f.reconciler.Reconcile(context.Background(), Request{TenantID: testTenant, SessionID: testSession, RestoreRequested: restore})
+}
+
+// TestWithoutARestoreAReleasedSessionIsNotRedesired is the licence's other
+// half at the reconciler: no desire is written, the released intent is never
+// handed to a controller, and the answer is ErrSessionReleased by name.
+func TestWithoutARestoreAReleasedSessionIsNotRedesired(t *testing.T) {
 	t.Parallel()
 
 	f := newReleasedFixture(t)
 	result, err := f.reconcileOpen(t, false)
-	if !errors.Is(err, errUnsupportedPayload) {
-		t.Fatalf("Reconcile without open work = %+v, %v; want the controller's refusal of the released intent", result, err)
+	if !errors.Is(err, ErrSessionReleased) || len(f.controller.intents) != 0 {
+		t.Fatalf("Reconcile without a restore = %+v, %v, intents %+v; want ErrSessionReleased and no ensure", result, err, f.controller.intents)
 	}
 	if record := catalogRecord(t, f.store); record.DesiredGeneration != 2 || !emptyWorkload(record.DesiredWorkload) {
 		t.Fatalf("record = generation %d workload %+v, want the release untouched", record.DesiredGeneration, record.DesiredWorkload)
@@ -256,7 +357,7 @@ func TestADedicatedSessionThatIsNotReleasedIsNotRewritten(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewReconciler: %v", err)
 	}
-	result, err := reconciler.Reconcile(context.Background(), Request{TenantID: testTenant, SessionID: testSession, OpenWork: true})
+	result, err := reconciler.Reconcile(context.Background(), Request{TenantID: testTenant, SessionID: testSession, RestoreRequested: true})
 	if err != nil || result.DesiredWrites != 0 {
 		t.Fatalf("Reconcile = writes %d, %v; want no write", result.DesiredWrites, err)
 	}
@@ -275,7 +376,7 @@ func TestAReleasedSessionWithNoCreateProvenanceIsRefusedByName(t *testing.T) {
 	f := newFixture(t, sessionwire.HostPlacementDedicated, "factory-1")
 	release(t, f.store, "release-1")
 	before := f.generation(t)
-	_, err := f.reconciler.Reconcile(context.Background(), Request{TenantID: testTenant, SessionID: testSession, OpenWork: true})
+	_, err := f.reconciler.Reconcile(context.Background(), Request{TenantID: testTenant, SessionID: testSession, RestoreRequested: true})
 	if !errors.Is(err, ErrNoLaunchTemplate) {
 		t.Fatalf("Reconcile = %v, want ErrNoLaunchTemplate", err)
 	}
@@ -302,7 +403,7 @@ func TestAReplicaWithNoControllerStillRedesires(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewReconciler: %v", err)
 	}
-	_, err = reconciler.Reconcile(context.Background(), Request{TenantID: testTenant, SessionID: testSession, OpenWork: true})
+	_, err = reconciler.Reconcile(context.Background(), Request{TenantID: testTenant, SessionID: testSession, RestoreRequested: true})
 	if !errors.Is(err, ErrNoWorkloadController) {
 		t.Fatalf("Reconcile = %v, want ErrNoWorkloadController", err)
 	}
@@ -387,7 +488,7 @@ func TestTwoReplicasReexpressingOneReleaseWriteOneGeneration(t *testing.T) {
 			t.Errorf("racer revive: %v", err)
 		}
 	}
-	result, err := f.racingReconciler(t, catalog).Reconcile(context.Background(), Request{TenantID: testTenant, SessionID: testSession, OpenWork: true})
+	result, err := f.racingReconciler(t, catalog).Reconcile(context.Background(), Request{TenantID: testTenant, SessionID: testSession, RestoreRequested: true})
 	if err != nil {
 		t.Fatalf("Reconcile: %v", err)
 	}
@@ -421,7 +522,7 @@ func TestARacersWorkloadIsNeverOverwritten(t *testing.T) {
 			t.Errorf("racer write: %v", err)
 		}
 	}
-	result, err := f.racingReconciler(t, catalog).Reconcile(context.Background(), Request{TenantID: testTenant, SessionID: testSession, OpenWork: true})
+	result, err := f.racingReconciler(t, catalog).Reconcile(context.Background(), Request{TenantID: testTenant, SessionID: testSession, RestoreRequested: true})
 	if err != nil {
 		t.Fatalf("Reconcile: %v", err)
 	}
@@ -443,7 +544,7 @@ func TestARacingReleaseIsAnsweredWithAFreshGeneration(t *testing.T) {
 	f := newReleasedFixture(t)
 	catalog := &racingRedesire{Store: f.store}
 	catalog.race = func() { release(t, f.store, "release-racer") }
-	if _, err := f.racingReconciler(t, catalog).Reconcile(context.Background(), Request{TenantID: testTenant, SessionID: testSession, OpenWork: true}); err != nil {
+	if _, err := f.racingReconciler(t, catalog).Reconcile(context.Background(), Request{TenantID: testTenant, SessionID: testSession, RestoreRequested: true}); err != nil {
 		t.Fatalf("Reconcile: %v", err)
 	}
 	record := catalogRecord(t, f.store)
@@ -468,6 +569,7 @@ func TestAnEmptyCreateWorkloadIsNotATemplate(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = store.Close(context.Background()) })
 	admitDedicatedCreate(t, store, clock, sessionstore.DesiredWorkload{})
+	release(t, store, "release-1")
 	reconciler, err := NewReconciler(Config{
 		Directory: mustDirectory(t, store), Catalog: store, Claims: store, Workloads: &strictController{},
 		Clock: clock, HolderID: "factory-1", ClaimTTL: time.Minute, CandidateLimit: 8,
@@ -475,11 +577,11 @@ func TestAnEmptyCreateWorkloadIsNotATemplate(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewReconciler: %v", err)
 	}
-	_, err = reconciler.Reconcile(context.Background(), Request{TenantID: testTenant, SessionID: testSession, OpenWork: true})
+	_, err = reconciler.Reconcile(context.Background(), Request{TenantID: testTenant, SessionID: testSession, RestoreRequested: true})
 	if !errors.Is(err, ErrNoLaunchTemplate) {
 		t.Fatalf("Reconcile = %v, want ErrNoLaunchTemplate", err)
 	}
-	if got := catalogRecord(t, store).DesiredGeneration; got != 1 {
-		t.Fatalf("generation = %d, want 1", got)
+	if got := catalogRecord(t, store).DesiredGeneration; got != 2 {
+		t.Fatalf("generation = %d, want 2", got)
 	}
 }

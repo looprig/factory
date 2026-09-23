@@ -151,6 +151,10 @@ type PendingSweepResult struct {
 	// NoController counts dedicated sessions this replica cannot place because
 	// it composes no workload controller (ErrNoWorkloadController).
 	NoController int
+	// Released counts dedicated sessions whose desire is released and that
+	// no pending restore asked to bring back (ErrSessionReleased). Their open
+	// commands are left to the disposition deadline sweep.
+	Released int
 	// Failures counts the sessions whose reconciliation returned an error. A
 	// failure is per session and never stops the pass: one session whose
 	// registry is stale must not keep every other session in the shard cold.
@@ -172,6 +176,9 @@ type openSession struct {
 	// gates is the subset of wake that is gate responses, which placement
 	// delivers only to a Host that can apply one.
 	gates []sessionwire.CommandID
+	// restore reports a PENDING restore command still inside its deadline:
+	// the explicit intent that may bring a released dedicated session back.
+	restore bool
 }
 
 // Sweep places every session with open work in the next control shard.
@@ -197,11 +204,18 @@ func (s *PendingSweeper) Sweep(ctx context.Context, principal identity.Principal
 		result.Sessions++
 		placed, err := s.cfg.Placer.Reconcile(ctx, Request{
 			TenantID: session.tenant, SessionID: session.id, Wake: session.wake, GateResponses: session.gates,
-			// Every session reconciled here has open work (needsHost), which is
-			// what licenses re-expressing a released dedicated session's
-			// launch template (D3.1 F2).
-			OpenWork: true,
+			// Only a live pending restore licenses re-expressing a released
+			// dedicated session's launch template (D3.1 F2); other open work
+			// may be what the product abandoned by deleting it.
+			RestoreRequested: session.restore,
 		})
+		if errors.Is(err, ErrSessionReleased) {
+			// A deleted dedicated session with leftover commands but no
+			// restore: the deletion working, counted rather than logged, and
+			// it recurs every pass until the deadline sweep settles them.
+			result.Released++
+			continue
+		}
 		if errors.Is(err, ErrNoWorkloadController) {
 			// A dedicated session reaching a replica composed with no
 			// workload controller is a composition fact, not a failure of
@@ -276,8 +290,11 @@ func (s *PendingSweeper) collect(ctx context.Context, shard int, cursor sessionw
 			case sessionstore.InboxStatePending:
 				if live {
 					session.wake = append(session.wake, descriptor.CommandID)
-					if descriptor.Kind == command.KindGateResponse {
+					switch descriptor.Kind {
+					case command.KindGateResponse:
 						session.gates = append(session.gates, descriptor.CommandID)
+					case command.KindRestore:
+						session.restore = true
 					}
 					session.needsHost = true
 				}

@@ -35,12 +35,20 @@ var ErrInvalidConfig = errors.New("placement: invalid reconciler configuration")
 // reporting success would claim a workload nobody created.
 var ErrNoWorkloadController = errors.New("placement: this replica reconciles no dedicated workloads")
 
-// ErrNoLaunchTemplate reports a RELEASED dedicated session with open work whose
+// ErrSessionReleased reports a dedicated session whose desire is released
+// (a dedicated placement naming no workload) and that no restore command asked
+// to bring back. It is the deletion working, not a failure: the session is
+// not placed, nothing is written, and its leftover pending commands are left
+// to the disposition deadline sweep, which rejects them at their apply
+// deadline. An applying one waits for the successor a later restore brings.
+var ErrSessionReleased = errors.New("placement: the dedicated session is released and no restore was requested")
+
+// ErrNoLaunchTemplate reports a RELEASED dedicated session asked to restore whose
 // launch template cannot be recovered from durable state.
 //
 // A dedicated session is released by deletion desire: its dedicated placement
-// names no workload. Open work for it means a workload is wanted again, and the
-// only template this package re-expresses is the one the session was CREATED
+// names no workload. A pending restore for it means a workload is wanted again,
+// and the only template this package re-expresses is the one the session was CREATED
 // with -- the public create's InitialWorkload, which SessionStore keeps as
 // immutable provenance beside the mutable desire. A session with no such record
 // (one created through CreateCatalogEntry rather than the public create) has no
@@ -217,15 +225,21 @@ type Request struct {
 	// command not named here is delivered as before.
 	GateResponses []sessionwire.CommandID
 
-	// OpenWork reports that the caller observed commands this session still
-	// needs a Host for. It is what licenses re-expressing a RELEASED dedicated
-	// session's launch template: when the record's desire is a dedicated
-	// placement naming no workload (deletion desire) and the caller has open
-	// work, the reconciler writes a NEW desired generation carrying the
-	// template the session was created with before ensuring its workload (see
-	// reviveReleased). Without it a released session is reconciled as the
-	// record says, and no desired-state write is made on its behalf.
-	OpenWork bool
+	// RestoreRequested reports that the caller observed a LIVE PENDING
+	// RESTORE command for this session: the one explicit, post-release intent
+	// that licenses re-expressing a RELEASED dedicated session's launch
+	// template. When the record's desire is a dedicated placement naming no
+	// workload (deletion desire) and this is set, the reconciler writes a NEW
+	// desired generation carrying the template the session was created with
+	// before ensuring its workload (see reviveReleased).
+	//
+	// Other open work deliberately does NOT license it. An input, an interrupt
+	// or a claimed or applying command may be work the product abandoned by
+	// deleting the session -- an applying one never expires, since only a
+	// successor runtime can settle it -- so reviving on it would silently undo
+	// the deletion and run the abandoned work. Without it a released session is
+	// refused with ErrSessionReleased and nothing is written or ensured.
+	RestoreRequested bool
 }
 
 // Result is what one reconciliation did.
@@ -374,11 +388,11 @@ func (r *Reconciler) Reconcile(ctx context.Context, req Request) (Result, error)
 			return Result{}, err
 		}
 	}
-	// A released dedicated session with open work gets its template back
+	// A released dedicated session asked to restore gets its template back
 	// BEFORE the controller check: desire is Factory-authored, and a
 	// controller process never writes it, so a Factory replica composed with
 	// no controller (H5's split) must still be the one that re-expresses it.
-	if req.OpenWork {
+	if req.RestoreRequested {
 		var revived int
 		entry, revived, err = r.reviveReleased(ctx, req, entry)
 		writes += revived
@@ -402,6 +416,12 @@ func (r *Reconciler) Reconcile(ctx context.Context, req Request) (Result, error)
 		}
 		decision = Decide(entry.Record, owner, observed, page.Hosts, now)
 	case sessionwire.HostPlacementDedicated:
+		// A release nobody asked to restore is not placed: its empty intent
+		// is one no controller can create, and saying so by name lets a
+		// sweep count it instead of failing it on every pass.
+		if released(entry.Record) {
+			return Result{DesiredWrites: writes}, ErrSessionReleased
+		}
 		if r.cfg.Workloads == nil {
 			return Result{}, ErrNoWorkloadController
 		}
@@ -593,11 +613,27 @@ func (r *Reconciler) reviveReleased(
 	return entry, writes, nil
 }
 
-// released reports deletion desire: a dedicated placement naming no workload.
+// released reports deletion desire: a dedicated placement naming no workload,
+// written AFTER creation.
+//
+// The generation clause is what makes it a release rather than a shape. The
+// create is the record's first desired-state write (generation 1), and a
+// dedicated create carries its launch template's workload -- a dedicated
+// LaunchTemplate without one is refused at composition -- so a record still at
+// its first generation with no workload was never released: it was created
+// without a template, which is a composition fault this package keeps
+// reporting through the controller's own refusal rather than renaming a
+// deletion. Deletion desire is always a later write, so it always sits above
+// the first generation.
 func released(record sessionstore.CatalogRecord) bool {
 	return record.DesiredPlacement == sessionwire.HostPlacementDedicated &&
+		record.DesiredGeneration > firstDesiredGeneration &&
 		record.DesiredWorkload.PayloadVersion == "" && len(record.DesiredWorkload.Payload) == 0
 }
+
+// firstDesiredGeneration is the generation SessionStore gives a catalog
+// record at creation ("Creation is the first desired-state write").
+const firstDesiredGeneration = 1
 
 // launchTemplate is the workload a released dedicated session is re-created
 // from: the public create's InitialWorkload, retained by SessionStore as
