@@ -90,11 +90,16 @@ the public bundle, so a deployment can provide either, both, or neither.
 The protected handler reads the same verified principal passed to authorization
 through `UIRoutePrincipal(request)`.
 
-### A Host-owned session's journal: `WithJournalResolver` (v0.9.0)
+### A Host-owned session's journal: `WithSessionJournalResolver` (v0.10.0)
 
-**Required with `WithPublicCreates` or `WithPendingCommands`; `New` refuses
-either without it (`ErrHostSessionsWithoutJournalResolver`, as an
-`*OptionError` naming `WithJournalResolver`).** A session a Host runs is
+**A journal resolver is required with `WithPublicCreates` or
+`WithPendingCommands`; `New` refuses either without one
+(`ErrHostSessionsWithoutJournalResolver`, as an `*OptionError` naming
+`WithSessionJournalResolver`).** Use `WithSessionJournalResolver`; the v0.9.0
+`WithJournalResolver` still works and satisfies the requirement, but is
+**deprecated**, and supplying both is refused (`ErrConflictingJournalResolvers`,
+as an `*OptionError` naming `WithSessionJournalResolver`) rather than one
+silently shadowing the other. A session a Host runs is
 DISPOSITION-bound, and its journal is **not** in the SessionStore you hand
 `WithSessionReader`: the runtime keeps it on its own backend under the
 binding's `RuntimeSessionID`, and SessionStore never writes a public journal
@@ -109,13 +114,52 @@ With a resolver, every journal read Factory makes -- `/v1/sessions/{sid}/journal
 (and its `journal_tip`), the `journal_tip` hint for an unbound watched session,
 and the tip every live-tail repair resets to -- reads the catalog binding for
 the public id and, for a disposition-bound session, reads
-`resolver(ctx, tenant, binding)` under `binding.RuntimeSessionID`. Cursors are
+`resolver(ctx, tenant, session, binding)` under `binding.RuntimeSessionID`.
+`session` is the PUBLIC session id the read is for -- the authorized
+`/journal` route's session, or the watched session a hint, repair or gap probe
+is for; the id the catalog entry and so `binding` were read by, never a value
+taken from a cursor or the runtime journal. It is the only place that id
+exists: the request the reader is then asked names the runtime id, a one-way
+derivation of the public one. Cursors are
 wrapped to the public session and its binding. A legacy-bound session is still
 read from `WithSessionReader`. A resolver error is an error, never an empty
 journal; return SessionStore's typed errors (or wrap them) so `/journal`
 classifies them.
 
-**The stock composition for a Harness runtime needs no adapter.** Harness
+**Project the runtime journal to public identities with Host's
+`NewPublicJournals`.** A Host's runtime journal bodies carry runtime identities
+(the binding's `RuntimeSessionID`, runtime command ids) that must never reach a
+client. `host` (>= v0.10.0) exports the projection; Factory cannot import
+`host`, so the composition (Carbon, the tests lane) applies it. Share one
+`*host.PublicJournals` across calls -- it caches each session's mapping (LRU,
+`0` takes the default 1024):
+
+```go
+publicJournals := host.NewPublicJournals(0)
+
+factory.WithSessionJournalResolver(func(ctx context.Context, tenant sessionwire.TenantID,
+	session sessionwire.SessionID, binding sessionstore.SessionBinding) (factory.JournalReader, error) {
+	if binding.StorageBindingID != myBindingID || binding.BindingVersion != myVersion {
+		return nil, fmt.Errorf("unknown journal binding %q/%q", binding.StorageBindingID, binding.BindingVersion)
+	}
+	// One store per tenant, opened once and cached; closed at shutdown.
+	store, err := journals.forTenant(ctx, tenant, func(ctx context.Context) (*sessionstore.Store, error) {
+		return sessionstore.Open(ctx, runtimeBackend(tenant), sessionstore.WithLegacySingleTenant(tenant))
+	})
+	if err != nil {
+		return nil, err
+	}
+	// Refuses (host.ErrPublicJournalScope) any request not for this tenant and
+	// binding.RuntimeSessionID; bodies are byte-identical to the live tail's.
+	return publicJournals.Reader(store, tenant, session, binding)
+})
+```
+
+Without the projection (the deprecated `WithJournalResolver`, or a
+`WithSessionJournalResolver` that returns the store directly) `/journal`
+serves the runtime journal's bodies as written, runtime ids included.
+
+**The unprojected composition (v0.9.0 shape) needs no adapter.** Harness
 writes its journal in SessionStore's own envelope format on its legacy
 single-tenant layout, so a `*sessionstore.Store` opened over the **runtime's
 backend** the way Harness opens it is the `JournalReader`:
@@ -186,7 +230,7 @@ the routing and live-tail planes, and the placement and disposition sweeps.
 `Start` runs the background components. Pooled placement requires
 `WithPendingCommands`; without it the replica logs a warning and places no
 session (an error-level log if public creates are also composed). Either option
-also requires `WithJournalResolver` (above).
+also requires `WithSessionJournalResolver` (above).
 
 Each public seam is the union of the narrow interfaces the packages that CALL
 it declare for themselves, in `internal/httpapi`, `internal/admission`,
@@ -467,8 +511,8 @@ tail start, or at the tip a reset sent every viewer to), a record that skips
 positions is checked against the journal with one bounded read: if a PUBLIC
 record lies in the gap, every viewer is sent a `session.reset` to the journal's
 tip in front of it; a gap of private records needs none. A tip that cannot
-describe the gap closes the viewers instead. This needs `WithJournalResolver`
-for Host sessions -- the check reads the runtime journal.
+describe the gap closes the viewers instead. This needs a journal resolver
+(`WithSessionJournalResolver`) for Host sessions -- the check reads the runtime journal.
 
 ## Placement
 

@@ -273,11 +273,11 @@ func stubFS() fs.FS {
 	return fstest.MapFS{"index.html": &fstest.MapFile{Data: []byte("ui")}}
 }
 
-// WithFakeJournals is a WithJournalResolver that refuses every binding, for a
+// WithFakeJournals is a WithSessionJournalResolver that refuses every binding, for a
 // composition that creates or places Host sessions -- which New refuses
 // without a resolver -- but never reads a Host session's journal.
 func WithFakeJournals() Option {
-	return WithJournalResolver(func(context.Context, sessionwire.TenantID, sessionstore.SessionBinding) (JournalReader, error) {
+	return WithSessionJournalResolver(func(context.Context, sessionwire.TenantID, sessionwire.SessionID, sessionstore.SessionBinding) (JournalReader, error) {
 		return nil, errors.New("fake journals: no binding is known")
 	})
 }

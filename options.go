@@ -114,11 +114,13 @@ type config struct {
 	authorizer    Authorizer
 	reads         SessionReader
 	// journals is where a Host-owned session's journal is read; nil reads
-	// every journal from reads. See WithJournalResolver.
-	journals  JournalResolver
-	commands  Commands
-	directory Directory
-	placement PlacementController
+	// every journal from reads. See WithSessionJournalResolver; at most one
+	// of the two is set.
+	journals        JournalResolver
+	sessionJournals SessionJournalResolver
+	commands        Commands
+	directory       Directory
+	placement       PlacementController
 
 	clock Clock
 	uuids UUIDSource

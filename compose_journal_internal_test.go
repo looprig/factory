@@ -408,7 +408,7 @@ func TestALegacySessionIsStillReadFromTheSessionReader(t *testing.T) {
 
 	var resolved int
 	reads := &legacyReads{}
-	router := resolvedJournals{SessionReader: reads, resolve: func(context.Context, sessionwire.TenantID, sessionstore.SessionBinding) (JournalReader, error) {
+	router := resolvedJournals{SessionReader: reads, resolve: func(context.Context, sessionwire.TenantID, sessionwire.SessionID, sessionstore.SessionBinding) (JournalReader, error) {
 		resolved++
 		return nil, errors.New("must not be asked")
 	}}
@@ -444,24 +444,29 @@ func TestAHostPlacingCompositionWithoutAJournalResolverIsRefused(t *testing.T) {
 	resolver := WithJournalResolver(func(context.Context, sessionwire.TenantID, sessionstore.SessionBinding) (JournalReader, error) {
 		return nil, errors.New("unused")
 	})
+	aware := WithSessionJournalResolver(func(context.Context, sessionwire.TenantID, sessionwire.SessionID, sessionstore.SessionBinding) (JournalReader, error) {
+		return nil, errors.New("unused")
+	})
 	for name, row := range map[string]struct {
 		options []Option
 		refused bool
 	}{
-		"creates":                     {createPlane, true},
-		"placement":                   {[]Option{WithPendingCommands(FakeSeams{})}, true},
-		"creates and placement":       {append(append([]Option(nil), createPlane...), WithPendingCommands(FakeSeams{})), true},
-		"creates with a resolver":     {append(append([]Option(nil), createPlane...), resolver), false},
-		"placement with a resolver":   {[]Option{WithPendingCommands(FakeSeams{}), resolver}, false},
-		"neither, without a resolver": {nil, false},
+		"creates with a session resolver":   {append(append([]Option(nil), createPlane...), aware), false},
+		"placement with a session resolver": {[]Option{WithPendingCommands(FakeSeams{}), aware}, false},
+		"creates":                           {createPlane, true},
+		"placement":                         {[]Option{WithPendingCommands(FakeSeams{})}, true},
+		"creates and placement":             {append(append([]Option(nil), createPlane...), WithPendingCommands(FakeSeams{})), true},
+		"creates with a resolver":           {append(append([]Option(nil), createPlane...), resolver), false},
+		"placement with a resolver":         {[]Option{WithPendingCommands(FakeSeams{}), resolver}, false},
+		"neither, without a resolver":       {nil, false},
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
 			_, err := New(append(RequiredOptions(), row.options...)...)
 			if row.refused {
 				var named *OptionError
-				if !errors.Is(err, ErrHostSessionsWithoutJournalResolver) || !errors.As(err, &named) || named.Option != "WithJournalResolver" {
-					t.Fatalf("New = %v, want ErrHostSessionsWithoutJournalResolver naming WithJournalResolver", err)
+				if !errors.Is(err, ErrHostSessionsWithoutJournalResolver) || !errors.As(err, &named) || named.Option != "WithSessionJournalResolver" {
+					t.Fatalf("New = %v, want ErrHostSessionsWithoutJournalResolver naming WithSessionJournalResolver", err)
 				}
 				return
 			}

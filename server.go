@@ -52,7 +52,7 @@ type Authorizer interface {
 // Its ReadPublicJournal is keyed by the PUBLIC session id, so it answers the
 // journal of a legacy-bound session only. A Host-owned (disposition) session's
 // journal lives on the runtime's backend under its binding's RuntimeSessionID
-// and is read through WithJournalResolver; without one it reads empty at tip 0.
+// and is read through WithSessionJournalResolver; without one it reads empty at tip 0.
 type SessionReader interface {
 	ListSessions(ctx context.Context, req sessionstore.ListSessionsRequest) (sessionstore.SessionPage, error)
 	GetCatalogEntry(ctx context.Context, req sessionstore.GetCatalogEntryRequest) (sessionstore.CatalogEntry, error)
@@ -317,8 +317,11 @@ func New(opts ...Option) (*Server, error) {
 	// empty at tip 0, so every live-tail repair after a delivered record
 	// UNSUBSCRIBES the session's viewers, and a reconnecting viewer has
 	// nothing to catch up from. Nothing at request time could tell the
-	// operator why. See WithJournalResolver.
-	if cfg.journals == nil {
+	// operator why. See WithSessionJournalResolver.
+	if cfg.journals != nil && cfg.sessionJournals != nil {
+		return nil, &OptionError{Option: "WithSessionJournalResolver", Err: ErrConflictingJournalResolvers}
+	}
+	if cfg.journals == nil && cfg.sessionJournals == nil {
 		for _, host := range []struct {
 			option  string
 			present bool
@@ -327,7 +330,7 @@ func New(opts ...Option) (*Server, error) {
 			{"WithPendingCommands", cfg.pending != nil},
 		} {
 			if host.present {
-				return nil, &OptionError{Option: "WithJournalResolver", Err: fmt.Errorf("%w: %s is composed", ErrHostSessionsWithoutJournalResolver, host.option)}
+				return nil, &OptionError{Option: "WithSessionJournalResolver", Err: fmt.Errorf("%w: %s is composed", ErrHostSessionsWithoutJournalResolver, host.option)}
 			}
 		}
 	}
@@ -371,8 +374,11 @@ func New(opts ...Option) (*Server, error) {
 	// Every journal read -- the /journal route, the demand plane's tip hint
 	// and the live-tail repair's tip -- goes through this one reader, so the
 	// three cannot disagree about where a session's journal is.
-	if cfg.journals != nil {
-		cfg.reads = resolvedJournals{SessionReader: cfg.reads, resolve: cfg.journals}
+	switch {
+	case cfg.sessionJournals != nil:
+		cfg.reads = resolvedJournals{SessionReader: cfg.reads, resolve: cfg.sessionJournals}
+	case cfg.journals != nil:
+		cfg.reads = resolvedJournals{SessionReader: cfg.reads, resolve: sessionAware(cfg.journals)}
 	}
 
 	credentials, err := composeCredentials(cfg)

@@ -2659,8 +2659,8 @@ because its `ServeSessionReader` did the mapping by hand.
   runtime id, anything else to `SessionReader` unchanged. **Precedence is the
   binding's protocol mode, never "resolver if present".**
 - **Refused, not warned.** `WithPublicCreates` or `WithPendingCommands` without
-  a resolver is `ErrHostSessionsWithoutJournalResolver` at `New` (an
-  `*OptionError` naming `WithJournalResolver`). A warning would leave the
+  a resolver (either option) is `ErrHostSessionsWithoutJournalResolver` at `New`
+  (an `*OptionError` naming `WithSessionJournalResolver` since v0.10.0). A warning would leave the
   failure a wrong answer at request time that nobody could trace. A replica
   composing neither may still omit it (a legacy-only or read-only reader);
   such a replica reading Host sessions still sees tip 0 -- stated, not guarded.
@@ -2683,12 +2683,40 @@ because its `ServeSessionReader` did the mapping by hand.
   the assertions name sequences, not counts. `WithFakeJournals()` (fakes) is
   what compositions that create/place but never read a journal use.
 
+### The resolver is handed the PUBLIC session id (`WithSessionJournalResolver`, v0.10.0)
+
+A Host's runtime journal bodies carry runtime identities (the binding's
+`RuntimeSessionID`, runtime command ids) that must never reach a client; host
+v0.10.0 exports the projection (`host.NewPublicJournals(cap).Reader(store,
+tenant, publicSession, binding)`), and it needs the PUBLIC session id. The
+v0.9.0 `JournalResolver` was never handed it, and it cannot be recovered: the
+request is already rewritten to the runtime id, which is a one-way derivation.
+
+- **`SessionJournalResolver(ctx, tenant, session, binding)`** is the plane's
+  only resolver type; `resolvedJournals.ReadPublicJournal` passes
+  `req.SessionID` -- the id it just read the catalog entry (and so the binding)
+  by, i.e. the authorized route's or watched session's id -- BEFORE rewriting
+  the request. Every journal read (`/journal`, tip hint, repair tip, gap probe)
+  goes through that one call, so one argument covers all four.
+- **`WithJournalResolver` is Deprecated and adapted** (`sessionAware` drops the
+  session). It still satisfies the Host-sessions requirement.
+- **Both options is refused** (`ErrConflictingJournalResolvers`, an
+  `*OptionError` naming `WithSessionJournalResolver`), not a precedence rule:
+  preferring the deprecated one would leak runtime ids, preferring the other
+  would silently ignore a deployer's value.
+- **Readers:** `compose_session_journal_internal_test.go` records the session
+  the resolver was handed for every runtime read and classifies the read
+  (`/journal` page and continuation, tail tip reads, the gap probe's
+  `FromSeq/Limit 1/ScanLimit` page) over the real composition. Mutating the
+  argument to the runtime id or `""`, removing either `switch` arm in `New`,
+  or dropping the conflict or either-satisfies check each fails a named case.
+
 ## Current composition boundary
 
 `factory.New` composes the public router, admission, ClientLink, HostLink pool,
 placement sweeps, disposition reconciliation and live tail. `Start` runs their
 background work. `WithPendingCommands` (which, like `WithPublicCreates`, requires
-`WithJournalResolver`) is required for pooled placement; without
+`WithSessionJournalResolver` or the deprecated `WithJournalResolver`) is required for pooled placement; without
 it the replica reports that it will place no sessions. Factory ships no UI and
 no binary; a product mounts its own UI through `WithUIHandler`, `WithUIFS` and
 `WithUIRoutes`. `internal/placement/kubernetes` is absent from this root
