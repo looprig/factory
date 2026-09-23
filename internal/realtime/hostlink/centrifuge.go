@@ -342,6 +342,17 @@ type centrifugeLink struct {
 	// subscriptionState is the live-tail half of the link (subscribe.go). Its
 	// maps are guarded by mu like everything above.
 	subscriptionState
+
+	// rpcs counts the goroutines inside client.RPC, so Close can wait for them
+	// before it closes the transport. It has its own lock: it is not guarded by
+	// mu, and nothing is held across the RPC it counts.
+	rpcs inflight
+	// closeOnce makes the bounded wait happen once: a second Close -- the
+	// reaper and a shutdown racing -- waits for the first to finish rather
+	// than sitting out closeBound again behind an RPC that will never leave.
+	closeOnce sync.Once
+	// closeTransport, when set, replaces client.Close. Tests only.
+	closeTransport func()
 }
 
 func (l *centrifugeLink) Host() sessionwire.HostID { return l.host }
@@ -419,14 +430,100 @@ func (l *centrifugeLink) DeliverCommand(ctx context.Context, tenant sessionwire.
 	return l.call(ctx, sessionwire.HostLinkChannel(tenant, session), req, false)
 }
 
+// closeBound caps how long Close may take, whatever its context allows: the
+// drain wait and the transport's own close share it.
+//
+// The drain is bounded because Close first cancels every RPC in flight, and a
+// cancelled RPC leaves the transport within one websocket write --
+// centrifuge-go's default WriteTimeout, 1s, which Dial does not change. What
+// can outlive it is an RPC wedged in centrifuge-go's double completion
+// callback (see call); that goroutine is blocked AFTER its send, so closing
+// past it cannot race it.
+//
+// The transport's close is bounded because it can hang FOREVER in
+// centrifuge-go v0.12.0/v0.12.1: Client.handle reads a pending request under
+// requestsMu.RLock, releases it and runs the callback (client.go:855-860),
+// while Close's clearConnectedState snapshots the same request and runs its
+// callback on a new goroutine (:745-747). When the snapshot's callback fills
+// RPC's capacity-1 result channel first, the reply's callback blocks on the
+// READER goroutine, the reader never exits, and moveToClosed waits for it on
+// disconnectedCh (:688) indefinitely. A request is left pending whenever an
+// RPC's caller gave up before the reply -- which is what a shutdown does -- so
+// no drain on this side can rule it out. Reproduced here about once in seven
+// fifty-round runs of TestCloseDoesNotRaceAnRPCInFlight before the bound.
+//
+// centrifuge-go's master branch fixes both halves (a transportMu in send, and
+// handle popping the request atomically), but no release carries them as of
+// v0.12.1; on a release that does, this bound and Close's ordering can be
+// revisited.
+const closeBound = 2 * time.Second
+
 // Close releases the connection.
+//
+// It is ORDERED against the link's own RPCs, and the order is the fix for a
+// race inside centrifuge-go v0.12.0 (and v0.12.1, whose client.go is
+// identical): Client.send reads c.transport with no lock on the goroutine that
+// called RPC (client.go:2187), while Client.Close writes it under c.mu
+// (moveToDisconnected, client.go:457). The transport orders neither against
+// the other, so closing the client while any RPC is still inside send is a
+// data race -- the tests lane's I1.3 regate hit it through Server.Stop ->
+// Pool.Close against a placement Bind the Stop had abandoned. A caller
+// returning is no evidence its RPC is done, because rpc runs client.RPC on its
+// own goroutine that outlives a caller whose context ended.
+//
+// So Close (1) marks the link terminal, refusing every later call before it
+// reaches the transport, and cancels the current generation, which ends every
+// admitted RPC's context; (2) waits for the RPC goroutines already inside the
+// transport to return; (3) closes the client while holding regMu, the lock
+// every subscription-side send is made under, so a Subscribe or a discard
+// cannot be inside send either. Steps (2) and (3) together are bounded by ctx
+// and closeBound, so Close -- and through it Pool.Close and Server.Stop --
+// cannot be made unkillable by the transport; a close that outlives the bound
+// is left running on its own goroutine (see closeBound). No lock is held across
+// client.RPC: the wait is on a counter, not on a mutex any call holds. A
+// reconnect's own teardown (moveToConnecting) has the same unlocked read
+// against it and is the transport's; see TestReconnectStressNeverWedgesACaller.
 //
 // It is idempotent, because the pool closes a link on reap and again on
 // shutdown if the two race, and a second close that failed would make Close
-// report an error about a connection that is already gone.
-func (l *centrifugeLink) Close(context.Context) error {
-	l.client.Close()
+// report an error about a connection that is already gone; a concurrent second
+// call waits for the first to finish (closeOnce). It reports nothing when the
+// bound cuts it short: the link refuses every call either way, and there is
+// nothing a caller could do with the difference.
+func (l *centrifugeLink) Close(ctx context.Context) error {
+	l.fail(fmt.Errorf("%w: %s", ErrLinkClosed, l.host))
+	l.closeOnce.Do(func() {
+		// One deadline for both waits: a timer's channel fires once, so a
+		// second select on it would never be released.
+		bounded, cancel := context.WithTimeout(ctx, closeBound)
+		defer cancel()
+		select {
+		case <-l.rpcs.close():
+		case <-bounded.Done():
+		}
+		closed := make(chan struct{})
+		go func() {
+			defer close(closed)
+			l.regMu.Lock()
+			defer l.regMu.Unlock()
+			l.closeClient()
+		}()
+		select {
+		case <-closed:
+		case <-bounded.Done():
+		}
+	})
 	return nil
+}
+
+// closeClient closes the transport. It is a seam only so a test can stand in
+// a close that never returns; the dialled link leaves it nil.
+func (l *centrifugeLink) closeClient() {
+	if l.closeTransport != nil {
+		l.closeTransport()
+		return
+	}
+	l.client.Close()
 }
 
 // call is one HostLink RPC.
@@ -535,9 +632,17 @@ type rpcOutcome struct {
 // the goroutine can always finish once the caller has left; a goroutine
 // wedged INSIDE client.RPC (see call) is the one this cannot collect, by
 // design.
+//
+// The goroutine is COUNTED in rpcs from before it starts until client.RPC
+// returns, which is what lets Close wait for it (see Close); a link that is
+// closing refuses here, so no RPC can enter the transport behind Close's wait.
 func (l *centrifugeLink) rpc(ctx context.Context, method string, body []byte) (centrifugego.RPCResult, error) {
+	if !l.rpcs.enter() {
+		return centrifugego.RPCResult{}, fmt.Errorf("%w: %s", ErrLinkClosed, l.host)
+	}
 	outcome := make(chan rpcOutcome, 1)
 	go func() {
+		defer l.rpcs.leave()
 		reply, err := l.client.RPC(ctx, method, body)
 		outcome <- rpcOutcome{reply: reply, err: err}
 	}()
@@ -594,8 +699,10 @@ func (l *centrifugeLink) onConnected(e centrifugego.ConnectedEvent) {
 		l.fail(err)
 		l.endAllSubscriptions(false)
 		// Closing from inside a transport callback would block the callback on
-		// the client's own teardown, so it is handed to a goroutine.
-		go l.client.Close()
+		// the client's own teardown, so it is handed to a goroutine. It is the
+		// link's Close, not the client's, so it is ordered against RPCs in
+		// flight like every other close (see Close).
+		go func() { _ = l.Close(context.Background()) }()
 	} else {
 		l.mu.Lock()
 		if l.terminal == nil {
@@ -665,6 +772,51 @@ func (l *centrifugeLink) fail(err error) {
 	if generation != nil {
 		generation.cancel()
 	}
+}
+
+// inflight counts the operations inside the transport and, once closed,
+// admits no more and reports when the last one has left.
+type inflight struct {
+	mu      sync.Mutex
+	count   int
+	closing bool
+	drained chan struct{}
+}
+
+// enter admits one operation, or refuses it once the count is closed.
+func (f *inflight) enter() bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.closing {
+		return false
+	}
+	f.count++
+	return true
+}
+
+// leave ends one admitted operation.
+func (f *inflight) leave() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.count--
+	if f.closing && f.count == 0 {
+		close(f.drained)
+	}
+}
+
+// close stops admission and returns a channel closed when nothing admitted is
+// still inside. It is idempotent: every call returns the same channel.
+func (f *inflight) close() <-chan struct{} {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if !f.closing {
+		f.closing = true
+		f.drained = make(chan struct{})
+		if f.count == 0 {
+			close(f.drained)
+		}
+	}
+	return f.drained
 }
 
 // rpcGeneration owns the cancellation of every RPC admitted to one transport

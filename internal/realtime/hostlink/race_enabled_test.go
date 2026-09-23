@@ -7,5 +7,8 @@ package hostlink
 // INSIDE centrifuge-go v0.12.0 (client.go:2187 reads c.transport without c.mu
 // while moveToConnecting writes it under c.mu at :533) on nearly every run
 // under the detector. The race is third-party, reachable from the production
-// path, and not this module's to fix; see the test for the opt-in.
+// path, and not this module's to fix; see the test for the opt-in. The same
+// unlocked read against Client.Close (:457) IS this module's, because Factory
+// decides when it closes: centrifugeLink.Close orders it after every RPC in
+// flight (TestCloseDoesNotRaceAnRPCInFlight).
 const raceDetectorEnabled = true

@@ -36,8 +36,10 @@ test:
 
 # TestReconnectStressNeverWedgesACaller skips itself under -race (see
 # race_enabled_test.go): it trips a confirmed third-party data race inside
-# centrifuge-go v0.12.0 (client.go:2187 vs :457/:533), and that report says
-# nothing about this module. `test` above runs -race exclusively, so without
+# centrifuge-go v0.12.0 (client.go:2187 vs :533, a reconnect's teardown), and
+# that report says nothing about this module. The :457 half -- Client.Close
+# against an RPC in flight -- is Factory's to order, and centrifugeLink.Close
+# does (TestCloseDoesNotRaceAnRPCInFlight runs under -race here). `test` above runs -race exclusively, so without
 # this target the stress case -- the one reader of the wedge-confinement fix
 # in internal/realtime/hostlink -- never executes in any automated lane. This
 # runs it without the detector, which is the lane the test itself documents

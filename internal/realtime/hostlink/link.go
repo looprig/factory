@@ -44,6 +44,12 @@ var ErrUnsupportedMethod = errors.New("hostlink: host did not advertise the requ
 // and is queued by the transport instead.
 var ErrLinkReconnecting = errors.New("hostlink: link is reconnecting")
 
+// ErrLinkClosed reports a call on a link this replica has closed: by the
+// pool's shutdown, the idle reaper, an eviction, or a handshake it refused. It
+// is TERMINAL -- a closed link never answers again -- and it is returned
+// before anything is sent.
+var ErrLinkClosed = errors.New("hostlink: link is closed")
+
 // ErrNoTenantEndpoint reports a Host whose advertised base cannot carry one
 // tenant's HostLink address: Core's sessionwire.HostLinkEndpoint refused to
 // derive it. It is a PER-TENANT fact about one Host -- a tenant too long for
@@ -575,11 +581,12 @@ func (p *Pool) Attach(ctx context.Context, target Target, req sessionwire.HostLi
 // terminalLinkError reports an error from a link that will never answer again:
 // the Host speaks another wire version (ErrUnsupportedProtocol), or closed the
 // connection with a code the transport will not reconnect from
-// (*HostDisconnect). A link is marked terminal by either, and every later call
-// on it returns the same error BEFORE anything is sent.
+// (*HostDisconnect), or this replica closed it (ErrLinkClosed). A link is
+// marked terminal by any of them, and every later call on it returns the same
+// error BEFORE anything is sent.
 func terminalLinkError(err error) bool {
 	var disconnect *HostDisconnect
-	return errors.Is(err, ErrUnsupportedProtocol) || errors.As(err, &disconnect)
+	return errors.Is(err, ErrUnsupportedProtocol) || errors.Is(err, ErrLinkClosed) || errors.As(err, &disconnect)
 }
 
 // evict drops a dead link from the pool, with every route that names its Host
