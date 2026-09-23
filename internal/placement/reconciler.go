@@ -35,6 +35,21 @@ var ErrInvalidConfig = errors.New("placement: invalid reconciler configuration")
 // reporting success would claim a workload nobody created.
 var ErrNoWorkloadController = errors.New("placement: this replica reconciles no dedicated workloads")
 
+// ErrNoLaunchTemplate reports a RELEASED dedicated session with open work whose
+// launch template cannot be recovered from durable state.
+//
+// A dedicated session is released by deletion desire: its dedicated placement
+// names no workload. Open work for it means a workload is wanted again, and the
+// only template this package re-expresses is the one the session was CREATED
+// with -- the public create's InitialWorkload, which SessionStore keeps as
+// immutable provenance beside the mutable desire. A session with no such record
+// (one created through CreateCatalogEntry rather than the public create) has no
+// template this package may vouch for. Substituting today's configured launch
+// target would make a returning session's workload depend on configuration
+// drift since it was created, so the session is refused by name instead, on
+// every pass, until a caller supplies Request.Desired.
+var ErrNoLaunchTemplate = errors.New("placement: a released dedicated session has no recoverable launch template")
+
 // The interfaces here are the ones THIS package calls, declared where they are
 // consumed. internal/routing supplies Directory and SessionStore supplies the
 // other two; neither names this package.
@@ -201,6 +216,16 @@ type Request struct {
 	// predicate); for any other Host it is WITHHELD and counted, never sent. A
 	// command not named here is delivered as before.
 	GateResponses []sessionwire.CommandID
+
+	// OpenWork reports that the caller observed commands this session still
+	// needs a Host for. It is what licenses re-expressing a RELEASED dedicated
+	// session's launch template: when the record's desire is a dedicated
+	// placement naming no workload (deletion desire) and the caller has open
+	// work, the reconciler writes a NEW desired generation carrying the
+	// template the session was created with before ensuring its workload (see
+	// reviveReleased). Without it a released session is reconciled as the
+	// record says, and no desired-state write is made on its behalf.
+	OpenWork bool
 }
 
 // Result is what one reconciliation did.
@@ -349,6 +374,18 @@ func (r *Reconciler) Reconcile(ctx context.Context, req Request) (Result, error)
 			return Result{}, err
 		}
 	}
+	// A released dedicated session with open work gets its template back
+	// BEFORE the controller check: desire is Factory-authored, and a
+	// controller process never writes it, so a Factory replica composed with
+	// no controller (H5's split) must still be the one that re-expresses it.
+	if req.OpenWork {
+		var revived int
+		entry, revived, err = r.reviveReleased(ctx, req, entry)
+		writes += revived
+		if err != nil {
+			return Result{}, err
+		}
+	}
 
 	decision := Decision{Outcome: OutcomeUndecided}
 	switch entry.Record.DesiredPlacement {
@@ -492,6 +529,110 @@ func (r *Reconciler) ensureDesired(
 	return entry, writes, nil
 }
 
+// reviveReleased re-expresses a released dedicated session's launch template
+// as a new desired generation, at most once per release.
+//
+// WHAT IS WRITTEN is the template the session was created with (launchTemplate)
+// under the session's own placement and runtime compatibility, so the
+// controller receives the same workload payload its first generation was built
+// from. The store issues the generation, and it strictly increases: the
+// released generation is never reused, so a termination recorded for the
+// generation whose workload ended is never superseded by this write, and a
+// later release names a generation above this one.
+//
+// ONLY A RELEASE IS REPLACED. The write is a compare-and-swap on the revision
+// read, and a conflict re-reads and re-decides from the fresh record: a racer
+// that wrote any non-empty workload -- this same template, or a different one
+// -- ends the work rather than being overwritten. Two replicas re-expressing
+// one release derive one idempotency key (reviveKey names the released
+// generation), so the loser is absorbed as a replay of the winner's write, and
+// each later release gets a key of its own.
+func (r *Reconciler) reviveReleased(
+	ctx context.Context,
+	req Request,
+	entry sessionstore.CatalogEntry,
+) (sessionstore.CatalogEntry, int, error) {
+	const attempts = 2
+	writes := 0
+	for attempt := range attempts {
+		record := entry.Record
+		if !released(record) {
+			return entry, writes, nil
+		}
+		template, ok := launchTemplate(record)
+		if !ok {
+			return sessionstore.CatalogEntry{}, writes, fmt.Errorf("%w: session %q", ErrNoLaunchTemplate, req.SessionID)
+		}
+		desired := Desired{
+			Placement:              record.DesiredPlacement,
+			RuntimeCompatibilityID: record.RuntimeCompatibilityID,
+			Workload:               template,
+		}
+		writes++
+		updated, err := r.cfg.Catalog.UpdateCatalogDesiredState(ctx, sessionstore.UpdateCatalogDesiredStateRequest{
+			TenantID: req.TenantID, SessionID: req.SessionID,
+			ExpectedRevision:       entry.Revision,
+			IdempotencyKey:         reviveKey(req, desired, record.DesiredGeneration),
+			DesiredPlacement:       desired.Placement,
+			RuntimeCompatibilityID: desired.RuntimeCompatibilityID,
+			DesiredWorkload:        desired.Workload,
+		})
+		if err == nil {
+			return updated, writes, nil
+		}
+		var catalogErr *sessionstore.CatalogError
+		if !errors.As(err, &catalogErr) || catalogErr.Code != sessionstore.CatalogErrorConflict || attempt == attempts-1 {
+			return sessionstore.CatalogEntry{}, writes, err
+		}
+		if entry, err = r.cfg.Catalog.GetCatalogEntry(ctx, sessionstore.GetCatalogEntryRequest{
+			TenantID: req.TenantID, SessionID: req.SessionID,
+		}); err != nil {
+			return sessionstore.CatalogEntry{}, writes, err
+		}
+	}
+	return entry, writes, nil
+}
+
+// released reports deletion desire: a dedicated placement naming no workload.
+func released(record sessionstore.CatalogRecord) bool {
+	return record.DesiredPlacement == sessionwire.HostPlacementDedicated &&
+		record.DesiredWorkload.PayloadVersion == "" && len(record.DesiredWorkload.Payload) == 0
+}
+
+// launchTemplate is the workload a released dedicated session is re-created
+// from: the public create's InitialWorkload, retained by SessionStore as
+// immutable provenance that desired-state writes never rewrite. See
+// ErrNoLaunchTemplate for why nothing else is consulted.
+func launchTemplate(record sessionstore.CatalogRecord) (sessionstore.DesiredWorkload, bool) {
+	if record.PublicCreate == nil {
+		return sessionstore.DesiredWorkload{}, false
+	}
+	workload := record.PublicCreate.InitialWorkload
+	if workload.PayloadVersion == "" || len(workload.Payload) == 0 {
+		return sessionstore.DesiredWorkload{}, false
+	}
+	return workload, true
+}
+
+// reviveKey derives the idempotency key for re-expressing one release.
+//
+// It is desiredKey's intent framing plus the RELEASED generation, and the
+// addition is load-bearing: SessionStore compares a key only with the record's
+// current one, so a content-only key would be the same for every release of a
+// session, and two replicas racing one release must collide while a replica
+// acting on a LATER release must not be taken for a replay of an earlier one.
+func reviveKey(req Request, desired Desired, releasedGeneration uint64) string {
+	return "revive-" + framedDigest(
+		[]byte(req.TenantID),
+		[]byte(req.SessionID),
+		[]byte(desired.Placement),
+		[]byte(desired.RuntimeCompatibilityID),
+		[]byte(desired.Workload.PayloadVersion),
+		desired.Workload.Payload,
+		[]byte(strconv.FormatUint(releasedGeneration, 10)),
+	)
+}
+
 // storedDesired reports whether the record already carries this intent.
 //
 // The payload is compared by BYTES rather than by the stored idempotency key.
@@ -526,20 +667,25 @@ func storedDesired(record sessionstore.CatalogRecord, desired Desired) bool {
 // reintroduced by the mechanism preventing it. A NUL cannot appear among
 // decimal digits, so the boundary is unambiguous and no conversion is needed.
 func desiredKey(req Request, desired Desired) string {
-	digest := sha256.New()
-	for _, field := range [][]byte{
+	return "placement-" + framedDigest(
 		[]byte(req.TenantID),
 		[]byte(req.SessionID),
 		[]byte(desired.Placement),
 		[]byte(desired.RuntimeCompatibilityID),
 		[]byte(desired.Workload.PayloadVersion),
 		desired.Workload.Payload,
-	} {
+	)
+}
+
+// framedDigest hashes length-prefixed fields with desiredKey's framing.
+func framedDigest(fields ...[]byte) string {
+	digest := sha256.New()
+	for _, field := range fields {
 		digest.Write([]byte(strconv.Itoa(len(field))))
 		digest.Write([]byte{0})
 		digest.Write(field)
 	}
-	return "placement-" + hex.EncodeToString(digest.Sum(nil))
+	return hex.EncodeToString(digest.Sum(nil))
 }
 
 // targetKey is the directory scope a session's own record names. It is the

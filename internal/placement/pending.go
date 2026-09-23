@@ -195,7 +195,13 @@ func (s *PendingSweeper) Sweep(ctx context.Context, principal identity.Principal
 			continue
 		}
 		result.Sessions++
-		placed, err := s.cfg.Placer.Reconcile(ctx, Request{TenantID: session.tenant, SessionID: session.id, Wake: session.wake, GateResponses: session.gates})
+		placed, err := s.cfg.Placer.Reconcile(ctx, Request{
+			TenantID: session.tenant, SessionID: session.id, Wake: session.wake, GateResponses: session.gates,
+			// Every session reconciled here has open work (needsHost), which is
+			// what licenses re-expressing a released dedicated session's
+			// launch template (D3.1 F2).
+			OpenWork: true,
+		})
 		if errors.Is(err, ErrNoWorkloadController) {
 			// A dedicated session reaching a replica composed with no
 			// workload controller is a composition fact, not a failure of
