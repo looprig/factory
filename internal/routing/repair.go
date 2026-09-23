@@ -25,6 +25,20 @@ var ErrNoHostBinding = errors.New("routing: no host binding for session")
 // hand a client a coverage claim nobody is in a position to make.
 var ErrUnexpectedControl = errors.New("routing: a host may not send a repair control")
 
+// ErrForeignRecord reports a Host publication naming a tenant or session other
+// than the one whose live tail it arrived on.
+//
+// A record carries its own routing envelope, and the tail it arrives on names
+// the session a viewer subscribed to. Only a faulty or compromised Host can make
+// the two disagree, and forwarding such a record would put another session's --
+// or another TENANT's -- output in front of this session's viewers. It wraps
+// delivery.ErrMalformed deliberately: the livetail drainer answers every refused
+// record with the same repair (the tail is stopped, every viewer is reset from
+// one durable tip, and the tail is re-bound), so a foreign record is a hole in
+// the stream like any other, never a silent skip. Relay.ForeignRecords counts
+// them.
+var ErrForeignRecord = fmt.Errorf("routing: a host record names another tenant or session: %w", delivery.ErrMalformed)
+
 // ErrWouldBlock reports a transport that cannot take a record right now.
 //
 // It is the ONE publish outcome that is not a failure: the record stays queued,
@@ -188,6 +202,8 @@ type Relay struct {
 	mu     sync.Mutex
 	closed bool
 	hosts  map[sessionKey]*hostBinding
+	// foreign counts records refused with ErrForeignRecord, under mu.
+	foreign uint64
 }
 
 // hostBinding is one session's inbound route queue and the clients it feeds.
@@ -345,8 +361,11 @@ func (r *Relay) Receive(ctx context.Context, tenant sessionwire.TenantID, sessio
 		r.mu.Unlock()
 		return nil
 	}
-	record, err := r.classify(frame)
+	record, err := r.classify(key, frame)
 	if err != nil {
+		if errors.Is(err, ErrForeignRecord) {
+			r.foreign++
+		}
 		r.mu.Unlock()
 		return err
 	}
@@ -365,8 +384,9 @@ func (r *Relay) Receive(ctx context.Context, tenant sessionwire.TenantID, sessio
 }
 
 // classify turns one frame into the queue record it is, or reports why it is
-// not one.
-func (r *Relay) classify(frame Frame) (delivery.Record, error) {
+// not one. A publication whose own tenant or session is not key's is refused
+// with ErrForeignRecord.
+func (r *Relay) classify(key sessionKey, frame Frame) (delivery.Record, error) {
 	recordType, err := sessionwire.SessionRecordTypeOf(frame.Encoded)
 	if err != nil {
 		return delivery.Record{}, fmt.Errorf("%w: %w", delivery.ErrMalformed, err)
@@ -377,11 +397,17 @@ func (r *Relay) classify(frame Frame) (delivery.Record, error) {
 		if err != nil {
 			return delivery.Record{}, err
 		}
+		if err := key.owns(parsed.TenantID, parsed.SessionID); err != nil {
+			return delivery.Record{}, err
+		}
 		return parsed.Record(), nil
 	case sessionwire.SessionRecordTypeEphemeralPublication:
 		var publication sessionwire.EphemeralPublication
 		if err := publication.UnmarshalJSON(frame.Encoded); err != nil {
 			return delivery.Record{}, fmt.Errorf("%w: %w", delivery.ErrMalformed, err)
+		}
+		if err := key.owns(publication.TenantID, publication.SessionID); err != nil {
+			return delivery.Record{}, err
 		}
 		return delivery.Record{
 			Class:       delivery.ClassEphemeral,
@@ -391,6 +417,26 @@ func (r *Relay) classify(frame Frame) (delivery.Record, error) {
 	default:
 		return delivery.Record{}, fmt.Errorf("%w: %s", ErrUnexpectedControl, recordType)
 	}
+}
+
+// owns reports ErrForeignRecord unless a record's own routing envelope names
+// this key's tenant and session.
+func (k sessionKey) owns(tenant sessionwire.TenantID, session sessionwire.SessionID) error {
+	if tenant == k.tenant && session == k.session {
+		return nil
+	}
+	return fmt.Errorf("%w: the tail is %s/%s, the record names %s/%s",
+		ErrForeignRecord, k.tenant, k.session, tenant, session)
+}
+
+// ForeignRecords reports how many Host publications this relay has refused
+// with ErrForeignRecord since it was built. It never decreases. Any nonzero
+// value means a Host sent a record for a session other than the tail it was
+// sent on, which a correct Host never does.
+func (r *Relay) ForeignRecords() uint64 {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.foreign
 }
 
 // Pump moves one session's queued route records out to its DeliveryBindings and

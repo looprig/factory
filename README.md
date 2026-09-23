@@ -393,6 +393,10 @@ durable journal. On a HostLink reconnect Factory withdraws every tail itself
 re-binds on the new connection, then subscribes, then resets. Limits: a private
 record between public ones makes resets name an older sequence than necessary
 (over-repair), and Host silence while bound still looks like idle.
+Since v0.8.1 a Host record whose own tenant or session is not the tail's it
+arrived on is refused (`routing.ErrForeignRecord`, a `delivery.ErrMalformed`),
+logged at ERROR, counted (`Relay.ForeignRecords`) and repaired like any refused
+record: it never reaches a viewer, and the viewers are reset.
 `factory.New` composes the pool, and `Start` drives the reaper on the sweep
 cadence.
 

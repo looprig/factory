@@ -655,8 +655,16 @@ func (p *Plane) handle(relay Relay, rebinder routing.Rebinder, key sessionKey, e
 		}
 		if err := relay.Receive(ctx, tenant, session, frame); err != nil {
 			// A frame the Relay would not take is a hole in the stream, and a
-			// hole is repaired, never skipped.
-			p.warn(ctx, "a Host publication was refused; repairing", key, err)
+			// hole is repaired, never skipped. A record naming another tenant
+			// or session is the same hole, but only a faulty or compromised
+			// Host sends one, so it is logged at ERROR under its own message.
+			if errors.Is(err, routing.ErrForeignRecord) {
+				p.log.ErrorContext(ctx, "livetail: a Host publication named another tenant or session; refused and repairing",
+					slog.String("tenant_id", string(key.tenant)), slog.String("session_id", string(key.session)),
+					slog.String("error", err.Error()))
+			} else {
+				p.warn(ctx, "a Host publication was refused; repairing", key, err)
+			}
 			if err := relay.HostLinkClosed(ctx, tenant, session); err != nil {
 				p.warn(ctx, "the repair of a refused publication failed", key, err)
 			}

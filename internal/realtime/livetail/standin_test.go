@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -405,6 +406,7 @@ type rig struct {
 type rigOptions struct {
 	mailbox   int
 	reconnect time.Duration
+	logger    *slog.Logger
 }
 
 func newRig(t *testing.T, opts rigOptions) *rig {
@@ -439,6 +441,7 @@ func newRig(t *testing.T, opts rigOptions) *rig {
 		Viewers:      func() livetail.Viewers { return r.viewers },
 		MailboxLimit: opts.mailbox,
 		EventTimeout: 10 * time.Second,
+		Logger:       opts.logger,
 	})
 	if err != nil {
 		t.Fatalf("livetail.New: %v", err)
