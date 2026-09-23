@@ -111,7 +111,7 @@ func composedWithPlacement(t *testing.T, p *pendingProbe, pending bool) *factory
 		factory.WithDepartment(probeTemplate()),
 	)
 	if pending {
-		options = append(options, factory.WithPendingCommands(p))
+		options = append(options, factory.WithPendingCommands(p), factory.WithFakeJournals())
 	}
 	server, err := factory.New(options...)
 	if err != nil {
@@ -296,6 +296,7 @@ func TestATruncatedPassIsLogged(t *testing.T) {
 		factory.WithDirectory(p),
 		factory.WithDepartment(probeTemplate()),
 		factory.WithPendingCommands(p),
+		factory.WithFakeJournals(),
 		factory.WithLogger(slog.New(slog.NewJSONHandler(logs, nil))),
 	)
 	server, err := factory.New(options...)

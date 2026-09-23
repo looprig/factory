@@ -124,7 +124,7 @@ func TestThePlacementPathIsComposedWithTheReplicasLoggerActorAndHorizon(t *testi
 	limits := DefaultReconcileLimits()
 	limits.ApplyDeadline = 7*time.Minute + 13*time.Second
 	options := append(RequiredOptions(),
-		WithReconcileLimits(limits), WithLogger(logger), WithPendingCommands(FakeSeams{}))
+		WithReconcileLimits(limits), WithLogger(logger), WithPendingCommands(FakeSeams{}), WithFakeJournals())
 	server, err := New(options...)
 	if err != nil {
 		t.Fatalf("New: %v", err)

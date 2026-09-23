@@ -2569,11 +2569,54 @@ trusted the routing table's own binding and never did (spec gate C1). (5)
 `Demand`'s mutex across a bind means one slow Host delays other sessions' binds
 and polls, not their delivery (above).
 
+## A Host session's journal is the runtime's (`WithJournalResolver`, v0.9.0)
+
+**Defect it closes (HIGH, `CLAUDE_DEBUG_TIP0_VIEWER_CLOSE.md`):** Factory read
+`/journal`, the `journal_tip` hint and `Relay.readTip` from the one
+`SessionReader`, keyed by the PUBLIC session id. For a disposition (Host-owned)
+session that SessionStore journal is never written -- Harness keeps the journal
+on the runtime backend under `Binding.RuntimeSessionID` -- so the tip was
+always 0, every live-tail repair after a delivered record built an incoherent
+reset and **closed the viewers**, and `/journal` was empty. Only Carbon worked,
+because its `ServeSessionReader` did the mapping by hand.
+
+- **One reader for all three.** `New` wraps `cfg.reads` in `resolvedJournals`
+  (`journal.go`) when a resolver is composed, BEFORE composing the router,
+  demand plane and relay, so the three journal reads cannot disagree about
+  where a session's journal is. It reads the catalog binding per call; a
+  disposition binding goes to `resolver(ctx, tenant, binding)` under the
+  runtime id, anything else to `SessionReader` unchanged. **Precedence is the
+  binding's protocol mode, never "resolver if present".**
+- **Refused, not warned.** `WithPublicCreates` or `WithPendingCommands` without
+  a resolver is `ErrHostSessionsWithoutJournalResolver` at `New` (an
+  `*OptionError` naming `WithJournalResolver`). A warning would leave the
+  failure a wrong answer at request time that nobody could trace. A replica
+  composing neither may still omit it (a legacy-only or read-only reader);
+  such a replica reading Host sessions still sees tip 0 -- stated, not guarded.
+- **The relay's fail-closed arm is untouched.** Do not "fix" tip 0 by clamping
+  `JournalTip` up to `lastContiguous`: the client would re-read an empty
+  journal and fail the same way, and the reset would claim coverage the read
+  plane cannot serve.
+- **Cursors are wrapped** (`j1.<scope>.<b64>`, scope = sha256 over tenant,
+  public id and the whole binding, length-framed): a runtime store's own token,
+  or one minted for another session or binding, is `JournalErrorCursor` (400).
+  A `JournalReader` is any deployer value and need not scope its own tokens.
+- **Readers:** `compose_journal_internal_test.go` -- over a real SessionStore
+  (public create, disposition) and a real runtime journal in Harness's legacy
+  layout, through `composeLive` over the composed config: a HostLink drop after
+  three delivered records resets at the last delivered sequence with tip >= it
+  and closes nothing (the inverted `TestTip0Repro`), and without a resolver the
+  same world closes the viewer (the control). The runtime journal's opening
+  fence occupies sequence 1, so the three events are 2..4 -- which is also why
+  the assertions name sequences, not counts. `WithFakeJournals()` (fakes) is
+  what compositions that create/place but never read a journal use.
+
 ## Current composition boundary
 
 `factory.New` composes the public router, admission, ClientLink, HostLink pool,
 placement sweeps, disposition reconciliation and live tail. `Start` runs their
-background work. `WithPendingCommands` is required for pooled placement; without
+background work. `WithPendingCommands` (which, like `WithPublicCreates`, requires
+`WithJournalResolver`) is required for pooled placement; without
 it the replica reports that it will place no sessions. Factory ships no UI and
 no binary; a product mounts its own UI through `WithUIHandler`, `WithUIFS` and
 `WithUIRoutes`. `internal/placement/kubernetes` is absent from this root

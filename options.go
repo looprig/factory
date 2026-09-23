@@ -113,9 +113,12 @@ type config struct {
 	defaultTenant sessionwire.TenantID
 	authorizer    Authorizer
 	reads         SessionReader
-	commands      Commands
-	directory     Directory
-	placement     PlacementController
+	// journals is where a Host-owned session's journal is read; nil reads
+	// every journal from reads. See WithJournalResolver.
+	journals  JournalResolver
+	commands  Commands
+	directory Directory
+	placement PlacementController
 
 	clock Clock
 	uuids UUIDSource

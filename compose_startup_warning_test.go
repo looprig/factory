@@ -30,6 +30,7 @@ func TestAReplicaThatWillPlaceNothingSaysSoAtStart(t *testing.T) {
 		}),
 		factory.WithSessionBinding("storage-a", "v1"),
 		factory.WithPublicCreates(stubPublicCreates{}),
+		factory.WithFakeJournals(),
 	}
 	for _, test := range []struct {
 		name    string
@@ -39,7 +40,7 @@ func TestAReplicaThatWillPlaceNothingSaysSoAtStart(t *testing.T) {
 	}{
 		{"neither option", nil, "WARN", plain},
 		{"creates without placement", createPlane, "ERROR", creates},
-		{"placement composed", []factory.Option{factory.WithPendingCommands(factory.FakeSeams{})}, "", ""},
+		{"placement composed", []factory.Option{factory.WithPendingCommands(factory.FakeSeams{}), factory.WithFakeJournals()}, "", ""},
 		{"creates and placement", append(append([]factory.Option(nil), createPlane...), factory.WithPendingCommands(factory.FakeSeams{})), "", ""},
 	} {
 		t.Run(test.name, func(t *testing.T) {

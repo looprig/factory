@@ -1220,7 +1220,7 @@ func TestTheCreateCompositionIsRefusedUnlessEveryHalfIsPresent(t *testing.T) {
 		want    error
 	}{
 		{"no create composition at all", nil, nil},
-		{"every half", []factory.Option{resolver, binding, plane}, nil},
+		{"every half", []factory.Option{resolver, binding, plane, factory.WithFakeJournals()}, nil},
 		// A plane alone is accepted: it pins nothing, so nothing is
 		// irreversible, and admission refuses the create for want of a
 		// binding. This row is what stops the pairing rule being written as
@@ -1271,6 +1271,7 @@ func TestAnIncompleteSessionBindingIsRefusedByTheOption(t *testing.T) {
 					return nil, errProbeUnavailable
 				}),
 				factory.WithPublicCreates(stubPublicCreates{}),
+				factory.WithFakeJournals(),
 				factory.WithSessionBinding(test.storage, test.version))
 			_, err := factory.New(options...)
 			if test.accept {
