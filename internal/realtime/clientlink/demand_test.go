@@ -642,7 +642,7 @@ func TestAChannelTheAuthorizerAllowedButThisEdgeCannotNameIsAFault(t *testing.T)
 		t.Fatalf("NewEngine: %v", err)
 	}
 
-	for _, channel := range []string{"anything", "session:tenant-b:session-1", "session:tenant-a:s\xff", "session:tenant-a:a:b"} {
+	for _, channel := range []string{"anything", "session:tenant-a:s\xff", "session:tenant-a:a:b"} {
 		_, err := engine.Bind(t.Context(), principal, channel)
 		if err == nil {
 			t.Fatalf("Bind(%q) succeeded against a permissive authorizer", channel)
@@ -656,6 +656,35 @@ func TestAChannelTheAuthorizerAllowedButThisEdgeCannotNameIsAFault(t *testing.T)
 	}
 	if calls := demand.acquired(); len(calls) != 0 {
 		t.Fatalf("an unroutable channel took demand for %v", sessionsOf(calls))
+	}
+}
+
+// TestAnotherTenantsChannelIsADenialEvenWhenTheAuthorizerAllowsIt: the
+// channel's tenant not being the principal's is Factory's own tenant boundary,
+// not a grammar this build cannot parse. No principal of this tenant is ever
+// served another tenant's channel, whatever the Authorizer said, so the answer
+// is terminal -- a denial (F2 of the tests-lane wire freeze) -- and it is not
+// the composition fault ErrUnroutableChannel names.
+func TestAnotherTenantsChannelIsADenialEvenWhenTheAuthorizerAllowsIt(t *testing.T) {
+	t.Parallel()
+
+	principal, err := identity.NewPrincipal(tenantA, "user-a", identity.KindActor)
+	if err != nil {
+		t.Fatalf("NewPrincipal: %v", err)
+	}
+	engine, demand := permissiveEngine(t, principal)
+	_, err = engine.Bind(t.Context(), principal, "session:tenant-b:session-1")
+	if !errors.Is(err, internalidentity.ErrUnauthorized) || !errors.Is(err, identity.ErrUnauthorized) {
+		t.Fatalf("Bind() = %v, want a denial wrapping identity.ErrUnauthorized", err)
+	}
+	if errors.Is(err, clientlink.ErrUnroutableChannel) {
+		t.Errorf("Bind() = %v: a cross-tenant channel was reported as a composition fault", err)
+	}
+	if strings.Contains(err.Error(), "tenant-b") || strings.Contains(err.Error(), "session-1") {
+		t.Errorf("Bind() = %q: a denial must carry no identifier", err)
+	}
+	if calls := demand.acquired(); len(calls) != 0 {
+		t.Fatalf("a cross-tenant channel took demand for %v", sessionsOf(calls))
 	}
 }
 

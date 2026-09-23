@@ -24,6 +24,10 @@ import (
 // terminal for the principal, so a browser entitled to the channel would stop
 // asking for a condition that has nothing to do with its permissions.
 //
+// A well-formed channel naming ANOTHER TENANT is not this error: no principal
+// is entitled to it through this Factory, so there is no browser the quiet
+// wrong answer could stop, and demandKeyOf reports it as a denial.
+//
 // FuzzTheDemandGrammarAgreesWithTheAuthorizers holds the production pair to one
 // answer, so this is unreachable through Factory's own authorizer; the arm has
 // a reader because the seam is an interface and a test can implement it.
@@ -292,9 +296,11 @@ func (e *Engine) releaseDemandLocked(ctx context.Context, key demandKey) error {
 // no colon anywhere else, both segments non-empty and both valid Core
 // identifiers, and the tenant segment equal to the principal's. Every clause is
 // a way the derivation could otherwise name something the caller did not
-// subscribe to; none of them is an authorization decision, which has already
-// been made, and a failure here is reported as a fault for the reason
-// ErrUnroutableChannel gives.
+// subscribe to. A grammar failure is reported as a fault for the reason
+// ErrUnroutableChannel gives. The tenant clause is the exception: a
+// well-formed channel naming another tenant is refused on Factory's own tenant
+// boundary, which no Authorizer can widen, so it is a denial wrapping
+// identity.ErrUnauthorized (since v0.8.1; it was a fault before).
 //
 // The channel is never returned in the error, and neither is the tenant. A
 // message quoting the channel would put a client-controlled string into an
@@ -319,7 +325,13 @@ func demandKeyOf(principal identity.Principal, channel string) (demandKey, error
 		return demandKey{}, fmt.Errorf("%w: the session segment is not an identity Core carries", ErrUnroutableChannel)
 	}
 	if sessionwire.TenantID(tenant) != principal.Tenant() {
-		return demandKey{}, fmt.Errorf("%w: the channel names another tenant", ErrUnroutableChannel)
+		// NOT a composition fault. The channel parses; it names a session this
+		// principal is never served, whatever an Authorizer said, because
+		// demand is keyed by the principal's tenant. That is terminal for the
+		// principal, so it is a DENIAL -- permission denied (103) at the wire,
+		// not a temporary 100 a browser would retry forever (F2 of the
+		// tests-lane wire freeze). Like every denial it names nothing.
+		return demandKey{}, fmt.Errorf("clientlink: the channel names another tenant: %w", identity.ErrUnauthorized)
 	}
 	return demandKey{tenant: principal.Tenant(), session: sessionwire.SessionID(session)}, nil
 }

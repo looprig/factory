@@ -93,7 +93,11 @@ type recordingAuthorizer struct {
 	mu           sync.Mutex
 	subscribe    []subscribeCall
 	subscribeErr error
-	control      []controlCall
+	// permitSubscribes allows every channel, the way an external Authorizer
+	// that does not share Factory's channel grammar may, so a subscribe reaches
+	// the engine's own channel derivation.
+	permitSubscribes bool
+	control          []controlCall
 	// denyKind, when set, refuses exactly one command kind.
 	denyKind sessionstore.CommandKind
 	denyErr  error
@@ -124,10 +128,13 @@ type controlCall struct {
 func (a *recordingAuthorizer) AuthorizeSubscribe(ctx context.Context, principal identity.Principal, channel string) error {
 	a.mu.Lock()
 	a.subscribe = append(a.subscribe, subscribeCall{tenant: principal.Tenant(), channel: channel})
-	result := a.subscribeErr
+	result, permit := a.subscribeErr, a.permitSubscribes
 	a.mu.Unlock()
 	if result != nil {
 		return result
+	}
+	if permit {
+		return nil
 	}
 	return a.inner.AuthorizeSubscribe(ctx, principal, channel)
 }
@@ -705,6 +712,36 @@ func TestASuccessfulHandshakeAuthorizesNoChannel(t *testing.T) {
 
 	// The same link may still subscribe to its OWN tenant, which is what makes
 	// the refusals above about the channel rather than about the link.
+	if err := subscribe(t, client, sessionChannel(tenantA, "session-1")); err != nil {
+		t.Fatalf("subscribing to this principal's own session failed: %v", err)
+	}
+}
+
+// TestAnotherTenantsChannelIsPermissionDeniedEvenWhenTheAuthorizerAllowsIt is
+// F2 of the tests-lane wire freeze. An external Authorizer is a seam, and one
+// that does not compare the channel's tenant with the principal's lets a
+// cross-tenant subscribe through to the engine, which refuses it on its own
+// tenant boundary. Before v0.8.1 that refusal was answered 100 -- internal,
+// TEMPORARY -- so a browser was told to retry a request no Factory will ever
+// grant. It is permission denied (103): terminal, and disclosing nothing.
+// A channel the engine cannot NAME a session in stays a fault (100); that is
+// the composition-fault arm, and the control keeps the two apart.
+func TestAnotherTenantsChannelIsPermissionDeniedEvenWhenTheAuthorizerAllowsIt(t *testing.T) {
+	t.Parallel()
+
+	f := newFixture(t, testLimits())
+	f.authorizer.mu.Lock()
+	f.authorizer.permitSubscribes = true
+	f.authorizer.mu.Unlock()
+	client, observed := dialSupported(t, f, "token-a")
+	await(t, observed.connected, "connected event")
+
+	if got := codeOf(subscribe(t, client, sessionChannel(tenantB, "session-1"))); got != 103 {
+		t.Errorf("a cross-tenant subscribe failed with code %d, want 103 (permission denied)", got)
+	}
+	if got := codeOf(subscribe(t, client, "session:tenant-a:session-1:extra")); got != 100 {
+		t.Errorf("an unroutable channel failed with code %d, want 100 (a composition fault)", got)
+	}
 	if err := subscribe(t, client, sessionChannel(tenantA, "session-1")); err != nil {
 		t.Fatalf("subscribing to this principal's own session failed: %v", err)
 	}
