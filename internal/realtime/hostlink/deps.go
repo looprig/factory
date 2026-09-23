@@ -46,6 +46,13 @@ import (
 type Target struct {
 	Host     sessionwire.HostID
 	Endpoint sessionwire.InternalEndpoint
+	// Generation is the Host incarnation the endpoint was advertised under,
+	// or zero when the caller does not know it. It is read by a path that
+	// carries no request of its own (the gate-response capability read); a
+	// bind and an attach take the generation their request is fenced to. The
+	// pool uses it only to decide which of two advertisements of one HostID
+	// is newer -- see Pool.acquireLocked -- and never dials it.
+	Generation uint64
 }
 
 // Validate reports why this target may not be dialled.

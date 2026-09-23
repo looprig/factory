@@ -316,8 +316,15 @@ func (k routeKey) link(host sessionwire.HostID) linkKey {
 }
 
 type pooledLink struct {
-	link     Link
-	bindings map[routeKey]struct{}
+	link Link
+	// endpoint and generation are the advertisement the link was dialled on:
+	// the tenant's DERIVED address and the Host incarnation (zero if the
+	// caller did not know it). A later advertisement of the same HostID at
+	// another address, not older than this one, replaces the link; see
+	// acquireLocked.
+	endpoint   sessionwire.InternalEndpoint
+	generation uint64
+	bindings   map[routeKey]struct{}
 	// idleSince is when the last binding was released. It is the zero time
 	// while the link has bindings, so "is it idle" and "how long for" are one
 	// question with one answer rather than a flag and a timestamp that can
@@ -453,6 +460,9 @@ func (p *Pool) Bind(ctx context.Context, target Target, req sessionwire.HostLink
 	if err != nil {
 		return err
 	}
+	// The request is fenced to one incarnation; that is the advertisement
+	// this bind acts on.
+	dial.Generation = req.HostGeneration
 
 	key := routeKey{tenant: req.TenantID, session: req.SessionID}
 
@@ -475,9 +485,12 @@ func (p *Pool) Bind(ctx context.Context, target Target, req sessionwire.HostLink
 		return fmt.Errorf("%w: session %q is bound to %q", ErrBindingConflict, req.SessionID, bound)
 	}
 
-	pooled, err := p.acquireLocked(ctx, key.link(target.Host), dial)
+	pooled, replaced, err := p.acquireLocked(ctx, key.link(target.Host), dial)
 	if err != nil {
 		return err
+	}
+	if replaced != nil {
+		dead = replaced
 	}
 	if err := pooled.link.Bind(ctx, req); err != nil {
 		// The BINDING is not recorded, because the Host does not have it. The
@@ -550,6 +563,7 @@ func (p *Pool) Attach(ctx context.Context, target Target, req sessionwire.HostLi
 	if err != nil {
 		return sessionwire.HostLinkRegistryObservation{}, err
 	}
+	dial.Generation = req.HostGeneration
 	linked := linkKey{host: target.Host, tenant: req.TenantID}
 
 	p.mu.Lock()
@@ -557,13 +571,16 @@ func (p *Pool) Attach(ctx context.Context, target Target, req sessionwire.HostLi
 		p.mu.Unlock()
 		return sessionwire.HostLinkRegistryObservation{}, ErrPoolClosed
 	}
-	pooled, err := p.acquireLocked(ctx, linked, dial)
+	pooled, replaced, err := p.acquireLocked(ctx, linked, dial)
 	if err != nil {
 		p.mu.Unlock()
 		return sessionwire.HostLinkRegistryObservation{}, err
 	}
 	link := pooled.link
 	p.mu.Unlock()
+	if replaced != nil {
+		_ = replaced.Close(context.Background())
+	}
 
 	observation, err := link.Attach(ctx, req)
 	if err != nil {
@@ -839,27 +856,83 @@ func (p *Pool) Close(ctx context.Context) error {
 }
 
 // acquireLocked returns the pooled link for one (Host, tenant), dialling dial
-// -- that tenant's DERIVED address -- if there is none.
+// -- that tenant's DERIVED address -- if there is none, or if the one it holds
+// was dialled on an advertisement the caller's has superseded.
 //
 // The ceiling is checked before the dial and only for a pair that has no link,
 // so it bounds (Host, tenant) pairs. A pool that checked it per bind would
 // refuse the second session of a tenant on a Host it is already connected to,
-// which is the opposite of what this type is for.
-func (p *Pool) acquireLocked(ctx context.Context, linked linkKey, dial Target) (*pooledLink, error) {
-	if pooled, ok := p.links[linked]; ok {
-		return pooled, nil
+// which is the opposite of what this type is for. A replacement does not grow
+// the table, so it is not checked against the ceiling.
+//
+// # A Host that moved (I3.1 D1)
+//
+// A Host restarted the way a pod is keeps its HostID and comes back at a
+// higher generation on a NEW address. The cached link keeps redialling the old
+// one, answering ErrLinkReconnecting, and before this rule the pair was
+// reachable again only when the idle reaper collected it -- 60s, or never while
+// a viewer's route pinned it. So a cached link whose address differs from the
+// caller's is REPLACED when the caller's generation is HIGHER than the link's,
+// and kept otherwise (a stale registry row must not drag the pool back to a
+// dead address, and one incarnation cannot be at two addresses). The same address at a higher generation keeps the link:
+// the transport's own reconnect reaches the restarted Host there. The replaced
+// link is dropped with every route it carried, as evict drops a dead one --
+// they named an incarnation that is gone, and the routing plane's repair
+// rebinds a subscriber's -- and it is RETURNED for the caller to close after
+// releasing the pool's lock, for Bind's reason. The new link is dialled before
+// the old one is dropped, so a failed dial changes nothing.
+func (p *Pool) acquireLocked(ctx context.Context, linked linkKey, dial Target) (*pooledLink, Link, error) {
+	current, ok := p.links[linked]
+	if ok && !current.supersededBy(dial) {
+		current.observe(dial)
+		return current, nil, nil
 	}
-	if len(p.links) >= p.limits.MaxLinks {
-		return nil, fmt.Errorf("%w: %d links open, cannot dial %q for tenant %q", ErrLinkLimit, len(p.links), linked.host, linked.tenant)
+	if !ok && len(p.links) >= p.limits.MaxLinks {
+		return nil, nil, fmt.Errorf("%w: %d links open, cannot dial %q for tenant %q", ErrLinkLimit, len(p.links), linked.host, linked.tenant)
 	}
-	link, err := p.dialer.Dial(ctx, dial, p.observer)
+	link, err := p.dialer.Dial(ctx, dial.dialable(), p.observer)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	pooled := &pooledLink{link: link, bindings: map[routeKey]struct{}{}, idleSince: p.now()}
+	var replaced Link
+	if ok && p.dropLinkLocked(linked, current) {
+		replaced = current.link
+	}
+	pooled := p.newPooledLink(link, dial)
 	p.links[linked] = pooled
-	return pooled, nil
+	return pooled, replaced, nil
 }
+
+// newPooledLink records a freshly dialled link and the advertisement it was
+// dialled on.
+func (p *Pool) newPooledLink(link Link, dial Target) *pooledLink {
+	return &pooledLink{link: link, bindings: map[routeKey]struct{}{}, idleSince: p.now(), endpoint: dial.Endpoint, generation: dial.Generation}
+}
+
+// supersededBy reports whether dial names the same HostID at ANOTHER address
+// under a NEWER incarnation than the one this link was dialled on. Only a
+// higher generation moves a link: two observations of one incarnation at two
+// addresses contradict each other, and following whichever arrived last would
+// let two stale sources flap the link. A link dialled with no known
+// generation (zero) is moved by any known one; a caller that does not know
+// the incarnation moves nothing.
+func (l *pooledLink) supersededBy(dial Target) bool {
+	return dial.Endpoint != l.endpoint && dial.Generation > l.generation
+}
+
+// observe raises the link's recorded generation to one seen at its own
+// address, so an older advertisement of another address cannot later replace
+// a link the Host has already been confirmed at. It is called under the pool's
+// lock.
+func (l *pooledLink) observe(dial Target) {
+	if dial.Endpoint == l.endpoint && dial.Generation > l.generation {
+		l.generation = dial.Generation
+	}
+}
+
+// dialable is the target handed to the Dialer: the Host and its address. The
+// generation is the pool's bookkeeping and is not part of what is dialled.
+func (t Target) dialable() Target { return Target{Host: t.Host, Endpoint: t.Endpoint} }
 
 // tenantTarget is the address this pool dials for one tenant's link to a Host:
 // Core's HostLinkEndpoint over the Host's advertised BASE. It is the ONE place
@@ -878,7 +951,7 @@ func tenantTarget(base Target, tenantID sessionwire.TenantID) (Target, error) {
 		}
 		return Target{}, fmt.Errorf("%w: host %q tenant %q: %w", ErrNoTenantEndpoint, base.Host, tenantID, err)
 	}
-	return Target{Host: base.Host, Endpoint: endpoint}, nil
+	return Target{Host: base.Host, Endpoint: endpoint, Generation: base.Generation}, nil
 }
 
 func validateHost(host sessionwire.HostID) error {

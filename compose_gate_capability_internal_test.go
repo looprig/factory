@@ -117,3 +117,30 @@ func TestTheComposedGateResponseQuestionAsksTheOwnersTenantLink(t *testing.T) {
 		}
 	}
 }
+
+// TestTheCapabilityAdapterCarriesTheOwnersGeneration (I3.1 D1): a gate
+// response's capability read is asked of the owner's link, and when the owner
+// is a Host restarted under its HostID at a new address, the read must follow
+// it -- which the pool does only for a NEWER generation, so the adapter must
+// pass the owner's.
+func TestTheCapabilityAdapterCarriesTheOwnersGeneration(t *testing.T) {
+	t.Parallel()
+	dialer := &scriptedDial{methods: []string{sessionwire.HostLinkCapabilityGateResponse}}
+	pool, err := hostlink.NewPool(hostlink.Config{Dialer: dialer})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = pool.Close(context.Background()) })
+	owner := sessionwire.HostLinkRegistryObservation{TenantID: "tenant-a", SessionID: "session-a", HostID: "host-a",
+		HostGeneration: 1, InternalEndpoint: "ws://host-a.internal"}
+	if _, err := (gateResponders{pool: pool}).AcceptsGateResponses(context.Background(), owner); err != nil {
+		t.Fatal(err)
+	}
+	owner.HostGeneration, owner.InternalEndpoint = 2, "ws://host-a-restarted.internal"
+	if _, err := (gateResponders{pool: pool}).AcceptsGateResponses(context.Background(), owner); err != nil {
+		t.Fatal(err)
+	}
+	if len(dialer.dialled) != 2 || dialer.dialled[1].Endpoint != "ws://host-a-restarted.internal/hostlink/tenant-a" {
+		t.Fatalf("dialled %v, want the restarted owner dialled at its new address", dialer.dialled)
+	}
+}

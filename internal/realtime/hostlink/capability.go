@@ -64,18 +64,22 @@ func (p *Pool) acquireUnlocked(ctx context.Context, linked linkKey, dial Target)
 		p.mu.Unlock()
 		return nil, ErrPoolClosed
 	}
-	if pooled, ok := p.links[linked]; ok {
+	// A link dialled on an advertisement this one supersedes is replaced, as
+	// acquireLocked replaces one (I3.1 D1); otherwise the cached link answers.
+	current, ok := p.links[linked]
+	if ok && !current.supersededBy(dial) {
+		current.observe(dial)
 		p.mu.Unlock()
-		return pooled, nil
+		return current, nil
 	}
-	if len(p.links) >= p.limits.MaxLinks {
+	if !ok && len(p.links) >= p.limits.MaxLinks {
 		n := len(p.links)
 		p.mu.Unlock()
 		return nil, fmt.Errorf("%w: %d links open, cannot dial %q for tenant %q", ErrLinkLimit, n, linked.host, linked.tenant)
 	}
 	p.mu.Unlock()
 
-	link, err := p.dialer.Dial(ctx, dial, p.observer)
+	link, err := p.dialer.Dial(ctx, dial.dialable(), p.observer)
 	if err != nil {
 		return nil, err
 	}
@@ -83,20 +87,27 @@ func (p *Pool) acquireUnlocked(ctx context.Context, linked linkKey, dial Target)
 	p.mu.Lock()
 	var refused error
 	var pooled *pooledLink
+	var replaced Link
 	kept := false // whether OUR dial became the pool's link (links may not be comparable)
 	switch existing, ok := p.links[linked]; {
 	case p.closed:
 		refused = ErrPoolClosed
-	case ok:
-		pooled = existing // a racer dialled first; ours is surplus
-	case len(p.links) >= p.limits.MaxLinks:
+	case ok && !existing.supersededBy(dial):
+		pooled = existing // a racer dialled first (or it is current); ours is surplus
+	case !ok && len(p.links) >= p.limits.MaxLinks:
 		refused = fmt.Errorf("%w: %d links open, cannot keep %q for tenant %q", ErrLinkLimit, len(p.links), linked.host, linked.tenant)
 	default:
-		pooled = &pooledLink{link: link, bindings: map[routeKey]struct{}{}, idleSince: p.now()}
+		if ok && p.dropLinkLocked(linked, existing) {
+			replaced = existing.link
+		}
+		pooled = p.newPooledLink(link, dial)
 		p.links[linked] = pooled
 		kept = true
 	}
 	p.mu.Unlock()
+	if replaced != nil {
+		_ = replaced.Close(context.Background())
+	}
 	if !kept {
 		_ = link.Close(context.Background())
 	}

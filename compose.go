@@ -465,7 +465,7 @@ func (l placementLinks) AcceptsGateResponses(ctx context.Context, owner sessionw
 type gateResponders struct{ pool *hostlink.Pool }
 
 func (g gateResponders) AcceptsGateResponses(ctx context.Context, owner sessionwire.HostLinkRegistryObservation) (bool, error) {
-	capable, err := g.pool.AcceptsGateResponses(ctx, hostlink.Target{Host: owner.HostID, Endpoint: owner.InternalEndpoint}, owner.TenantID)
+	capable, err := g.pool.AcceptsGateResponses(ctx, hostlink.Target{Host: owner.HostID, Endpoint: owner.InternalEndpoint, Generation: owner.HostGeneration}, owner.TenantID)
 	return capable, classifyCapabilityRead(err)
 }
 
