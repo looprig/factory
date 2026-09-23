@@ -194,6 +194,14 @@ type subscriptionState struct {
 	// call into the client, so a callback waiting for regMu could wait on a
 	// Close that waits on it. Callbacks hand withdrawals to a goroutine.
 	regMu sync.Mutex
+	// transportClosed is set under regMu by Close just before it closes the
+	// client, and every regMu holder checks it after acquiring and then does
+	// not touch the client. It is what lets Close order the client's close
+	// after every subscription-side send WITHOUT holding regMu across
+	// Client.Close, which can hang forever in centrifuge-go v0.12.x (see
+	// closeBound): a regMu held across that would park every later Subscribe
+	// or withdrawal on this link for the process's life (v0.7.2 gate S1).
+	transportClosed bool
 	// beforeSubscribeSend is a TEST seam, nil in every composition: it runs
 	// between a subscription's registration and the send of its subscribe,
 	// which is the window the regate's N4 orphan lived in, so a test can put a
@@ -274,6 +282,12 @@ func (l *centrifugeLink) Subscribe(ctx context.Context, tenant sessionwire.Tenan
 	// holders call into the client, and no callback takes it (rule 2,
 	// regmu_structure_test.go).
 	l.regMu.Lock()
+	if l.transportClosed {
+		l.regMu.Unlock()
+		err := fmt.Errorf("%w: %s", ErrLinkClosed, l.host)
+		l.withdraw(entry, err)
+		return fmt.Errorf("hostlink: subscribe %s: %w", channel, err)
+	}
 	l.mu.Lock()
 	current = l.subs[channel] == entry
 	l.mu.Unlock()
@@ -296,6 +310,9 @@ func (l *centrifugeLink) Subscribe(ctx context.Context, tenant sessionwire.Tenan
 func (l *centrifugeLink) newSubscription(channel string) (*centrifugego.Subscription, error) {
 	l.regMu.Lock()
 	defer l.regMu.Unlock()
+	if l.transportClosed {
+		return nil, fmt.Errorf("%w: %s", ErrLinkClosed, l.host)
+	}
 	sub, err := l.client.NewSubscription(channel)
 	if !errors.Is(err, centrifugego.ErrDuplicateSubscription) {
 		return sub, err
@@ -513,6 +530,11 @@ func (l *centrifugeLink) Unsubscribe(tenant sessionwire.TenantID, session sessio
 func (l *centrifugeLink) discard(sub *centrifugego.Subscription) {
 	l.regMu.Lock()
 	defer l.regMu.Unlock()
+	if l.transportClosed {
+		// The client is closed, or closing: its close unsubscribes every
+		// subscription locally, and there is no connection to tell the Host.
+		return
+	}
 	current, ok := l.client.GetSubscription(sub.Channel)
 	if !ok || current != sub {
 		return

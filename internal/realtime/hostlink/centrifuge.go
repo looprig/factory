@@ -471,18 +471,25 @@ const closeBound = 2 * time.Second
 // returning is no evidence its RPC is done, because rpc runs client.RPC on its
 // own goroutine that outlives a caller whose context ended.
 //
-// So Close (1) marks the link terminal, refusing every later call before it
-// reaches the transport, and cancels the current generation, which ends every
-// admitted RPC's context; (2) waits for the RPC goroutines already inside the
-// transport to return; (3) closes the client while holding regMu, the lock
-// every subscription-side send is made under, so a Subscribe or a discard
-// cannot be inside send either. Steps (2) and (3) together are bounded by ctx
-// and closeBound, so Close -- and through it Pool.Close and Server.Stop --
-// cannot be made unkillable by the transport; a close that outlives the bound
-// is left running on its own goroutine (see closeBound). No lock is held across
-// client.RPC: the wait is on a counter, not on a mutex any call holds. A
-// reconnect's own teardown (moveToConnecting) has the same unlocked read
-// against it and is the transport's; see TestReconnectStressNeverWedgesACaller.
+// So Close:
+//
+//  1. marks the link terminal, refusing every later call before it reaches
+//     the transport, and cancels the current generation, which ends every
+//     admitted RPC's context;
+//  2. waits for the RPC goroutines already inside the transport to return;
+//  3. sets transportClosed under regMu, the lock every subscription-side send
+//     is made under, so no Subscribe or discard is inside send and none will
+//     touch the client afterwards;
+//  4. closes the client with regMu RELEASED, because that close may never
+//     return (see closeBound).
+//
+// Steps 2 and 4 share one bound, ctx and closeBound, so Close -- and through
+// it Pool.Close and Server.Stop -- cannot be made unkillable by the transport;
+// a close that outlives the bound is left running on its own goroutine, and it
+// holds no lock of this link's. No lock is held across client.RPC: the wait is
+// on a counter, not on a mutex any call holds. A reconnect's own teardown
+// (moveToConnecting) has the same unlocked read against it and is the
+// transport's; see TestReconnectStressNeverWedgesACaller.
 //
 // It is idempotent, because the pool closes a link on reap and again on
 // shutdown if the two race, and a second close that failed would make Close
@@ -501,11 +508,16 @@ func (l *centrifugeLink) Close(ctx context.Context) error {
 		case <-l.rpcs.close():
 		case <-bounded.Done():
 		}
+		// Every subscription-side send is made under regMu, so taking it
+		// here waits out any send in flight; the flag set under it turns
+		// every later holder away before it touches the client. regMu is
+		// released BEFORE the client's close, which may never return.
+		l.regMu.Lock()
+		l.transportClosed = true
+		l.regMu.Unlock()
 		closed := make(chan struct{})
 		go func() {
 			defer close(closed)
-			l.regMu.Lock()
-			defer l.regMu.Unlock()
 			l.closeClient()
 		}()
 		select {
