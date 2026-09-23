@@ -91,3 +91,34 @@ func TestTheGatesReadAgreesWithTheGateResponseWritePath(t *testing.T) {
 		})
 	}
 }
+
+// TestAStoredNonResidentGateIsReportedAsStored (v0.9.0 gate F2): only a stored
+// "resident" gate is overlaid. A gate the Host stored as suspended keeps that
+// value -- with no owner, and with a fresh capable one -- and the owner check
+// is not even asked: it would have nothing to change, and asking it can dial
+// the owner's link on a public read. The fresh owner is what makes the ask
+// observable (a dial); with no owner the check stops before any dial.
+func TestAStoredNonResidentGateIsReportedAsStored(t *testing.T) {
+	t.Parallel()
+
+	for name, owner := range map[string]func(*sessionstore.PutHostRegistrationRequest) bool{
+		"no owner":              func(*sessionstore.PutHostRegistrationRequest) bool { return false },
+		"a fresh capable owner": func(*sessionstore.PutHostRegistrationRequest) bool { return true },
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			store := gateWorldStored(t, owner, sessionwire.GateAnswerabilitySuspended)
+			dial := &scriptedDial{methods: []string{sessionwire.HostLinkCapabilityGateResponse}}
+			page := getGates(t, composedGateServer(t, store, dial))
+			if len(page.Gates) != 1 || page.Gates[0].Answerability != sessionwire.GateAnswerabilitySuspended {
+				t.Fatalf("the gates read = %+v, want the stored suspended gate unchanged", page.Gates)
+			}
+			dial.mu.Lock()
+			dialled := len(dial.dialled)
+			dial.mu.Unlock()
+			if dialled != 0 {
+				t.Fatalf("the owner check dialled %d times for a gate it could not change", dialled)
+			}
+		})
+	}
+}

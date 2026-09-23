@@ -96,6 +96,13 @@ func gateWorld(t *testing.T) *sessionstore.Store {
 // owner edits the request, and false registers no owner at all.
 func gateWorldWithOwner(t *testing.T, owner func(*sessionstore.PutHostRegistrationRequest) bool) *sessionstore.Store {
 	t.Helper()
+	return gateWorldStored(t, owner, sessionwire.GateAnswerabilityResident)
+}
+
+// gateWorldStored is gateWorldWithOwner whose gate the Host stored with the
+// given answerability.
+func gateWorldStored(t *testing.T, owner func(*sessionstore.PutHostRegistrationRequest) bool, answerability sessionwire.GateAnswerability) *sessionstore.Store {
+	t.Helper()
 	ctx := context.Background()
 	store, err := sessionstore.Open(ctx, memstore.New())
 	if err != nil {
@@ -126,7 +133,7 @@ func gateWorldWithOwner(t *testing.T, owner func(*sessionstore.PutHostRegistrati
 	t.Cleanup(func() { _ = grant.Release(context.Background()) })
 	if _, err := store.OpenGate(ctx, sessionstore.OpenGateRequest{TenantID: FakeTenant, SessionID: e2eSession, Residency: grant,
 		Gate: sessionwire.GateProjection{GateID: "gate-a", Kind: "approval", Prompt: sessionwire.GatePrompt{Title: "approve?"},
-			OpenedEventID: "event-a", OpenedJournalSeq: 3, Deadline: now.Add(time.Hour), Answerability: sessionwire.GateAnswerabilityResident}}); err != nil {
+			OpenedEventID: "event-a", OpenedJournalSeq: 3, Deadline: now.Add(time.Hour), Answerability: answerability}}); err != nil {
 		t.Fatalf("OpenGate: %v", err)
 	}
 	registration := sessionstore.PutHostRegistrationRequest{
