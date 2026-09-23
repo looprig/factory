@@ -1841,6 +1841,36 @@ pooled placement at all until the directory carries a tenant dimension, which is
 H8's per-tenant Department and a specification section 7 change that is not this
 repository's to book.
 
+### A released dedicated session is placed again (D3.1 F2)
+
+Deletion desire is a dedicated placement naming **no** workload. Before this, a
+later command for such a session was admitted and never placed: the dedicated
+arm handed the controller the released intent every pass, and controller
+v0.2.0's adapter refuses an empty payload (`unsupported workload payload
+version`). Now `Request.OpenWork` (set by `PendingSweeper` for every session it
+reconciles) licenses `reviveReleased`: the record is re-expressed as a **new
+desired generation** carrying `CatalogRecord.PublicCreate.InitialWorkload` —
+the template the session was **created** with, SessionStore's immutable
+provenance — and only then ensured. Rules:
+
+- It runs **before** the `Workloads == nil` check: desire is Factory-authored
+  and the controller driver never writes it, so a controller-less replica (H5's
+  split) must be the one that re-expresses it.
+- **Only a release is replaced.** The write is a revision CAS; a conflict
+  re-reads and re-decides, so a racer's non-empty workload is never
+  overwritten, and a racing re-release is answered with another generation.
+- The key (`reviveKey`) is the intent **plus the released generation**:
+  replicas re-expressing one release collide and are absorbed, while each later
+  release gets a key of its own (SessionStore compares only the current key).
+- No provenance (a `CreateCatalogEntry` session) or an empty `InitialWorkload`
+  is `ErrNoLaunchTemplate`, by name, with nothing written. The configured
+  `LaunchTemplate` is deliberately **not** consulted: a returning session's
+  workload must not depend on configuration drift since it was created.
+- **Open work wins over a release.** A command still open when a product writes
+  deletion desire re-expresses the workload; a product that means "gone for
+  good" must let its open commands settle or expire first (the reviver does
+  not read session state; the controller driver ignores a `stopped` session).
+
 Not built here: drain-before-delete of D2.2, and the authorship of a dedicated workload's
 payload — `Desired` is an INPUT, because what a launch template should contain
 is a composition question A9.1 owns.
