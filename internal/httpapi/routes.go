@@ -137,6 +137,12 @@ type RouterConfig struct {
 	// rather than that the caller's command was refused.
 	Admissions ControlAdmitter
 
+	// GateOwners overlays the gates read's answerability with the gate
+	// response write path's own owner check (see serveSessionGates). nil
+	// leaves every stored answerability as it is; the composition always
+	// supplies the admission service.
+	GateOwners GateOwners
+
 	// Realtime is the optional ClientLink entry point mounted at /v1/realtime.
 	//
 	// A nil Realtime FAILS CLOSED rather than being rejected by NewRouter, for
@@ -248,6 +254,7 @@ type Router struct {
 	ui                 http.Handler
 	limits             RouteLimits
 	admissions         ControlAdmitter
+	gateOwners         GateOwners
 	realtime           func() http.Handler
 	wakes              *wakes
 	objectPolicy       ObjectPolicy
@@ -320,6 +327,7 @@ func NewRouter(cfg RouterConfig) (*Router, error) {
 		ui:                 cfg.UI,
 		limits:             cfg.Limits,
 		admissions:         cfg.Admissions,
+		gateOwners:         cfg.GateOwners,
 		realtime:           cfg.Realtime,
 		wakes:              newWakes(cfg.Delivery, cfg.Limits.RequestTimeout, maxConcurrentWakes).withLogger(cfg.Logger),
 		objectPolicy:       cfg.ObjectPolicy,

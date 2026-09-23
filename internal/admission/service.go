@@ -415,17 +415,44 @@ func (s *Service) AdmitGateResponse(ctx context.Context, principal identity.Prin
 	if err := gateAdmission(entry.Record.OpenGates, req, now); err != nil {
 		return sessionstore.DispositionInboxEntry{}, false, err
 	}
-	owner, ok, err := s.cfg.Directory.Owner(ctx, principal.Tenant(), req.SessionID)
-	if err != nil {
-		return sessionstore.DispositionInboxEntry{}, false, fmt.Errorf("admission: observe the session's owner: %w", err)
-	}
-	if !ok || !freshMatchingOwner(owner, entry.Record, now) {
-		return sessionstore.DispositionInboxEntry{}, false, refusal(sessionwire.ErrorCodeGateNotResumable, nil)
-	}
-	if err := s.ownerAppliesGateResponses(ctx, owner); err != nil {
+	if err := s.gateOwnerAnswers(ctx, principal.Tenant(), req.SessionID, entry.Record, now); err != nil {
 		return sessionstore.DispositionInboxEntry{}, false, err
 	}
 	return s.admit(ctx, principal.Tenant(), req.SessionID, req.CommandID, CommandGateResponse, entry.Record.Binding, payload)
+}
+
+// gateOwnerAnswers is the ONE owner check a gate response must pass: a fresh
+// owner matching the session's record, and one that can apply a gate
+// response. nil admits; a gate_not_resumable refusal is a decision; any other
+// error is a fault. AdmitGateResponse and GateResponsesAnswerable both call it,
+// so the gates read and the write cannot disagree about a gate's answerability.
+func (s *Service) gateOwnerAnswers(ctx context.Context, tenant sessionwire.TenantID, session sessionwire.SessionID, record sessionstore.CatalogRecord, now time.Time) error {
+	owner, ok, err := s.cfg.Directory.Owner(ctx, tenant, session)
+	if err != nil {
+		return fmt.Errorf("admission: observe the session's owner: %w", err)
+	}
+	if !ok || !freshMatchingOwner(owner, record, now) {
+		return refusal(sessionwire.ErrorCodeGateNotResumable, nil)
+	}
+	return s.ownerAppliesGateResponses(ctx, owner)
+}
+
+// GateResponsesAnswerable reports, for the gates READ, whether a gate response
+// for this session would pass AdmitGateResponse's owner check now: (true, nil)
+// when it would, (false, nil) when the write would refuse it
+// gate_not_resumable, and (false, err) when the owner could not be asked --
+// where the write would answer a fault. It writes nothing and takes no
+// admission slot: it is a read.
+func (s *Service) GateResponsesAnswerable(ctx context.Context, tenant sessionwire.TenantID, session sessionwire.SessionID, record sessionstore.CatalogRecord) (bool, error) {
+	err := s.gateOwnerAnswers(ctx, tenant, session, record, s.cfg.Clock.Now())
+	if err == nil {
+		return true, nil
+	}
+	var refused *Error
+	if errors.As(err, &refused) {
+		return false, nil
+	}
+	return false, err
 }
 
 // ownerAppliesGateResponses is the gate_response capability gate: nil when the

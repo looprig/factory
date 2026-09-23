@@ -334,6 +334,7 @@ func (rt *Router) serveSessionGates() http.Handler {
 			writeAPIError(w, catalogFailure(err))
 			return
 		}
+		page = rt.overlayAnswerability(r.Context(), operation.Principal.Tenant(), entry.Record, page)
 		// Core validates on marshal, and part of what it validates is that the
 		// gates are in ascending opened-sequence order with the captured tip at
 		// or after every one of them. So "ordered" is enforced on the way out
@@ -346,6 +347,50 @@ func (rt *Router) serveSessionGates() http.Handler {
 		}
 		writeJSONBytes(w, http.StatusOK, body)
 	})
+}
+
+// GateOwners answers whether a gate response for a session would pass the
+// gate_response write path's owner check now. *admission.Service satisfies it
+// with the SAME check AdmitGateResponse makes, so the read and the write agree.
+type GateOwners interface {
+	GateResponsesAnswerable(ctx context.Context, tenant sessionwire.TenantID, session sessionwire.SessionID, record sessionstore.CatalogRecord) (bool, error)
+}
+
+// overlayAnswerability reports a stored "resident" gate as "unavailable" when
+// an answer to it would be refused gate_not_resumable: its Host released the
+// session or crashed (no fresh matching owner), or the owner does not
+// advertise hostlink.command.gate_response. SessionStore keeps the
+// answerability the Host wrote at open, and only a successor re-publishes a
+// gate, so the stored value outlives its owner.
+//
+// The gate itself is never hidden: a successor restores it, and the prompt is
+// still the session's. Only "resident" is overlaid -- every other stored value
+// already says it cannot be answered. An owner that could not be ASKED also
+// reads "unavailable": the write answers that 503, and a read cannot promise a
+// button it could not check. The owner check runs once per read, and only when
+// some gate is stored resident.
+func (rt *Router) overlayAnswerability(ctx context.Context, tenant sessionwire.TenantID, record sessionstore.CatalogRecord, page sessionwire.GatePage) sessionwire.GatePage {
+	if rt.gateOwners == nil {
+		return page
+	}
+	resident := false
+	for _, gate := range page.Gates {
+		resident = resident || gate.Answerability == sessionwire.GateAnswerabilityResident
+	}
+	if !resident {
+		return page
+	}
+	if answerable, err := rt.gateOwners.GateResponsesAnswerable(ctx, tenant, record.SessionID, record); err == nil && answerable {
+		return page
+	}
+	gates := append([]sessionwire.GateProjection(nil), page.Gates...)
+	for i := range gates {
+		if gates[i].Answerability == sessionwire.GateAnswerabilityResident {
+			gates[i].Answerability = sessionwire.GateAnswerabilityUnavailable
+		}
+	}
+	page.Gates = gates
+	return page
 }
 
 // ---------------------------------------------------------------------------

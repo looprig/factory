@@ -575,6 +575,15 @@ candidate's) link for the session's tenant:
   it from the durable stream — so a gate response for an owner without the
   token is refused `409 gate_not_resumable` (`ErrGateResponseUnsupported`)
   before anything is written.
+- **The gates read (v0.9.0).** `GET /v1/sessions/{sid}/gates` reports a gate
+  stored `resident` as `unavailable` whenever an answer would be refused
+  `gate_not_resumable` -- no fresh matching owner (its Host released the
+  session crash-equivalently, is releasing it, or crashed and lapsed), or an
+  owner without the token -- and also when the owner could not be asked (the
+  write's 503). It is the admission service's own check
+  (`GateResponsesAnswerable`, the one `AdmitGateResponse` makes), so the read
+  and the write agree. The gate itself is still listed; a successor restores
+  and re-publishes it. Other stored values are left as they are.
 - **The wake.** A gate-response wake is withheld from a bound Host without the
   token and counted (`WithheldGateResponses`).
 - **Placement.** A session with a pending gate response attaches only to a Host

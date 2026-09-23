@@ -1296,6 +1296,8 @@ func nonEntryPointServiceMethods() map[string]string {
 	return map[string]string{
 		"Quiesce":         "lifecycle wait, not a command admission entry point",
 		"FenceAdmissions": "lifecycle fence, not a command admission entry point",
+		"GateResponsesAnswerable": "a read of the gate_response owner check; it returns (bool, error) and so cannot " +
+			"carry a public code at all -- a refusal is (false, nil) and a fault is returned as itself",
 	}
 }
 

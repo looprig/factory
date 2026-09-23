@@ -458,6 +458,10 @@ func composeRouter(cfg config, credentials *internalidentity.Authenticator, part
 		// The four control routes admit into the composed service, so a
 		// deployed binary answers them for real instead of 503.
 		Admissions: parts.admissions,
+		// The gates read reports answerability from the gate_response write
+		// path's own owner check, so a UI never offers an answer the write
+		// would refuse gate_not_resumable.
+		GateOwners: parts.admissions,
 		// The best-effort local wake-up for a command this replica just
 		// admitted. It is the routing table rather than the pool: a delivery
 		// does not open a route, so a session this replica holds no demand for

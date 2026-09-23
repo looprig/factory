@@ -89,6 +89,13 @@ func (l scriptedLink) Negotiated() (sessionwire.VersionNegotiationResponse, erro
 // Host-published open gate and a fresh resident owner.
 func gateWorld(t *testing.T) *sessionstore.Store {
 	t.Helper()
+	return gateWorldWithOwner(t, func(*sessionstore.PutHostRegistrationRequest) bool { return true })
+}
+
+// gateWorldWithOwner is gateWorld whose owner registration the case shapes:
+// owner edits the request, and false registers no owner at all.
+func gateWorldWithOwner(t *testing.T, owner func(*sessionstore.PutHostRegistrationRequest) bool) *sessionstore.Store {
+	t.Helper()
 	ctx := context.Background()
 	store, err := sessionstore.Open(ctx, memstore.New())
 	if err != nil {
@@ -122,14 +129,17 @@ func gateWorld(t *testing.T) *sessionstore.Store {
 			OpenedEventID: "event-a", OpenedJournalSeq: 3, Deadline: now.Add(time.Hour), Answerability: sessionwire.GateAnswerabilityResident}}); err != nil {
 		t.Fatalf("OpenGate: %v", err)
 	}
-	if _, err := store.PutHostRegistration(ctx, sessionstore.PutHostRegistrationRequest{
+	registration := sessionstore.PutHostRegistrationRequest{
 		TenantID: FakeTenant, SessionID: e2eSession, LeaseEpoch: uint64(grant.Epoch()),
 		ObservedAt: now, ExpiresAt: now.Add(time.Hour),
 		Route: sessionstore.HostRoute{HostID: "host-owner", HostGeneration: 2, AgentID: e2eAgent, RuntimeCompatibilityID: e2eRuntime,
 			Placement: sessionwire.HostPlacementPooled, InternalEndpoint: "ws://10.9.8.7:7100",
 			Residency: sessionwire.SessionResidencyResident, Accepting: true},
-	}); err != nil {
-		t.Fatalf("PutHostRegistration: %v", err)
+	}
+	if owner(&registration) {
+		if _, err := store.PutHostRegistration(ctx, registration); err != nil {
+			t.Fatalf("PutHostRegistration: %v", err)
+		}
 	}
 	return store
 }

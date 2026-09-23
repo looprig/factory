@@ -1525,6 +1525,24 @@ successor settles it `not_applied`; the filter keeps a *pending* one off an
 incapable Host but cannot recall one in flight. Do not run v0.3.0 and v0.4.0
 Hosts serving gating agents together.
 
+**The gates read agrees with the write (v0.9.0, tests-lane I2.3).** SessionStore
+keeps the answerability a Host wrote at open, and only a successor re-publishes
+a gate, so a gate read `resident` after its Host released the session or
+crashed -- a UI offered an answer button whose press was always `409
+gate_not_resumable`. `httpapi.Router.overlayAnswerability` now asks
+`admission.Service.GateResponsesAnswerable`, which calls **`gateOwnerAnswers`,
+the same function `AdmitGateResponse` calls** (fresh matching owner, then
+`ownerAppliesGateResponses`), and reports every stored `resident` gate as
+`unavailable` unless it answers yes. A fault (owner not askable) also reads
+`unavailable`; `GateResponsesAnswerable` still returns it as an error, which
+the read treats as not-answerable (measured equivalent at the edge). The gate
+is never hidden; only `resident` is overlaid; the owner check runs only when
+some gate is stored resident (skipping that short-circuit is an equivalent
+mutant -- cost, not output). The capability read may dial the owner's link on a
+public read, as the write already does. Reader:
+`TestTheGatesReadAgreesWithTheGateResponseWritePath` (real store, composed
+Server; each row asserts the read AND the answer's status).
+
 **A gate response is never admitted by reference** (host v0.4.0 spec gate C1):
 above `sessionstore.MaxInboxPayloadBytes` (64 KiB, measured on the same
 canonical ENCODED payload `admit` stores, not on the bytes sent) a NEW gate response is refused
