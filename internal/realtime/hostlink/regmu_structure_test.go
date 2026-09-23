@@ -50,8 +50,8 @@ func TestRegMuGuardsTheRegistryAndNoCallbackTakesIt(t *testing.T) {
 func TestTheRegMuReaderCatchesEveryRegateMutant(t *testing.T) {
 	sources := readLinkSources(t)
 	for _, m := range []struct{ id, old, new string }{
-		{"X2d", "\tl.regMu.Lock()\n\tdefer l.regMu.Unlock()\n\tcurrent, ok", "\tcurrent, ok"},
-		{"X2e", "\tl.regMu.Lock()\n\tdefer l.regMu.Unlock()\n\tsub, err := l.client.NewSubscription(channel)", "\tsub, err := l.client.NewSubscription(channel)"},
+		{"X2d", "\tl.regMu.Lock()\n\tdefer l.regMu.Unlock()\n\tif l.transportClosed {\n\t\t// The client is closed", "\tif l.transportClosed {\n\t\t// The client is closed"},
+		{"X2e", "\tl.regMu.Lock()\n\tdefer l.regMu.Unlock()\n\tif l.transportClosed {\n\t\treturn nil, ", "\tif l.transportClosed {\n\t\treturn nil, "},
 		{"X2f", "still this one's.\n\t\tl.discard(sub)\n\t\treturn l.await(ctx, entry)", "still this one's.\n\t\t_ = l.client.RemoveSubscription(sub)\n\t\treturn l.await(ctx, entry)"},
 		{"D1", "\t\tif sub != nil {\n\t\t\tgo l.discard(sub)\n\t\t}\n\t\tif live {", "\t\tif sub != nil {\n\t\t\tl.discard(sub)\n\t\t}\n\t\tif live {"},
 		{"D2", "\t\t\tgo l.discard(sub)\n\t\t}\n\t})\n\tsub.OnSubscribing", "\t\t\tl.discard(sub)\n\t\t}\n\t})\n\tsub.OnSubscribing"},
