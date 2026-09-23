@@ -282,12 +282,33 @@ func TestTheProductionWaitSleepsAJitteredBackoffAndHonoursCancellation(t *testin
 		}
 		return 100 * time.Millisecond
 	}}
-	start := time.Now()
-	if err := drawn.wait(context.Background(), time.Second); err != nil {
-		t.Fatalf("wait = %v", err)
+	//
+	// The ceiling is asserted on the FASTEST of up to five waits, not on one.
+	// A single wait overshot 180ms under whole-module -race load (v0.8.0 review
+	// R-N2), and a timer can only ever fire late, never early. The mutants it
+	// exists to kill cannot pass that way: a doubled draw sleeps at least 200ms
+	// and a dropped jitter at least 1s on EVERY attempt, so no minimum of theirs
+	// is under the ceiling. The floor stays on every attempt, since a timer
+	// firing early is not a load effect.
+	fastest := time.Duration(-1)
+	for range 5 {
+		start := time.Now()
+		if err := drawn.wait(context.Background(), time.Second); err != nil {
+			t.Fatalf("wait = %v", err)
+		}
+		elapsed := time.Since(start)
+		if elapsed < 100*time.Millisecond {
+			t.Fatalf("a wait drawn as 100ms took %v, less than the draw", elapsed)
+		}
+		if fastest < 0 || elapsed < fastest {
+			fastest = elapsed
+		}
+		if fastest <= 180*time.Millisecond {
+			break
+		}
 	}
-	if elapsed := time.Since(start); elapsed < 100*time.Millisecond || elapsed > 180*time.Millisecond {
-		t.Fatalf("a wait drawn as 100ms took %v, want within [100ms, 180ms]", elapsed)
+	if fastest > 180*time.Millisecond {
+		t.Fatalf("the fastest of five waits drawn as 100ms took %v, want within [100ms, 180ms]", fastest)
 	}
 	// G4: production's draw -- a nil one -- IS jittered, not the nominal
 	// duration or a multiple of it. Compared by identity, since two functions
@@ -299,7 +320,7 @@ func TestTheProductionWaitSleepsAJitteredBackoffAndHonoursCancellation(t *testin
 		t.Fatal("an injected draw is not the one the wait uses")
 	}
 	r := &Reconciler{}
-	start = time.Now()
+	start := time.Now()
 	if err := r.wait(context.Background(), 60*time.Millisecond); err != nil {
 		t.Fatalf("wait = %v", err)
 	}

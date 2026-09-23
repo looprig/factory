@@ -303,6 +303,38 @@ func TestAnApplyingCommandAloneDoesNotReviveAReleasedSession(t *testing.T) {
 	f.assertStillReleased(t, f.sweepAll(t))
 }
 
+// TestALiveClaimedLeftoverDoesNotReviveAReleasedSession: a claimed command
+// inside its deadline keeps the session in the sweep (it needs a Host), but a
+// claim is not a request to bring a deleted session back -- only a pending
+// restore is. The leftover here is the session's own create, claimed by a
+// residency that then went away (v0.8.0 review R-N1, mutant R8).
+func TestALiveClaimedLeftoverDoesNotReviveAReleasedSession(t *testing.T) {
+	t.Parallel()
+
+	f := newReleasedFixture(t)
+	ctx := context.Background()
+	create, err := f.store.GetDispositionCommand(ctx, sessionstore.GetDispositionCommandRequest{TenantID: testTenant, SessionID: testSession, CommandID: "create-dedicated"})
+	if err != nil {
+		t.Fatalf("GetDispositionCommand: %v", err)
+	}
+	grant, err := f.store.AcquireResidency(ctx, sessionstore.AcquireResidencyRequest{TenantID: testTenant, SessionID: testSession})
+	if err != nil {
+		t.Fatalf("AcquireResidency: %v", err)
+	}
+	t.Cleanup(func() { _ = grant.Release(context.Background()) })
+	claimed, _, err := f.store.ClaimDispositionCommand(ctx, sessionstore.ClaimDispositionCommandRequest{
+		TenantID: testTenant, SessionID: testSession, CommandID: "create-dedicated",
+		ExpectedRevision: create.Revision, Residency: grant, ClaimExpiresAt: f.clock.now.Add(30 * time.Second),
+	})
+	if err != nil || claimed.Record.State != sessionstore.InboxStateClaimed {
+		t.Fatalf("ClaimDispositionCommand = %q, %v; the premise is a claimed command", claimed.Record.State, err)
+	}
+	if !f.clock.now.Before(claimed.Record.ApplyDeadline) {
+		t.Fatalf("the claimed command's deadline %v is not after now %v; the premise is a LIVE claim", claimed.Record.ApplyDeadline, f.clock.now)
+	}
+	f.assertStillReleased(t, f.sweepAll(t))
+}
+
 // TestAnExpiredRestoreDoesNotReviveAReleasedSession: the licence is a LIVE
 // restore. One at or past its deadline is the deadline sweep's to reject, even
 // when a live input keeps the session in the sweep.
