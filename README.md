@@ -140,6 +140,12 @@ without the bounded reader lifecycle (`fsstore`), so a filesystem deployment
 wraps its Blobs as Carbon does. Refuse any binding you do not know: a resolver
 answering a default serves one deployment's journal under another's
 configuration.
+SessionStore's legacy layout marker admits **one tenant per backend**: `Open`
+persists the tenant in the backend's layout marker and refuses another, so
+`runtimeBackend(tenant)` must be exactly the backend the Host's Harness uses for
+that tenant -- not a shared one -- and the session is addressed by
+`binding.RuntimeSessionID`, which must be a canonical UUID (the rendering Harness
+files a journal under).
 
 ## Serving
 
@@ -452,6 +458,18 @@ record: it never reaches a viewer, and the viewers are reset.
 `factory.New` composes the pool, and `Start` drives the reaper on the sweep
 cadence.
 
+**A record the live tail never carried is not skipped silently (v0.9.0, I3.1
+D2).** A Host relays public records only, and it can commit one it never
+relays -- a warm release commits `SessionResidencyReleased` after its tail
+stopped -- before a re-placed session's new tail arrives on the same
+subscription. Once the tail's position is known (anchored at a first viewer's
+tail start, or at the tip a reset sent every viewer to), a record that skips
+positions is checked against the journal with one bounded read: if a PUBLIC
+record lies in the gap, every viewer is sent a `session.reset` to the journal's
+tip in front of it; a gap of private records needs none. A tip that cannot
+describe the gap closes the viewers instead. This needs `WithJournalResolver`
+for Host sessions -- the check reads the runtime journal.
+
 ## Placement
 
 `internal/placement` decides where a session runs. `Decide` is pure — a catalog
@@ -500,6 +518,16 @@ contract every module in this workspace is released under — and the widening t
 added `ObserveWorkload`, `RequestDrain`, and `DeleteWorkload` as `EnsureWorkload`'s
 companions rides `v0.2.0`. Once `v1.0.0` is cut, widening it becomes a major
 release.
+
+**A Host restarted under its HostID is followed promptly (v0.9.0, I3.1 D1).**
+A pooled Host that restarts the way a pod does keeps its HostID and comes back
+at a higher generation on a new address. The HostLink pool now replaces a
+cached (Host, tenant) link whose Host advertises a new address under a HIGHER
+generation -- on the next bind, attach or gate-capability read -- closing the
+old link and dropping its routes (a viewer's route is re-bound by the routing
+plane's repair). Before, the replica kept redialling the dead address until the
+60 s idle reaper collected the link, or never while a viewer pinned it. An
+older or same-generation observation of another address does not move a link.
 
 **Pooled placement attaches (B5).** With `WithPendingCommands`, a
 "placement" sweep pages one control shard of the disposition inbox per

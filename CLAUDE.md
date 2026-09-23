@@ -1481,6 +1481,30 @@ refusal on the viewing path. A base that is not bare (`base_names_tenant`,
 `base_not_bare`) refuses EVERY tenant: that is the compatibility window with a
 Host still advertising `…/hostlink/<tenant>`.
 
+### A Host restarted under its HostID moves its link (v0.9.0, I3.1 D1)
+
+A pod-style restart keeps the HostID and comes back at a HIGHER generation on a
+NEW address. `acquireLocked`/`acquireUnlocked` used to return the cached
+`linkKey{host, tenant}` link without looking at where it went, so a replica
+redialled the dead address (`ErrLinkReconnecting`, placement skipped the Host)
+until the 60 s reaper collected it -- never, while a viewer's route pinned it.
+Each `pooledLink` now records the derived `endpoint` and `generation` it was
+dialled on, and **`supersededBy` replaces it only for another address under a
+strictly higher generation**; same address at a higher generation just raises
+the recorded one (`observe`: the transport's reconnect reaches it there), and
+an older or same-generation observation of another address keeps the link --
+one incarnation cannot be at two addresses, and following the last caller would
+let two stale sources flap it. Zero generation is the oldest. The replacement
+dials FIRST (a failed dial changes nothing), then drops the old link with its
+routes (`dropLinkLocked`, as a terminal eviction does) and closes it AFTER the
+pool lock is released. Bind and Attach take the generation from their request;
+the gate-capability read from `Target.Generation`, which `gateResponders` fills
+from the owner observation (the one caller-supplied use of that field; the
+Dialer is handed `Target.dialable()` without it). Readers:
+`host_moved_test.go` and `TestTheCapabilityAdapterCarriesTheOwnersGeneration`;
+the tests lane's `TestASessionIsRePlacedPromptlyOnAHostRestartedUnderItsHostID`
+went 61 s -> 3.2 s.
+
 ### The gate_response capability gate (v0.5.0)
 
 **`hostlink.GateResponseCapable` is the ONE predicate** over a Host's connect
@@ -1537,8 +1561,9 @@ the same function `AdmitGateResponse` calls** (fresh matching owner, then
 `unavailable`; `GateResponsesAnswerable` still returns it as an error, which
 the read treats as not-answerable (measured equivalent at the edge). The gate
 is never hidden; only `resident` is overlaid; the owner check runs only when
-some gate is stored resident (skipping that short-circuit is an equivalent
-mutant -- cost, not output). The capability read may dial the owner's link on a
+some gate is stored resident -- that short-circuit is observable, because the
+check can DIAL the owner's link: `TestAStoredNonResidentGateIsReportedAsStored`
+stores a suspended gate under a fresh capable owner and requires no dial. The capability read may dial the owner's link on a
 public read, as the write already does. Reader:
 `TestTheGatesReadAgreesWithTheGateResponseWritePath` (real store, composed
 Server; each row asserts the read AND the answer's status).
@@ -2569,6 +2594,34 @@ silent for as long as it was watched.
 **A bind that meets a terminal link now evicts it**, as attach did since B5: a
 viewer's route otherwise pins a dead link and the re-bind never reaches the Host.
 
+**A tail that skips a PUBLIC record is repaired, not relayed (v0.9.0, I3.1
+D2).** A Host can commit a public record it never relays -- a warm release
+commits `SessionResidencyReleased` after its tail stopped -- and a re-placed
+session's new tail then arrives on the SAME subscription, so a viewer on a
+replica that did not place it received E8.. with nothing in front and a later
+reset vouched for 7. `hostBinding` now keeps the tail's known position
+(`tailSeq`/`tailKnown`): anchored by `Relay.Anchor` (the plane calls it on the
+first viewer's gapless tail start, whose durable read reaches at least that
+tip), by every Resync/repair (the tip every viewer was sent to), and raised by
+each enduring record. A record past `tailSeq+1` is PROBED in `Receive` with the
+lock released: one page from `tailSeq+1`, `Limit 1`, `ScanLimit` = the gap
+(capped at `storage.MaxOrderedPageLimit`). An event below the record, or a page
+that could not cover the gap, is a hole: every binding is reset to the page's
+tip BEFORE the record is queued (`resetForGapLocked`); a failed probe takes a
+fresh tip read; a tip below the record's predecessor closes the viewers
+(fail closed). A gap of private records -- ordinary, since Hosts relay public
+records only -- costs one bounded read and no reset. A tail with no known
+position (a Relay no plane anchored) keeps the original rule and is never
+probed. Readers: `internal/routing/anchor_test.go` (the first-record and
+mid-stream cases of the reproduction, private gaps, bounds, the fail-closed
+arms) and `TestAViewerJoiningAQuietHostSessionIsToldOfARecordItsTailNeverCarried`
+over a real runtime journal. The probe needs a truthful journal: it reads the
+runtime journal through `WithJournalResolver`, and a reader that reports
+`covered_through` over positions it holds no events for (as the tests kit's
+`pooledTipReader` did) reads as all-private and hides the hole. Without a
+resolver a Host session's tip is 0, so the first record past it is an
+unrepairable gap and the viewer is closed before anything reaches it.
+
 **Known limits, booked rather than hidden.** (1) A private record between two
 public ones makes the Relay's `lastContiguous` stick (Core requires
 `covered_through == journal_seq` on a live publication), so a reset names an
@@ -2624,7 +2677,8 @@ because its `ServeSessionReader` did the mapping by hand.
   layout, through `composeLive` over the composed config: a HostLink drop after
   three delivered records resets at the last delivered sequence with tip >= it
   and closes nothing (the inverted `TestTip0Repro`), and without a resolver the
-  same world closes the viewer (the control). The runtime journal's opening
+  same world closes the viewer before its first record (the control; see the
+  D2 paragraph under The live tail). The runtime journal's opening
   fence occupies sequence 1, so the three events are 2..4 -- which is also why
   the assertions name sequences, not counts. `WithFakeJournals()` (fakes) is
   what compositions that create/place but never read a journal use.
