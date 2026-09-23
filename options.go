@@ -45,11 +45,12 @@ var (
 	// ErrEmptyVersion reports an empty WithVersion.
 	ErrEmptyVersion = errors.New("factory: the build version is empty")
 	// ErrObjectPolicyWithoutResolver reports an ObjectPolicy composed with no
-	// ObjectStoreResolver behind it. See WithObjectPolicy.
-	ErrObjectPolicyWithoutResolver = errors.New("factory: WithObjectPolicy requires WithObjectStoreResolver")
+	// object resolver behind it -- neither WithSessionObjectStoreResolver nor
+	// the deprecated WithObjectStoreResolver. See WithObjectPolicy.
+	ErrObjectPolicyWithoutResolver = errors.New("factory: WithObjectPolicy requires WithSessionObjectStoreResolver")
 	// ErrSessionBindingWithoutResolver reports a SessionBinding composed with
-	// no ObjectStoreResolver behind it. See WithSessionBinding.
-	ErrSessionBindingWithoutResolver = errors.New("factory: WithSessionBinding requires WithObjectStoreResolver")
+	// no object resolver behind it. See WithSessionBinding.
+	ErrSessionBindingWithoutResolver = errors.New("factory: WithSessionBinding requires WithSessionObjectStoreResolver")
 	// ErrIncompleteSessionBinding reports a WithSessionBinding missing a
 	// member. A binding is immutable after create, so a partial one cannot be
 	// completed later.
@@ -142,10 +143,14 @@ type config struct {
 	replicaID  string
 	version    string
 
-	workloads      WorkloadController
-	department     []LaunchTemplate
-	objectPolicy   ObjectPolicy
+	workloads    WorkloadController
+	department   []LaunchTemplate
+	objectPolicy ObjectPolicy
+	// objectStores is the deprecated resolver, sessionObjects its
+	// replacement; at most one of the two is set. See
+	// WithSessionObjectStoreResolver.
 	objectStores   ObjectStoreResolver
+	sessionObjects SessionObjectStoreResolver
 	sessionBinding SessionBindingTemplate
 	publicCreates  PublicCreates
 	objects        ObjectLimits

@@ -374,9 +374,14 @@ Redis or NATS broker. NATS may separately be selected as a Storage backend.
 
 Pooled and dedicated describe placement, not durability. Durable recovery
 requires a shared SessionStore backend, its leases and the Harness journal;
-object bytes require the selected object store. SessionStore's legacy
-`PutObject` and object-first write order do not provide a Host disposition
-`SessionObjectStore` by themselves. A dedicated workload is controlled by its
+object bytes require the selected object store. A Host session's tool-result
+captures live in the runtime's store under the binding's `RuntimeSessionID`;
+`WithSessionObjectStoreResolver` resolves that store from the principal's
+tenant, the public session and the catalog binding, and Factory addresses the
+read to the runtime id. The object route serves only with an injected
+`ObjectPolicy` (503 without one), serves only `tool-result` objects, answers a
+policy denial with the same 404 as an absent object, and verifies at most
+64 MiB per object. A dedicated workload is controlled by its
 workload controller, including drain and termination; Factory does not issue a
 HostLink drain or implement drain-before-delete in its placement seam.
 

@@ -119,7 +119,14 @@ type RouterConfig struct {
 	// namespace translation belongs to the resolved adapter, never this handler.
 	// Production resolver/public server composition remains A9's obligation.
 	ResolveObjectStore func(context.Context, sessionstore.SessionBinding) (ObjectReader, error)
-	ObjectLimits       ObjectLimits
+	// ResolveSessionObjectStore is ResolveObjectStore handed, as well, the
+	// principal's tenant and the PUBLIC session id the route was authorized
+	// for. Its reader is addressed by the binding's RuntimeSessionID -- this
+	// handler rewrites the request, as the journal plane does -- because a
+	// Host-owned session's objects live under the runtime id. At most one of
+	// the two resolvers may be supplied.
+	ResolveSessionObjectStore func(context.Context, sessionwire.TenantID, sessionwire.SessionID, sessionstore.SessionBinding) (ObjectReader, error)
+	ObjectLimits              ObjectLimits
 
 	// Directory is the observed Host target directory, read by /v1/agents to
 	// learn which configured launch targets are currently advertised.
@@ -243,23 +250,24 @@ type RouterConfig struct {
 
 // Router is Factory's public HTTP surface.
 type Router struct {
-	quiesced           atomic.Bool
-	credentials        *internalidentity.Authenticator
-	authorizer         Authorizer
-	reads              SessionReader
-	directory          Directory
-	department         []LaunchTemplate
-	guard              *Guard
-	ids                IDSource
-	ui                 http.Handler
-	limits             RouteLimits
-	admissions         ControlAdmitter
-	gateOwners         GateOwners
-	realtime           func() http.Handler
-	wakes              *wakes
-	objectPolicy       ObjectPolicy
-	resolveObjectStore func(context.Context, sessionstore.SessionBinding) (ObjectReader, error)
-	objectLimits       ObjectLimits
+	quiesced              atomic.Bool
+	credentials           *internalidentity.Authenticator
+	authorizer            Authorizer
+	reads                 SessionReader
+	directory             Directory
+	department            []LaunchTemplate
+	guard                 *Guard
+	ids                   IDSource
+	ui                    http.Handler
+	limits                RouteLimits
+	admissions            ControlAdmitter
+	gateOwners            GateOwners
+	realtime              func() http.Handler
+	wakes                 *wakes
+	objectPolicy          ObjectPolicy
+	resolveObjectStore    func(context.Context, sessionstore.SessionBinding) (ObjectReader, error)
+	resolveSessionObjects func(context.Context, sessionwire.TenantID, sessionwire.SessionID, sessionstore.SessionBinding) (ObjectReader, error)
+	objectLimits          ObjectLimits
 
 	// own is every response the router produces itself: the security headers,
 	// then the path split, then authentication, then the guard, then the mux.
@@ -306,6 +314,9 @@ func NewRouter(cfg RouterConfig) (*Router, error) {
 	if err := cfg.Limits.Validate(); err != nil {
 		return nil, err
 	}
+	if cfg.ResolveObjectStore != nil && cfg.ResolveSessionObjectStore != nil {
+		return nil, fmt.Errorf("%w: ResolveObjectStore and ResolveSessionObjectStore are alternatives; supply one", ErrInvalidRouterConfig)
+	}
 	if cfg.ObjectLimits == (ObjectLimits{}) {
 		cfg.ObjectLimits = DefaultObjectLimits()
 	}
@@ -321,18 +332,19 @@ func NewRouter(cfg RouterConfig) (*Router, error) {
 		// The caller's configuration is COPIED rather than referenced, so a
 		// composer that reuses its buffers after NewRouter returns cannot
 		// change what a running router advertises.
-		department:         cloneDepartment(cfg.Department),
-		guard:              cfg.Guard,
-		ids:                cfg.IDs,
-		ui:                 cfg.UI,
-		limits:             cfg.Limits,
-		admissions:         cfg.Admissions,
-		gateOwners:         cfg.GateOwners,
-		realtime:           cfg.Realtime,
-		wakes:              newWakes(cfg.Delivery, cfg.Limits.RequestTimeout, maxConcurrentWakes).withLogger(cfg.Logger),
-		objectPolicy:       cfg.ObjectPolicy,
-		resolveObjectStore: cfg.ResolveObjectStore,
-		objectLimits:       cfg.ObjectLimits,
+		department:            cloneDepartment(cfg.Department),
+		guard:                 cfg.Guard,
+		ids:                   cfg.IDs,
+		ui:                    cfg.UI,
+		limits:                cfg.Limits,
+		admissions:            cfg.Admissions,
+		gateOwners:            cfg.GateOwners,
+		realtime:              cfg.Realtime,
+		wakes:                 newWakes(cfg.Delivery, cfg.Limits.RequestTimeout, maxConcurrentWakes).withLogger(cfg.Logger),
+		objectPolicy:          cfg.ObjectPolicy,
+		resolveObjectStore:    cfg.ResolveObjectStore,
+		resolveSessionObjects: cfg.ResolveSessionObjectStore,
+		objectLimits:          cfg.ObjectLimits,
 	}
 
 	mux := http.NewServeMux()

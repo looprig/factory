@@ -376,7 +376,8 @@ has to name the `METHOD /path` and say why its rule is adequate, and
 rule, command kind, body, session, streaming and readiness columns — written
 from the operation's shape, not from the table. Both object routes now require
 `AuthorizeObjectRead` before catalog lookup, then a configured committed-reference
-policy before metadata or bytes. Missing policy fails closed with 503.
+policy before metadata or bytes. Missing policy fails closed with 503. See
+"A Host session's objects are the runtime's" for v0.11.0's addressing.
 
 **`owner` and `handle` are per METHOD, for the reason `auth` is.** A2.1 moved
 authorization onto `methodRule` because `/v1/sessions` is a list and a create
@@ -2711,6 +2712,42 @@ request is already rewritten to the runtime id, which is a one-way derivation.
   argument to the runtime id or `""`, removing either `switch` arm in `New`,
   or dropping the conflict or either-satisfies check each fails a named case.
 
+## A Host session's objects are the runtime's (`WithSessionObjectStoreResolver`, v0.11.0)
+
+I2.2 defect 3: the object route answered 503 for every Host session (no policy,
+or a bound session with no resolver), and the v0.10.0 `ObjectStoreResolver` was
+shaped wrongly -- handed only the binding, its reader asked by the PUBLIC
+session id, while a Harness runtime writes a tool-result capture under the
+binding's `RuntimeSessionID` in the per-tenant runtime store.
+
+- **`SessionObjectStoreResolver(ctx, tenant, session, binding)`** mirrors
+  `SessionJournalResolver`: tenant from the principal, session and binding from
+  the catalog entry the route was authorized for. `serveObject` (not an
+  adapter) rewrites both store requests to `binding.RuntimeSessionID`, so the
+  rewrite has one reader. A zero binding still reads `WithSessionReader` under
+  the public id. The runtime id is never echoed (metadata names no session).
+- **The deprecated `WithObjectStoreResolver` keeps v0.10.0 addressing** (public
+  id). Both options is `ErrConflictingObjectResolvers` (an `*OptionError`
+  naming `WithSessionObjectStoreResolver`); `NewRouter` refuses both too.
+  Either satisfies `WithObjectPolicy` and `WithSessionBinding`.
+- **Missing policy stays 503 `unavailable`**, before the resolver -- kept for
+  compatibility (Carbon asserts it). Its `retryable:true` is the one 5xx rule's,
+  not a promise.
+- **A policy denial (`identity.ErrUnauthorized`) is 404, the same bytes as an
+  absent object** (`objectAbsent`, the one construction). v0.10.0 answered 403.
+  Another session's reference is absent because the read is addressed to THIS
+  session's runtime scope, whatever the policy said.
+- **Only `ObjectKindToolResult` is served.** Any other kind from the policy is a
+  policy fault (500), refused before a store is resolved.
+- **Size** stays `ObjectLimits` (1 MiB page, 64 MiB verification). The runtime's
+  capture ceiling must not exceed `MaxVerificationBytes`; Factory cannot see it,
+  so the composition asserts it (I2.2 D7).
+- **The production policy is not here**: Factory has no harness edge, so the
+  committed-journal evidence check (D1, harness `LookupToolResultCapture`) is
+  composition glue in `tests`/Carbon.
+- **Readers:** `compose_session_objects_internal_test.go` over a real control
+  store and a real runtime store in Harness's legacy layout.
+
 ## Current composition boundary
 
 `factory.New` composes the public router, admission, ClientLink, HostLink pool,
@@ -2726,5 +2763,5 @@ The service exports no Prometheus metrics handler. Do not invent backlog,
 resident-wait, queue, reconciliation or drain series in an operations example.
 The placement seam does not implement dedicated drain-before-delete; that is
 owned by the workload controller. A cold AskUser answer/resume remains
-unsupported. SessionStore's legacy object-first `PutObject` does not imply a
-Host disposition `SessionObjectStore`.
+unsupported. A Host session's objects are read through
+`WithSessionObjectStoreResolver` (above).

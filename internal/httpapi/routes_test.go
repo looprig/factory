@@ -2361,6 +2361,19 @@ func TestNewRouterRefusesAnIncompleteComposition(t *testing.T) {
 			t.Errorf("omitting %s returned a router as well as an error", name)
 		}
 	}
+	// The two object resolvers are alternatives; each alone is accepted.
+	both := complete()
+	both.ResolveObjectStore = func(context.Context, sessionstore.SessionBinding) (ObjectReader, error) { return nil, nil }
+	both.ResolveSessionObjectStore = func(context.Context, sessionwire.TenantID, sessionwire.SessionID, sessionstore.SessionBinding) (ObjectReader, error) {
+		return nil, nil
+	}
+	if router, err := NewRouter(both); !errors.Is(err, ErrInvalidRouterConfig) || router != nil {
+		t.Errorf("both object resolvers = %v, want ErrInvalidRouterConfig", err)
+	}
+	both.ResolveObjectStore = nil
+	if _, err := NewRouter(both); err != nil {
+		t.Errorf("the session object resolver alone was refused: %v", err)
+	}
 	for name, limits := range map[string]RouteLimits{
 		"a zero body ceiling": {MaxRequestBytes: 0, RequestTimeout: time.Second},
 		"a negative ceiling":  {MaxRequestBytes: -1, RequestTimeout: time.Second},

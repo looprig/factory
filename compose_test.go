@@ -1126,7 +1126,9 @@ func TestABoundSessionsObjectReadGoesThroughTheComposedResolver(t *testing.T) {
 type grantingObjectPolicy struct{}
 
 func (grantingObjectPolicy) AuthorizeReference(context.Context, identity.Principal, sessionstore.CatalogEntry, sessionwire.ObjectReference) (sessionstore.ObjectKind, error) {
-	return sessionstore.ObjectKindCommandPayload, nil
+	// The route serves tool-result and nothing else (v0.11.0); a policy
+	// granting another kind is refused before any resolver is reached.
+	return sessionstore.ObjectKindToolResult, nil
 }
 
 // TestStopWaitsForASweepThatIsStillInFlight is the sharp form of the wait.

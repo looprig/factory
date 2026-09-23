@@ -2,6 +2,7 @@ package factory
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 
@@ -150,13 +151,16 @@ func (t LaunchTemplate) published() httpapi.LaunchTemplate {
 
 // ObjectPolicy authorizes one object reference using trusted committed session
 // evidence, and it is an alias for LaunchTemplate's reason.
-// A denial must wrap identity.ErrUnauthorized; any other error is a policy
-// dependency fault.
+// A denial must wrap identity.ErrUnauthorized, and since v0.11.0 it is
+// answered 404 with the same body as an absent object (v0.10.0 answered 403),
+// so a caller cannot tell a reference it may not read from one that does not
+// exist. Any other error is a policy dependency fault (500). The kind returned
+// must be sessionstore.ObjectKindToolResult; the route serves no other.
 //
 // A nil policy fails closed at the router: an object read is answered
 // "unavailable" before the catalog summary, before any authorization call and
 // before any reader is reached. That is why supplying one is OPTIONAL here and
-// why supplying one without an ObjectStoreResolver is REFUSED -- see
+// why supplying one without an object resolver is REFUSED -- see
 // WithObjectPolicy.
 type ObjectPolicy = httpapi.ObjectPolicy
 
@@ -171,7 +175,47 @@ type ObjectReader = httpapi.ObjectReader
 // BindingVersion chosen at create and immutable afterwards; a resolver that
 // answered a default for an unknown one would serve one deployment's bytes
 // under another's configuration.
+//
+// The reader it returns is asked by the principal's tenant and the PUBLIC
+// session id.
+//
+// Deprecated: use SessionObjectStoreResolver. This resolver is handed neither
+// the tenant nor the public session, and its reader is addressed by the public
+// session id -- but a Host-owned session's objects (a Harness runtime's
+// tool-result captures) live under the binding's RuntimeSessionID in the
+// runtime's own store, so through this resolver they are never found.
 type ObjectStoreResolver func(ctx context.Context, binding sessionstore.SessionBinding) (ObjectReader, error)
+
+// ErrConflictingObjectResolvers reports a composition that supplies both
+// WithSessionObjectStoreResolver and the deprecated WithObjectStoreResolver.
+// They are alternatives for the same route and neither silently shadows the
+// other. It is reported as an *OptionError naming
+// WithSessionObjectStoreResolver.
+var ErrConflictingObjectResolvers = errors.New("factory: WithSessionObjectStoreResolver and WithObjectStoreResolver are alternatives; supply one")
+
+// SessionObjectStoreResolver answers the store a bound session's objects live
+// in, and is the object route's counterpart of SessionJournalResolver.
+//
+// It is handed the principal's tenant, the PUBLIC session id the route was
+// authorized for (the id the catalog entry -- and so binding -- was read by,
+// never a value taken from the request body or the store), and the catalog's
+// full immutable binding. It must refuse any binding this deployment does not
+// know, for ObjectStoreResolver's reason.
+//
+// The reader it returns is asked with the principal's tenant and the
+// binding's RUNTIME session id: Factory rewrites every GetObjectMetadata and
+// GetObject request before it is called, exactly as it rewrites a journal
+// read. For a Harness runtime that reader is the per-tenant runtime store --
+// sessionstore.Open(ctx, harnessBackend, sessionstore.WithLegacySingleTenant(tenant)),
+// the same store WithSessionJournalResolver answers -- where Harness writes a
+// tool-result capture under the runtime session. The runtime session id never
+// reaches a client: object metadata names no session.
+//
+// It is consulted only for a session with a non-zero binding; an unbound
+// (legacy) session's objects are read from WithSessionReader under the public
+// id, unchanged. And it is consulted only AFTER the ObjectPolicy has
+// authorized the reference -- see WithSessionObjectStoreResolver.
+type SessionObjectStoreResolver func(ctx context.Context, tenant sessionwire.TenantID, session sessionwire.SessionID, binding sessionstore.SessionBinding) (ObjectReader, error)
 
 // ---------------------------------------------------------------------------
 // Options for the seams above.
@@ -309,7 +353,8 @@ func WithWorkloadController(w WorkloadController) Option {
 // object reference. Optional; without one every object read answers
 // "unavailable" before any reader is reached.
 //
-// Supplying it WITHOUT WithObjectStoreResolver is refused by New, and that
+// Supplying it WITHOUT an object resolver (WithSessionObjectStoreResolver, or
+// the deprecated WithObjectStoreResolver) is refused by New, and that
 // refusal is the whole reason these are two options rather than one value. The
 // router resolves a store only for a NON-ZERO binding and falls back to the
 // read plane for a zero (legacy) one; a nil policy refuses first and
@@ -360,7 +405,8 @@ func WithPublicCreates(p PublicCreates) Option {
 // is permanently pinned to. Without it a V1 create is refused
 // runtime_unavailable and every other operation is unaffected.
 //
-// It is REFUSED without WithObjectStoreResolver, for a sharper reason than
+// It is REFUSED without an object resolver (WithSessionObjectStoreResolver, or
+// the deprecated WithObjectStoreResolver), for a sharper reason than
 // WithObjectPolicy's. A SessionBinding is IMMUTABLE AFTER CREATE: a session
 // pinned to a StorageBindingID this deployment's resolver cannot resolve has
 // permanently unreadable objects, and there is no repair short of an offline
@@ -380,8 +426,57 @@ func WithSessionBinding(storageBindingID, bindingVersion string) Option {
 	})
 }
 
+// WithSessionObjectStoreResolver supplies where a bound session's objects are
+// read: GET|HEAD /v1/sessions/{sid}/objects/{oid} and its /metadata.
+//
+//	factory.WithSessionObjectStoreResolver(func(ctx context.Context, tenant sessionwire.TenantID,
+//		session sessionwire.SessionID, binding sessionstore.SessionBinding) (factory.ObjectReader, error) {
+//		return runtimeStore(ctx, tenant, binding) // refuses an unknown binding
+//	})
+//
+// What the route guarantees around it:
+//
+//   - It serves only with an ObjectPolicy (WithObjectPolicy). With none, every
+//     object read answers 503 "unavailable" before the catalog summary, the
+//     policy or this resolver -- the same answer v0.10.0 gave, kept so a
+//     composition that serves no objects is not moved.
+//   - The policy is asked FIRST, with the catalog entry; this resolver is
+//     reached only for a reference it authorized. A denial (identity.ErrUnauthorized)
+//     answers the same 404 body as an object the store does not hold, so a
+//     caller cannot tell "not yours" from "not there". Evidence belongs to
+//     the policy, not to the store: SessionStore's metadata index is not
+//     authorization.
+//   - Only ObjectKindToolResult is served. A policy answering any other kind
+//     is a policy fault (500), refused before this resolver is asked.
+//   - Size is bounded by ObjectLimits: at most 1 MiB per page and 64 MiB of
+//     whole-object verification. A larger object answers 413 however it is
+//     paged, so a runtime's capture ceiling must stay within
+//     MaxVerificationBytes (I2.2 D7) -- that is the composition's to assert;
+//     Factory cannot see the runtime's ceiling.
+//   - Tenant and session come from the principal and the catalog, never from
+//     the client; the object reference is resolved only within the addressed
+//     (tenant, runtime session) scope, so another session's reference is absent.
+//
+// It is the replacement for WithObjectStoreResolver and satisfies the same
+// requirements (WithObjectPolicy and WithSessionBinding need one of them).
+// Supplying both is refused by New with ErrConflictingObjectResolvers.
+func WithSessionObjectStoreResolver(r SessionObjectStoreResolver) Option {
+	return option("WithSessionObjectStoreResolver", func(cfg *config) error {
+		if r == nil {
+			return nilDependency("WithSessionObjectStoreResolver")
+		}
+		cfg.sessionObjects = r
+		return nil
+	})
+}
+
 // WithObjectStoreResolver supplies the binding-to-store resolution an object
 // read uses. See WithObjectPolicy for why the two travel together.
+//
+// Deprecated: use WithSessionObjectStoreResolver. This resolver's reader is
+// addressed by the public session id, so a Host-owned session's objects,
+// stored under its RuntimeSessionID, are never found through it. It keeps its
+// v0.10.0 behaviour and cannot be combined with WithSessionObjectStoreResolver.
 func WithObjectStoreResolver(r ObjectStoreResolver) Option {
 	return option("WithObjectStoreResolver", func(cfg *config) error {
 		if r == nil {

@@ -144,12 +144,12 @@ func TestObjectAuthPrecedesExistenceAndPolicyPrecedesMetadata(t *testing.T) {
 			wantStatus int
 			wantCode   sessionwire.ErrorCode
 		}{
-			{"public sentinel", identity.ErrUnauthorized, http.StatusForbidden, ErrorCodeNotAuthorized},
-			{"wrapped public sentinel", fmt.Errorf("external object policy: %w", identity.ErrUnauthorized), http.StatusForbidden, ErrorCodeNotAuthorized},
+			{"public sentinel", identity.ErrUnauthorized, http.StatusNotFound, sessionwire.ErrorCodeInvalidRequest},
+			{"wrapped public sentinel", fmt.Errorf("external object policy: %w", identity.ErrUnauthorized), http.StatusNotFound, sessionwire.ErrorCodeInvalidRequest},
 			// Depth 2 and a join: a classifier that unwraps exactly once
 			// passes the two rows above and fails both of these.
-			{"doubly wrapped public sentinel", fmt.Errorf("external object policy: %w", fmt.Errorf("policy engine: %w", identity.ErrUnauthorized)), http.StatusForbidden, ErrorCodeNotAuthorized},
-			{"joined public sentinel", errors.Join(errors.New("audit sink unavailable"), identity.ErrUnauthorized), http.StatusForbidden, ErrorCodeNotAuthorized},
+			{"doubly wrapped public sentinel", fmt.Errorf("external object policy: %w", fmt.Errorf("policy engine: %w", identity.ErrUnauthorized)), http.StatusNotFound, sessionwire.ErrorCodeInvalidRequest},
+			{"joined public sentinel", errors.Join(errors.New("audit sink unavailable"), identity.ErrUnauthorized), http.StatusNotFound, sessionwire.ErrorCodeInvalidRequest},
 			{"policy dependency fault", errors.New("policy backend failed"), http.StatusInternalServerError, ErrorCodeInternal},
 		} {
 			t.Run(suffix+"/"+policy.name, func(t *testing.T) {
@@ -163,6 +163,18 @@ func TestObjectAuthPrecedesExistenceAndPolicyPrecedesMetadata(t *testing.T) {
 				}
 				if code := decodeEnvelope(t, got).Error.Code; code != policy.wantCode {
 					t.Errorf("error code = %q, want %q", code, policy.wantCode)
+				}
+				// A denial is ABSENCE (v0.11.0): the same bytes as a reference
+				// the store does not hold, so "not yours" and "not there"
+				// cannot be told apart.
+				if policy.wantStatus == http.StatusNotFound {
+					f.router.objectPolicy = objectPolicyFunc(func(context.Context, identity.Principal, sessionstore.CatalogEntry, sessionwire.ObjectReference) (sessionstore.ObjectKind, error) {
+						return sessionstore.ObjectKindToolResult, nil
+					})
+					absent := f.get(strings.Replace(objectTarget(m), m.Reference.ObjectID[len(m.Reference.ObjectID)-8:], "00000000", 1) + suffix)
+					if absent.Code != http.StatusNotFound || responseDifference(got, absent) != "" {
+						t.Fatalf("a denial (%d %s) differs from an absent object (%d %s)", got.Code, got.Body, absent.Code, absent.Body)
+					}
 				}
 			})
 		}
@@ -387,23 +399,26 @@ func TestObjectPolicyIsNotMetadataExistenceOrCallerKind(t *testing.T) {
 		return "", internalidentity.ErrUnauthorized
 	})
 	for _, suffix := range []string{"", "/metadata"} {
-		if got := f.get(objectTarget(m) + suffix); got.Code != 403 {
+		if got := f.get(objectTarget(m) + suffix); got.Code != 404 {
 			t.Fatal(got.Code)
 		}
 	}
 	if observer.metadataCalls != 0 || observer.bodyCalls != 0 {
 		t.Fatalf("denied policy reached storage: %+v", observer)
 	}
-	// Even an allowed logical tool-result ID cannot select its own kind: trusted
-	// policy says artifact, so SessionStore rejects the disagreement.
-	f.router.objectPolicy = objectPolicyFunc(func(context.Context, identity.Principal, sessionstore.CatalogEntry, sessionwire.ObjectReference) (sessionstore.ObjectKind, error) {
-		return sessionstore.ObjectKindArtifact, nil
-	})
-	if got := f.get(objectTarget(m)); got.Code != 400 {
-		t.Fatalf("caller kind overrode policy: %d", got.Code)
+	// The route serves tool-result only. A policy answering any other kind is
+	// a policy fault, refused before any store is asked -- so a logical
+	// tool-result ID can neither select its own kind nor be read as another.
+	for _, kind := range []sessionstore.ObjectKind{sessionstore.ObjectKindArtifact, sessionstore.ObjectKindCommandPayload, ""} {
+		f.router.objectPolicy = objectPolicyFunc(func(context.Context, identity.Principal, sessionstore.CatalogEntry, sessionwire.ObjectReference) (sessionstore.ObjectKind, error) {
+			return kind, nil
+		})
+		if got := f.get(objectTarget(m)); got.Code != 500 {
+			t.Fatalf("%q: a kind the route does not serve answered %d", kind, got.Code)
+		}
 	}
-	if observer.bodyCalls != 0 {
-		t.Fatal("wrong kind opened body")
+	if observer.metadataCalls != 0 || observer.bodyCalls != 0 {
+		t.Fatalf("a kind the route does not serve reached storage: %+v", observer)
 	}
 }
 

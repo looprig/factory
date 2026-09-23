@@ -660,6 +660,17 @@ func resolveObjectStore(r ObjectStoreResolver) func(context.Context, sessionstor
 	}
 }
 
+// resolveSessionObjects is resolveObjectStore for the session-aware resolver,
+// and keeps nil nil for the same reason.
+func resolveSessionObjects(r SessionObjectStoreResolver) func(context.Context, sessionwire.TenantID, sessionwire.SessionID, sessionstore.SessionBinding) (httpapi.ObjectReader, error) {
+	if r == nil {
+		return nil
+	}
+	return func(ctx context.Context, tenant sessionwire.TenantID, session sessionwire.SessionID, binding sessionstore.SessionBinding) (httpapi.ObjectReader, error) {
+		return r(ctx, tenant, session, binding)
+	}
+}
+
 // stopRealtime owns one shutdown attempt. It hides the node from new requests
 // immediately, retains the handle on failure, and replays that result to every
 // later caller. Repeating Demand.Release would be unsafe: its local count may

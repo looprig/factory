@@ -58,6 +58,23 @@ func invalidObjectRequest() apiError {
 func objectUnavailable() apiError {
 	return apiError{status: 503, code: ErrorCodeUnavailable, message: "this deployment cannot read the object at the moment"}
 }
+
+// objectAbsent is the ONE answer for "there is no object here you may read":
+// a store that does not hold the reference in the addressed scope, and an
+// ObjectPolicy denial. One construction serves both so their bytes cannot
+// drift apart and a caller cannot tell "not yours" from "not there".
+func objectAbsent() apiError {
+	return apiError{status: 404, code: sessionwire.ErrorCodeInvalidRequest, message: "there is no readable object"}
+}
+
+// objectPolicyFailure classifies an ObjectPolicy error. A denial is absence;
+// anything else is the policy's own fault and stays 500.
+func objectPolicyFailure(err error) apiError {
+	if errors.Is(err, internalidentity.ErrUnauthorized) {
+		return objectAbsent()
+	}
+	return authorizationFailure(err)
+}
 func objectTooLarge() apiError {
 	return apiError{status: 413, code: ErrorCodePayloadTooLarge, message: "the object or requested page exceeds this deployment's read limit"}
 }
@@ -71,12 +88,12 @@ func objectFailure(err error) apiError {
 	var absent *storage.BlobNotFoundError
 	var object *sessionstore.ObjectError
 	if errors.As(err, &absent) {
-		return apiError{status: 404, code: sessionwire.ErrorCodeInvalidRequest, message: "there is no readable object"}
+		return objectAbsent()
 	}
 	if errors.As(err, &object) {
 		switch object.Code {
 		case sessionstore.ObjectErrorMetadataUnavailable:
-			return apiError{status: 404, code: sessionwire.ErrorCodeInvalidRequest, message: "there is no readable object"}
+			return objectAbsent()
 		case sessionstore.ObjectErrorInvalid:
 			return invalidObjectRequest()
 		case sessionstore.ObjectErrorBackend:
@@ -111,21 +128,41 @@ func (rt *Router) serveObject(metadataOnly bool) http.Handler {
 		ref := sessionwire.ObjectReference{ObjectID: r.PathValue("oid")}
 		kind, err := rt.objectPolicy.AuthorizeReference(r.Context(), op.Principal, entry, ref)
 		if err != nil {
-			writeAPIError(w, authorizationFailure(err))
+			writeAPIError(w, objectPolicyFailure(err))
+			return
+		}
+		// The route serves tool-result captures and nothing else. A policy
+		// vouching for another kind -- a command payload, a checkpoint -- is
+		// the policy's fault, refused before any store is resolved, rather
+		// than a reason to hand those bytes to a browser.
+		if kind != sessionstore.ObjectKindToolResult {
+			writeAPIError(w, internalFailure())
 			return
 		}
 		reader := ObjectReader(rt.reads)
+		// address is the session every store request is addressed by: the
+		// public id for an unbound session and for the deprecated resolver,
+		// the binding's runtime id for the session-aware one.
+		address := entry.Record.SessionID
 		var unbound sessionstore.SessionBinding
 		// Zero-value comparison is sufficient only because the Summary guard
 		// above ran sessionstore@v0.8.0's canonicalCatalogRecord, which validates
 		// any non-zero binding: a partial binding cannot reach here as a valid
 		// record. If SessionStore ever relaxes that, this test is not enough.
-		if entry.Record.Binding != unbound {
-			if rt.resolveObjectStore == nil {
+		if binding := entry.Record.Binding; binding != unbound {
+			switch {
+			case rt.resolveSessionObjects != nil:
+				// Tenant from the principal, session and binding from the
+				// catalog entry the route was authorized for -- never the
+				// request. The read is then rewritten to the runtime id.
+				reader, err = rt.resolveSessionObjects(r.Context(), op.Principal.Tenant(), entry.Record.SessionID, binding)
+				address = sessionwire.SessionID(binding.RuntimeSessionID)
+			case rt.resolveObjectStore != nil:
+				reader, err = rt.resolveObjectStore(r.Context(), binding)
+			default:
 				writeAPIError(w, objectUnavailable())
 				return
 			}
-			reader, err = rt.resolveObjectStore(r.Context(), entry.Record.Binding)
 			if err != nil {
 				if fail, ok := contextFailure(err); ok {
 					writeAPIError(w, fail)
@@ -140,7 +177,7 @@ func (rt *Router) serveObject(metadataOnly bool) http.Handler {
 			}
 		}
 		scope := newScope(op.Principal)
-		m, err := reader.GetObjectMetadata(r.Context(), scope.objectMetadata(entry.Record.SessionID, ref, kind))
+		m, err := reader.GetObjectMetadata(r.Context(), scope.objectMetadata(address, ref, kind))
 		if err != nil {
 			writeAPIError(w, objectFailure(err))
 			return
@@ -170,7 +207,7 @@ func (rt *Router) serveObject(metadataOnly bool) http.Handler {
 			writeAPIError(w, objectTooLarge())
 			return
 		}
-		stream, err := reader.GetObject(r.Context(), scope.objectBody(entry.Record.SessionID, m, kind))
+		stream, err := reader.GetObject(r.Context(), scope.objectBody(address, m, kind))
 		if err != nil {
 			writeAPIError(w, objectFailure(err))
 			return

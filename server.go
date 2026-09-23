@@ -290,7 +290,15 @@ func New(opts ...Option) (*Server, error) {
 	// the fallback is unreachable until a policy exists. Composing the policy
 	// alone is exactly the change that makes it reachable with nothing behind
 	// it, and it is a composition mistake rather than a request-time one.
-	if cfg.objectPolicy != nil && cfg.objectStores == nil {
+	// The two object resolvers are alternatives for one route, and neither
+	// silently shadows the other: preferring the deprecated one would address
+	// a Host session's objects by its public id, where nothing is stored, and
+	// preferring the other would ignore a value the deployer supplied.
+	if cfg.objectStores != nil && cfg.sessionObjects != nil {
+		return nil, &OptionError{Option: "WithSessionObjectStoreResolver", Err: ErrConflictingObjectResolvers}
+	}
+	objectResolver := cfg.objectStores != nil || cfg.sessionObjects != nil
+	if cfg.objectPolicy != nil && !objectResolver {
 		return nil, ErrObjectPolicyWithoutResolver
 	}
 	// A session binding with no resolver behind it is refused for a STRONGER
@@ -301,7 +309,7 @@ func New(opts ...Option) (*Server, error) {
 	// deployment that resolves no storage at all can never read their objects
 	// back. Nothing here can verify the resolver knows this particular
 	// binding; what it can refuse is the composition that is certainly wrong.
-	if cfg.sessionBinding != (SessionBindingTemplate{}) && cfg.objectStores == nil {
+	if cfg.sessionBinding != (SessionBindingTemplate{}) && !objectResolver {
 		return nil, ErrSessionBindingWithoutResolver
 	}
 	// EITHER half alone is refused, rather than silently serving a create
@@ -484,7 +492,11 @@ func composeRouter(cfg config, credentials *internalidentity.Authenticator, part
 		}(),
 		ObjectPolicy:       cfg.objectPolicy,
 		ResolveObjectStore: resolveObjectStore(cfg.objectStores),
-		ObjectLimits:       cfg.objects,
+		// The session-aware resolver is handed to the router as is: the
+		// router, not an adapter here, rewrites the read to the binding's
+		// RuntimeSessionID, so the rewrite has one reader.
+		ResolveSessionObjectStore: resolveSessionObjects(cfg.sessionObjects),
+		ObjectLimits:              cfg.objects,
 	})
 	if err != nil {
 		// Unreachable from a composition New accepted: every value NewRouter
