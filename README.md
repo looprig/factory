@@ -634,7 +634,7 @@ unread is logged at WARN. `Commands` accordingly names the disposition admission
 retry read, payload upload, rejection and due query in place of `AdmitCommand`
 and `GetCommand`; a `*sessionstore.Store` satisfies it.
 
-**The gate rollout rule is met: sessionstore is pinned at v0.12.0**, whose
+**The gate rollout rule is met: sessionstore is pinned at v0.13.1**, whose
 readers accept a gate page a Host wrote on a disposition session (older readers
 refuse it). `TestAHostPublishedDispositionGateIsReadByThePinnedStore` writes a
 gate the way a Host does and reads it through both of Factory's gate readers.

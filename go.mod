@@ -6,10 +6,10 @@ require (
 	github.com/centrifugal/centrifuge v0.38.0
 	github.com/centrifugal/centrifuge-go v0.12.0
 	github.com/looprig/core v0.11.0
-	github.com/looprig/sessionstore v0.12.0
+	github.com/looprig/sessionstore v0.13.1
 )
 
-require github.com/looprig/storage v0.6.0
+require github.com/looprig/storage v0.7.0
 
 require (
 	github.com/FZambia/eagle v0.2.0 // indirect
