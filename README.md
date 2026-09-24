@@ -15,6 +15,83 @@ Factory is deliberately in the data path for active clients at the expected
 1,000–5,000 connection scale, and its required state is disposable: reconnects
 and reads recover from SessionStore.
 
+Factory is a Go library, not a program: it ships no binary and no UI. A product
+composes it with `factory.New` and its own storage, authentication and UI (Carbon
+and the `tests` integration lane are the in-workspace compositions).
+
+## Status
+
+Released and in use. `factory.New` composes the whole service:
+
+- identity (bearer, cookie and ClientLink credentials through an injected
+  `identity.Verifier`), authorization, and the origin/CSRF guard;
+- the `/v1` REST API: bootstrap, agents, the session list, session create,
+  status, journal, gates, objects, and the input, interrupt, restore and
+  gate-response controls;
+- durable command admission through SessionStore's disposition inbox, with
+  deadline and reconciliation sweeps;
+- the ClientLink (browser WebSocket) and the HostLink pool, one link per
+  (Host, tenant), dialled at Core's `HostLinkEndpoint`;
+- pooled placement (`WithPendingCommands`) and dedicated placement through an
+  injected `WorkloadController` with `WorkloadEndpointDiscovery`, including
+  restoring a released dedicated session;
+- the live tail from a Host to a session's viewers, with `session.reset`
+  repair and gap detection;
+- reads of a Host session's runtime journal and tool-result objects through
+  `WithSessionJournalResolver` and `WithSessionObjectStoreResolver`;
+- ordered shutdown with `Server.Quiesce` and `Server.Stop`.
+
+Known limits that matter to a deployer (each is described in its section below):
+
+- No Prometheus `/metrics` handler or `factory_` series.
+- Drain-before-delete of a dedicated workload is the workload controller's, not
+  Factory's.
+- A cold AskUser answer/resume is unsupported; gate answers need a resident
+  session on a Host that advertises `hostlink.command.gate_response`.
+- A `tenant_exclusive` pooled Host advertisement is never selected.
+- `WithPlacementController`, `WithJournalResolver` and `WithObjectStoreResolver`
+  are deprecated.
+
+Compatibility: pair Factory with Host ≥ v0.3.0 advertising a bare HostLink base;
+gate responses need Host ≥ v0.4.0; dedicated first placement needs a controller
+implementing `WorkloadEndpointDiscovery` (`looprig/controller` ≥ v0.2.0).
+
+## Install
+
+```sh
+go get github.com/looprig/factory@latest
+```
+
+## Packages
+
+| Package | Purpose |
+|---|---|
+| `github.com/looprig/factory` | `New`, options, public seams, `Server` (`Handler`, `Start`, `Serve`, `Quiesce`, `Stop`) |
+| `github.com/looprig/factory/identity` | Public identity vocabulary: `Principal`, `Verifier`, `Credential`, `CSRFConfig`, `ErrUnauthorized` |
+| `internal/httpapi` | The public REST plane, origin/CSRF guard and error envelope |
+| `internal/identity` | Principal derivation from credentials |
+| `internal/admission` | Durable command admission and deadline reconciliation |
+| `internal/command` | The shared command vocabulary, refusal status and state projection |
+| `internal/placement` | Placement decisions, pooled attach and dedicated workload reconciliation |
+| `internal/routing` | Local binding table, demand-driven binding and the backpressure relay |
+| `internal/reconcile` | Retirement of durable remnants of crashed control-plane operations |
+| `internal/realtime/clientlink` | Browser-facing ClientLink over an embedded Centrifuge node |
+| `internal/realtime/hostlink` | Factory's client side of the Factory-Host connection |
+| `internal/realtime/livetail` | Live output from a Host to a session's viewers |
+| `internal/realtime/delivery` | Bounded record queues above the transport |
+| `internal/realtime/transport` | Realtime transport version pins and measurements |
+| `internal/modfiles` | Module file enumeration used by the guards and `make fmt` |
+
+`examples/deploy` is a product composition template (a Kubernetes manifest and
+a separately-moduled `wiring` package), not a runnable Factory command.
+
+## Where it sits
+
+Tier 5 (orchestration). Direct Looprig dependencies: `core`, `sessionstore` and
+`storage`. Factory never imports `host`, `harness` or `wui`, and no Kubernetes
+library enters its module graph; the Kubernetes adapter is the separate
+`looprig/controller` repository, which depends on Factory.
+
 ## The import boundary is a test
 
 `import_boundary_test.go` parses every Go file's import block — production and
@@ -451,10 +528,10 @@ and routes untouched, measured over fakes and over real sockets.
 v0.9.1's (pinned: v0.11.0) `sessionwire/v1` defines the bare connect codecs, reserved method
 names, and injective `HostLinkChannel` derivation that Factory and Host must
 share. The asynchronous `{type, data}` push envelope is the only framing still
-local to Factory; it is not a Core record or a HostLink RPC method. The Host half
-does not exist in this repository, so these tests still run against a stand-in
-node implementing the proposal. They pin Factory's side, but are not proof of a
-live cross-module Host implementation.
+local to Factory; it is not a Core record or a HostLink RPC method. Host may not
+be imported here, so this module's tests run against a stand-in node that gates
+the upgrade as a Host does. They pin Factory's side; the cross-module proof
+against a released Host lives in the `tests` integration lane.
 
 **Three defects kept every Factory before the v0.2.0 release from ever holding a link to a
 Host, and the stand-ins hid all three.** Host decoded the connect Data as a
@@ -484,7 +561,7 @@ The pool carries the control plane and, since v0.4.0, a session's live tail:
 a subscribe to the session's `HostLinkChannel` made after a successful bind on
 the same connection. The per-binding queues and the backpressure repair sit
 *above* it, in `internal/realtime/delivery` and `routing.Relay`. Choosing which
-Host a session belongs to is A7.2.
+Host a session belongs to is placement's (see Placement).
 
 ## Live output (Gap 3, v0.4.0)
 
@@ -698,13 +775,20 @@ v0.4.0 successor settles it `not_applied`. The placement filter keeps a
 *pending* answer off an incapable Host, but it cannot recall one already in
 flight.
 
-## Status
+## Development
 
-`factory.New` composes the whole service: identity, the HTTP API, admission,
-the ClientLink node (started by `Start`), the HostLink pool, the routing table
-and demand plane, placement and its sweeps, and -- since v0.4.0 -- the live
-tail (`routing.Relay` between the HostLink subscription and the ClientLink).
-Since v0.5.0 one pooled Host serves several tenants (Gap 1), and a gate
-response reaches a Host that advertises `hostlink.command.gate_response`
-(host ≥ v0.4.0). Factory ships no UI and no binary; a product mounts its own
-UI through `WithUIHandler`, `WithUIFS` and `WithUIRoutes`.
+The Go baseline is 1.26.8. Verify standalone, with no workspace masking:
+
+```sh
+GOWORK=off go test ./...
+make check   # fmt-check, vet, staticcheck, gosec, govulncheck, race tests, HostLink stress, bounded fuzz, build
+```
+
+Individual targets: `make test` (race, uncached), `make stress`, `make fuzz`,
+`make fmt`, `make fmt-check`, `make vet`, `make staticcheck`, `make gosec`,
+`make vuln`, `make secure`, `make build`. The 5,000-connection transport case
+runs only under the `transportscale` build tag.
+
+## License
+
+Apache License 2.0; see `LICENSE`.
