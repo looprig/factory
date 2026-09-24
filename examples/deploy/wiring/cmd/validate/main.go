@@ -18,11 +18,11 @@ func main() {
 		fmt.Fprintln(os.Stderr, "usage: validate MANIFEST wiring.go")
 		os.Exit(2)
 	}
-	manifest, err := os.ReadFile(os.Args[1])
+	manifest, err := os.ReadFile(os.Args[1]) // #nosec G703 -- the operator names the file to check
 	if err != nil {
 		panic(err)
 	}
-	wiring, err := os.ReadFile(os.Args[2])
+	wiring, err := os.ReadFile(os.Args[2]) // #nosec G703 -- the operator names the file to check
 	if err != nil {
 		panic(err)
 	}
