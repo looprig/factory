@@ -3,6 +3,7 @@ package factory
 import (
 	"bytes"
 	"context"
+	"errors"
 	"log/slog"
 	"strings"
 	"sync"
@@ -23,6 +24,141 @@ type pagedWarningDirectory struct {
 }
 
 type deadlineWarningDirectory struct{ FakeSeams }
+
+type blockedWarningDirectory struct {
+	FakeSeams
+	entered chan struct{}
+	once    sync.Once
+}
+
+func (d *blockedWarningDirectory) Candidates(ctx context.Context, _ sessionstore.ListCompatibleHostsRequest) (sessionstore.HostTargetPage, error) {
+	d.once.Do(func() { close(d.entered) })
+	<-ctx.Done()
+	return sessionstore.HostTargetPage{}, ctx.Err()
+}
+
+func TestPrincipalStartupProbeDoesNotWarnWhenStopCancelsAnInFlightDirectoryRead(t *testing.T) {
+	directory := &blockedWarningDirectory{entered: make(chan struct{})}
+	logs := &bytes.Buffer{}
+	s := &Server{cfg: config{
+		stampPrincipal: true,
+		directory:      directory,
+		department:     []LaunchTemplate{{Key: sessionstore.HostTargetKey{AgentID: "agent-a", RuntimeCompatibilityID: "runtime-a", Placement: sessionwire.HostPlacementPooled}}},
+		logger:         slog.New(slog.NewJSONHandler(logs, nil)),
+	}}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { defer close(done); s.warnIncapableHosts(ctx) }()
+	select {
+	case <-directory.entered:
+	case <-time.After(5 * time.Second):
+		cancel()
+		t.Fatal("probe never entered Candidates")
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("probe did not stop after cancellation")
+	}
+	if got := logs.String(); got != "" {
+		t.Fatalf("normal shutdown emitted a rollout warning: %s", got)
+	}
+}
+
+type oneHostWarningDirectory struct{ FakeSeams }
+
+func (oneHostWarningDirectory) Candidates(context.Context, sessionstore.ListCompatibleHostsRequest) (sessionstore.HostTargetPage, error) {
+	return sessionstore.HostTargetPage{Hosts: []sessionwire.HostLinkCapacityReport{{HostID: "host-blocked", HostGeneration: 1, InternalEndpoint: "ws://host-blocked.internal"}}}, nil
+}
+
+type blockedWarningDialer struct {
+	entered chan struct{}
+	once    sync.Once
+}
+
+func (d *blockedWarningDialer) Dial(ctx context.Context, _ hostlink.Target, _ hostlink.Observer) (hostlink.Link, error) {
+	d.once.Do(func() { close(d.entered) })
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
+func TestPrincipalStartupProbeDoesNotWarnWhenStopCancelsAnInFlightHostAsk(t *testing.T) {
+	dialer := &blockedWarningDialer{entered: make(chan struct{})}
+	pool, err := hostlink.NewPool(hostlink.Config{Dialer: dialer})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = pool.Close(context.Background()) })
+	service, _ := identity.NewPrincipal("tenant-a", "factory", identity.KindService)
+	logs := &bytes.Buffer{}
+	s := &Server{cfg: config{
+		stampPrincipal: true,
+		directory:      oneHostWarningDirectory{},
+		service:        service,
+		department:     []LaunchTemplate{{Key: sessionstore.HostTargetKey{AgentID: "agent-a", RuntimeCompatibilityID: "runtime-a", Placement: sessionwire.HostPlacementPooled}}},
+		logger:         slog.New(slog.NewJSONHandler(logs, nil)),
+	}, components: &components{pool: pool}}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { defer close(done); s.warnIncapableHosts(ctx) }()
+	select {
+	case <-dialer.entered:
+	case <-time.After(5 * time.Second):
+		cancel()
+		t.Fatal("probe never entered HostLink Dial")
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("probe did not stop after cancellation")
+	}
+	if got := logs.String(); got != "" {
+		t.Fatalf("normal shutdown emitted a rollout warning: %s", got)
+	}
+}
+
+type failingWarningDirectory struct{ FakeSeams }
+
+func (failingWarningDirectory) Candidates(context.Context, sessionstore.ListCompatibleHostsRequest) (sessionstore.HostTargetPage, error) {
+	return sessionstore.HostTargetPage{}, errors.New("provider unavailable")
+}
+
+func TestPrincipalStartupProbeStillWarnsForADirectoryFault(t *testing.T) {
+	logs := &bytes.Buffer{}
+	s := &Server{cfg: config{
+		stampPrincipal: true,
+		directory:      failingWarningDirectory{},
+		department:     []LaunchTemplate{{Key: sessionstore.HostTargetKey{AgentID: "agent-a", RuntimeCompatibilityID: "runtime-a", Placement: sessionwire.HostPlacementPooled}}},
+		logger:         slog.New(slog.NewJSONHandler(logs, nil)),
+	}}
+	s.warnIncapableHosts(context.Background())
+	if got := logs.String(); !strings.Contains(got, "provider unavailable") || !strings.Contains(got, warnHostPrincipalUnasked) {
+		t.Fatalf("real directory fault did not warn: %s", got)
+	}
+}
+
+func TestPrincipalStartupProbeStillWarnsForAHostLinkFault(t *testing.T) {
+	pool, err := hostlink.NewPool(hostlink.Config{Dialer: failingCapabilityDialer{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = pool.Close(context.Background()) })
+	service, _ := identity.NewPrincipal("tenant-a", "factory", identity.KindService)
+	logs := &bytes.Buffer{}
+	s := &Server{cfg: config{
+		stampPrincipal: true,
+		directory:      oneHostWarningDirectory{},
+		service:        service,
+		department:     []LaunchTemplate{{Key: sessionstore.HostTargetKey{AgentID: "agent-a", RuntimeCompatibilityID: "runtime-a", Placement: sessionwire.HostPlacementPooled}}},
+		logger:         slog.New(slog.NewJSONHandler(logs, nil)),
+	}, components: &components{pool: pool}}
+	s.warnIncapableHosts(context.Background())
+	if got := logs.String(); !strings.Contains(got, warnHostPrincipalUnasked) || !strings.Contains(got, "host-blocked") || !strings.Contains(got, "reconnecting") {
+		t.Fatalf("real HostLink fault did not warn: %s", got)
+	}
+}
 
 func (d deadlineWarningDirectory) Candidates(ctx context.Context, _ sessionstore.ListCompatibleHostsRequest) (sessionstore.HostTargetPage, error) {
 	<-ctx.Done()

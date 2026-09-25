@@ -361,6 +361,9 @@ func (s *Server) warnIncapableHosts(ctx context.Context) {
 			}
 			page, err := s.cfg.directory.Candidates(probeCtx, sessionstore.ListCompatibleHostsRequest{Key: template.Key, Cursor: cursor, Limit: principalProbePageLimit})
 			if err != nil {
+				if ctx.Err() == context.Canceled {
+					return // Stop interrupted the read; no rollout diagnosis is possible.
+				}
 				logger(s.cfg).WarnContext(probeCtx, warnHostPrincipalUnasked, slog.String("error", err.Error()))
 				break
 			}
@@ -372,6 +375,9 @@ func (s *Server) warnIncapableHosts(ctx context.Context) {
 				hostCtx, hostCancel := context.WithTimeout(probeCtx, principalProbeTimeout)
 				capable, err := s.components.pool.AcceptsCommandPrincipal(hostCtx, hostlink.Target{Host: host.HostID, Endpoint: host.InternalEndpoint, Generation: host.HostGeneration}, s.cfg.service.Tenant())
 				hostCancel()
+				if ctx.Err() == context.Canceled {
+					return // Stop interrupted the ask; never label it a Host fault.
+				}
 				switch {
 				case err != nil:
 					logger(s.cfg).WarnContext(probeCtx, warnHostPrincipalUnasked, slog.String("host_id", string(host.HostID)), slog.String("error", err.Error()))
