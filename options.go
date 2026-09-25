@@ -109,11 +109,12 @@ type config struct {
 	// cannot stand up a Host). nil takes the real CentrifugeDialer.
 	hostDialer hostlink.Dialer
 
-	verifier      identity.Verifier
-	cookieName    string
-	defaultTenant sessionwire.TenantID
-	authorizer    Authorizer
-	reads         SessionReader
+	verifier       identity.Verifier
+	stampPrincipal bool
+	cookieName     string
+	defaultTenant  sessionwire.TenantID
+	authorizer     Authorizer
+	reads          SessionReader
 	// journals is where a Host-owned session's journal is read; nil reads
 	// every journal from reads. See WithSessionJournalResolver; at most one
 	// of the two is set.
@@ -190,6 +191,18 @@ func WithCredentialVerifier(v identity.Verifier) Option {
 			return nilDependency("WithCredentialVerifier")
 		}
 		c.verifier = v
+		return nil
+	})
+}
+
+// WithPrincipalStamping stamps the verified sender on every admitted command.
+// It is off by default and requires the already-mandatory credential verifier.
+// Upgrade Hosts to ones advertising hostlink.attribution.principal before
+// enabling it. A retry admitted before enablement changes identity, and
+// attributed rows require every reader to stay on sessionstore >= v0.14.0.
+func WithPrincipalStamping() Option {
+	return option("WithPrincipalStamping", func(c *config) error {
+		c.stampPrincipal = true
 		return nil
 	})
 }

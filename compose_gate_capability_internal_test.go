@@ -37,6 +37,45 @@ func TestPlacementCapabilityAdapterKeepsTransientCause(t *testing.T) {
 	}
 }
 
+func TestPrincipalCapabilityAdapterAndPlacementClassification(t *testing.T) {
+	dialer := &advertisingDialer{methods: map[sessionwire.HostID][]string{
+		"host-old": {sessionwire.HostLinkCapabilityGateResponse},
+		"host-new": {sessionwire.HostLinkCapabilityAttributionPrincipal},
+	}}
+	pool, err := hostlink.NewPool(hostlink.Config{Dialer: dialer})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = pool.Close(context.Background()) })
+	owner := sessionwire.HostLinkRegistryObservation{TenantID: "tenant-a", SessionID: "session-a", HostID: "host-old", InternalEndpoint: "ws://host-old.internal"}
+	for _, ask := range []func(context.Context, sessionwire.HostLinkRegistryObservation) (bool, error){principalResponders{pool}.AcceptsCommandPrincipal, placementLinks{pool}.AcceptsCommandPrincipal} {
+		if yes, err := ask(context.Background(), owner); err != nil || yes {
+			t.Fatalf("old Host = (%t,%v)", yes, err)
+		}
+	}
+	owner.HostID, owner.InternalEndpoint = "host-new", "ws://host-new.internal"
+	if yes, err := (principalResponders{pool}).AcceptsCommandPrincipal(context.Background(), owner); err != nil || !yes {
+		t.Fatalf("new Host = (%t,%v)", yes, err)
+	}
+	if len(dialer.dialled) != 2 || dialer.dialled[1].Endpoint != "ws://host-new.internal/hostlink/tenant-a" {
+		t.Fatalf("dialled %v", dialer.dialled)
+	}
+
+	transient, err := hostlink.NewPool(hostlink.Config{Dialer: failingCapabilityDialer{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = transient.Close(context.Background()) })
+	_, err = (principalResponders{transient}).AcceptsCommandPrincipal(context.Background(), owner)
+	if !errors.Is(err, admission.ErrPrincipalResponderUnavailable) || !errors.Is(err, hostlink.ErrLinkReconnecting) {
+		t.Fatalf("admission fault = %v", err)
+	}
+	_, err = (placementLinks{transient}).AcceptsCommandPrincipal(context.Background(), owner)
+	if !errors.Is(err, placement.ErrHostUnreachable) {
+		t.Fatalf("placement fault = %v", err)
+	}
+}
+
 func (d *advertisingDialer) Dial(_ context.Context, target hostlink.Target, _ hostlink.Observer) (hostlink.Link, error) {
 	d.dialled = append(d.dialled, target)
 	return advertisingLink{host: target.Host, methods: d.methods[target.Host]}, nil

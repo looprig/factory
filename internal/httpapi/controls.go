@@ -492,7 +492,7 @@ func admissionFailure(err error) apiError {
 	if failure, ok := storeUnavailable(err); ok {
 		return failure
 	}
-	if errors.Is(err, admission.ErrGateResponderUnavailable) {
+	if errors.Is(err, admission.ErrGateResponderUnavailable) || errors.Is(err, admission.ErrPrincipalResponderUnavailable) {
 		// The owner could not be reached to ask whether it applies gate
 		// responses: a reconnecting link, a full link ceiling, a failed dial.
 		// Transient and nothing was written, so 503 and retryable, as a

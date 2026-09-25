@@ -15,6 +15,42 @@ import (
 // "hostlink.command.gate_response"), which is the real signal.
 const testGateMethod = "test.only.gate-response-capability"
 
+func TestPrincipalCapabilityMatchesOnlyCoresExactToken(t *testing.T) {
+	for _, row := range []struct {
+		methods []string
+		want    bool
+	}{
+		{[]string{sessionwire.HostLinkCapabilityAttributionPrincipal}, true},
+		{[]string{sessionwire.HostLinkCapabilityGateResponse}, false},
+		{[]string{"hostlink.v1." + sessionwire.HostLinkCapabilityAttributionPrincipal}, false},
+		{[]string{sessionwire.HostLinkCapabilityAttributionPrincipal + ".v2"}, false},
+		{nil, false},
+	} {
+		reply := sessionwire.VersionNegotiationResponse{Version: sessionwire.CurrentWireVersion}.WithHostLinkMethods(row.methods...)
+		if got := hostlink.PrincipalCapable(reply); got != row.want {
+			t.Fatalf("methods=%v got=%t want=%t", row.methods, got, row.want)
+		}
+	}
+}
+
+func TestPoolAsksTenantsLinkForPrincipalCapability(t *testing.T) {
+	capable := newHostServer(t, hostOptions{token: serviceToken, methods: []string{sessionwire.HostLinkMethodBind, sessionwire.HostLinkCapabilityAttributionPrincipal}})
+	older := newHostServer(t, hostOptions{token: serviceToken, methods: []string{sessionwire.HostLinkMethodBind}})
+	pool, err := hostlink.NewPool(hostlink.Config{Dialer: dialerFor(t, serviceToken)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = pool.Close(context.Background()) })
+	if yes, err := pool.AcceptsCommandPrincipal(context.Background(), capable.target(), tenant); err != nil || !yes {
+		t.Fatalf("capable = (%t, %v)", yes, err)
+	}
+	other := older.target()
+	other.Host = hostTwo
+	if yes, err := pool.AcceptsCommandPrincipal(context.Background(), other, tenant); err != nil || yes {
+		t.Fatalf("incapable = (%t, %v)", yes, err)
+	}
+}
+
 // TestTheGateResponseCapabilityIsExactlyCoresToken: a Host is gate_response-
 // capable when, and only when, its connect reply lists Core's token. The token
 // is spelled here as an ABSOLUTE LITERAL, because a fixture built from the

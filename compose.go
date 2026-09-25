@@ -121,7 +121,9 @@ func composeComponents(cfg config, credentials *internalidentity.Authenticator) 
 		// for the session's tenant and decided by
 		// hostlink.GateResponseCapable: the owner's connect reply must carry
 		// Core's token sessionwire.HostLinkCapabilityGateResponse.
-		GateResponders: gateResponders{pool: pool},
+		GateResponders:      gateResponders{pool: pool},
+		StampPrincipal:      cfg.stampPrincipal,
+		PrincipalResponders: principalResponders{pool: pool},
 	})
 	if err != nil {
 		return nil, &OptionError{Option: "WithReconcileLimits", Err: err}
@@ -457,6 +459,17 @@ func (l placementLinks) AcceptsGateResponses(ctx context.Context, owner sessionw
 	return capable, err
 }
 
+func (l placementLinks) AcceptsCommandPrincipal(ctx context.Context, owner sessionwire.HostLinkRegistryObservation) (bool, error) {
+	capable, err := principalResponders(l).AcceptsCommandPrincipal(ctx, owner)
+	if errors.Is(err, hostlink.ErrNoTenantEndpoint) {
+		return false, fmt.Errorf("%w: %w", placement.ErrTenantUnaddressable, err)
+	}
+	if errors.Is(err, admission.ErrPrincipalResponderUnavailable) {
+		return false, fmt.Errorf("%w: %w", placement.ErrHostUnreachable, err)
+	}
+	return capable, err
+}
+
 // gateResponders is the gate_response capability question asked of the pool:
 // the owner's link FOR THE SESSION'S TENANT, at the address derived from the
 // owner's advertised base, answered by hostlink.GateResponseCapable. Admission
@@ -466,7 +479,14 @@ type gateResponders struct{ pool *hostlink.Pool }
 
 func (g gateResponders) AcceptsGateResponses(ctx context.Context, owner sessionwire.HostLinkRegistryObservation) (bool, error) {
 	capable, err := g.pool.AcceptsGateResponses(ctx, hostlink.Target{Host: owner.HostID, Endpoint: owner.InternalEndpoint, Generation: owner.HostGeneration}, owner.TenantID)
-	return capable, classifyCapabilityRead(err)
+	return capable, classifyCapabilityRead(err, admission.ErrGateResponderUnavailable)
+}
+
+type principalResponders struct{ pool *hostlink.Pool }
+
+func (p principalResponders) AcceptsCommandPrincipal(ctx context.Context, owner sessionwire.HostLinkRegistryObservation) (bool, error) {
+	capable, err := p.pool.AcceptsCommandPrincipal(ctx, hostlink.Target{Host: owner.HostID, Endpoint: owner.InternalEndpoint, Generation: owner.HostGeneration}, owner.TenantID)
+	return capable, classifyCapabilityRead(err, admission.ErrPrincipalResponderUnavailable)
 }
 
 // classifyCapabilityRead marks a TRANSIENT failure to reach the owner --
@@ -476,14 +496,14 @@ func (g gateResponders) AcceptsGateResponses(ctx context.Context, owner sessionw
 // which the HTTP edge answers 503 retryable (quality gate F1). Anything else,
 // a base that cannot address the tenant included, stays a plain fault: it is a
 // deployment fact a retry will not change.
-func classifyCapabilityRead(err error) error {
+func classifyCapabilityRead(err error, unavailable error) error {
 	if err == nil {
 		return nil
 	}
 	for _, transient := range []error{hostlink.ErrLinkReconnecting, hostlink.ErrLinkLimit, hostlink.ErrDialFailed,
 		hostlink.ErrUnsupportedProtocol, hostlink.ErrPoolClosed, hostlink.ErrLinkClosed} {
 		if errors.Is(err, transient) {
-			return fmt.Errorf("%w: %w", admission.ErrGateResponderUnavailable, err)
+			return fmt.Errorf("%w: %w", unavailable, err)
 		}
 	}
 	return err

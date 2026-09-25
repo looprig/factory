@@ -40,6 +40,12 @@ func GateResponseCapable(reply sessionwire.VersionNegotiationResponse) bool {
 	return reply.Supports(sessionwire.HostLinkCapabilityGateResponse)
 }
 
+// PrincipalCapable is the exact advertised support for reading principal and
+// metadata on incoming commands, never inferred from lease or Host version.
+func PrincipalCapable(reply sessionwire.VersionNegotiationResponse) bool {
+	return reply.Supports(sessionwire.HostLinkCapabilityAttributionPrincipal)
+}
+
 // Negotiator is the capability of a Link that can report the connect reply its
 // Host last sent. It is discovered by assertion, like Subscriber, so a Link a
 // test or a later transport supplies without it fails the capability question
@@ -147,6 +153,16 @@ func (l *centrifugeLink) Negotiated() (sessionwire.VersionNegotiationResponse, e
 // link is evicted as Attach evicts one, so the caller can tell "this Host
 // cannot" (false, nil) from "this Host could not be asked" (false, err).
 func (p *Pool) AcceptsGateResponses(ctx context.Context, target Target, tenantID sessionwire.TenantID) (bool, error) {
+	return p.accepts(ctx, target, tenantID, p.gateResponses)
+}
+
+// AcceptsCommandPrincipal asks the tenant's HostLink for its last verified
+// attribution capability reply.
+func (p *Pool) AcceptsCommandPrincipal(ctx context.Context, target Target, tenantID sessionwire.TenantID) (bool, error) {
+	return p.accepts(ctx, target, tenantID, PrincipalCapable)
+}
+
+func (p *Pool) accepts(ctx context.Context, target Target, tenantID sessionwire.TenantID, capable func(sessionwire.VersionNegotiationResponse) bool) (bool, error) {
 	if err := target.Validate(); err != nil {
 		return false, err
 	}
@@ -173,5 +189,5 @@ func (p *Pool) AcceptsGateResponses(ctx context.Context, target Target, tenantID
 		}
 		return false, err
 	}
-	return p.gateResponses(reply), nil
+	return capable(reply), nil
 }

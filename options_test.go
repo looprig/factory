@@ -56,6 +56,35 @@ func TestRequiredOptionsCompose(t *testing.T) {
 // TestNewRejectsAMissingSeam drops exactly one required option at a time. The
 // table is derived from RequiredOptions rather than written out, so a seam that
 // becomes required later is covered without anyone remembering to add a row.
+func TestPrincipalStampingOptionAndVerifierRequirement(t *testing.T) {
+	off, err := New(RequiredOptions()...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if off.cfg.stampPrincipal {
+		t.Fatal("stamping is on by default")
+	}
+	on, err := New(append(RequiredOptions(), WithPrincipalStamping())...)
+	if err != nil || !on.cfg.stampPrincipal {
+		t.Fatalf("opt-in stamping = %v (%v)", on, err)
+	}
+	if _, err := New(append(RequiredOptions(), WithPrincipalStamping(), WithPrincipalStamping())...); !errors.Is(err, ErrDuplicateOption) {
+		t.Fatalf("duplicate option = %v", err)
+	}
+	base := RequiredOptions()
+	for i, option := range base {
+		if option.name != "WithCredentialVerifier" {
+			continue
+		}
+		without := append(slices.Concat(base[:i:i], base[i+1:]), WithPrincipalStamping())
+		if _, err := New(without...); !errors.Is(err, ErrMissingDependency) || !strings.Contains(err.Error(), "WithCredentialVerifier") {
+			t.Fatalf("missing verifier = %v", err)
+		}
+		return
+	}
+	t.Fatal("RequiredOptions lacks WithCredentialVerifier")
+}
+
 func TestNewRejectsAMissingSeam(t *testing.T) {
 	t.Parallel()
 

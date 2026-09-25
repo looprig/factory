@@ -34,3 +34,11 @@ func TestATransientCapabilityReadIsAnsweredRetryable(t *testing.T) {
 		}
 	}
 }
+
+func TestPrincipalCapabilityFaultIsAnsweredRetryable(t *testing.T) {
+	err := fmt.Errorf("ask: %w", admission.ErrPrincipalResponderUnavailable)
+	got := admissionFailure(err)
+	if got.status != http.StatusServiceUnavailable || got.code != ErrorCodeUnavailable {
+		t.Fatalf("admissionFailure = %+v", got)
+	}
+}

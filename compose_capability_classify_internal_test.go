@@ -33,7 +33,7 @@ func TestOnlyATransientCapabilityReadIsClassifiedUnavailable(t *testing.T) {
 			Cause: &sessionwire.HostLinkEndpointError{Code: sessionwire.HostLinkEndpointCodeTooLong}}, false},
 		"anything else": {errors.New("boom"), false},
 	} {
-		got := classifyCapabilityRead(row.err)
+		got := classifyCapabilityRead(row.err, admission.ErrGateResponderUnavailable)
 		if errors.Is(got, admission.ErrGateResponderUnavailable) != row.transient {
 			t.Errorf("%s: classified %v, transient = %v", name, got, row.transient)
 		}
@@ -41,7 +41,7 @@ func TestOnlyATransientCapabilityReadIsClassifiedUnavailable(t *testing.T) {
 			t.Errorf("%s: the cause was dropped: %v", name, got)
 		}
 	}
-	if classifyCapabilityRead(nil) != nil {
+	if classifyCapabilityRead(nil, admission.ErrGateResponderUnavailable) != nil {
 		t.Error("classifyCapabilityRead(nil) is not nil")
 	}
 }
