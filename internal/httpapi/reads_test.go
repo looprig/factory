@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -492,23 +493,42 @@ func TestTheAgentListNeverPublishesAHostOrAnEndpoint(t *testing.T) {
 	}
 }
 
-// TestTheAgentListIsTheSameAggregateUnderBothPaths holds /v1/capabilities to
-// /v1/agents.
-//
-// Section 8.1 keeps capabilities as a migration spelling that "may project
-// Factory and agent capabilities until clients use /v1/agents". Two handlers
-// would be two answers to one question and would drift; the comparison is over
-// the whole response so a difference cannot hide in a header.
-func TestTheAgentListIsTheSameAggregateUnderBothPaths(t *testing.T) {
+// The capabilities route adds deployment flags but retains Core's agent
+// aggregate; the agents route remains byte-identical to its old shape.
+func TestCapabilitiesExtendsTheAgentAggregateWithCommandFlags(t *testing.T) {
 	t.Parallel()
 
 	f := newFixture(t, withDepartment(pooledTemplate, dedicatedTemplate), withAdvertised(pooledTemplate.Key))
 	agents, capabilities := f.get("/v1/agents"), f.get("/v1/capabilities")
-	if agents.Code != http.StatusOK {
-		t.Fatalf("/v1/agents = %d, want 200; body %q", agents.Code, agents.Body)
+	if agents.Code != http.StatusOK || capabilities.Code != http.StatusOK {
+		t.Fatalf("responses: %d %d", agents.Code, capabilities.Code)
 	}
-	if diff := responseDifference(agents, capabilities); diff != "" {
-		t.Errorf("/v1/capabilities differs from /v1/agents: %s", diff)
+	if bytes.Contains(agents.Body.Bytes(), []byte("message_metadata")) || bytes.Contains(agents.Body.Bytes(), []byte("command_principal")) {
+		t.Fatalf("agents changed shape: %s", agents.Body)
+	}
+	var flags struct {
+		MessageMetadata  bool `json:"message_metadata"`
+		CommandPrincipal bool `json:"command_principal"`
+	}
+	if err := json.Unmarshal(capabilities.Body.Bytes(), &flags); err != nil || !flags.MessageMetadata || flags.CommandPrincipal {
+		t.Fatalf("capabilities: %s (%v)", capabilities.Body, err)
+	}
+	if !reflect.DeepEqual(decodeDepartment(t, agents).Agents, decodeDepartment(t, capabilities).Agents) {
+		t.Fatalf("agent aggregate changed")
+	}
+	if agents.Header().Get("ETag") == capabilities.Header().Get("ETag") {
+		t.Fatal("different bodies have equal ETags")
+	}
+}
+
+func TestCapabilitiesReflectsStampingOptIn(t *testing.T) {
+	f := newFixture(t, func(cfg *RouterConfig, _ *fixture) { cfg.StampsPrincipal = true })
+	var flags struct {
+		CommandPrincipal bool `json:"command_principal"`
+		MessageMetadata  bool `json:"message_metadata"`
+	}
+	if err := json.Unmarshal(f.get("/v1/capabilities").Body.Bytes(), &flags); err != nil || !flags.CommandPrincipal || !flags.MessageMetadata {
+		t.Fatalf("flags = %+v (%v)", flags, err)
 	}
 }
 
@@ -1548,7 +1568,7 @@ func TestTheAuthenticatedFallbackIsNotReachableThroughTheChain(t *testing.T) {
 
 	f := newFixture(t, withDepartment(dedicatedTemplate))
 	for name, handler := range map[string]http.Handler{
-		"the agent list":   f.router.serveAgents(),
+		"the agent list":   f.router.serveAgents(false),
 		"the session list": f.router.serveSessionList(),
 	} {
 		recorder := httptest.NewRecorder()

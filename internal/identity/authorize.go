@@ -39,6 +39,10 @@ func (Authorizer) AuthorizeSessionRead(_ context.Context, principal factoryident
 	return authorizeTenantPrincipal(principal)
 }
 
+func (Authorizer) AuthorizeAuditRead(_ context.Context, principal factoryidentity.Principal, _ sessionwire.SessionID) error {
+	return authorizeTenantPrincipal(principal)
+}
+
 // AuthorizeObjectRead authorizes an object read within the principal's tenant.
 // The session and object identifiers are intentionally not inspected: both are
 // opaque and tenant-local.

@@ -95,6 +95,9 @@ func (l RouteLimits) Validate() error {
 
 // RouterConfig composes the public REST plane.
 type RouterConfig struct {
+	// StampsPrincipal is published as command_principal on /v1/capabilities.
+	StampsPrincipal bool
+	CommandReads    CommandReader
 	// Credentials authenticates a request and derives its operation context.
 	//
 	// It is the CONCRETE authenticator rather than the Authenticator interface
@@ -250,6 +253,8 @@ type RouterConfig struct {
 
 // Router is Factory's public HTTP surface.
 type Router struct {
+	stampsPrincipal       bool
+	commandReads          CommandReader
 	quiesced              atomic.Bool
 	credentials           *internalidentity.Authenticator
 	authorizer            Authorizer
@@ -325,10 +330,12 @@ func NewRouter(cfg RouterConfig) (*Router, error) {
 	}
 
 	router := &Router{
-		credentials: cfg.Credentials,
-		authorizer:  cfg.Authorizer,
-		reads:       cfg.Reads,
-		directory:   cfg.Directory,
+		stampsPrincipal: cfg.StampsPrincipal,
+		commandReads:    cfg.CommandReads,
+		credentials:     cfg.Credentials,
+		authorizer:      cfg.Authorizer,
+		reads:           cfg.Reads,
+		directory:       cfg.Directory,
 		// The caller's configuration is COPIED rather than referenced, so a
 		// composer that reuses its buffers after NewRouter returns cannot
 		// change what a running router advertises.
@@ -926,11 +933,12 @@ func routeTable() []route {
 	served := func(auth authRule, handle func(*Router) http.Handler) []methodRule {
 		return readRules(methodRule{auth: auth, handle: handle})
 	}
-	agents := served(authAuthenticated, func(rt *Router) http.Handler { return rt.serveAgents() })
+	agents := served(authAuthenticated, func(rt *Router) http.Handler { return rt.serveAgents(false) })
 	return []route{
 		{pattern: "/v1/bootstrap", rules: served(authAuthenticated, func(rt *Router) http.Handler { return rt.serveBootstrap() })},
 		{pattern: "/v1/agents", rules: agents},
-		{pattern: "/v1/capabilities", rules: agents},
+		{pattern: "/v1/capabilities", rules: served(authAuthenticated, func(rt *Router) http.Handler { return rt.serveAgents(true) })},
+		{pattern: "/v1/sessions/{sid}/commands/{cid}", rules: served(authSessionRead, func(rt *Router) http.Handler { return rt.serveCommandStatus() }), session: true},
 		{pattern: "/v1/sessions", rules: append(
 			served(authSessionList, func(rt *Router) http.Handler { return rt.serveSessionList() }),
 			// The create, served as of A3.1.
@@ -1224,6 +1232,9 @@ func (s scope) catalogEntry(session sessionwire.SessionID) sessionstore.GetCatal
 		TenantID:  s.principal.Tenant(),
 		SessionID: session,
 	}
+}
+func (s scope) commandEntry(session sessionwire.SessionID, command sessionwire.CommandID) sessionstore.GetDispositionCommandRequest {
+	return sessionstore.GetDispositionCommandRequest{TenantID: s.principal.Tenant(), SessionID: session, CommandID: command}
 }
 
 // ---------------------------------------------------------------------------

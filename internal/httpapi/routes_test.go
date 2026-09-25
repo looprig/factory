@@ -568,6 +568,7 @@ func TestTheRouteTableServesEveryPathTheSpecNames(t *testing.T) {
 		"/v1/capabilities":                          read,
 		"/v1/sessions":                              {http.MethodGet, http.MethodHead, http.MethodPost},
 		"/v1/sessions/{sid}/status":                 read,
+		"/v1/sessions/{sid}/commands/{cid}":         read,
 		"/v1/sessions/{sid}/journal":                read,
 		"/v1/sessions/{sid}/gates":                  read,
 		"/v1/sessions/{sid}/input":                  {http.MethodPost},
@@ -2536,9 +2537,10 @@ func expectedRoutes() map[string]expectation {
 		// Durable reads within one session, all three served by this build.
 		// They are replay-free projections of durable state, so each remains
 		// answerable while every Host is stopped.
-		"GET /v1/sessions/{sid}/status":  read(authSessionRead, true),
-		"GET /v1/sessions/{sid}/journal": read(authSessionRead, true),
-		"GET /v1/sessions/{sid}/gates":   read(authSessionRead, true),
+		"GET /v1/sessions/{sid}/status":         read(authSessionRead, true),
+		"GET /v1/sessions/{sid}/commands/{cid}": read(authSessionRead, true),
+		"GET /v1/sessions/{sid}/journal":        read(authSessionRead, true),
+		"GET /v1/sessions/{sid}/gates":          read(authSessionRead, true),
 		// Object decisions precede catalog resolution and trusted reference
 		// policy precedes metadata or bytes. Verification has a deadline.
 		"GET /v1/sessions/{sid}/objects/{oid}": expectation{
@@ -2717,9 +2719,10 @@ func sanctionedImplementedMethods() map[string]string {
 			"assumed. The accepted cost, written down rather than discovered: a deployment whose " +
 			"tenants may launch different agents cannot express that here, and every authenticated " +
 			"principal learns every configured AgentID -- topology, not tenant data",
-		"GET /v1/capabilities": "is the migration spelling of /v1/agents and serves the identical " +
-			"aggregate under the identical rule; a weaker rule on either would be two answers to " +
-			"one question",
+		"GET /v1/capabilities": "serves the deployment's launchable agent aggregate under " +
+			"authAuthenticated, adding only command_principal and message_metadata flags. " +
+			"Its directory and configuration inputs have no tenant dimension, so the body " +
+			"is identical for every authenticated principal",
 		"GET /v1/sessions/{sid}/status": "serves the durable replay-free projection of ONE session " +
 			"under authSessionRead, which is the decision AuthorizeSessionRead exists to make. The " +
 			"record is the one serveRoute resolved through scope.catalogEntry from principal.Tenant(), " +
@@ -2727,6 +2730,10 @@ func sanctionedImplementedMethods() map[string]string {
 			"handler ran, and a session in another tenant is answered by the same sessionNotFound() " +
 			"construction absence produces. It reads no Host and consults no directory: every member " +
 			"it answers is a catalog record member",
+		"GET /v1/sessions/{sid}/commands/{cid}": "serves a tenant-scoped durable command status under authSessionRead. " +
+			"The session is resolved from principal.Tenant() before the handler reads the command, and the command " +
+			"query repeats that tenant scope. The public status needs no stronger decision, while principal and " +
+			"metadata are appended only when the optional AuditAuthorizer grants; absence or denial omits both",
 		"GET /v1/sessions/{sid}/journal": "serves one BOUNDED page of a session's public events under " +
 			"authSessionRead, the same decision the status makes and over the same resource. Its " +
 			"position is either a cursor SessionStore issued for this session or an absolute sequence, " +

@@ -4,10 +4,15 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"net/http"
 	"sync"
 	"time"
+
+	sessionwire "github.com/looprig/core/sessionwire/v1"
+	"github.com/looprig/factory/internal/realtime/hostlink"
+	"github.com/looprig/sessionstore"
 )
 
 // Lifecycle errors. Serve reports these; Stop reports only what shutting a
@@ -302,11 +307,78 @@ func (s *Server) Start(ctx context.Context) error {
 			s.runSweep(loopCtx, pass)
 		}(pass)
 	}
+	if s.cfg.stampPrincipal {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			s.warnIncapableHosts(loopCtx)
+		}()
+	}
 	go func() {
 		wg.Wait()
 		close(done)
 	}()
 	return nil
+}
+
+const (
+	warnHostLacksPrincipal   = "factory: WithPrincipalStamping is on and a registered Host does not advertise hostlink.attribution.principal; sessions on it are refused runtime_unavailable and none are placed on it"
+	warnHostPrincipalUnasked = "factory: WithPrincipalStamping is on and a registered Host could not be asked whether it advertises hostlink.attribution.principal"
+	principalProbeTimeout    = 5 * time.Second
+	principalProbeBudget     = 30 * time.Second
+	principalProbePageLimit  = 64
+	principalProbeMaxPages   = 64
+)
+
+// warnIncapableHosts is a bounded, informational rollout probe. Admission
+// and placement enforce the capability independently of these warnings.
+func (s *Server) warnIncapableHosts(ctx context.Context) {
+	if !s.cfg.stampPrincipal {
+		return
+	}
+	probeCtx, cancel := context.WithTimeout(ctx, principalProbeBudget)
+	defer cancel()
+	seen := map[sessionwire.HostID]bool{}
+	for _, configured := range s.cfg.department {
+		template := configured.normalized()
+		if template.Key.Placement != sessionwire.HostPlacementPooled {
+			continue
+		}
+		var cursor sessionwire.Cursor
+		for pageNo := 0; pageNo < principalProbeMaxPages; pageNo++ {
+			if err := probeCtx.Err(); err != nil {
+				return
+			}
+			page, err := s.cfg.directory.Candidates(probeCtx, sessionstore.ListCompatibleHostsRequest{Key: template.Key, Cursor: cursor, Limit: principalProbePageLimit})
+			if err != nil {
+				logger(s.cfg).WarnContext(probeCtx, warnHostPrincipalUnasked, slog.String("error", err.Error()))
+				break
+			}
+			for _, host := range page.Hosts {
+				if seen[host.HostID] {
+					continue
+				}
+				seen[host.HostID] = true
+				hostCtx, hostCancel := context.WithTimeout(probeCtx, principalProbeTimeout)
+				capable, err := s.components.pool.AcceptsCommandPrincipal(hostCtx, hostlink.Target{Host: host.HostID, Endpoint: host.InternalEndpoint, Generation: host.HostGeneration}, s.cfg.service.Tenant())
+				hostCancel()
+				switch {
+				case err != nil:
+					logger(s.cfg).WarnContext(probeCtx, warnHostPrincipalUnasked, slog.String("host_id", string(host.HostID)), slog.String("error", err.Error()))
+				case !capable:
+					logger(s.cfg).WarnContext(probeCtx, warnHostLacksPrincipal, slog.String("host_id", string(host.HostID)), slog.Uint64("host_generation", host.HostGeneration))
+				}
+			}
+			if page.NextCursor == "" {
+				break
+			}
+			if pageNo == principalProbeMaxPages-1 {
+				logger(s.cfg).WarnContext(probeCtx, warnHostPrincipalUnasked, slog.String("error", "startup probe reached its page bound; some registered Hosts were not checked"))
+				break
+			}
+			cursor = page.NextCursor
+		}
+	}
 }
 
 // runSweep drives one periodic pass until the loop context is cancelled.

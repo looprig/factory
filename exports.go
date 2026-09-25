@@ -49,6 +49,11 @@ import (
 type TenantAuthorizer struct{}
 
 var _ Authorizer = TenantAuthorizer{}
+var _ AuditAuthorizer = TenantAuthorizer{}
+
+func (TenantAuthorizer) AuthorizeAuditRead(ctx context.Context, principal identity.Principal, session sessionwire.SessionID) error {
+	return internalidentity.Authorizer{}.AuthorizeAuditRead(ctx, principal, session)
+}
 
 func (TenantAuthorizer) AuthorizeSessionList(ctx context.Context, principal identity.Principal) error {
 	return internalidentity.Authorizer{}.AuthorizeSessionList(ctx, principal)

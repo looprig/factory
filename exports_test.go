@@ -110,6 +110,20 @@ func TestTenantAuthorizerIsTheInternalAuthorizer(t *testing.T) {
 	}
 }
 
+func TestTenantAuthorizerGrantsAuditOnlyToConstructedTenantPrincipal(t *testing.T) {
+	var _ factory.AuditAuthorizer = factory.TenantAuthorizer{}
+	actor, err := identity.NewPrincipal("tenant-a", "actor-a", identity.KindActor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := (factory.TenantAuthorizer{}).AuthorizeAuditRead(context.Background(), actor, "session-a"); err != nil {
+		t.Fatal(err)
+	}
+	if err := (factory.TenantAuthorizer{}).AuthorizeAuditRead(context.Background(), identity.Principal{}, "session-a"); !errors.Is(err, identity.ErrUnauthorized) {
+		t.Fatalf("unconstructed principal = %v", err)
+	}
+}
+
 // TestNewStoreDirectoryReadsTheStoresRegistryAndTargetIndex drives the exported
 // directory over the released store: ownership comes from the epoch-fenced
 // registry and candidates from the ranked target index, in the store's own

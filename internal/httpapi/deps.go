@@ -59,6 +59,14 @@ type Authorizer interface {
 	AuthorizeControl(ctx context.Context, principal identity.Principal, session sessionwire.SessionID, kind sessionstore.CommandKind) error
 }
 
+type AuditAuthorizer interface {
+	AuthorizeAuditRead(context.Context, identity.Principal, sessionwire.SessionID) error
+}
+
+type CommandReader interface {
+	GetDispositionCommand(context.Context, sessionstore.GetDispositionCommandRequest) (sessionstore.DispositionInboxEntry, error)
+}
+
 // SessionReader is the durable read plane the handlers use.
 //
 // It is a SessionStore DOMAIN interface: no method names a

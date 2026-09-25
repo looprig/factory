@@ -47,6 +47,13 @@ type Authorizer interface {
 	AuthorizeServiceSweep(ctx context.Context, principal identity.Principal) error
 }
 
+// AuditAuthorizer optionally grants a command's principal and metadata on
+// GET /v1/sessions/{sid}/commands/{cid}. Without it, public status remains
+// readable but the audit members are omitted.
+type AuditAuthorizer interface {
+	AuthorizeAuditRead(context.Context, identity.Principal, sessionwire.SessionID) error
+}
+
 // SessionReader is the durable read plane.
 //
 // Its ReadPublicJournal is keyed by the PUBLIC session id, so it answers the
@@ -460,6 +467,8 @@ func composeRouter(cfg config, credentials *internalidentity.Authenticator, part
 	// failure and never the application shell. A composition that consulted the
 	// UI first would serve index.html with status 200 there.
 	router, err := httpapi.NewRouter(httpapi.RouterConfig{
+		StampsPrincipal:  cfg.stampPrincipal,
+		CommandReads:     cfg.commands,
 		Credentials:      credentials,
 		Authorizer:       cfg.authorizer,
 		Reads:            cfg.reads,

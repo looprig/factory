@@ -196,7 +196,7 @@ const _ = uint(storePageCeiling - agentProbePageLimit)
 // specification's Department model expresses a per-tenant agent set today; a
 // deployment that needs one needs a per-tenant Department, which is a change to
 // section 7 and not a filter here.
-func (rt *Router) serveAgents() http.Handler {
+func (rt *Router) serveAgents(features bool) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		operation, authenticated := internalidentity.OperationContextFrom(r.Context())
 		if !authenticated {
@@ -218,6 +218,9 @@ func (rt *Router) serveAgents() http.Handler {
 			writeAPIError(w, internalFailure())
 			return
 		}
+		if features {
+			body = withFeatures(body, rt.stampsPrincipal)
+		}
 		// The validator is over the exact bytes that would be sent, so it
 		// changes when and only when the response does.
 		etag := entityTag(body)
@@ -230,6 +233,14 @@ func (rt *Router) serveAgents() http.Handler {
 		}
 		writeJSONBytes(w, http.StatusOK, body)
 	})
+}
+
+func withFeatures(body []byte, stamps bool) []byte {
+	if len(body) < 2 || body[len(body)-1] != '}' {
+		return body
+	}
+	flags := `,"command_principal":` + strconv.FormatBool(stamps) + `,"message_metadata":true}`
+	return append(body[:len(body)-1:len(body)-1], flags...)
 }
 
 // launchableAgents aggregates the configured Department against the directory.

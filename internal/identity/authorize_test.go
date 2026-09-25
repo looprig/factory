@@ -153,21 +153,26 @@ var (
 
 func authorizerSeam(t *testing.T) (map[string]struct{}, map[qualifiedType]bool, int) {
 	t.Helper()
-	typeOf := reflect.TypeOf((*factory.Authorizer)(nil)).Elem()
-	methods := make(map[string]struct{}, typeOf.NumMethod())
+	// The built-in Authorizer implements the required seam and the optional
+	// audit seam. Both must obey the same opaque-parameter rule without making
+	// audit mandatory for third-party authorizers.
+	seams := []reflect.Type{reflect.TypeOf((*factory.Authorizer)(nil)).Elem(), reflect.TypeOf((*factory.AuditAuthorizer)(nil)).Elem()}
+	methods := make(map[string]struct{})
 	opaque := make(map[qualifiedType]bool)
 	channels := 0
-	for index := range typeOf.NumMethod() {
-		method := typeOf.Method(index)
-		methods[method.Name] = struct{}{}
-		for parameter := range method.Type.NumIn() {
-			typ := qualifiedReflectType(method.Type.In(parameter))
-			switch {
-			case typ == contextType, typ == principalType:
-			case method.Name == "AuthorizeSubscribe" && typ == stringType:
-				channels++
-			default:
-				opaque[typ] = true
+	for _, typeOf := range seams {
+		for index := range typeOf.NumMethod() {
+			method := typeOf.Method(index)
+			methods[method.Name] = struct{}{}
+			for parameter := range method.Type.NumIn() {
+				typ := qualifiedReflectType(method.Type.In(parameter))
+				switch {
+				case typ == contextType, typ == principalType:
+				case method.Name == "AuthorizeSubscribe" && typ == stringType:
+					channels++
+				default:
+					opaque[typ] = true
+				}
 			}
 		}
 	}

@@ -82,6 +82,8 @@ const (
 	// ErrorCodeTimeout reports that the deadline this router imposed on the
 	// request's work expired.
 	ErrorCodeTimeout sessionwire.ErrorCode = "timeout"
+	// ErrorCodeCommandNotFound is an absent command under an existing session.
+	ErrorCodeCommandNotFound sessionwire.ErrorCode = "command_not_found"
 )
 
 // statusClientClosedRequest is the status recorded when the CALLER's context
@@ -127,6 +129,7 @@ func declaredErrorCodes() []sessionwire.ErrorCode {
 		ErrorCodeInternal,
 		ErrorCodeUnavailable,
 		ErrorCodeTimeout,
+		ErrorCodeCommandNotFound,
 	}
 }
 
