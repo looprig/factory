@@ -1097,6 +1097,17 @@ func newAuditImporter() *auditImporter {
 	validator(tenant)
 	session := namedString(wire, "SessionID")
 	validator(session)
+	subject := namedString(wire, "SubjectID")
+	kind := namedString(wire, "PrincipalKind")
+	principalObject := types.NewTypeName(token.NoPos, wire, "Principal", nil)
+	principalFields := []*types.Var{
+		types.NewField(token.NoPos, wire, "Tenant", tenant, false),
+		types.NewField(token.NoPos, wire, "Subject", subject, false),
+		types.NewField(token.NoPos, wire, "Kind", kind, false),
+	}
+	principal := types.NewNamed(principalObject, types.NewStruct(principalFields, nil), nil)
+	wire.Scope().Insert(principalObject)
+	validator(principal)
 	object := types.NewTypeName(token.NoPos, wire, "ObjectReference", nil)
 	types.NewNamed(object, types.NewStruct(nil, nil), nil)
 	wire.Scope().Insert(object)

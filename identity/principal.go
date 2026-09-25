@@ -22,6 +22,14 @@ import (
 // ErrInvalidPrincipal is the class of every NewPrincipal rejection.
 var ErrInvalidPrincipal = errors.New("identity: invalid principal")
 
+// ErrClientPrincipal refuses a principal supplied by a client. Only Factory
+// may stamp the sender derived from verified credentials.
+var ErrClientPrincipal = errors.New("admission: principal is Factory-stamped; a client may not supply it")
+
+// ErrMetadataUnsupported refuses an attributed command for a resident Host
+// that does not advertise support for principal and metadata.
+var ErrMetadataUnsupported = errors.New("admission: the session's Host does not apply command principal or metadata")
+
 // ErrUnauthenticated is what an Authenticator reports when a request or
 // ClientLink credential is absent, malformed, unverifiable, or expired.
 //
@@ -120,3 +128,17 @@ func (p Principal) Kind() Kind { return p.kind }
 
 // IsService reports whether this principal may perform control-plane work.
 func (p Principal) IsService() bool { return p.kind == KindService }
+
+// Wire returns the verified principal as Core's session wire record.
+func (p Principal) Wire() sessionwire.Principal {
+	return sessionwire.Principal{Tenant: p.tenant, Subject: sessionwire.SubjectID(p.subject), Kind: sessionwire.PrincipalKind(p.kind)}
+}
+
+// PrincipalFromWire validates and converts a durable assertion; it does not
+// freshly verify the recorded sender.
+func PrincipalFromWire(wire sessionwire.Principal) (Principal, error) {
+	if err := wire.Validate(); err != nil {
+		return Principal{}, fmt.Errorf("%w: %v", ErrInvalidPrincipal, err)
+	}
+	return NewPrincipal(wire.Tenant, string(wire.Subject), Kind(wire.Kind))
+}

@@ -96,6 +96,38 @@ func TestNewPrincipalValidates(t *testing.T) {
 	}
 }
 
+func TestWireRoundTripEveryKind(t *testing.T) {
+	for _, kind := range []identity.Kind{identity.KindActor, identity.KindService} {
+		principal, err := identity.NewPrincipal("acme", "user-01", kind)
+		if err != nil {
+			t.Fatal(err)
+		}
+		wire := principal.Wire()
+		if wire != (sessionwire.Principal{Tenant: "acme", Subject: "user-01", Kind: sessionwire.PrincipalKind(kind)}) {
+			t.Fatalf("Wire() = %+v", wire)
+		}
+		back, err := identity.PrincipalFromWire(wire)
+		if err != nil || back != principal {
+			t.Fatalf("round trip = (%+v, %v)", back, err)
+		}
+	}
+}
+
+func TestPrincipalFromWireRejectsInvalidValues(t *testing.T) {
+	for _, wire := range []sessionwire.Principal{{}, {Tenant: "acme", Subject: "u"}, {Tenant: "acme", Subject: "u", Kind: "robot"}} {
+		principal, err := identity.PrincipalFromWire(wire)
+		if !errors.Is(err, identity.ErrInvalidPrincipal) || principal != (identity.Principal{}) {
+			t.Fatalf("PrincipalFromWire(%+v) = (%+v, %v)", wire, principal, err)
+		}
+	}
+}
+
+func TestAdmissionSentinelsAreDistinct(t *testing.T) {
+	if errors.Is(identity.ErrClientPrincipal, identity.ErrMetadataUnsupported) {
+		t.Fatal("the admission refusals are indistinguishable")
+	}
+}
+
 // TestPrincipalHasNoAssignableOrSharedState is the immutability claim, checked
 // against the ways a value type loses it: an exported field, which lets a
 // holder rewrite its own tenant, and a member through which a COPY can observe
