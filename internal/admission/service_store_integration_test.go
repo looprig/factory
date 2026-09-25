@@ -131,6 +131,33 @@ func newCreateIntegrationService(t *testing.T, store *sessionstore.Store, create
 	return svc, f.principal
 }
 
+func TestRealStoreRejectsDifferentSubjectRetryOfStampedCreate(t *testing.T) {
+	store := openCreateIntegrationStore(t)
+	f := newServiceFixture(t)
+	svc, err := NewService(Config{
+		Authorizer: f.auth, Targets: f.targets, Catalog: store, Commands: store,
+		Directory: f.directory, Clock: serviceClock{serviceNow}, IDs: fixedServiceID("runtime-command-stamped"),
+		PublicCreates: store, Binding: SessionBindingTemplate{StorageBindingID: "storage-a", BindingVersion: "v1"},
+		StampPrincipal: true, ApplyDeadline: time.Minute,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := createRequest("stamped-create", "session-stamped", smallBlocks)
+	first, created, err := svc.AdmitCreate(context.Background(), f.principal, req)
+	if err != nil || !created {
+		t.Fatalf("first = (%+v, %t, %v)", first, created, err)
+	}
+	other, _ := identity.NewPrincipal("tenant-a", "actor-b", identity.KindActor)
+	if _, _, err := svc.AdmitCreate(context.Background(), other, req); !IsCode(err, sessionwire.ErrorCodeCommandRejected) {
+		t.Fatalf("different subject = %v", err)
+	}
+	retry, created, err := svc.AdmitCreate(context.Background(), f.principal, req)
+	if err != nil || created || retry.Record.Descriptor.Principal == nil || *retry.Record.Descriptor.Principal != f.principal.Wire() {
+		t.Fatalf("same subject = (%+v, %t, %v)", retry, created, err)
+	}
+}
+
 // TestServiceRefusesLegacyCreateWithoutPersistingASession proves absence by
 // SCANNING, not by a lookup at one guessed id: a refusal that wrote a session
 // under any id would pass a probe of `generated-1`.

@@ -75,6 +75,10 @@ var ErrGateResponseUnsupported = errors.New("admission: the session's owner cann
 // retry under the same CommandID is idempotent.
 var ErrGateResponderUnavailable = errors.New("admission: the session's owner could not be reached to ask whether it applies gate responses")
 
+// ErrPrincipalResponderUnavailable is a transient failure to ask a Host about
+// its principal and metadata capability. It is not a command refusal.
+var ErrPrincipalResponderUnavailable = errors.New("admission: the session's owner could not be reached to ask whether it applies command principal and metadata")
+
 // ErrGateResponseTooLarge is the cause of the invalid_request refusal a NEW
 // gate response gets when its canonical command payload is larger than
 // sessionstore.MaxInboxPayloadBytes (64 KiB), the most the disposition inbox
@@ -191,6 +195,11 @@ type GateResponders interface {
 	AcceptsGateResponses(ctx context.Context, owner sessionwire.HostLinkRegistryObservation) (bool, error)
 }
 
+// PrincipalResponders asks whether a resident Host reads attribution members.
+type PrincipalResponders interface {
+	AcceptsCommandPrincipal(context.Context, sessionwire.HostLinkRegistryObservation) (bool, error)
+}
+
 // Target is the configured immutable launch identity selected for a create.
 // It is configuration, not current Host capacity and not an ownership claim.
 type Target struct {
@@ -216,7 +225,9 @@ type Config struct {
 	// owner that would apply it. OPTIONAL, and nil REFUSES every gate response
 	// with gate_not_resumable (ErrGateResponseUnsupported): the safe default is
 	// the one that never hands a Host a command it cannot apply.
-	GateResponders GateResponders
+	GateResponders      GateResponders
+	StampPrincipal      bool
+	PrincipalResponders PrincipalResponders
 
 	// PublicCreates is the durable public-create plane a V1 create admits
 	// into. It is OPTIONAL, and its absence is a supported composition rather
@@ -321,6 +332,9 @@ func (s *Service) AdmitCreate(ctx context.Context, principal identity.Principal,
 		return sessionstore.DispositionInboxEntry{}, false, gateErr
 	}
 	defer end()
+	if err := s.attribute(principal, &req.Principal); err != nil {
+		return sessionstore.DispositionInboxEntry{}, false, err
+	}
 	if err := req.Validate(); err != nil {
 		return sessionstore.DispositionInboxEntry{}, false, refusal(sessionwire.ErrorCodeInvalidRequest, err)
 	}
@@ -350,10 +364,13 @@ func (s *Service) AdmitInput(ctx context.Context, principal identity.Principal, 
 		return sessionstore.DispositionInboxEntry{}, false, gateErr
 	}
 	defer end()
+	if err := s.attribute(principal, &req.Principal); err != nil {
+		return sessionstore.DispositionInboxEntry{}, false, err
+	}
 	if err := req.Validate(); err != nil {
 		return sessionstore.DispositionInboxEntry{}, false, refusal(sessionwire.ErrorCodeInvalidRequest, err)
 	}
-	return s.admitExisting(ctx, principal, req.SessionID, req.CommandID, CommandInput, req)
+	return s.admitExisting(ctx, principal, req.SessionID, req.CommandID, CommandInput, req, members{req.Principal, req.Metadata})
 }
 
 func (s *Service) AdmitInterrupt(ctx context.Context, principal identity.Principal, req sessionwire.InterruptRequest) (sessionstore.DispositionInboxEntry, bool, error) {
@@ -362,10 +379,13 @@ func (s *Service) AdmitInterrupt(ctx context.Context, principal identity.Princip
 		return sessionstore.DispositionInboxEntry{}, false, gateErr
 	}
 	defer end()
+	if err := s.attribute(principal, &req.Principal); err != nil {
+		return sessionstore.DispositionInboxEntry{}, false, err
+	}
 	if err := req.Validate(); err != nil {
 		return sessionstore.DispositionInboxEntry{}, false, refusal(sessionwire.ErrorCodeInvalidRequest, err)
 	}
-	return s.admitExisting(ctx, principal, req.SessionID, req.CommandID, CommandInterrupt, req)
+	return s.admitExisting(ctx, principal, req.SessionID, req.CommandID, CommandInterrupt, req, members{principal: req.Principal})
 }
 
 func (s *Service) AdmitRestore(ctx context.Context, principal identity.Principal, req sessionwire.RestoreRequest) (sessionstore.DispositionInboxEntry, bool, error) {
@@ -374,10 +394,13 @@ func (s *Service) AdmitRestore(ctx context.Context, principal identity.Principal
 		return sessionstore.DispositionInboxEntry{}, false, gateErr
 	}
 	defer end()
+	if err := s.attribute(principal, &req.Principal); err != nil {
+		return sessionstore.DispositionInboxEntry{}, false, err
+	}
 	if err := req.Validate(); err != nil {
 		return sessionstore.DispositionInboxEntry{}, false, refusal(sessionwire.ErrorCodeInvalidRequest, err)
 	}
-	return s.admitExisting(ctx, principal, req.SessionID, req.CommandID, CommandRestore, req)
+	return s.admitExisting(ctx, principal, req.SessionID, req.CommandID, CommandRestore, req, members{principal: req.Principal})
 }
 
 // AdmitGateResponse is runbook A3.1 step 4: a gate response needs the matching
@@ -390,6 +413,9 @@ func (s *Service) AdmitGateResponse(ctx context.Context, principal identity.Prin
 		return sessionstore.DispositionInboxEntry{}, false, gateErr
 	}
 	defer end()
+	if err := s.attribute(principal, &req.Principal); err != nil {
+		return sessionstore.DispositionInboxEntry{}, false, err
+	}
 	if err := req.Validate(); err != nil {
 		return sessionstore.DispositionInboxEntry{}, false, refusal(sessionwire.ErrorCodeInvalidRequest, err)
 	}
@@ -400,7 +426,8 @@ func (s *Service) AdmitGateResponse(ctx context.Context, principal identity.Prin
 	if err := s.cfg.Authorizer.AuthorizeControl(ctx, principal, req.SessionID, CommandGateResponse); err != nil {
 		return sessionstore.DispositionInboxEntry{}, false, err
 	}
-	if retry, handled, err := s.retry(ctx, principal.Tenant(), req.SessionID, req.CommandID, CommandGateResponse, payload); handled || err != nil {
+	m := members{principal: req.Principal}
+	if retry, handled, err := s.retry(ctx, principal.Tenant(), req.SessionID, req.CommandID, CommandGateResponse, payload, m); handled || err != nil {
 		return retry, false, err
 	}
 	if len(payload) > sessionstore.MaxInboxPayloadBytes {
@@ -418,7 +445,26 @@ func (s *Service) AdmitGateResponse(ctx context.Context, principal identity.Prin
 	if err := s.gateOwnerAnswers(ctx, principal.Tenant(), req.SessionID, entry.Record, now); err != nil {
 		return sessionstore.DispositionInboxEntry{}, false, err
 	}
-	return s.admit(ctx, principal.Tenant(), req.SessionID, req.CommandID, CommandGateResponse, entry.Record.Binding, payload)
+	if err := s.ownerAppliesPrincipal(ctx, principal.Tenant(), req.SessionID, entry.Record, m); err != nil {
+		return sessionstore.DispositionInboxEntry{}, false, err
+	}
+	return s.admit(ctx, principal.Tenant(), req.SessionID, req.CommandID, CommandGateResponse, entry.Record.Binding, payload, m)
+}
+
+func (s *Service) attribute(principal identity.Principal, carried **sessionwire.Principal) error {
+	if *carried != nil {
+		return refusal(sessionwire.ErrorCodeInvalidRequest, fmt.Errorf("%w (field principal)", identity.ErrClientPrincipal))
+	}
+	if s.cfg.StampPrincipal {
+		wire := principal.Wire()
+		*carried = &wire
+	}
+	return nil
+}
+
+type members struct {
+	principal *sessionwire.Principal
+	metadata  sessionwire.MessageMetadata
 }
 
 // gateOwnerAnswers is the ONE owner check a gate response must pass: a fresh
@@ -473,7 +519,7 @@ func (s *Service) ownerAppliesGateResponses(ctx context.Context, owner sessionwi
 	return nil
 }
 
-func (s *Service) admitExisting(ctx context.Context, principal identity.Principal, session sessionwire.SessionID, command sessionwire.CommandID, kind sessionstore.CommandKind, request any) (sessionstore.DispositionInboxEntry, bool, error) {
+func (s *Service) admitExisting(ctx context.Context, principal identity.Principal, session sessionwire.SessionID, command sessionwire.CommandID, kind sessionstore.CommandKind, request any, m members) (sessionstore.DispositionInboxEntry, bool, error) {
 	payload, err := canonicalCommand(request)
 	if err != nil {
 		return sessionstore.DispositionInboxEntry{}, false, refusal(sessionwire.ErrorCodeInvalidRequest, err)
@@ -481,14 +527,41 @@ func (s *Service) admitExisting(ctx context.Context, principal identity.Principa
 	if err := s.cfg.Authorizer.AuthorizeControl(ctx, principal, session, kind); err != nil {
 		return sessionstore.DispositionInboxEntry{}, false, err
 	}
-	if retry, handled, err := s.retry(ctx, principal.Tenant(), session, command, kind, payload); handled || err != nil {
+	if retry, handled, err := s.retry(ctx, principal.Tenant(), session, command, kind, payload, m); handled || err != nil {
 		return retry, false, err
 	}
 	entry, err := s.existingCompatible(ctx, principal.Tenant(), session)
 	if err != nil {
 		return sessionstore.DispositionInboxEntry{}, false, err
 	}
-	return s.admit(ctx, principal.Tenant(), session, command, kind, entry.Record.Binding, payload)
+	if err := s.ownerAppliesPrincipal(ctx, principal.Tenant(), session, entry.Record, m); err != nil {
+		return sessionstore.DispositionInboxEntry{}, false, err
+	}
+	return s.admit(ctx, principal.Tenant(), session, command, kind, entry.Record.Binding, payload, m)
+}
+
+func (s *Service) ownerAppliesPrincipal(ctx context.Context, tenant sessionwire.TenantID, session sessionwire.SessionID, record sessionstore.CatalogRecord, m members) error {
+	if m.principal == nil && len(m.metadata) == 0 {
+		return nil
+	}
+	owner, ok, err := s.cfg.Directory.Owner(ctx, tenant, session)
+	if err != nil {
+		return fmt.Errorf("admission: observe the session's owner: %w", err)
+	}
+	if !ok || !freshMatchingOwner(owner, record, s.cfg.Clock.Now()) {
+		return nil
+	}
+	if s.cfg.PrincipalResponders == nil {
+		return refusal(sessionwire.ErrorCodeRuntimeUnavailable, identity.ErrMetadataUnsupported)
+	}
+	accepts, err := s.cfg.PrincipalResponders.AcceptsCommandPrincipal(ctx, owner)
+	if err != nil {
+		return fmt.Errorf("admission: ask the owner whether it applies command principal and metadata: %w", err)
+	}
+	if !accepts {
+		return refusal(sessionwire.ErrorCodeRuntimeUnavailable, identity.ErrMetadataUnsupported)
+	}
+	return nil
 }
 
 // existingCompatible reads the session a command is addressed to and refuses
@@ -531,7 +604,7 @@ func (s *Service) existingCompatible(ctx context.Context, tenant sessionwire.Ten
 // and deliberately not on the object reference, so a retry that uploads again
 // under a fresh generation still matches; the losing upload may stay orphaned,
 // which the store documents.
-func (s *Service) admit(ctx context.Context, tenant sessionwire.TenantID, session sessionwire.SessionID, command sessionwire.CommandID, kind sessionstore.CommandKind, binding sessionstore.SessionBinding, payload []byte) (sessionstore.DispositionInboxEntry, bool, error) {
+func (s *Service) admit(ctx context.Context, tenant sessionwire.TenantID, session sessionwire.SessionID, command sessionwire.CommandID, kind sessionstore.CommandKind, binding sessionstore.SessionBinding, payload []byte, m members) (sessionstore.DispositionInboxEntry, bool, error) {
 	runtimeID, err := s.cfg.IDs.NewUUID()
 	if err != nil {
 		return sessionstore.DispositionInboxEntry{}, false, err
@@ -541,6 +614,7 @@ func (s *Service) admit(ctx context.Context, tenant sessionwire.TenantID, sessio
 		TenantID: tenant, SessionID: session, CommandID: command, Binding: binding,
 		ProposedRuntimeCommandID: sessionstore.RuntimeCommandID(runtimeID), Kind: kind,
 		AcceptedAt: now, ApplyDeadline: now.Add(s.cfg.ApplyDeadline),
+		Principal: m.principal, Metadata: m.metadata,
 	}
 	if len(payload) > sessionstore.MaxInboxPayloadBytes {
 		object, err := putCommandPayload(ctx, s.cfg.Commands, tenant, session, payload)
@@ -565,7 +639,7 @@ func (s *Service) admit(ctx context.Context, tenant sessionwire.TenantID, sessio
 // performs the immutable content comparison -- kind, digest and size -- and
 // returns the winner's runtime mapping, so the retry is re-admitted under the
 // winner's own binding rather than answered from this read.
-func (s *Service) retry(ctx context.Context, tenant sessionwire.TenantID, session sessionwire.SessionID, command sessionwire.CommandID, kind sessionstore.CommandKind, payload []byte) (sessionstore.DispositionInboxEntry, bool, error) {
+func (s *Service) retry(ctx context.Context, tenant sessionwire.TenantID, session sessionwire.SessionID, command sessionwire.CommandID, kind sessionstore.CommandKind, payload []byte, m members) (sessionstore.DispositionInboxEntry, bool, error) {
 	found, err := s.cfg.Commands.GetDispositionCommand(ctx, sessionstore.GetDispositionCommandRequest{TenantID: tenant, SessionID: session, CommandID: command})
 	if commandNotFound(err) {
 		return sessionstore.DispositionInboxEntry{}, false, nil
@@ -573,7 +647,7 @@ func (s *Service) retry(ctx context.Context, tenant sessionwire.TenantID, sessio
 	if err != nil {
 		return sessionstore.DispositionInboxEntry{}, false, commandRefusal(err)
 	}
-	entry, _, err := s.admit(ctx, tenant, session, command, kind, found.Record.Descriptor.Binding, payload)
+	entry, _, err := s.admit(ctx, tenant, session, command, kind, found.Record.Descriptor.Binding, payload, m)
 	return entry, true, err
 }
 

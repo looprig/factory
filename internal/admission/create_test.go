@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"io"
+	"maps"
 	"reflect"
 	"strconv"
 	"strings"
@@ -43,6 +44,8 @@ type servicePublicCreates struct {
 	sessions     map[sessionwire.SessionID]sessionwire.CommandID
 	records      map[sessionwire.CommandID]sessionstore.DispositionInboxEntry
 	uploads      int
+	prepares     int
+	lastAdmit    sessionstore.AdmitPublicCreateRequest
 	// putBodies records the bytes each upload actually streamed, so a test can
 	// assert the store was handed the same content the identity declared.
 	putBodies [][]byte
@@ -57,6 +60,7 @@ func newServicePublicCreates() *servicePublicCreates {
 }
 
 func (c *servicePublicCreates) PreparePublicCreate(_ context.Context, req sessionstore.PreparePublicCreateRequest) (sessionstore.PublicCreatePreparation, error) {
+	c.prepares++
 	if err := c.enter("PreparePublicCreate"); err != nil {
 		return sessionstore.PublicCreatePreparation{}, err
 	}
@@ -104,6 +108,7 @@ func (c *servicePublicCreates) PutCommandPayload(_ context.Context, req sessions
 }
 
 func (c *servicePublicCreates) AdmitPublicCreate(_ context.Context, req sessionstore.AdmitPublicCreateRequest) (sessionstore.DispositionInboxEntry, bool, error) {
+	c.lastAdmit = req
 	if err := c.enter("AdmitPublicCreate"); err != nil {
 		return sessionstore.DispositionInboxEntry{}, false, err
 	}
@@ -117,7 +122,7 @@ func (c *servicePublicCreates) AdmitPublicCreate(_ context.Context, req sessions
 		// PayloadSize. PayloadObject and Payload are excluded, which is what
 		// lets a re-upload under a fresh generation still be a retry.
 		d := prior.Record.Descriptor
-		if !d.PublicCreate || d.Kind != id.Kind || d.PayloadDigest != id.PayloadDigest || d.PayloadSize != id.PayloadSize {
+		if !d.PublicCreate || d.Kind != id.Kind || d.PayloadDigest != id.PayloadDigest || d.PayloadSize != id.PayloadSize || !samePrincipalForTest(d.Principal, req.Principal) || !maps.Equal(d.Metadata, req.Metadata) {
 			return sessionstore.DispositionInboxEntry{}, false, &sessionstore.InboxError{Code: sessionstore.InboxErrorCommandMismatch}
 		}
 		return prior, false, nil
@@ -129,6 +134,7 @@ func (c *servicePublicCreates) AdmitPublicCreate(_ context.Context, req sessions
 				Binding: id.Binding, RuntimeCommandID: reservation.RuntimeCommandID, Kind: id.Kind,
 				PayloadDigest: id.PayloadDigest, PayloadSize: id.PayloadSize,
 				Payload: req.Payload, PayloadObject: req.PayloadObject,
+				Principal: req.Principal, Metadata: maps.Clone(req.Metadata),
 			},
 			AcceptedAt: reservation.AcceptedAt, ApplyDeadline: reservation.ApplyDeadline,
 			State: sessionstore.InboxStatePending,

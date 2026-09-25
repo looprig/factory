@@ -12,6 +12,7 @@ import (
 	"go/parser"
 	"go/token"
 	"io"
+	"maps"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -273,6 +274,9 @@ func (c *serviceCommands) AdmitDispositionCommand(_ context.Context, req session
 		if winner.Kind != req.Kind || winner.PayloadDigest != digest || winner.PayloadSize != size {
 			return sessionstore.DispositionInboxEntry{}, false, &sessionstore.InboxError{Code: sessionstore.InboxErrorCommandMismatch, Field: "command"}
 		}
+		if !samePrincipalForTest(winner.Principal, req.Principal) || !maps.Equal(winner.Metadata, req.Metadata) {
+			return sessionstore.DispositionInboxEntry{}, false, &sessionstore.InboxError{Code: sessionstore.InboxErrorCommandMismatch, Field: "attribution"}
+		}
 		return prior, false, nil
 	}
 	entry := sessionstore.DispositionInboxEntry{Record: sessionstore.DispositionInboxRecord{
@@ -281,11 +285,19 @@ func (c *serviceCommands) AdmitDispositionCommand(_ context.Context, req session
 			RuntimeCommandID: req.ProposedRuntimeCommandID, Kind: req.Kind,
 			PayloadDigest: digest, PayloadSize: size,
 			Payload: append([]byte(nil), req.Payload...), PayloadObject: req.PayloadObject,
+			Principal: req.Principal, Metadata: maps.Clone(req.Metadata),
 		},
 		AcceptedAt: req.AcceptedAt, ApplyDeadline: req.ApplyDeadline, State: sessionstore.InboxStatePending,
 	}, Revision: 1, AcceptedOrder: uint64(len(c.records) + 1)}
 	c.records[req.CommandID] = entry
 	return entry, true, nil
+}
+
+func samePrincipalForTest(a, b *sessionwire.Principal) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	return *a == *b
 }
 
 type serviceDirectory struct {
@@ -358,16 +370,17 @@ func (s *serviceIDs) NewUUID() (string, error) {
 }
 
 type serviceFixture struct {
-	service   *Service
-	auth      *serviceAuthorizer
-	targets   *serviceTargets
-	catalog   *serviceCatalog
-	commands  *serviceCommands
-	directory *serviceDirectory
-	ids       *serviceIDs
-	creates   *servicePublicCreates
-	principal identity.Principal
-	gates     *serviceGateResponders
+	service    *Service
+	auth       *serviceAuthorizer
+	targets    *serviceTargets
+	catalog    *serviceCatalog
+	commands   *serviceCommands
+	directory  *serviceDirectory
+	ids        *serviceIDs
+	creates    *servicePublicCreates
+	principal  identity.Principal
+	gates      *serviceGateResponders
+	principals *servicePrincipalResponders
 }
 
 // configureCreates supplies the deployment-configuration half a V1 create
@@ -387,9 +400,9 @@ func (f *serviceFixture) configureCreates(t *testing.T) {
 func (f *serviceFixture) rebuildConfigured() {
 	cfg := Config{Authorizer: f.auth, Targets: f.targets, Catalog: f.catalog, Commands: f.commands,
 		Directory: f.directory, Clock: serviceClock{serviceNow}, IDs: f.ids, PublicCreates: f.creates,
-		GateResponders: f.gates,
-		Binding:        SessionBindingTemplate{StorageBindingID: "storage-a", BindingVersion: "v1"},
-		ApplyDeadline:  time.Minute}
+		GateResponders: f.gates, PrincipalResponders: f.principals,
+		Binding:       SessionBindingTemplate{StorageBindingID: "storage-a", BindingVersion: "v1"},
+		ApplyDeadline: time.Minute}
 	if svc, err := NewService(cfg); err == nil {
 		f.service = svc
 	}
@@ -401,7 +414,7 @@ func (f *serviceFixture) rebuild(t *testing.T, adjust func(*Config)) {
 	t.Helper()
 	cfg := Config{Authorizer: f.auth, Targets: f.targets, Catalog: f.catalog, Commands: f.commands,
 		Directory: f.directory, Clock: serviceClock{serviceNow}, IDs: f.ids,
-		PublicCreates: f.creates, GateResponders: f.gates, ApplyDeadline: time.Minute}
+		PublicCreates: f.creates, GateResponders: f.gates, PrincipalResponders: f.principals, ApplyDeadline: time.Minute}
 	adjust(&cfg)
 	svc, err := NewService(cfg)
 	if err != nil {
@@ -426,17 +439,18 @@ func newServiceFixture(t *testing.T) *serviceFixture {
 	ids := &serviceIDs{}
 	creates := newServicePublicCreates()
 	gates := &serviceGateResponders{}
+	principals := &servicePrincipalResponders{}
 	// The base fixture supplies the public-create STORE but NOT the binding
 	// configuration, so AdmitCreate refuses here and configureCreates is what
 	// turns a create on. Both halves are required and neither implies the
 	// other; see Config.createsServed.
 	svc, err := NewService(Config{Authorizer: auth, Targets: targets, Catalog: catalog, Commands: commands,
 		Directory: directory, Clock: serviceClock{serviceNow}, IDs: ids,
-		PublicCreates: creates, GateResponders: gates, ApplyDeadline: time.Minute})
+		PublicCreates: creates, GateResponders: gates, PrincipalResponders: principals, ApplyDeadline: time.Minute})
 	if err != nil {
 		t.Fatalf("NewService: %v", err)
 	}
-	return &serviceFixture{svc, auth, targets, catalog, commands, directory, ids, creates, p, gates}
+	return &serviceFixture{service: svc, auth: auth, targets: targets, catalog: catalog, commands: commands, directory: directory, ids: ids, creates: creates, principal: p, gates: gates, principals: principals}
 }
 
 func envelope(id string) sessionwire.CommandEnvelope {
@@ -1044,6 +1058,12 @@ func TestNoDependencyFaultBecomesAPublicCode(t *testing.T) {
 			t.Run(s.dependency+"."+s.method+"/"+entryName, func(t *testing.T) {
 				f := newServiceFixture(t)
 				resolvableSession(f)
+				if s.dependency == "PrincipalResponders" {
+					f.rebuild(t, func(cfg *Config) {
+						cfg.Binding = SessionBindingTemplate{StorageBindingID: "storage-a", BindingVersion: "v1"}
+						cfg.StampPrincipal = true
+					})
+				}
 				injector, armable := armFault(f, s.dependency, s.method)
 				if !armable {
 					t.Fatalf("no fake can arm %s", s.dependency)
@@ -1197,6 +1217,8 @@ func armFault(f *serviceFixture, dependency, method string) (*faultInjector, boo
 		injector = &f.creates.faultInjector
 	case "GateResponders":
 		injector = &f.gates.faultInjector
+	case "PrincipalResponders":
+		injector = &f.principals.faultInjector
 	default:
 		return nil, false
 	}
@@ -2361,7 +2383,7 @@ func TestARefusedCommandStopsAtItsGuardAndTouchesNothingFurther(t *testing.T) {
 		for _, injector := range []*faultInjector{
 			&f.auth.faultInjector, &f.targets.faultInjector, &f.catalog.faultInjector,
 			&f.commands.faultInjector, &f.directory.faultInjector, &f.ids.faultInjector,
-			&f.gates.faultInjector,
+			&f.gates.faultInjector, &f.principals.faultInjector,
 		} {
 			for method := range injector.called {
 				out = append(out, method)

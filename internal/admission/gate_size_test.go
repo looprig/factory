@@ -81,7 +81,7 @@ func TestAStoredOversizedGateResponseIsAnsweredFromItsRecordOnRetry(t *testing.T
 		t.Fatal(err)
 	}
 	// What an earlier Factory did: admit it by reference.
-	stored, created, err := f.service.admit(context.Background(), "tenant-a", "session-a", "stored-big", CommandGateResponse, existingBinding, payload)
+	stored, created, err := f.service.admit(context.Background(), "tenant-a", "session-a", "stored-big", CommandGateResponse, existingBinding, payload, members{})
 	if err != nil || !created || stored.Record.Descriptor.PayloadObject == nil {
 		t.Fatalf("seeding the by-reference record = (%+v, %v, %v)", stored.Record.Descriptor.PayloadObject, created, err)
 	}

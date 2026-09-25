@@ -159,7 +159,7 @@ func (s *Service) admitPublicCreate(ctx context.Context, tenant sessionwire.Tena
 	}); err != nil {
 		return sessionstore.DispositionInboxEntry{}, false, createRefusal(err)
 	}
-	admit := sessionstore.AdmitPublicCreateRequest{Identity: identity}
+	admit := sessionstore.AdmitPublicCreateRequest{Identity: identity, Principal: req.Principal, Metadata: req.Metadata}
 	if identity.PayloadSize > sessionstore.MaxInboxPayloadBytes {
 		object, err := putCommandPayload(ctx, s.cfg.PublicCreates, tenant, req.SessionID, payload)
 		if err != nil {
