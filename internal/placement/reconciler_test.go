@@ -1161,7 +1161,7 @@ var pinnedHostLinkTypes = []string{
 // "the sessionwire on disk" and "the sessionwire this build resolves" are not
 // the same directory, and a premise checked against the wrong one is the stale
 // citation this test exists to prevent.
-const pinnedCoreVersion = "v0.11.0"
+const pinnedCoreVersion = "v0.12.0"
 
 const pinnedCoreModule = "github.com/looprig/core"
 
