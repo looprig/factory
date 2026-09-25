@@ -88,6 +88,36 @@ func TestStampedInputStoresVerifiedPrincipalAndMetadata(t *testing.T) {
 	}
 }
 
+func TestStampedCreateStoresVerifiedPrincipalAndMetadata(t *testing.T) {
+	f := newServiceFixture(t)
+	f.rebuild(t, func(cfg *Config) {
+		cfg.StampPrincipal = true
+		cfg.Binding = SessionBindingTemplate{StorageBindingID: "storage-a", BindingVersion: "v1"}
+	})
+	metadata := sessionwire.MessageMetadata{"space": "family"}
+	_, _, err := f.service.AdmitCreate(context.Background(), f.principal, sessionwire.CreateRequest{
+		CommandEnvelope: envelope("create-metadata"), SessionID: "session-new", AgentID: "agent-a", Metadata: metadata,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := f.creates.lastAdmit
+	if got.Principal == nil || *got.Principal != f.principal.Wire() || got.Metadata["space"] != "family" {
+		t.Fatalf("create descriptor columns = %+v %+v", got.Principal, got.Metadata)
+	}
+	stored := f.creates.records["create-metadata"].Record.Descriptor
+	if stored.Principal == nil || *stored.Principal != f.principal.Wire() || stored.Metadata["space"] != "family" {
+		t.Fatalf("stored create descriptor = %+v", stored)
+	}
+	var body struct {
+		Principal *sessionwire.Principal      `json:"principal"`
+		Metadata  sessionwire.MessageMetadata `json:"metadata"`
+	}
+	if err := json.Unmarshal(got.Payload, &body); err != nil || body.Principal == nil || *body.Principal != f.principal.Wire() || body.Metadata["space"] != "family" {
+		t.Fatalf("create payload = %s (%v)", got.Payload, err)
+	}
+}
+
 func TestStampedRetryByAnotherSubjectIsCommandRejected(t *testing.T) {
 	f := newServiceFixture(t)
 	resolvableSession(f)
@@ -170,6 +200,20 @@ func TestMemberBearingCommandIsRefusedBeforeWriteForIncapableResident(t *testing
 		if !IsCode(err, sessionwire.ErrorCodeRuntimeUnavailable) || !errors.Is(err, identity.ErrMetadataUnsupported) || f.commands.calls != 0 {
 			t.Fatalf("noResponder=%v: err=%v writes=%d", noResponder, err, f.commands.calls)
 		}
+	}
+}
+
+func TestStampedGateResponseRequiresBothHostCapabilities(t *testing.T) {
+	f := newServiceFixture(t)
+	resolvableSession(f)
+	f.principals.refuse = true
+	f.rebuild(t, func(cfg *Config) { cfg.StampPrincipal = true })
+	_, _, err := f.service.AdmitGateResponse(context.Background(), f.principal, gateAnswer("answer-attributed"))
+	if !IsCode(err, sessionwire.ErrorCodeRuntimeUnavailable) || !errors.Is(err, identity.ErrMetadataUnsupported) {
+		t.Fatalf("stamped gate response = %v", err)
+	}
+	if f.gates.calls != 1 || f.principals.calls != 1 || f.commands.calls != 0 {
+		t.Fatalf("gate asks=%d principal asks=%d writes=%d", f.gates.calls, f.principals.calls, f.commands.calls)
 	}
 }
 

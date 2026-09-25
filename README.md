@@ -482,6 +482,52 @@ dedicated Host's pre-attach endpoint before any resident session exists.
 Factory v0.5.0 remains storage-compatible but cannot discover that endpoint, so
 it cannot place a new dedicated session against a controller of that shape.
 
+### Principal stamping and message metadata (v0.12.0)
+
+Factory accepts client `metadata` on create and input. Core limits it to 16
+string-to-string fields, keys of at most 64 bytes, values of at most 1024
+bytes, and 4096 bytes total; keys with the `looprig` prefix are reserved.
+A client-supplied `principal` on any command kind is refused on REST and
+ClientLink with 400 `invalid_request` (`identity.ErrClientPrincipal`), whether
+or not stamping is enabled.
+
+`WithPrincipalStamping()` opts a deployment into stamping the verified
+credential's tenant, subject and actor/service kind on **every** admitted
+create, input, interrupt, restore and gate response. It is off by default;
+`WithCredentialVerifier` is already a required Factory seam. The stamped
+principal and metadata are part of the canonical command identity: a retry of
+the same `command_id` by a different subject is 409 `command_rejected` and
+does not reattribute the stored command. Enabling stamping also makes an
+in-flight retry of a previously unstamped command `command_rejected`; enable
+it during a quiet period.
+
+A resident Host must advertise Core's exact
+`hostlink.attribution.principal` token before Factory admits a command carrying
+either member. An incapable owner is 422 `runtime_unavailable`
+(`identity.ErrMetadataUnsupported`) with nothing written; an owner that
+cannot be asked is 503 retryable. Placement skips incapable pooled or
+dedicated candidates and waits with `NoCapacity` until a capable one exists.
+The wake filter avoids sending an attributed hint to an incapable resident,
+but only admission prevents that resident from reading a newly written durable
+command. With stamping enabled, `Start` probes the registered pooled Hosts and
+WARNs for each one lacking the token or unable to answer. The probe is bounded
+to 30 seconds and 64 pages per target; an incomplete scan also WARNs.
+
+`GET /v1/capabilities` retains the `/v1/agents` aggregate and adds
+`message_metadata: true` and `command_principal`, which reports whether this
+deployment enabled stamping. `/v1/agents` keeps its old body. New
+`GET /v1/sessions/{sid}/commands/{cid}` returns public command status. Its
+`principal` and `metadata` members appear only when the supplied Authorizer
+also implements optional `AuditAuthorizer` and grants that read; absence,
+denial or an audit-authorizer fault omits both. `TenantAuthorizer` grants audit
+reads within the principal's tenant.
+
+Roll out every Host at v0.11.0 or later first, then Factory v0.12.0; confirm
+the HostLink token across the fleet before enabling stamping. **One-way:**
+once any attributed command is stored, every Factory and Host sharing the
+store must remain on sessionstore v0.14.0 or later. Older readers refuse the
+new durable record version.
+
 ## The HostLink
 
 `internal/realtime/hostlink` is Factory's client side of the Factory-Host

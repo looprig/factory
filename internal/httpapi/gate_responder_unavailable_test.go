@@ -6,6 +6,8 @@ import (
 	"net/http"
 	"testing"
 
+	sessionwire "github.com/looprig/core/sessionwire/v1"
+	"github.com/looprig/factory/identity"
 	"github.com/looprig/factory/internal/admission"
 	"github.com/looprig/factory/internal/realtime/hostlink"
 )
@@ -40,5 +42,12 @@ func TestPrincipalCapabilityFaultIsAnsweredRetryable(t *testing.T) {
 	got := admissionFailure(err)
 	if got.status != http.StatusServiceUnavailable || got.code != ErrorCodeUnavailable {
 		t.Fatalf("admissionFailure = %+v", got)
+	}
+}
+
+func TestIncapableResidentIsRuntimeUnavailable422(t *testing.T) {
+	got := admissionFailure(&admission.Error{Code: sessionwire.ErrorCodeRuntimeUnavailable, Cause: identity.ErrMetadataUnsupported})
+	if got.status != http.StatusUnprocessableEntity || got.code != sessionwire.ErrorCodeRuntimeUnavailable {
+		t.Fatalf("refusal = %+v", got)
 	}
 }

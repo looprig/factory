@@ -587,10 +587,11 @@ func TestAFaultIsNotARefusal(t *testing.T) {
 	t.Parallel()
 
 	for name, cause := range map[string]error{
-		"a cancelled context":     context.Canceled,
-		"an expired deadline":     context.DeadlineExceeded,
-		"a closing store":         &sessionstore.StoreClosedError{},
-		"an unclassified failure": errors.New("connection refused"),
+		"a cancelled context":                       context.Canceled,
+		"an expired deadline":                       context.DeadlineExceeded,
+		"a closing store":                           &sessionstore.StoreClosedError{},
+		"an unreachable principal-capability owner": admission.ErrPrincipalResponderUnavailable,
+		"an unclassified failure":                   errors.New("connection refused"),
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()

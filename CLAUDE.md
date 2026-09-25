@@ -24,6 +24,10 @@ no Host type Factory could hold, because Factory cannot name one. `contract.go`
 states it in code and `TestCrossServiceContractTypes` pins that every member of
 the contract is a Core wire type.
 
+Principal and metadata rules live in `internal/admission` only; the capability
+predicate is `hostlink.PrincipalCapable`, asked through
+`Pool.AcceptsCommandPrincipal`, and nothing else decides.
+
 Use exact released Core, Storage and SessionStore versions. No `replace`, no
 vendoring. Verify standalone with `GOWORK=off go test ./...`; the workspace
 `go.work` will otherwise mask a missing dependency.
