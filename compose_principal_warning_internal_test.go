@@ -22,6 +22,73 @@ type pagedWarningDirectory struct {
 	once  sync.Once
 }
 
+type deadlineWarningDirectory struct{ FakeSeams }
+
+func (d deadlineWarningDirectory) Candidates(ctx context.Context, _ sessionstore.ListCompatibleHostsRequest) (sessionstore.HostTargetPage, error) {
+	<-ctx.Done()
+	// A provider may return the page it finished concurrently with the
+	// deadline. Its continuation still means later registered Hosts were not
+	// checked, even though this call itself returned no error.
+	return sessionstore.HostTargetPage{NextCursor: "more"}, nil
+}
+
+func TestPrincipalStartupProbeWarnsWhenItsDeadlineLeavesPagesUnchecked(t *testing.T) {
+	logs := &bytes.Buffer{}
+	s := &Server{cfg: config{
+		stampPrincipal: true,
+		directory:      deadlineWarningDirectory{},
+		department:     []LaunchTemplate{{Key: sessionstore.HostTargetKey{AgentID: "agent-a", RuntimeCompatibilityID: "runtime-a", Placement: sessionwire.HostPlacementPooled}}},
+		logger:         slog.New(slog.NewJSONHandler(logs, nil)),
+	}}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond)
+	defer cancel()
+	s.warnIncapableHosts(ctx)
+	if got := logs.String(); !strings.Contains(got, "some registered Hosts were not checked") {
+		t.Fatalf("deadline stopped a paged probe without an incomplete-scan warning: %s", got)
+	}
+}
+
+type endlessWarningDirectory struct {
+	FakeSeams
+	calls int
+}
+
+func (d *endlessWarningDirectory) Candidates(context.Context, sessionstore.ListCompatibleHostsRequest) (sessionstore.HostTargetPage, error) {
+	d.calls++
+	return sessionstore.HostTargetPage{NextCursor: "more"}, nil
+}
+
+func TestPrincipalStartupProbeWarnsAtItsPageBound(t *testing.T) {
+	directory := &endlessWarningDirectory{}
+	logs := &bytes.Buffer{}
+	s := &Server{cfg: config{
+		stampPrincipal: true,
+		directory:      directory,
+		department:     []LaunchTemplate{{Key: sessionstore.HostTargetKey{AgentID: "agent-a", RuntimeCompatibilityID: "runtime-a", Placement: sessionwire.HostPlacementPooled}}},
+		logger:         slog.New(slog.NewJSONHandler(logs, nil)),
+	}}
+	s.warnIncapableHosts(context.Background())
+	if directory.calls != principalProbeMaxPages || !strings.Contains(logs.String(), "page bound") {
+		t.Fatalf("pages=%d, warnings=%s", directory.calls, logs.String())
+	}
+}
+
+func TestPrincipalStartupProbeShutdownCancellationIsSilent(t *testing.T) {
+	logs := &bytes.Buffer{}
+	s := &Server{cfg: config{
+		stampPrincipal: true,
+		directory:      deadlineWarningDirectory{},
+		department:     []LaunchTemplate{{Key: sessionstore.HostTargetKey{AgentID: "agent-a", RuntimeCompatibilityID: "runtime-a", Placement: sessionwire.HostPlacementPooled}}},
+		logger:         slog.New(slog.NewJSONHandler(logs, nil)),
+	}}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	s.warnIncapableHosts(ctx)
+	if got := logs.String(); got != "" {
+		t.Fatalf("shutdown cancellation logged a rollout warning: %s", got)
+	}
+}
+
 func (d *pagedWarningDirectory) Candidates(_ context.Context, req sessionstore.ListCompatibleHostsRequest) (sessionstore.HostTargetPage, error) {
 	d.calls++
 	if req.Cursor == "" {

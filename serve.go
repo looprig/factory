@@ -324,6 +324,7 @@ func (s *Server) Start(ctx context.Context) error {
 const (
 	warnHostLacksPrincipal   = "factory: WithPrincipalStamping is on and a registered Host does not advertise hostlink.attribution.principal; sessions on it are refused runtime_unavailable and none are placed on it"
 	warnHostPrincipalUnasked = "factory: WithPrincipalStamping is on and a registered Host could not be asked whether it advertises hostlink.attribution.principal"
+	warnHostProbeBudget      = "factory: principal capability startup probe reached its time budget; some registered Hosts were not checked"
 	principalProbeTimeout    = 5 * time.Second
 	principalProbeBudget     = 30 * time.Second
 	principalProbePageLimit  = 64
@@ -338,6 +339,15 @@ func (s *Server) warnIncapableHosts(ctx context.Context) {
 	}
 	probeCtx, cancel := context.WithTimeout(ctx, principalProbeBudget)
 	defer cancel()
+	// A deadline can land between page reads, during Candidates, or while
+	// asking a Host. Report it on every exit path; shutdown cancellation is not
+	// a rollout warning. Use Warn without the expired context so a handler that
+	// honors context cancellation cannot discard this diagnostic.
+	defer func() {
+		if errors.Is(probeCtx.Err(), context.DeadlineExceeded) {
+			logger(s.cfg).Warn(warnHostProbeBudget)
+		}
+	}()
 	seen := map[sessionwire.HostID]bool{}
 	for _, configured := range s.cfg.department {
 		template := configured.normalized()

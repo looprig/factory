@@ -511,7 +511,10 @@ The wake filter avoids sending an attributed hint to an incapable resident,
 but only admission prevents that resident from reading a newly written durable
 command. With stamping enabled, `Start` probes the registered pooled Hosts and
 WARNs for each one lacking the token or unable to answer. The probe is bounded
-to 30 seconds and 64 pages per target; an incomplete scan also WARNs.
+to 30 seconds and 64 pages per target. It pages toward completion rather than
+sampling only one page; reaching either bound WARNs that some Hosts were not
+checked. Admission and placement enforce capability independently of this
+informational probe.
 
 `GET /v1/capabilities` retains the `/v1/agents` aggregate and adds
 `message_metadata: true` and `command_principal`, which reports whether this
@@ -526,7 +529,10 @@ Roll out every Host at v0.11.0 or later first, then Factory v0.12.0; confirm
 the HostLink token across the fleet before enabling stamping. **One-way:**
 once any attributed command is stored, every Factory and Host sharing the
 store must remain on sessionstore v0.14.0 or later. Older readers refuse the
-new durable record version.
+new durable record version. Once any stamped or presented record exists, rolling
+Harness below v0.41.0 is also forbidden: old Harness decoders silently drop
+the additive members, so rollback is lossy. In particular, an applied input
+not yet started may be re-offered without its principal or presenter frame.
 
 ## The HostLink
 
