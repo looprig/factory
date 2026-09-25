@@ -235,6 +235,7 @@ func writeJSONBytes(w http.ResponseWriter, status int, body []byte) {
 	header.Set("X-Content-Type-Options", "nosniff")
 	header.Set("Cache-Control", "no-store")
 	w.WriteHeader(status)
+	// #nosec G705 -- All callers pass Core/json.Marshal JSON, and this writer sets application/json plus nosniff before the body. The audit metadata path is regression-tested with HTML-shaped input.
 	_, _ = w.Write(body)
 }
 

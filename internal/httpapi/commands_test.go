@@ -85,6 +85,29 @@ func TestCommandStatusAuditMembersRequireOptionalGrant(t *testing.T) {
 	}
 }
 
+func TestAuditMetadataIsJSONEscapedAndNeverServedAsHTML(t *testing.T) {
+	entry := stampedCommandEntry()
+	entry.Record.Descriptor.Metadata = sessionwire.MessageMetadata{"markup": "<script>alert(1)</script>"}
+	reader := &commandReadFixture{entry: entry}
+	f := newFixture(t, func(cfg *RouterConfig, _ *fixture) {
+		cfg.CommandReads = reader
+		cfg.Authorizer = optionalAuditAuthorizer{recordingAuthorizer: &recordingAuthorizer{}, grant: true}
+	})
+	response := f.get("/v1/sessions/session-a/commands/input-1")
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d %s", response.Code, response.Body)
+	}
+	if got := response.Header().Get("Content-Type"); got != "application/json" {
+		t.Errorf("Content-Type = %q", got)
+	}
+	if got := response.Header().Get("X-Content-Type-Options"); got != "nosniff" {
+		t.Errorf("X-Content-Type-Options = %q", got)
+	}
+	if bytes.Contains(response.Body.Bytes(), []byte("<script>")) || !bytes.Contains(response.Body.Bytes(), []byte(`\u003cscript\u003e`)) {
+		t.Errorf("markup was not JSON-escaped: %s", response.Body)
+	}
+}
+
 func TestCommandStatusRejectsInvalidAbsentAndWrongSession(t *testing.T) {
 	reader := &commandReadFixture{entry: stampedCommandEntry()}
 	f := newFixture(t, func(cfg *RouterConfig, f *fixture) {
