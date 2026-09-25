@@ -60,6 +60,10 @@ func (duringAttach) DeliverCommand(context.Context, sessionwire.TenantID, sessio
 func (duringAttach) AcceptsGateResponses(context.Context, sessionwire.HostLinkRegistryObservation) (bool, error) {
 	return false, nil
 }
+
+func (duringAttach) AcceptsCommandPrincipal(context.Context, sessionwire.HostLinkRegistryObservation) (bool, error) {
+	return true, nil
+}
 func (duringAttach) RouteFor(sessionwire.TenantID, sessionwire.SessionID) (sessionwire.HostID, bool) {
 	return "", false
 }

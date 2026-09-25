@@ -175,7 +175,8 @@ type openSession struct {
 	needsHost bool
 	// gates is the subset of wake that is gate responses, which placement
 	// delivers only to a Host that can apply one.
-	gates []sessionwire.CommandID
+	gates      []sessionwire.CommandID
+	principals []sessionwire.CommandID
 	// restore reports a PENDING restore command still inside its deadline:
 	// the explicit intent that may bring a released dedicated session back.
 	restore bool
@@ -203,7 +204,7 @@ func (s *PendingSweeper) Sweep(ctx context.Context, principal identity.Principal
 		}
 		result.Sessions++
 		placed, err := s.cfg.Placer.Reconcile(ctx, Request{
-			TenantID: session.tenant, SessionID: session.id, Wake: session.wake, GateResponses: session.gates,
+			TenantID: session.tenant, SessionID: session.id, Wake: session.wake, GateResponses: session.gates, PrincipalCommands: session.principals,
 			// Only a live pending restore licenses re-expressing a released
 			// dedicated session's launch template (D3.1 F2); other open work
 			// may be what the product abandoned by deleting it.
@@ -286,10 +287,14 @@ func (s *PendingSweeper) collect(ctx context.Context, shard int, cursor sessionw
 				order = append(order, session)
 			}
 			live := now.Before(entry.Record.ApplyDeadline)
+			carries := descriptor.Principal != nil || len(descriptor.Metadata) > 0
 			switch entry.Record.State {
 			case sessionstore.InboxStatePending:
 				if live {
 					session.wake = append(session.wake, descriptor.CommandID)
+					if carries {
+						session.principals = append(session.principals, descriptor.CommandID)
+					}
 					switch descriptor.Kind {
 					case command.KindGateResponse:
 						session.gates = append(session.gates, descriptor.CommandID)
@@ -301,6 +306,9 @@ func (s *PendingSweeper) collect(ctx context.Context, shard int, cursor sessionw
 			case sessionstore.InboxStateClaimed:
 				if live {
 					session.needsHost = true
+					if carries {
+						session.principals = append(session.principals, descriptor.CommandID)
+					}
 				}
 			case sessionstore.InboxStateApplying:
 				session.needsHost = true

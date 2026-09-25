@@ -225,6 +225,10 @@ type Request struct {
 	// command not named here is delivered as before.
 	GateResponses []sessionwire.CommandID
 
+	// PrincipalCommands names live pending or claimed commands carrying a
+	// principal or metadata. Placement requires a capable Host for them.
+	PrincipalCommands []sessionwire.CommandID
+
 	// RestoreRequested reports that the caller observed a LIVE PENDING
 	// RESTORE command for this session: the one explicit, post-release intent
 	// that licenses re-expressing a RELEASED dedicated session's launch
@@ -288,6 +292,10 @@ type Result struct {
 	Delivered             int
 	DeliveryFailures      int
 	WithheldGateResponses int
+	// WithheldPrincipalCommands counts attributed wakes not sent to an
+	// incapable resident. It cannot prevent that Host reading its durable stream;
+	// admission refuses such a resident before writing the command.
+	WithheldPrincipalCommands int
 
 	// Excluded names the admissible candidates skipped because they do not
 	// advertise hostlink.attach; Unreachable those this replica could not ask;
