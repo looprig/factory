@@ -18,6 +18,25 @@ func Pending(p *Plane, tenant sessionwire.TenantID, session sessionwire.SessionI
 	return len(s.events), lost
 }
 
+// QueuedFrames copies the mailbox's publication bytes for ordering assertions.
+func QueuedFrames(p *Plane, tenant sessionwire.TenantID, session sessionwire.SessionID) (frames [][]byte, lost bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	s := p.sessions[sessionKey{tenant: tenant, session: session}]
+	if s == nil {
+		return nil, false
+	}
+	for _, ev := range s.events {
+		if ev.kind == evLost {
+			lost = true
+		}
+		if ev.kind == evFrame {
+			frames = append(frames, append([]byte(nil), ev.data...))
+		}
+	}
+	return frames, lost
+}
+
 // Sessions reports how many sessions the plane holds state for.
 func Sessions(p *Plane) int {
 	p.mu.Lock()

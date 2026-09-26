@@ -120,9 +120,9 @@ type Config struct {
 	// Viewers supplies the running ClientLink, or nil when there is none.
 	// Required.
 	Viewers func() Viewers
-	// MailboxLimit bounds one session's undelivered events. A tail that
-	// outruns it is treated as LOST -- repaired with a reset -- rather than
-	// buffered without bound. Required, positive.
+	// MailboxLimit bounds one session's undelivered events. Ephemeral frames
+	// drop at capacity or make room for enduring frames; an overflow with no
+	// ephemeral victim loses the tail and triggers repair. Required, positive.
 	MailboxLimit int
 	// EventTimeout bounds the relay work one event may cost: a tip read, a
 	// rebind and the publishes. Required, positive.
@@ -146,11 +146,12 @@ type Plane struct {
 	relay    Relay
 	rebinder routing.Rebinder
 
-	mu       sync.Mutex
-	closed   bool
-	nextGen  uint64
-	sessions map[sessionKey]*sessionState
-	wg       sync.WaitGroup
+	mu                sync.Mutex
+	closed            bool
+	droppedEphemerals uint64
+	nextGen           uint64
+	sessions          map[sessionKey]*sessionState
+	wg                sync.WaitGroup
 }
 
 type sessionKey struct {
@@ -191,9 +192,10 @@ const (
 )
 
 type event struct {
-	kind    eventKind
-	initial bool
-	data    []byte
+	kind      eventKind
+	initial   bool
+	data      []byte
+	ephemeral bool
 }
 
 // New validates a composition.
@@ -504,9 +506,9 @@ func (k *sink) Subscribed() {
 	p.pushLocked(s, event{kind: evLive, initial: initial})
 }
 
-// Publication queues one frame of the accepted subscription. A mailbox at its
-// limit is not grown: the backlog of frames is dropped and the tail is treated
-// as lost, which the repair answers with a reset.
+// Publication queues one frame of the accepted subscription. Ephemeral frames
+// may be dropped to preserve room for enduring records; an irreducible
+// overflow loses the tail and is repaired with a reset.
 func (k *sink) Publication(data []byte) {
 	p := k.plane
 	p.mu.Lock()
@@ -515,26 +517,62 @@ func (k *sink) Publication(data []byte) {
 	if s == nil || !s.watched || s.gen == 0 || s.gen != k.gen {
 		return
 	}
+	ephemeral := droppableEphemeral(k.key, data)
 	if len(s.events) >= p.limit {
-		kept := s.events[:0]
-		for _, queued := range s.events {
-			if queued.kind != evFrame {
-				kept = append(kept, queued)
-			}
+		if ephemeral {
+			p.droppedEphemerals++
+			return
 		}
-		s.events = kept
-		s.gen = 0
-		// The subscription is NOT withdrawn here. The repair this queues
-		// withdraws it synchronously (Relay.HostLinkClosed -> Tail.Stop), in
-		// order with its own re-bind and re-subscribe; a withdrawal started
-		// here would run in no order with them and, landing after the
-		// re-subscribe, would remove the NEW tail (v0.4.0 gates F1/F2).
-		// Until the repair runs, the old tail's frames are dropped by the
-		// generation check above.
-		p.pushLocked(s, event{kind: evLost})
-		return
+		for len(s.events) >= p.limit {
+			victim := -1
+			for i, queued := range s.events {
+				if queued.ephemeral {
+					victim = i
+					break
+				}
+			}
+			if victim < 0 {
+				break
+			}
+			copy(s.events[victim:], s.events[victim+1:])
+			s.events[len(s.events)-1] = event{}
+			s.events = s.events[:len(s.events)-1]
+			p.droppedEphemerals++
+		}
+		if len(s.events) >= p.limit {
+			kept := s.events[:0]
+			for _, queued := range s.events {
+				if queued.kind != evFrame {
+					kept = append(kept, queued)
+				}
+			}
+			s.events = kept
+			s.gen = 0
+			// Withdrawal stays ordered with the repair's re-subscribe.
+			p.pushLocked(s, event{kind: evLost})
+			return
+		}
 	}
-	p.pushLocked(s, event{kind: evFrame, data: data})
+	p.pushLocked(s, event{kind: evFrame, data: data, ephemeral: ephemeral})
+}
+
+// droppableEphemeral uses Core's full decoder and the tail identity. A frame
+// that cannot pass both still reaches Relay.Receive (or an overflow repair).
+func droppableEphemeral(key sessionKey, data []byte) bool {
+	kind, err := sessionwire.SessionRecordTypeOf(data)
+	if err != nil || kind != sessionwire.SessionRecordTypeEphemeralPublication {
+		return false
+	}
+	var publication sessionwire.EphemeralPublication
+	return publication.UnmarshalJSON(data) == nil && publication.TenantID == key.tenant && publication.SessionID == key.session
+}
+
+// DroppedEphemerals counts mailbox admission drops and evictions. It does not
+// inspect or log publication bodies.
+func (p *Plane) DroppedEphemerals() uint64 {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.droppedEphemerals
 }
 
 // Ended queues the repair of a tail that stopped without being asked to.

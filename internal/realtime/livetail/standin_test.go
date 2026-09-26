@@ -259,6 +259,7 @@ type viewers struct {
 	records map[string][]string
 	closes  map[string]int
 	gate    chan struct{}
+	entered chan struct{}
 }
 
 func newViewers() *viewers {
@@ -272,8 +273,15 @@ func key(tenant sessionwire.TenantID, sid sessionwire.SessionID) string {
 func (v *viewers) PublishSession(tenant sessionwire.TenantID, sid sessionwire.SessionID, encoded []byte) error {
 	v.mu.Lock()
 	gate := v.gate
+	entered := v.entered
 	v.mu.Unlock()
 	if gate != nil {
+		if entered != nil {
+			select {
+			case entered <- struct{}{}:
+			default:
+			}
+		}
 		<-gate
 	}
 	v.mu.Lock()
@@ -407,6 +415,7 @@ type rigOptions struct {
 	mailbox   int
 	reconnect time.Duration
 	logger    *slog.Logger
+	viewers   livetail.Viewers
 }
 
 func newRig(t *testing.T, opts rigOptions) *rig {
@@ -436,9 +445,13 @@ func newRig(t *testing.T, opts rigOptions) *rig {
 		pool: pool, dir: &directory{owners: map[string]sessionwire.HostLinkRegistryObservation{}},
 		tips: &tips{}, viewers: newViewers(), clock: &manualClock{},
 	}
+	viewers := opts.viewers
+	if viewers == nil {
+		viewers = r.viewers
+	}
 	r.plane, err = livetail.New(livetail.Config{
 		Links:        pool,
-		Viewers:      func() livetail.Viewers { return r.viewers },
+		Viewers:      func() livetail.Viewers { return viewers },
 		MailboxLimit: opts.mailbox,
 		EventTimeout: 10 * time.Second,
 		Logger:       opts.logger,
