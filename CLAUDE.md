@@ -1857,15 +1857,25 @@ candidate, which is what every pre-B5 test drives.
 - **An owned session with a wake is bound with the REGISTRY's epoch** (section
   15 step 1) and takes no claim; with nothing to wake it touches no Host.
 
-**The trigger is `PendingSweeper`, a sweep over the disposition inbox**
-(`pending.go`), composed only with `WithPendingCommands`. The inbox files every
+**Placement has an admission fast path and a durable sweep** in `PendingSweeper`
+(`pending.go`), composed only with `WithPendingCommands`. Admission enqueues a
+notice after the inbox commit; bounded workers inspect SessionStore's
+`ListSessionDispositionCommands` for that session's open commands before
+calling the same reconciler the sweep uses. If settled history fills the first
+page, they inventory open work through the bounded due view instead. A busy
+due shard can defer that attempt to the sweep. Their claim
+holders differ from each other and from the sweep's. Adapters lacking that
+session read fall back to a bounded shard scan, and an incomplete cycle defers
+to the sweep. The inbox files every
 open disposition command at its apply deadline, so one page at
 `now + ApplyDeadline` is every command still open. A session is placed when it
 has a pending or claimed command inside its deadline, or an **applying** one at
 any age (only a successor runtime settles it); the wake is its live pending
-commands. It is a sweep and not admission because I1.2 case 3 kills the
-admitting replica, and section 10.4 lets any replica reconcile due work; an
-admission-time kick would be a latency optimisation on top, and is not built.
+commands. The sweep remains the durability path because I1.2 case 3 kills the
+admitting replica, and section 10.4 lets any replica reconcile due work. A
+successful local attach also rebinds that session's live tail when this replica
+has viewer demand; a remote attach reaches viewers through the independent
+five-second ownership poll.
 
 **`WithPlacementController` is no longer required.** Nothing ever read it but
 the required-seams table; `EnsurePlacement(DesiredWorkload)` cannot identify a

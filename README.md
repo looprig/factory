@@ -618,6 +618,10 @@ Host a session belongs to is placement's (see Placement).
 ## Live output (Gap 3, v0.4.0)
 
 A watched session's live output reaches the viewers watching it.
+When this replica places a session already watched locally, it rebinds the
+tail immediately after attach. A different replica's placement is picked up
+by the five-second ownership poll, independent of the 30-second subscriber
+release debounce.
 `internal/realtime/livetail` composes `routing.Relay` between the HostLink
 subscription and the ClientLink: each record a Host publishes is published once
 to `session:{tenant}:{session}`, the channel wui subscribes to, in order. A Host
@@ -711,9 +715,20 @@ plane's repair). Before, the replica kept redialling the dead address until the
 60 s idle reaper collected the link, or never while a viewer pinned it. An
 older or same-generation observation of another address does not move a link.
 
-**Pooled placement attaches (B5).** With `WithPendingCommands`, a
-"placement" sweep pages one control shard of the disposition inbox per
-interval and, for each session with an open command and no live owner, asks
+**Pooled placement attaches (B5).** With `WithPendingCommands`, each admitted
+command prompts a bounded placement attempt for its session. The "placement"
+sweep still pages one control shard of the disposition inbox per interval and
+recovers notifications lost to a full queue, crash, restart or another replica.
+The paths use distinct durable claim holders, so a concurrent sweep defers to
+an admission attempt. Admission workers read the session's disposition inbox
+before placing it. If settled history fills that read, they use the bounded
+due view to find open work and its Host capability needs. A busy due shard may
+defer the attempt to the periodic sweep.
+Older pending-query adapters without the session read use a bounded shard scan
+and fall back to the sweep if it is incomplete. Each placement pass
+has its own deadline (`ReconcileLimits.PassTimeout`, default 10 seconds, capped
+at half `ClaimTTL`), independent of the sweep interval. For each session with
+open work and no live owner, placement asks
 the first ranked admissible candidate to `hostlink.attach` -- fenced by that
 candidate's `host_id`/`host_generation` from its capacity report, with the
 sweep's service identity as `actor_id` -- then binds with the lease epoch the
