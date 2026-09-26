@@ -441,6 +441,61 @@ func TestTheFirstSubscriberBindsToTheSessionsOwner(t *testing.T) {
 	}
 }
 
+func TestOwnershipPollUsesShortCadenceOnlyWhileUnbound(t *testing.T) {
+	limits := DemandLimits{OwnershipPollInterval: 5 * time.Second, HeldPollInterval: 35 * time.Second, PollTimeout: time.Second}
+	ownerless := newDemandFixture(t, limits)
+	ownerless.acquire(t, bindSession)
+	if got := ownerless.clock.lastInterval(t); got != 5*time.Second {
+		t.Fatalf("unbound poll = %v", got)
+	}
+	held := newDemandFixture(t, limits, observation("host-a", 1, 1))
+	held.acquire(t, bindSession)
+	if got := held.clock.lastInterval(t); got != 35*time.Second {
+		t.Fatalf("held poll = %v", got)
+	}
+	beforeUnbound, beforeHeld := ownerless.resolver.count(), held.resolver.count()
+	ownerless.clock.tick(t)
+	held.clock.tick(t)
+	if got := ownerless.resolver.count() - beforeUnbound; got != 1 {
+		t.Fatalf("unbound poll registry reads = %d", got)
+	}
+	if got := held.resolver.count() - beforeHeld; got != 1 {
+		t.Fatalf("held poll registry reads = %d", got)
+	}
+	t.Log("measured one registry read per ownership poll in both states; cadence is 5s unbound and 35s held")
+	ownerless.resolver.put(observation("host-a", 1, 1))
+	if err := ownerless.demand.Rebind(context.Background(), bindTenant, bindSession); err != nil {
+		t.Fatal(err)
+	}
+	if got := ownerless.clock.lastInterval(t); got != 35*time.Second {
+		t.Fatalf("poll after rebind = %v, want held cadence", got)
+	}
+	beforeStale := ownerless.resolver.count()
+	ownerless.clock.fireEvenStopped(t, 1)
+	if got := ownerless.resolver.count(); got != beforeStale {
+		t.Fatalf("cancelled old poll read registry: %d -> %d", beforeStale, got)
+	}
+}
+
+func TestRebindReturnsWhenItsContextExpiresWaitingForDemand(t *testing.T) {
+	f := newDemandFixture(t, testDemandLimits)
+	f.acquire(t, bindSession)
+	f.demand.mu.Lock()
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- f.demand.Rebind(ctx, bindTenant, bindSession) }()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Errorf("Rebind = %v", err)
+		}
+	case <-time.After(200 * time.Millisecond):
+		t.Error("Rebind outlived its context")
+	}
+	f.demand.mu.Unlock()
+}
+
 // TestTheFirstSubscriberOfAnOwnerlessSessionIsWatchedUnbound is A1/B1/C1, and
 // it is the carry-forward A7.2-subscribe-no-restore in its behavioural half:
 // the subscriber is neither refused nor served by making the session resident.

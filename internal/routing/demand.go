@@ -62,6 +62,9 @@ type DemandLimits struct {
 	// armed. It is a gap between polls rather than a period, so a poll slower
 	// than the interval delays the next one instead of overlapping with it.
 	OwnershipPollInterval time.Duration
+	// HeldPollInterval is the gap for sessions already bound to an owner.
+	// Zero retains OwnershipPollInterval for direct package users.
+	HeldPollInterval time.Duration
 
 	// PollTimeout bounds ONE whole poll -- the registry read, the bind it may
 	// provoke, the tip read and the publish together -- rather than each call
@@ -351,9 +354,17 @@ func (d *Demand) Release(ctx context.Context, tenant sessionwire.TenantID, sessi
 // structural guard that keeps a second holder from appearing.
 func (d *Demand) Rebind(ctx context.Context, tenant sessionwire.TenantID, session sessionwire.SessionID) error {
 	key := sessionKey{tenant: tenant, session: session}
-
-	d.mu.Lock()
+	for !d.mu.TryLock() {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(time.Millisecond):
+		}
+	}
 	defer d.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if d.closed {
 		return ErrDemandClosed
 	}
@@ -370,11 +381,17 @@ func (d *Demand) Rebind(ctx context.Context, tenant sessionwire.TenantID, sessio
 		// the rebind, because the local route is gone either way.
 		err := d.bindings.Release(ctx, key.tenant, key.session)
 		entry.held = false
+		if ctx.Err() != nil {
+			d.rescheduleLocked(key, entry)
+			return errors.Join(err, ctx.Err())
+		}
 		d.serveLocked(ctx, key, entry)
-		return err
+		d.rescheduleLocked(key, entry)
+		return errors.Join(err, ctx.Err())
 	}
 	d.serveLocked(ctx, key, entry)
-	return nil
+	d.rescheduleLocked(key, entry)
+	return ctx.Err()
 }
 
 // Close stops every poll, gives every route back and refuses later work.
@@ -510,9 +527,23 @@ func (d *Demand) serveLocked(ctx context.Context, key sessionKey, entry *demandS
 // TestThePollIntervalIsAGapAndNotAPeriod asks the clock, from inside a seam
 // call, whether a successor is already armed.
 func (d *Demand) scheduleLocked(key sessionKey, entry *demandSession) {
-	entry.stop = d.clock.AfterFunc(d.limits.OwnershipPollInterval, func() {
+	interval := d.limits.OwnershipPollInterval
+	if entry.held && d.limits.HeldPollInterval > 0 {
+		interval = d.limits.HeldPollInterval
+	}
+	entry.stop = d.clock.AfterFunc(interval, func() {
 		d.poll(key, entry)
 	})
+}
+
+// rescheduleLocked changes the cadence after Rebind changes a route's state.
+// Replacing the entry also makes an old timer callback harmless if Stop lost
+// the race; poll compares the captured pointer with the table's current one.
+func (d *Demand) rescheduleLocked(key sessionKey, entry *demandSession) {
+	entry.cancelPoll()
+	next := &demandSession{subscribers: entry.subscribers, held: entry.held}
+	d.sessions[key] = next
+	d.scheduleLocked(key, next)
 }
 
 // cancelPoll supersedes the scheduled poll. The stop is what usually prevents
