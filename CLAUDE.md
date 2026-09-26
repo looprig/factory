@@ -2510,8 +2510,10 @@ time), `routing.Demand`, the HostLink pool -- and adds three edges:
   subscription's sink, in order. The sink runs on centrifuge-go's callback
   goroutine -- which for a publication is the goroutine READING the connection
   -- so it never blocks: it appends to a bounded mailbox (the Relay's
-  HostBinding queue size). A mailbox at its bound is a LOST tail (repaired
-  below), never unbounded growth.
+  HostBinding queue size). A valid local ephemeral arriving at capacity is
+  dropped; enduring and control arrivals evict queued ephemerals first. Only
+  an overflow with no ephemeral victim loses the tail and starts repair.
+  Malformed and foreign frames still reach the Relay's refusal path.
 
 **The rule: a Host keeps no history, so every tail START is followed by a
 session.reset, sent AFTER the tail is live -- except the one start inside the
