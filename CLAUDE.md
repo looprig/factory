@@ -2511,7 +2511,8 @@ time), `routing.Demand`, the HostLink pool -- and adds three edges:
   goroutine -- which for a publication is the goroutine READING the connection
   -- so it never blocks: it appends to a bounded mailbox (the Relay's
   HostBinding queue size). A valid local ephemeral arriving at capacity is
-  dropped; enduring and control arrivals evict queued ephemerals first. Only
+  dropped; non-ephemeral publications (enduring, or any record the Relay will
+  refuse) evict queued ephemerals first. Control events are not bounded. Only
   an overflow with no ephemeral victim loses the tail and starts repair.
   Malformed and foreign frames still reach the Relay's refusal path.
 
