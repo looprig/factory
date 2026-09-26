@@ -64,6 +64,9 @@ func (q *admissionQueue) enqueue(notice placement.AdmissionNotice) {
 
 func (q *admissionQueue) next(ctx context.Context) (placement.AdmissionNotice, admissionKey, bool) {
 	for {
+		if ctx.Err() != nil {
+			return placement.AdmissionNotice{}, admissionKey{}, false
+		}
 		q.mu.Lock()
 		if len(q.order) > 0 {
 			key := q.order[0]

@@ -64,3 +64,13 @@ func TestAdmissionQueueCoalescesQueuedCreateAndInput(t *testing.T) {
 		t.Fatal("a second placement or non-pending notice was queued")
 	}
 }
+
+func TestCanceledAdmissionWorkerLeavesQueuedWorkForTheDurableSweep(t *testing.T) {
+	q := newAdmissionQueue(1)
+	q.enqueue(placement.AdmissionNotice{TenantID: "tenant-a", SessionID: "cold", Pending: true})
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, _, ok := q.next(ctx); ok {
+		t.Fatal("canceled worker took queued placement")
+	}
+}
