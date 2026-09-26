@@ -66,16 +66,18 @@ type AdmissionNotice struct {
 	TenantID  sessionwire.TenantID
 	SessionID sessionwire.SessionID
 	CommandID sessionwire.CommandID
-	Deadline  time.Time
-	Pending   bool
+	// AcceptedOrder lets the targeted read stop at the committed command.
+	AcceptedOrder uint64
+	Deadline      time.Time
+	Pending       bool
 }
 
 func Notice(entry sessionstore.DispositionInboxEntry) AdmissionNotice {
 	d := entry.Record.Descriptor
 	return AdmissionNotice{
 		TenantID: d.TenantID, SessionID: d.SessionID, CommandID: d.CommandID,
-		Deadline: entry.Record.ApplyDeadline,
-		Pending:  entry.Record.State == sessionstore.InboxStatePending,
+		Deadline: entry.Record.ApplyDeadline, AcceptedOrder: entry.AcceptedOrder,
+		Pending: entry.Record.State == sessionstore.InboxStatePending,
 	}
 }
 
@@ -141,6 +143,9 @@ type PendingSweeper struct {
 	next    int
 	cursors map[int]sessionwire.Cursor
 }
+
+// SweepPlacer reports the reconciler composed for periodic placement.
+func (s *PendingSweeper) SweepPlacer() Placer { return s.cfg.Placer }
 
 // NewPendingSweeper validates a configuration before it can reach a store.
 func NewPendingSweeper(cfg PendingSweeperConfig) (*PendingSweeper, error) {
@@ -310,15 +315,16 @@ func (s *PendingSweeper) PlaceAdmissionWith(ctx context.Context, principal ident
 		if err != nil {
 			return Result{}, err
 		}
-		if observed && ReusableOwner(owner, entry.Record, s.cfg.Clock.Now()) {
+		if observed && Decide(entry.Record, owner, observed, nil, s.cfg.Clock.Now()).Outcome == OutcomeReuseOwner &&
+			(entry.Record.DesiredPlacement != sessionwire.HostPlacementDedicated || owner.HostGeneration == entry.Record.DesiredGeneration) {
 			return Result{}, nil
 		}
 	}
 	// Inventory this session's open commands before choosing a Host:
 	// an earlier gate response or attributed command constrains selection for
-	// a later plain command. A full session-history page falls back to the
-	// bounded due view, which omits settled history. Older adapters use that
-	// same bounded shard fallback.
+	// a later plain command. Session history is paged to the admitted order.
+	// If it cannot be reached inside MaxPages, a small due-view budget
+	// inventories open work instead. Older adapters use that fallback too.
 	var target *openSession
 	var err error
 	if s.cfg.SessionCommands != nil {
@@ -343,7 +349,7 @@ func (s *PendingSweeper) PlaceAdmissionWith(ctx context.Context, principal ident
 func (s *PendingSweeper) collectAdmissionSession(ctx context.Context, notice AdmissionNotice) (*openSession, error) {
 	target := &openSession{tenant: notice.TenantID, id: notice.SessionID}
 	var after uint64
-	for {
+	for range s.cfg.MaxPages {
 		page, err := s.cfg.SessionCommands.ListSessionDispositionCommands(ctx, sessionstore.ListSessionDispositionCommandsRequest{
 			TenantID: notice.TenantID, SessionID: notice.SessionID, AfterOrder: after, Limit: s.cfg.PageLimit,
 		})
@@ -359,27 +365,30 @@ func (s *PendingSweeper) collectAdmissionSession(ctx context.Context, notice Adm
 		for _, entry := range page.Commands {
 			target.add(entry, s.cfg.Clock.Now())
 		}
-		if slices.Contains(target.wake, notice.CommandID) {
+		if page.NextAfterOrder >= notice.AcceptedOrder && slices.Contains(target.wake, notice.CommandID) {
 			break
 		}
-		// The acceptance-order index includes settled history. If one page
-		// does not reach the notice, use the due index instead: it inventories
-		// older open work without imposing capabilities on a plain command.
-		if len(page.Commands) == s.cfg.PageLimit {
-			return s.collectAdmissionFallback(ctx, notice)
+		if len(page.Commands) < s.cfg.PageLimit {
+			break
 		}
 		after = page.NextAfterOrder
 	}
 	if !slices.Contains(target.wake, notice.CommandID) {
-		return nil, nil
+		return s.collectAdmissionFallback(ctx, notice)
 	}
 	return target, nil
 }
 
 func (s *PendingSweeper) collectAdmissionFallback(ctx context.Context, notice AdmissionNotice) (*openSession, error) {
+	const maxDuePages = 2
+	remaining := maxDuePages
 	for shard := range s.cfg.Pending.ControlShards() {
+		if remaining == 0 {
+			break
+		}
 		result := PendingSweepResult{}
-		sessions, _, err := s.collect(ctx, shard, "", s.cfg.Clock.Now(), &result)
+		sessions, _, err := s.collectPages(ctx, shard, "", s.cfg.Clock.Now(), &result, remaining)
+		remaining -= result.Pages
 		if err != nil {
 			return nil, err
 		}
@@ -435,11 +444,15 @@ func (session *openSession) add(entry sessionstore.DispositionInboxEntry, now ti
 // What is not read this pass is read by the next pass over the shard, from
 // where this one stopped.
 func (s *PendingSweeper) collect(ctx context.Context, shard int, cursor sessionwire.Cursor, now time.Time, result *PendingSweepResult) ([]*openSession, sessionwire.Cursor, error) {
+	return s.collectPages(ctx, shard, cursor, now, result, s.cfg.MaxPages)
+}
+
+func (s *PendingSweeper) collectPages(ctx context.Context, shard int, cursor sessionwire.Cursor, now time.Time, result *PendingSweepResult, maxPages int) ([]*openSession, sessionwire.Cursor, error) {
 	var (
 		order    []*openSession
 		sessions = map[sessionKey]*openSession{}
 	)
-	for range s.cfg.MaxPages {
+	for range maxPages {
 		req := sessionstore.ListDueDispositionCommandsRequest{Shard: shard, Limit: s.cfg.PageLimit, Cursor: cursor}
 		if cursor == "" {
 			req.DueAtOrBefore = now.Add(s.cfg.Horizon)

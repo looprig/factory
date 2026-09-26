@@ -302,6 +302,41 @@ func TestAdmissionWaitsForItsOwnDurableDueEntry(t *testing.T) {
 	}
 }
 
+type staleDedicatedOwner struct{}
+
+func (staleDedicatedOwner) GetCatalogEntry(context.Context, sessionstore.GetCatalogEntryRequest) (sessionstore.CatalogEntry, error) {
+	r := pooledRecord()
+	r.DesiredPlacement = sessionwire.HostPlacementDedicated
+	r.DesiredGeneration = 4
+	return sessionstore.CatalogEntry{Record: r}, nil
+}
+func (staleDedicatedOwner) UpdateCatalogDesiredState(context.Context, sessionstore.UpdateCatalogDesiredStateRequest) (sessionstore.CatalogEntry, error) {
+	return sessionstore.CatalogEntry{}, nil
+}
+func (staleDedicatedOwner) Owner(context.Context, sessionwire.TenantID, sessionwire.SessionID) (sessionwire.HostLinkRegistryObservation, bool, error) {
+	r := pooledRecord()
+	r.DesiredPlacement = sessionwire.HostPlacementDedicated
+	o := residentOwner(r)
+	o.ObservedAt = reconcileNow
+	o.ExpiresAt = reconcileNow.Add(time.Minute)
+	return o, true, nil
+}
+func (staleDedicatedOwner) Candidates(context.Context, sessionstore.ListCompatibleHostsRequest) (sessionstore.HostTargetPage, error) {
+	return sessionstore.HostTargetPage{}, nil
+}
+func TestAdmissionDoesNotSkipDedicatedOwnerFromOlderGeneration(t *testing.T) {
+	entry := open(testSession, "new-command", sessionstore.InboxStatePending, reconcileNow.Add(time.Minute))
+	placer := &recordingPlacer{}
+	s := newFakeSweeper(t, &fakePending{shards: 1, pages: []sessionstore.DispositionDueCommandPage{{Commands: []sessionstore.DispositionInboxEntry{entry}}}}, placer, &movableClock{now: reconcileNow}, &allowSweeps{})
+	s.cfg.Catalog, s.cfg.Directory = staleDedicatedOwner{}, staleDedicatedOwner{}
+	if _, err := s.PlaceAdmission(context.Background(), servicePrincipal(t), Notice(entry)); err != nil {
+		t.Fatal(err)
+	}
+	if len(placer.requests) != 1 {
+		t.Fatalf("placement calls = %d, want stale owner reconsidered", len(placer.requests))
+	}
+}
+
 type sessionCommandReader struct {
 	entry sessionstore.DispositionInboxEntry
 	calls int
@@ -331,6 +366,47 @@ func TestAdmissionFindsNewCommandBeyondBusyShardHead(t *testing.T) {
 	}
 	if reader.calls == 0 || len(busy.requests) != 0 || len(placer.requests) != 1 || placer.requests[0].SessionID != testSession {
 		t.Fatalf("session reads=%d shard reads=%d placements=%+v, want one targeted placement without a shard scan", reader.calls, len(busy.requests), placer.requests)
+	}
+}
+
+type pagedHistory struct {
+	entry sessionstore.DispositionInboxEntry
+	reads int
+}
+
+func (r *pagedHistory) ListSessionDispositionCommands(_ context.Context, req sessionstore.ListSessionDispositionCommandsRequest) (sessionstore.SessionDispositionCommandPage, error) {
+	r.reads++
+	page := sessionstore.SessionDispositionCommandPage{}
+	for i := req.AfterOrder + 1; i <= uint64(300) && len(page.Commands) < req.Limit; i++ {
+		old := open(testSession, sessionwire.CommandID(fmt.Sprintf("old-%d", i)), sessionstore.InboxStateApplied, reconcileNow)
+		old.AcceptedOrder = i
+		page.Commands = append(page.Commands, old)
+		page.NextAfterOrder = i
+	}
+	if len(page.Commands) < req.Limit {
+		page.Commands = append(page.Commands, r.entry)
+		page.NextAfterOrder = r.entry.AcceptedOrder
+	}
+	return page, nil
+}
+
+func TestAdmissionPagesPastMoreThan256SettledCommands(t *testing.T) {
+	entry := open(testSession, "new-command", sessionstore.InboxStatePending, reconcileNow.Add(time.Minute))
+	entry.AcceptedOrder = 301
+	if got := Notice(entry).AcceptedOrder; got != 301 {
+		t.Fatalf("notice accepted order = %d", got)
+	}
+	reader := &pagedHistory{entry: entry}
+	placer := &recordingPlacer{}
+	pending := &fakePending{shards: 1}
+	s := newFakeSweeper(t, pending, placer, &movableClock{now: reconcileNow}, &allowSweeps{})
+	s.cfg.PageLimit = 256
+	s.cfg.SessionCommands = reader
+	if _, err := s.PlaceAdmission(context.Background(), servicePrincipal(t), Notice(entry)); err != nil {
+		t.Fatal(err)
+	}
+	if reader.reads != 2 || len(pending.requests) != 0 || len(placer.requests) != 1 {
+		t.Fatalf("session reads=%d due reads=%d placements=%d, want two session pages and one placement", reader.reads, len(pending.requests), len(placer.requests))
 	}
 }
 
@@ -364,7 +440,7 @@ func TestAdmissionSkipsSettledHistoryWithoutMissingTheNewCommand(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !slices.Equal(reader.orders, []uint64{0}) || len(pending.requests) != 1 || len(placer.requests) != 1 || !slices.Equal(placer.requests[0].Wake, []sessionwire.CommandID{entry.Record.Descriptor.CommandID}) {
+	if !slices.Equal(reader.orders, []uint64{0, 7}) || len(pending.requests) != 1 || len(placer.requests) != 1 || !slices.Equal(placer.requests[0].Wake, []sessionwire.CommandID{entry.Record.Descriptor.CommandID}) {
 		t.Fatalf("history bounds=%v due reads=%d placement=%+v, want a bounded open-work read", reader.orders, len(pending.requests), placer.requests)
 	}
 	if len(placer.requests[0].GateResponses) != 0 || len(placer.requests[0].PrincipalCommands) != 0 {
