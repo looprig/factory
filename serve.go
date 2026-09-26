@@ -11,6 +11,7 @@ import (
 	"time"
 
 	sessionwire "github.com/looprig/core/sessionwire/v1"
+	"github.com/looprig/factory/internal/placement"
 	"github.com/looprig/factory/internal/realtime/hostlink"
 	"github.com/looprig/sessionstore"
 )
@@ -307,6 +308,25 @@ func (s *Server) Start(ctx context.Context) error {
 			s.runSweep(loopCtx, pass)
 		}(pass)
 	}
+	for _, placer := range s.components.admissionPlacers {
+		wg.Add(1)
+		go func(placer placement.Placer) {
+			defer wg.Done()
+			for {
+				select {
+				case <-loopCtx.Done():
+					return
+				case entry := <-s.components.admitted:
+					passCtx, cancel := context.WithTimeout(loopCtx, s.cfg.reconcile.passTimeout())
+					_, err := s.components.pending.PlaceAdmissionWith(passCtx, s.cfg.service, entry, placer)
+					cancel()
+					if err != nil && loopCtx.Err() == nil {
+						logger(s.cfg).Warn("placement: admission-triggered placement failed", slog.String("error", err.Error()))
+					}
+				}
+			}
+		}(placer)
+	}
 	if s.cfg.stampPrincipal {
 		wg.Add(1)
 		go func() {
@@ -424,11 +444,9 @@ func (s *Server) runSweep(ctx context.Context, pass sweep) {
 
 // runOnce bounds one pass and separates a cancelled pass from a failed one.
 //
-// The deadline is the sweep INTERVAL and not a separate limit, because a pass
-// that has not finished by the time the next one is due has already lost the
-// cadence; giving it longer would let one slow shard hold the loop.
+// The pass has its own bound; the interval is only the gap before the next pass.
 func (s *Server) runOnce(ctx context.Context, pass sweep) {
-	passCtx, cancel := context.WithTimeout(ctx, s.cfg.reconcile.Interval)
+	passCtx, cancel := context.WithTimeout(ctx, s.cfg.reconcile.passTimeout())
 	defer cancel()
 	_ = pass.run(passCtx)
 	s.components.reapIdle()

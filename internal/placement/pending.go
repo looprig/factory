@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"sync"
 	"time"
 
@@ -15,17 +16,17 @@ import (
 	"github.com/looprig/storage"
 )
 
-// This file is the TRIGGER for B5: what decides that a session needs placing.
+// This file carries the two triggers for B5: admission and durable pending work.
 //
-// THE TRIGGER IS A SWEEP OVER DURABLE PENDING WORK, and not admission. The
+// THE DURABILITY TRIGGER IS A SWEEP OVER DURABLE PENDING WORK. The
 // reason is specification section 10.4 and integration case I1.2-3 together:
 // "any Factory replica may reconcile due work", and a Factory that dies after
 // the inbox commit and before forwarding must be replaced by ANOTHER Factory
 // that still gets the command applied. The only thing both replicas share is
 // the durable inbox, so the thing that decides a session needs a Host must be
 // a reader of the inbox, and it must run with no user in the loop -- which is
-// why the attach carries a service ActorID. Admission-time placement would be
-// a latency optimisation on top of this, never a substitute: it runs on the
+// why the attach carries a service ActorID. Admission-time placement is a
+// latency optimisation on top of this, never a substitute: it runs on the
 // admitting replica, which is exactly the one I1.2-3 kills.
 //
 // The inbox index files every non-terminal disposition command at its apply
@@ -40,6 +41,13 @@ type PendingCommands interface {
 	ListDueDispositionCommands(context.Context, sessionstore.ListDueDispositionCommandsRequest) (sessionstore.DispositionDueCommandPage, error)
 }
 
+// SessionCommands is SessionStore's optional, acceptance-ordered read of one
+// session's inbox. The released Store implements it; the legacy PendingCommands
+// seam remains source compatible for adapters that do not.
+type SessionCommands interface {
+	ListSessionDispositionCommands(context.Context, sessionstore.ListSessionDispositionCommandsRequest) (sessionstore.SessionDispositionCommandPage, error)
+}
+
 // SweepAuthorizer decides the sweep, as it does for every other cross-tenant
 // sweep this module runs.
 type SweepAuthorizer interface {
@@ -52,6 +60,25 @@ type Placer interface {
 	Reconcile(ctx context.Context, req Request) (Result, error)
 }
 
+// AdmissionNotice is the placement-relevant part of a committed command.
+// It carries no immutable session binding across this notification boundary.
+type AdmissionNotice struct {
+	TenantID  sessionwire.TenantID
+	SessionID sessionwire.SessionID
+	CommandID sessionwire.CommandID
+	Deadline  time.Time
+	Pending   bool
+}
+
+func Notice(entry sessionstore.DispositionInboxEntry) AdmissionNotice {
+	d := entry.Record.Descriptor
+	return AdmissionNotice{
+		TenantID: d.TenantID, SessionID: d.SessionID, CommandID: d.CommandID,
+		Deadline: entry.Record.ApplyDeadline,
+		Pending:  entry.Record.State == sessionstore.InboxStatePending,
+	}
+}
+
 // ErrInvalidPendingSweeperConfig reports a pending sweeper that cannot keep
 // its own bounds. It is a third sentinel beside ErrInvalidConfig and
 // ErrInvalidSweeperConfig for the reason records.go gives for the second.
@@ -59,10 +86,17 @@ var ErrInvalidPendingSweeperConfig = errors.New("placement: invalid pending-work
 
 // PendingSweeperConfig is one replica's pending-work sweep.
 type PendingSweeperConfig struct {
-	Authorizer SweepAuthorizer
-	Pending    PendingCommands
-	Placer     Placer
-	Clock      Clock
+	Authorizer      SweepAuthorizer
+	Pending         PendingCommands
+	SessionCommands SessionCommands
+	Placer          Placer
+	// Catalog and Directory let the fast path skip an already-owned session.
+	Catalog   Catalog
+	Directory Directory
+	// AdmissionPlacer uses a distinct claim holder from Placer when supplied.
+	// Two concurrent calls from this replica must not renew one another's claim.
+	AdmissionPlacer Placer
+	Clock           Clock
 
 	// Horizon is how far past now the due read reaches. It is the apply
 	// deadline admission gives every command, so every command accepted up to
@@ -247,6 +281,151 @@ func (s *PendingSweeper) Sweep(ctx context.Context, principal identity.Principal
 	return result, nil
 }
 
+// PlaceAdmission gives a freshly admitted command a targeted chance to place
+// its session. The periodic durable sweep remains the recovery path if this
+// notification is lost. Reconcile owns the same claim for both callers.
+func (s *PendingSweeper) PlaceAdmission(ctx context.Context, principal identity.Principal, notice AdmissionNotice) (Result, error) {
+	placer := s.cfg.AdmissionPlacer
+	if placer == nil {
+		placer = s.cfg.Placer
+	}
+	return s.PlaceAdmissionWith(ctx, principal, notice, placer)
+}
+
+// PlaceAdmissionWith lets each admission worker use its own claim holder.
+// A slow attach on one worker must not renew another worker's claim.
+func (s *PendingSweeper) PlaceAdmissionWith(ctx context.Context, principal identity.Principal, notice AdmissionNotice, placer Placer) (Result, error) {
+	if err := s.cfg.Authorizer.AuthorizeServiceSweep(ctx, principal); err != nil {
+		return Result{}, err
+	}
+	if !notice.Pending || !s.cfg.Clock.Now().Before(notice.Deadline) {
+		return Result{}, nil
+	}
+	if s.cfg.Catalog != nil && s.cfg.Directory != nil {
+		entry, err := s.cfg.Catalog.GetCatalogEntry(ctx, sessionstore.GetCatalogEntryRequest{TenantID: notice.TenantID, SessionID: notice.SessionID})
+		if err != nil {
+			return Result{}, err
+		}
+		owner, observed, err := s.cfg.Directory.Owner(ctx, notice.TenantID, notice.SessionID)
+		if err != nil {
+			return Result{}, err
+		}
+		if observed && ReusableOwner(owner, entry.Record, s.cfg.Clock.Now()) {
+			return Result{}, nil
+		}
+	}
+	// Inventory this session's open commands before choosing a Host:
+	// an earlier gate response or attributed command constrains selection for
+	// a later plain command. A full session-history page falls back to the
+	// bounded due view, which omits settled history. Older adapters use that
+	// same bounded shard fallback.
+	var target *openSession
+	var err error
+	if s.cfg.SessionCommands != nil {
+		target, err = s.collectAdmissionSession(ctx, notice)
+	} else {
+		target, err = s.collectAdmissionFallback(ctx, notice)
+	}
+	if err != nil {
+		return Result{}, err
+	}
+	if target == nil || !target.needsHost {
+		return Result{}, nil
+	}
+	req := Request{
+		TenantID: target.tenant, SessionID: target.id,
+		Wake: target.wake, GateResponses: target.gates,
+		PrincipalCommands: target.principals, RestoreRequested: target.restore,
+	}
+	return placer.Reconcile(ctx, req)
+}
+
+func (s *PendingSweeper) collectAdmissionSession(ctx context.Context, notice AdmissionNotice) (*openSession, error) {
+	target := &openSession{tenant: notice.TenantID, id: notice.SessionID}
+	var after uint64
+	for {
+		page, err := s.cfg.SessionCommands.ListSessionDispositionCommands(ctx, sessionstore.ListSessionDispositionCommandsRequest{
+			TenantID: notice.TenantID, SessionID: notice.SessionID, AfterOrder: after, Limit: s.cfg.PageLimit,
+		})
+		if err != nil {
+			return nil, err
+		}
+		if len(page.Commands) == 0 {
+			break
+		}
+		if page.NextAfterOrder <= after {
+			return nil, fmt.Errorf("placement: session command page did not advance")
+		}
+		for _, entry := range page.Commands {
+			target.add(entry, s.cfg.Clock.Now())
+		}
+		if slices.Contains(target.wake, notice.CommandID) {
+			break
+		}
+		// The acceptance-order index includes settled history. If one page
+		// does not reach the notice, use the due index instead: it inventories
+		// older open work without imposing capabilities on a plain command.
+		if len(page.Commands) == s.cfg.PageLimit {
+			return s.collectAdmissionFallback(ctx, notice)
+		}
+		after = page.NextAfterOrder
+	}
+	if !slices.Contains(target.wake, notice.CommandID) {
+		return nil, nil
+	}
+	return target, nil
+}
+
+func (s *PendingSweeper) collectAdmissionFallback(ctx context.Context, notice AdmissionNotice) (*openSession, error) {
+	for shard := range s.cfg.Pending.ControlShards() {
+		result := PendingSweepResult{}
+		sessions, _, err := s.collect(ctx, shard, "", s.cfg.Clock.Now(), &result)
+		if err != nil {
+			return nil, err
+		}
+		for _, session := range sessions {
+			if session.tenant == notice.TenantID && session.id == notice.SessionID {
+				if result.Truncated || !slices.Contains(session.wake, notice.CommandID) {
+					return nil, nil
+				}
+				return session, nil
+			}
+		}
+	}
+	return nil, nil
+}
+
+func (session *openSession) add(entry sessionstore.DispositionInboxEntry, now time.Time) {
+	descriptor := entry.Record.Descriptor
+	live := now.Before(entry.Record.ApplyDeadline)
+	carries := descriptor.Principal != nil || len(descriptor.Metadata) > 0
+	switch entry.Record.State {
+	case sessionstore.InboxStatePending:
+		if live {
+			session.wake = append(session.wake, descriptor.CommandID)
+			if carries {
+				session.principals = append(session.principals, descriptor.CommandID)
+			}
+			switch descriptor.Kind {
+			case command.KindGateResponse:
+				session.gates = append(session.gates, descriptor.CommandID)
+			case command.KindRestore:
+				session.restore = true
+			}
+			session.needsHost = true
+		}
+	case sessionstore.InboxStateClaimed:
+		if live {
+			session.needsHost = true
+			if carries {
+				session.principals = append(session.principals, descriptor.CommandID)
+			}
+		}
+	case sessionstore.InboxStateApplying:
+		session.needsHost = true
+	}
+}
+
 // collect reads one shard's open commands from cursor, bounded by MaxPages,
 // groups them by session in first-seen order, and returns the position to
 // keep.
@@ -286,33 +465,7 @@ func (s *PendingSweeper) collect(ctx context.Context, shard int, cursor sessionw
 				sessions[key] = session
 				order = append(order, session)
 			}
-			live := now.Before(entry.Record.ApplyDeadline)
-			carries := descriptor.Principal != nil || len(descriptor.Metadata) > 0
-			switch entry.Record.State {
-			case sessionstore.InboxStatePending:
-				if live {
-					session.wake = append(session.wake, descriptor.CommandID)
-					if carries {
-						session.principals = append(session.principals, descriptor.CommandID)
-					}
-					switch descriptor.Kind {
-					case command.KindGateResponse:
-						session.gates = append(session.gates, descriptor.CommandID)
-					case command.KindRestore:
-						session.restore = true
-					}
-					session.needsHost = true
-				}
-			case sessionstore.InboxStateClaimed:
-				if live {
-					session.needsHost = true
-					if carries {
-						session.principals = append(session.principals, descriptor.CommandID)
-					}
-				}
-			case sessionstore.InboxStateApplying:
-				session.needsHost = true
-			}
+			session.add(entry, now)
 		}
 		cursor = page.NextCursor
 		if cursor == "" {

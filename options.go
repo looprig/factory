@@ -376,11 +376,15 @@ func WithUIFS(dir fs.FS) Option {
 	})
 }
 
-// ReconcileLimits bounds Factory's periodic reconciliation of pending commands
-// with no live owner.
+// ReconcileLimits bounds Factory's periodic reconciliation and immediate
+// placement of admitted commands whose sessions have no live owner.
 type ReconcileLimits struct {
 	// Interval is the sweep cadence.
 	Interval time.Duration
+	// PassTimeout bounds one sweep or admission-triggered placement pass.
+	// Zero uses the default, so older keyed limits literals remain valid.
+	// The effective bound is capped at half ClaimTTL to keep the claim live.
+	PassTimeout time.Duration
 	// ClaimTTL is how long a reconciliation claim suppresses duplicate work.
 	ClaimTTL time.Duration
 	// ApplyDeadline is how long an accepted command may stay unapplied before
@@ -397,6 +401,7 @@ type ReconcileLimits struct {
 func DefaultReconcileLimits() ReconcileLimits {
 	return ReconcileLimits{
 		Interval:       5 * time.Second,
+		PassTimeout:    10 * time.Second,
 		ClaimTTL:       30 * time.Second,
 		ApplyDeadline:  5 * time.Minute,
 		MaxDuePerSweep: 256,
@@ -408,6 +413,9 @@ func DefaultReconcileLimits() ReconcileLimits {
 func (l ReconcileLimits) Validate() error {
 	if err := positive("ReconcileLimits.Interval", l.Interval); err != nil {
 		return err
+	}
+	if l.PassTimeout < 0 {
+		return fmt.Errorf("%w: ReconcileLimits.PassTimeout must not be negative", ErrInvalidLimits)
 	}
 	if err := positive("ReconcileLimits.ClaimTTL", l.ClaimTTL); err != nil {
 		return err
@@ -435,6 +443,23 @@ func (l ReconcileLimits) Validate() error {
 			ErrInvalidLimits, l.ClaimTTL, l.ApplyDeadline)
 	}
 	return nil
+}
+
+func (l ReconcileLimits) passTimeout() time.Duration {
+	bound := l.PassTimeout
+	if bound == 0 {
+		bound = DefaultReconcileLimits().PassTimeout
+	}
+	// A pass must end while the placement claim it acquired can still fence
+	// another pass. Keep older keyed literals with a shorter ClaimTTL valid.
+	claimBound := l.ClaimTTL / 2
+	if claimBound < time.Nanosecond {
+		claimBound = time.Nanosecond
+	}
+	if bound > claimBound {
+		return claimBound
+	}
+	return bound
 }
 
 // ClientLinkLimits bounds this replica's local connections and fan-out queues.

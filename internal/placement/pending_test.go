@@ -98,8 +98,17 @@ func newPendingFixture(t *testing.T) *pendingFixture {
 	if err != nil {
 		t.Fatalf("NewReconciler: %v", err)
 	}
+	admissionPlacer, err := NewReconciler(Config{
+		Directory: mustDirectory(t, store), Catalog: store, Claims: store,
+		Clock: clock, HolderID: "factory-2-admission", ClaimTTL: time.Minute, CandidateLimit: 8,
+		Links: links, ActorID: testActor,
+	})
+	if err != nil {
+		t.Fatalf("NewReconciler admission: %v", err)
+	}
 	sweeper, err := NewPendingSweeper(PendingSweeperConfig{
-		Authorizer: &allowSweeps{}, Pending: store, Placer: reconciler, Clock: clock,
+		Authorizer: &allowSweeps{}, Pending: store, Placer: reconciler, AdmissionPlacer: admissionPlacer, Clock: clock,
+		Catalog: store, Directory: mustDirectory(t, store), SessionCommands: store,
 		Horizon: 5 * time.Minute, PageLimit: 16, MaxPages: 4,
 	})
 	if err != nil {
@@ -173,6 +182,229 @@ func TestASweepPlacesEveryCommittedCreateItDidNotAdmit(t *testing.T) {
 	slices.Sort(f.links.delivered)
 	if !slices.Equal(f.links.delivered, []sessionwire.CommandID{"create-1", "create-2"}) {
 		t.Errorf("delivered = %v, want each session's create command", f.links.delivered)
+	}
+}
+
+// The admission signal places directly: the fake clock never advances to a
+// periodic interval, and the durable sweep remains a separate recovery path.
+func TestAdmissionPlacesColdSessionBeforeOneInterval(t *testing.T) {
+	f := newPendingFixture(t)
+	publishPooled(t, f.store, f.clock, "host-a")
+	admitPooledCreate(t, f.store, f.clock, "session-cold", "create-cold", 5*time.Minute)
+	entry, err := f.store.GetDispositionCommand(context.Background(), sessionstore.GetDispositionCommandRequest{
+		TenantID: testTenant, SessionID: "session-cold", CommandID: "create-cold",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := f.sweeper.PlaceAdmission(context.Background(), servicePrincipal(t), Notice(entry))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Attached == (sessionwire.HostLinkRegistryObservation{}) || len(f.links.attaches) != 1 {
+		t.Fatalf("targeted placement = %+v, attaches = %+v", result, f.links.attaches)
+	}
+}
+
+func TestConcurrentAdmissionAndSweepShareThePlacementClaim(t *testing.T) {
+	f := newPendingFixture(t)
+	publishPooled(t, f.store, f.clock, "host-a")
+	admitPooledCreate(t, f.store, f.clock, "session-race", "create-race", 5*time.Minute)
+	entry, err := f.store.GetDispositionCommand(context.Background(), sessionstore.GetDispositionCommandRequest{
+		TenantID: testTenant, SessionID: "session-race", CommandID: "create-race",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	entered, release := make(chan struct{}), make(chan struct{})
+	f.links.on("host-a", func(_ int, req sessionwire.HostLinkAttachRequest) (sessionwire.HostLinkRegistryObservation, error) {
+		close(entered)
+		<-release
+		return acceptedObservation(req, attachedEpoch), nil
+	})
+	done := make(chan error, 1)
+	go func() {
+		_, err := f.sweeper.PlaceAdmission(context.Background(), servicePrincipal(t), Notice(entry))
+		done <- err
+	}()
+	<-entered
+	f.sweepEveryShard(t)
+	close(release)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	f.links.mu.Lock()
+	count := len(f.links.attaches)
+	f.links.mu.Unlock()
+	if count != 1 {
+		t.Fatalf("attach count = %d, want one", count)
+	}
+}
+
+type openGateCatalog struct{}
+
+func (openGateCatalog) GetCatalogEntry(context.Context, sessionstore.GetCatalogEntryRequest) (sessionstore.CatalogEntry, error) {
+	return sessionstore.CatalogEntry{Record: sessionstore.CatalogRecord{OpenGates: []sessionwire.GateProjection{{}}}}, nil
+}
+func (openGateCatalog) UpdateCatalogDesiredState(context.Context, sessionstore.UpdateCatalogDesiredStateRequest) (sessionstore.CatalogEntry, error) {
+	return sessionstore.CatalogEntry{}, nil
+}
+func (openGateCatalog) Owner(context.Context, sessionwire.TenantID, sessionwire.SessionID) (sessionwire.HostLinkRegistryObservation, bool, error) {
+	return sessionwire.HostLinkRegistryObservation{}, false, nil
+}
+func (openGateCatalog) Candidates(context.Context, sessionstore.ListCompatibleHostsRequest) (sessionstore.HostTargetPage, error) {
+	return sessionstore.HostTargetPage{}, nil
+}
+
+func TestAdmissionInventoriesOpenGateBeforePlacement(t *testing.T) {
+	placer := &recordingPlacer{}
+	gate := open(testSession, "answer-earlier", sessionstore.InboxStatePending, reconcileNow.Add(time.Minute))
+	gate.Record.Descriptor.Kind = sessionstore.CommandKind("gate_response")
+	input := open(testSession, "input-later", sessionstore.InboxStatePending, reconcileNow.Add(time.Minute))
+	s := newFakeSweeper(t, &fakePending{shards: 1, pages: []sessionstore.DispositionDueCommandPage{{Commands: []sessionstore.DispositionInboxEntry{gate, input}}}}, placer, &movableClock{now: reconcileNow}, &allowSweeps{})
+	s.cfg.Catalog = openGateCatalog{}
+	s.cfg.Directory = openGateCatalog{}
+	_, err := s.PlaceAdmission(context.Background(), servicePrincipal(t), Notice(input))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(placer.requests) != 1 || !slices.Equal(placer.requests[0].GateResponses, []sessionwire.CommandID{"answer-earlier"}) {
+		t.Fatalf("targeted placement = %+v, want earlier gate response in capability inventory", placer.requests)
+	}
+}
+
+func TestAdmissionInventoriesEarlierAttributedCommands(t *testing.T) {
+	placer := &recordingPlacer{}
+	attributed := open(testSession, "attributed-earlier", sessionstore.InboxStatePending, reconcileNow.Add(time.Minute))
+	attributed.Record.Descriptor.Principal = &sessionwire.Principal{}
+	plain := open(testSession, "plain-later", sessionstore.InboxStatePending, reconcileNow.Add(time.Minute))
+	s := newFakeSweeper(t, &fakePending{shards: 1, pages: []sessionstore.DispositionDueCommandPage{{Commands: []sessionstore.DispositionInboxEntry{attributed, plain}}}}, placer, &movableClock{now: reconcileNow}, &allowSweeps{})
+	_, err := s.PlaceAdmission(context.Background(), servicePrincipal(t), Notice(plain))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(placer.requests) != 1 || !slices.Equal(placer.requests[0].PrincipalCommands, []sessionwire.CommandID{"attributed-earlier"}) {
+		t.Fatalf("targeted placement = %+v, want earlier attributed command in capability inventory", placer.requests)
+	}
+}
+
+func TestAdmissionWaitsForItsOwnDurableDueEntry(t *testing.T) {
+	placer := &recordingPlacer{}
+	prior := open(testSession, "prior", sessionstore.InboxStatePending, reconcileNow.Add(time.Minute))
+	s := newFakeSweeper(t, &fakePending{shards: 1, pages: []sessionstore.DispositionDueCommandPage{{Commands: []sessionstore.DispositionInboxEntry{prior}}}}, placer, &movableClock{now: reconcileNow}, &allowSweeps{})
+	notice := Notice(open(testSession, "new-command", sessionstore.InboxStatePending, reconcileNow.Add(time.Minute)))
+	_, err := s.PlaceAdmission(context.Background(), servicePrincipal(t), notice)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(placer.requests) != 0 {
+		t.Fatalf("placed without seeing the admitted command: %+v", placer.requests)
+	}
+}
+
+type sessionCommandReader struct {
+	entry sessionstore.DispositionInboxEntry
+	calls int
+}
+
+func (r *sessionCommandReader) ListSessionDispositionCommands(context.Context, sessionstore.ListSessionDispositionCommandsRequest) (sessionstore.SessionDispositionCommandPage, error) {
+	r.calls++
+	if r.calls == 1 {
+		return sessionstore.SessionDispositionCommandPage{Commands: []sessionstore.DispositionInboxEntry{r.entry}, NextAfterOrder: r.entry.AcceptedOrder}, nil
+	}
+	return sessionstore.SessionDispositionCommandPage{}, nil
+}
+
+func TestAdmissionFindsNewCommandBeyondBusyShardHead(t *testing.T) {
+	placer := &recordingPlacer{}
+	busy := &fakePending{shards: 1, pages: []sessionstore.DispositionDueCommandPage{
+		{NextCursor: "p1"}, {NextCursor: "p2"}, {NextCursor: "p3"}, {NextCursor: "p4"},
+	}}
+	entry := open(testSession, "new-command", sessionstore.InboxStatePending, reconcileNow.Add(time.Minute))
+	entry.AcceptedOrder = 2050
+	reader := &sessionCommandReader{entry: entry}
+	s := newFakeSweeper(t, busy, placer, &movableClock{now: reconcileNow}, &allowSweeps{})
+	s.cfg.SessionCommands = reader
+	_, err := s.PlaceAdmission(context.Background(), servicePrincipal(t), Notice(entry))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reader.calls == 0 || len(busy.requests) != 0 || len(placer.requests) != 1 || placer.requests[0].SessionID != testSession {
+		t.Fatalf("session reads=%d shard reads=%d placements=%+v, want one targeted placement without a shard scan", reader.calls, len(busy.requests), placer.requests)
+	}
+}
+
+type longHistoryReader struct {
+	orders []uint64
+}
+
+func (r *longHistoryReader) ListSessionDispositionCommands(_ context.Context, req sessionstore.ListSessionDispositionCommandsRequest) (sessionstore.SessionDispositionCommandPage, error) {
+	r.orders = append(r.orders, req.AfterOrder)
+	if req.AfterOrder == 0 {
+		page := sessionstore.SessionDispositionCommandPage{NextAfterOrder: uint64(req.Limit)}
+		for i := 1; i <= req.Limit; i++ {
+			old := open(testSession, sessionwire.CommandID(fmt.Sprintf("settled-%d", i)), sessionstore.InboxStateApplied, reconcileNow)
+			old.AcceptedOrder = uint64(i)
+			page.Commands = append(page.Commands, old)
+		}
+		return page, nil
+	}
+	return sessionstore.SessionDispositionCommandPage{}, nil
+}
+
+func TestAdmissionSkipsSettledHistoryWithoutMissingTheNewCommand(t *testing.T) {
+	entry := open(testSession, "new-command", sessionstore.InboxStatePending, reconcileNow.Add(time.Minute))
+	entry.AcceptedOrder = 10000
+	reader := &longHistoryReader{}
+	placer := &recordingPlacer{}
+	pending := &fakePending{shards: 1, pages: []sessionstore.DispositionDueCommandPage{{Commands: []sessionstore.DispositionInboxEntry{entry}}}}
+	s := newFakeSweeper(t, pending, placer, &movableClock{now: reconcileNow}, &allowSweeps{})
+	s.cfg.SessionCommands = reader
+	_, err := s.PlaceAdmission(context.Background(), servicePrincipal(t), Notice(entry))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(reader.orders, []uint64{0}) || len(pending.requests) != 1 || len(placer.requests) != 1 || !slices.Equal(placer.requests[0].Wake, []sessionwire.CommandID{entry.Record.Descriptor.CommandID}) {
+		t.Fatalf("history bounds=%v due reads=%d placement=%+v, want a bounded open-work read", reader.orders, len(pending.requests), placer.requests)
+	}
+	if len(placer.requests[0].GateResponses) != 0 || len(placer.requests[0].PrincipalCommands) != 0 {
+		t.Fatalf("placement=%+v, plain command must not require optional Host capabilities", placer.requests[0])
+	}
+}
+
+func TestAdmissionLongHistoryPreservesOlderOpenCapabilities(t *testing.T) {
+	entry := open(testSession, "new-command", sessionstore.InboxStatePending, reconcileNow.Add(time.Minute))
+	gate := open(testSession, "older-gate", sessionstore.InboxStatePending, reconcileNow.Add(time.Minute))
+	gate.Record.Descriptor.Kind = sessionstore.CommandKind("gate_response")
+	gate.Record.Descriptor.Principal = &sessionwire.Principal{}
+	pending := &fakePending{shards: 1, pages: []sessionstore.DispositionDueCommandPage{{Commands: []sessionstore.DispositionInboxEntry{gate, entry}}}}
+	placer := &recordingPlacer{}
+	s := newFakeSweeper(t, pending, placer, &movableClock{now: reconcileNow}, &allowSweeps{})
+	s.cfg.SessionCommands = &longHistoryReader{}
+	_, err := s.PlaceAdmission(context.Background(), servicePrincipal(t), Notice(entry))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(placer.requests) != 1 || !slices.Equal(placer.requests[0].GateResponses, []sessionwire.CommandID{"older-gate"}) || !slices.Equal(placer.requests[0].PrincipalCommands, []sessionwire.CommandID{"older-gate"}) {
+		t.Fatalf("placement=%+v, want older open command's capabilities", placer.requests)
+	}
+}
+
+func TestAdmissionLongHistoryDefersWhenDueInventoryIsTruncated(t *testing.T) {
+	entry := open(testSession, "new-command", sessionstore.InboxStatePending, reconcileNow.Add(time.Minute))
+	pending := &fakePending{shards: 1, pages: []sessionstore.DispositionDueCommandPage{
+		{Commands: []sessionstore.DispositionInboxEntry{entry}, NextCursor: "p1"},
+		{NextCursor: "p2"},
+	}}
+	placer := &recordingPlacer{}
+	s := newFakeSweeper(t, pending, placer, &movableClock{now: reconcileNow}, &allowSweeps{})
+	s.cfg.SessionCommands = &longHistoryReader{}
+	_, err := s.PlaceAdmission(context.Background(), servicePrincipal(t), Notice(entry))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(placer.requests) != 0 {
+		t.Fatalf("placement=%+v, want deferred placement after an incomplete due scan", placer.requests)
 	}
 }
 

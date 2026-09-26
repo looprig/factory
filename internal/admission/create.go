@@ -9,6 +9,7 @@ import (
 	"fmt"
 
 	sessionwire "github.com/looprig/core/sessionwire/v1"
+	"github.com/looprig/factory/internal/placement"
 	"github.com/looprig/sessionstore"
 )
 
@@ -172,6 +173,9 @@ func (s *Service) admitPublicCreate(ctx context.Context, tenant sessionwire.Tena
 	entry, created, err := s.cfg.PublicCreates.AdmitPublicCreate(ctx, admit)
 	if err != nil {
 		return sessionstore.DispositionInboxEntry{}, false, createRefusal(err)
+	}
+	if s.cfg.OnAdmitted != nil {
+		s.cfg.OnAdmitted(placement.Notice(entry))
 	}
 	return entry, created, nil
 }

@@ -126,9 +126,9 @@ type PlacementController interface {
 // durable record of every session with open work. A *sessionstore.Store
 // satisfies it.
 //
-// It is what TRIGGERS pooled placement. With it, every sweep interval pages
-// one control shard for commands still open, and each session with one and no
-// live owner is attached to a Host and woken; see WithPendingCommands.
+// It enables immediate admission-triggered placement and the durable recovery
+// sweep. Each sweep interval pages one control shard for commands still open;
+// see WithPendingCommands.
 type PendingCommands interface {
 	ControlShards() int
 	ListDueDispositionCommands(ctx context.Context, req sessionstore.ListDueDispositionCommandsRequest) (sessionstore.DispositionDueCommandPage, error)

@@ -240,6 +240,9 @@ type Config struct {
 	Binding SessionBindingTemplate
 
 	ApplyDeadline time.Duration
+	// OnAdmitted is a best-effort notification after a durable admission.
+	// The durable pending sweep remains responsible for lost notifications.
+	OnAdmitted func(placement.AdmissionNotice)
 }
 
 // createsServed reports whether this composition can serve a V1 create. BOTH
@@ -628,6 +631,9 @@ func (s *Service) admit(ctx context.Context, tenant sessionwire.TenantID, sessio
 	entry, created, err := s.cfg.Commands.AdmitDispositionCommand(ctx, req)
 	if err != nil {
 		return sessionstore.DispositionInboxEntry{}, false, commandRefusal(err)
+	}
+	if s.cfg.OnAdmitted != nil {
+		s.cfg.OnAdmitted(placement.Notice(entry))
 	}
 	return entry, created, nil
 }
