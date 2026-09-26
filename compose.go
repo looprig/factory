@@ -64,7 +64,7 @@ type components struct {
 	pending *placement.PendingSweeper
 	// admitted is a bounded, best-effort fast path; the durable sweep recovers
 	// commands whose notification is dropped or whose process exits.
-	admitted         chan placement.AdmissionNotice
+	admitted         *admissionQueue
 	admissionPlacers []placement.Placer
 }
 
@@ -83,7 +83,7 @@ type realtimeNode interface {
 func composeComponents(cfg config, credentials *internalidentity.Authenticator) (*components, error) {
 	c := &components{}
 	if cfg.pending != nil {
-		c.admitted = make(chan placement.AdmissionNotice, cfg.reconcile.MaxDuePerSweep)
+		c.admitted = newAdmissionQueue(cfg.reconcile.MaxDuePerSweep)
 	}
 	realDialer, err := hostlink.NewCentrifugeDialer(hostlink.DialerConfig{
 		Credential: cfg.hostCredential,
@@ -136,10 +136,7 @@ func composeComponents(cfg config, credentials *internalidentity.Authenticator) 
 			if c.admitted == nil {
 				return
 			}
-			select {
-			case c.admitted <- entry:
-			default: // The durable pending sweep recovers a full queue.
-			}
+			c.admitted.enqueue(entry)
 		},
 	})
 	if err != nil {
@@ -252,13 +249,13 @@ func composeComponents(cfg config, credentials *internalidentity.Authenticator) 
 			if err != nil {
 				return nil, &OptionError{Option: "WithReconcileLimits", Err: err}
 			}
-			c.admissionPlacers = append(c.admissionPlacers, rebindingPlacer{placer: admissionPlacer, rebinder: demand, logger: logger(cfg)})
+			c.admissionPlacers = append(c.admissionPlacers, rebindingPlacer{placer: admissionPlacer, rebinder: demand, bindings: bindings, logger: logger(cfg)})
 		}
 		pending, err = placement.NewPendingSweeper(placement.PendingSweeperConfig{
 			Authorizer:      cfg.authorizer,
 			Pending:         cfg.pending,
 			SessionCommands: sessionCommands,
-			Placer:          rebindingPlacer{placer: placer, rebinder: demand, logger: logger(cfg)},
+			Placer:          rebindingPlacer{placer: placer, rebinder: demand, bindings: bindings, logger: logger(cfg)},
 			AdmissionPlacer: c.admissionPlacers[0],
 			Catalog:         cfg.catalog,
 			Directory:       cfg.directory,
@@ -311,6 +308,7 @@ type sessionRebinder interface {
 type rebindingPlacer struct {
 	placer   placement.Placer
 	rebinder sessionRebinder
+	bindings *routing.Bindings
 	logger   *slog.Logger
 }
 
@@ -319,9 +317,15 @@ func (p rebindingPlacer) Reconcile(ctx context.Context, req placement.Request) (
 	if err != nil || result.Attached == (sessionwire.HostLinkRegistryObservation{}) {
 		return result, err
 	}
+	if p.bindings != nil {
+		if binding, ok := p.bindings.Binding(req.TenantID, req.SessionID); ok &&
+			binding.Key.HostID == result.Attached.HostID && binding.Key.HostGeneration == result.Attached.HostGeneration && binding.Key.LeaseEpoch == result.Attached.LeaseEpoch {
+			return result, nil
+		}
+	}
 	if err := p.rebinder.Rebind(ctx, req.TenantID, req.SessionID); err != nil && !errors.Is(err, routing.ErrNoDemand) && !errors.Is(err, routing.ErrDemandClosed) {
 		if p.logger != nil {
-			p.logger.WarnContext(ctx, "placement: rebind the local live tail", slog.String("error", err.Error()))
+			p.logger.WarnContext(ctx, "placement: rebind the local live tail", slog.String("tenant_id", string(req.TenantID)), slog.String("session_id", string(req.SessionID)), slog.String("error", err.Error()))
 		}
 	}
 	return result, nil
@@ -369,7 +373,8 @@ func composeLive(cfg config, pool *hostlink.Pool, viewers func() livetail.Viewer
 	// The hint publisher is the same ClientLink channel the live tail uses:
 	// an unbound watched session's viewers are told the durable tip.
 	demand, err := routing.NewDemand(bindings, cfg.reads, live, cfg.clock, routing.DemandLimits{
-		OwnershipPollInterval: routing.DefaultDemandLimits().OwnershipPollInterval,
+		OwnershipPollInterval: clientOwnershipPollInterval(cfg.client),
+		HeldPollInterval:      cfg.client.DemandReleaseDebounce + cfg.reconcile.Interval,
 		PollTimeout:           cfg.client.DemandTimeout,
 	})
 	if err != nil {

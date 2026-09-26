@@ -381,10 +381,6 @@ func WithUIFS(dir fs.FS) Option {
 type ReconcileLimits struct {
 	// Interval is the sweep cadence.
 	Interval time.Duration
-	// PassTimeout bounds one sweep or admission-triggered placement pass.
-	// Zero uses the default, so older keyed limits literals remain valid.
-	// The effective bound is capped at half ClaimTTL to keep the claim live.
-	PassTimeout time.Duration
 	// ClaimTTL is how long a reconciliation claim suppresses duplicate work.
 	ClaimTTL time.Duration
 	// ApplyDeadline is how long an accepted command may stay unapplied before
@@ -392,8 +388,11 @@ type ReconcileLimits struct {
 	ApplyDeadline time.Duration
 	// MaxDuePerSweep bounds the due records one sweep withdraws.
 	MaxDuePerSweep int
-	// MaxConcurrent bounds concurrent reconciliations in this replica.
+	// MaxConcurrent bounds admission workers. A placement sweep can run alongside them.
 	MaxConcurrent int
+	// PassTimeout bounds one sweep or admission-triggered placement pass.
+	// Zero uses the default for older keyed limits literals.
+	PassTimeout time.Duration
 }
 
 // DefaultReconcileLimits is the configuration a composition gets if it names
@@ -442,24 +441,17 @@ func (l ReconcileLimits) Validate() error {
 		return fmt.Errorf("%w: ReconcileLimits.ClaimTTL (%v) must be shorter than ApplyDeadline (%v)",
 			ErrInvalidLimits, l.ClaimTTL, l.ApplyDeadline)
 	}
+	if l.passTimeout() >= l.ClaimTTL {
+		return fmt.Errorf("%w: ReconcileLimits.PassTimeout (%v) must be shorter than ClaimTTL (%v)", ErrInvalidLimits, l.passTimeout(), l.ClaimTTL)
+	}
 	return nil
 }
 
 func (l ReconcileLimits) passTimeout() time.Duration {
-	bound := l.PassTimeout
-	if bound == 0 {
-		bound = DefaultReconcileLimits().PassTimeout
+	if l.PassTimeout == 0 {
+		return DefaultReconcileLimits().PassTimeout
 	}
-	// A pass must end while the placement claim it acquired can still fence
-	// another pass. Keep older keyed literals with a shorter ClaimTTL valid.
-	claimBound := l.ClaimTTL / 2
-	if claimBound < time.Nanosecond {
-		claimBound = time.Nanosecond
-	}
-	if bound > claimBound {
-		return claimBound
-	}
-	return bound
+	return l.PassTimeout
 }
 
 // ClientLinkLimits bounds this replica's local connections and fan-out queues.
@@ -516,6 +508,10 @@ type ClientLinkLimits struct {
 	// local routing state and never authority. Zero is permitted and means
 	// "release as soon as the last subscription is gone".
 	DemandReleaseDebounce time.Duration
+
+	// OwnershipPollInterval is the gap between registry polls for unbound watched sessions.
+	// Zero retains the five-second default for older keyed literals.
+	OwnershipPollInterval time.Duration
 
 	// DemandTimeout bounds ONE call into the demand plane, in both directions.
 	//
@@ -595,6 +591,7 @@ func DefaultClientLinkLimits() ClientLinkLimits {
 		// held. A window below that turns every unlucky reconnect into a
 		// release, a re-acquire and a rebind.
 		DemandReleaseDebounce: 30 * time.Second,
+		OwnershipPollInterval: 5 * time.Second,
 		// The same patience the durable plane gets, because an acquire reaches
 		// the same durable plane: it reads the session registry and binds a
 		// HostLink. It is a separate field rather than a reuse of
@@ -602,6 +599,13 @@ func DefaultClientLinkLimits() ClientLinkLimits {
 		// has measured a reason for the two numbers to differ.
 		DemandTimeout: 30 * time.Second,
 	}
+}
+
+func clientOwnershipPollInterval(l ClientLinkLimits) time.Duration {
+	if l.OwnershipPollInterval == 0 {
+		return DefaultClientLinkLimits().OwnershipPollInterval
+	}
+	return l.OwnershipPollInterval
 }
 
 // Validate reports why these limits may not be used.
@@ -636,6 +640,9 @@ func (l ClientLinkLimits) Validate() error {
 	if l.DemandReleaseDebounce < 0 {
 		return fmt.Errorf("%w: ClientLinkLimits.DemandReleaseDebounce (%v) must not be negative",
 			ErrInvalidLimits, l.DemandReleaseDebounce)
+	}
+	if l.OwnershipPollInterval < 0 {
+		return fmt.Errorf("%w: ClientLinkLimits.OwnershipPollInterval must not be negative", ErrInvalidLimits)
 	}
 	if err := positive("ClientLinkLimits.DemandTimeout", l.DemandTimeout); err != nil {
 		return err

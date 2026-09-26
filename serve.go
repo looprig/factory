@@ -313,16 +313,16 @@ func (s *Server) Start(ctx context.Context) error {
 		go func(placer placement.Placer) {
 			defer wg.Done()
 			for {
-				select {
-				case <-loopCtx.Done():
+				entry, key, ok := s.components.admitted.next(loopCtx)
+				if !ok {
 					return
-				case entry := <-s.components.admitted:
-					passCtx, cancel := context.WithTimeout(loopCtx, s.cfg.reconcile.passTimeout())
-					_, err := s.components.pending.PlaceAdmissionWith(passCtx, s.cfg.service, entry, placer)
-					cancel()
-					if err != nil && loopCtx.Err() == nil {
-						logger(s.cfg).Warn("placement: admission-triggered placement failed", slog.String("error", err.Error()))
-					}
+				}
+				passCtx, cancel := context.WithTimeout(loopCtx, s.cfg.reconcile.passTimeout())
+				_, err := s.components.pending.PlaceAdmissionWith(passCtx, s.cfg.service, entry, placer)
+				cancel()
+				s.components.admitted.finish(key)
+				if err != nil && loopCtx.Err() == nil && !errors.Is(err, placement.ErrSessionReleased) && !errors.Is(err, placement.ErrNoWorkloadController) {
+					logger(s.cfg).Warn("placement: admission-triggered placement failed", slog.String("tenant_id", string(entry.TenantID)), slog.String("session_id", string(entry.SessionID)), slog.String("error", err.Error()))
 				}
 			}
 		}(placer)

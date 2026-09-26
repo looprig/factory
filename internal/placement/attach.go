@@ -769,6 +769,7 @@ func endpointCode(err error) sessionwire.HostLinkEndpointCode {
 // by the transport against the request's session and host fence before it
 // reached here.
 func (r *Reconciler) bindAttached(ctx context.Context, req Request, observation sessionwire.HostLinkRegistryObservation, result Result) (Result, error) {
+	// A failed bind leaves an already watching viewer to Demand's ownership poll.
 	return r.bindAndDeliver(ctx, req, observation, result, true)
 }
 

@@ -95,6 +95,7 @@ func composedWithPlacement(t *testing.T, p *pendingProbe, pending bool) *factory
 	limits := factory.DefaultReconcileLimits()
 	limits.Interval = 5 * time.Millisecond
 	limits.ClaimTTL = 50 * time.Millisecond
+	limits.PassTimeout = 10 * time.Millisecond
 	limits.ApplyDeadline = 500 * time.Millisecond
 	options := append(factory.RequiredOptionsExcept(
 		"WithCommands", "WithGates", "WithHostTargets", "WithSessionReader",
@@ -281,6 +282,7 @@ func TestATruncatedPassIsLogged(t *testing.T) {
 	limits := factory.DefaultReconcileLimits()
 	limits.Interval = 5 * time.Millisecond
 	limits.ClaimTTL = 50 * time.Millisecond
+	limits.PassTimeout = 10 * time.Millisecond
 	limits.MaxConcurrent = 1
 	options := append(factory.RequiredOptionsExcept(
 		"WithCommands", "WithGates", "WithHostTargets", "WithSessionReader",

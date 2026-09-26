@@ -73,13 +73,13 @@ func TestStartedAdmissionWorkersDoNotQueueColdSessionsBehindOneSlowAttach(t *tes
 	notice := func(id sessionwire.SessionID) placement.AdmissionNotice {
 		return placement.AdmissionNotice{TenantID: "tenant-a", SessionID: id, CommandID: sessionwire.CommandID("command-" + string(id)), Pending: true, Deadline: time.Now().Add(time.Hour)}
 	}
-	server.components.admitted <- notice("cold-a")
+	server.components.admitted.enqueue(notice("cold-a"))
 	select {
 	case <-placer.a:
 	case <-time.After(time.Second):
 		t.Fatal("first placement never started")
 	}
-	server.components.admitted <- notice("cold-b")
+	server.components.admitted.enqueue(notice("cold-b"))
 	select {
 	case <-placer.b:
 	case <-time.After(time.Second):

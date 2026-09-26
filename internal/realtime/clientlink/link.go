@@ -99,6 +99,8 @@ type Limits struct {
 	// makes an ordinary reconnect cost a rebind. Neither is a correctness
 	// failure -- demand is local routing state and never authority.
 	DemandReleaseDebounce time.Duration
+	// OwnershipPollInterval is the gap between ownership polls for unbound demand.
+	OwnershipPollInterval time.Duration
 
 	// DemandTimeout bounds ONE call into the DemandManager.
 	//

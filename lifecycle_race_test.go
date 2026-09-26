@@ -463,6 +463,7 @@ func raceServer(t *testing.T) *Server {
 	limits := DefaultReconcileLimits()
 	limits.Interval = 5 * time.Millisecond
 	limits.ClaimTTL = 50 * time.Millisecond
+	limits.PassTimeout = 10 * time.Millisecond
 	limits.ApplyDeadline = 500 * time.Millisecond
 
 	server, err := New(append(RequiredOptions(), WithReconcileLimits(limits))...)

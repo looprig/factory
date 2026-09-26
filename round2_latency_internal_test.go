@@ -62,8 +62,44 @@ func TestOlderReconcileLimitsLiteralGetsThePassDefault(t *testing.T) {
 func TestPassDeadlineStaysInsidePlacementClaim(t *testing.T) {
 	limits := DefaultReconcileLimits()
 	limits.ClaimTTL = 6 * time.Second
-	if got := limits.passTimeout(); got >= limits.ClaimTTL {
-		t.Fatalf("pass deadline %v can outlive claim TTL %v", got, limits.ClaimTTL)
+	if err := limits.Validate(); err == nil {
+		t.Fatal("PassTimeout >= ClaimTTL accepted")
+	}
+}
+
+func TestConfiguredOwnershipPollInterval(t *testing.T) {
+	limits := DefaultClientLinkLimits()
+	limits.OwnershipPollInterval = 7 * time.Second
+	if err := limits.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	s, err := New(append(RequiredOptions(), WithClientLinkLimits(limits))...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	clock := &pollClock{}
+	cfg := s.cfg
+	cfg.clock = clock
+	_, _, demand, err := composeLive(cfg, s.components.pool, func() livetail.Viewers { return nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := demand.Acquire(context.Background(), "tenant-a", "s-1"); err != nil {
+		t.Fatal(err)
+	}
+	if len(clock.durations) != 1 || clock.durations[0] != 7*time.Second {
+		t.Fatalf("poll timers = %v", clock.durations)
+	}
+	limits.OwnershipPollInterval = -time.Second
+	if err := limits.Validate(); err == nil {
+		t.Fatal("negative poll interval accepted")
+	}
+	limits.OwnershipPollInterval = 0
+	if err := limits.Validate(); err != nil {
+		t.Fatalf("older keyed limits literal: %v", err)
+	}
+	if got := clientOwnershipPollInterval(limits); got != 5*time.Second {
+		t.Fatalf("zero poll default = %v", got)
 	}
 }
 

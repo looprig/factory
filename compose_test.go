@@ -258,6 +258,7 @@ func composed(t *testing.T, p *probe, extra ...factory.Option) *factory.Server {
 	limits := factory.DefaultReconcileLimits()
 	limits.Interval = 5 * time.Millisecond
 	limits.ClaimTTL = 50 * time.Millisecond
+	limits.PassTimeout = 10 * time.Millisecond
 	limits.ApplyDeadline = 500 * time.Millisecond
 
 	// WithReplicaID is dropped from the base list and supplied here, so a case
@@ -953,6 +954,7 @@ func TestAnAdmittedCommandCarriesTheComposedApplyDeadline(t *testing.T) {
 	limits := factory.DefaultReconcileLimits()
 	limits.Interval = 5 * time.Millisecond
 	limits.ClaimTTL = 50 * time.Millisecond
+	limits.PassTimeout = 10 * time.Millisecond
 	limits.ApplyDeadline = 1234 * time.Millisecond
 
 	p := &probe{}

@@ -163,6 +163,9 @@ type Reconciler struct {
 	reports   map[sessionKey]time.Time
 }
 
+// HolderID identifies this reconciler's claim owner within the replica.
+func (r *Reconciler) HolderID() string { return r.cfg.HolderID }
+
 // NewReconciler validates a configuration before it can reach a store.
 func NewReconciler(cfg Config) (*Reconciler, error) {
 	switch {
