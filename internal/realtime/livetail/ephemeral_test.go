@@ -99,6 +99,49 @@ func TestEnduringArrivalEvictsAllAvailableEphemeralsBeforeLosingTail(t *testing.
 	}
 }
 
+func TestEphemeralArrivalBehindOnlyEnduringFramesDropsWithoutLosingTail(t *testing.T) {
+	t.Parallel()
+	links := &scriptedLinks{}
+	relay := &blockedReceiveRelay{gate: make(chan struct{}), entered: make(chan struct{}, 1)}
+	plane, err := livetail.New(livetail.Config{
+		Links: links, Viewers: func() livetail.Viewers { return nil }, MailboxLimit: 2, EventTimeout: time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	plane.Attach(relay, nil)
+	var once sync.Once
+	open := func() { once.Do(func() { close(relay.gate) }) }
+	t.Cleanup(func() {
+		open()
+		_ = plane.Close(context.Background())
+	})
+	plane.Watching(tenantA, session)
+	if err := plane.Bind(context.Background(), "ws://host-1", sessionwire.HostLinkBindRequest{TenantID: tenantA, SessionID: session, HostID: "host-1"}); err != nil {
+		t.Fatal(err)
+	}
+	plane.Served(tenantA, session)
+	sink := links.sink(0)
+	sink.Publication(enduring(t, tenantA, session, 1))
+	select {
+	case <-relay.entered:
+	case <-time.After(waitFor):
+		t.Fatal("first enduring frame never reached the blocked relay")
+	}
+	sink.Publication(enduring(t, tenantA, session, 2))
+	sink.Publication(enduring(t, tenantA, session, 3))
+	sink.Publication(ephemeral(t, "discard me"))
+	frames, lost := livetail.QueuedFrames(plane, tenantA, session)
+	if lost || len(frames) != 2 || string(frames[0]) != string(enduring(t, tenantA, session, 2)) || string(frames[1]) != string(enduring(t, tenantA, session, 3)) {
+		t.Fatalf("queued=%q lost=%t, want the two enduring frames and a live tail", frames, lost)
+	}
+	if got := plane.DroppedEphemerals(); got != 1 {
+		t.Fatalf("dropped %d ephemerals, want the arriving frame only", got)
+	}
+	open()
+	eventually(t, "the enduring frames to reach the relay", func() bool { return len(relay.got()) == 3 })
+}
+
 func TestHostLinkEphemeralReachesClientLinkUnchangedInOrder(t *testing.T) {
 	t.Parallel()
 	host := newStandIn(t, "host-1")

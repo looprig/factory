@@ -62,6 +62,7 @@
 package livetail
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -120,9 +121,11 @@ type Config struct {
 	// Viewers supplies the running ClientLink, or nil when there is none.
 	// Required.
 	Viewers func() Viewers
-	// MailboxLimit bounds one session's undelivered events. Ephemeral frames
-	// drop at capacity or make room for enduring frames; an overflow with no
-	// ephemeral victim loses the tail and triggers repair. Required, positive.
+	// MailboxLimit bounds one session's undelivered publications. Ephemeral
+	// arrivals drop at capacity; non-ephemeral publications (enduring, or any
+	// record the Relay will refuse) evict queued ephemerals. Control events
+	// are not bounded. An overflow with no ephemeral victim loses the tail
+	// and triggers repair. Required, positive.
 	MailboxLimit int
 	// EventTimeout bounds the relay work one event may cost: a tip read, a
 	// rebind and the publishes. Required, positive.
@@ -479,16 +482,17 @@ func (p *Plane) Unwatched(tenant sessionwire.TenantID, session sessionwire.Sessi
 // ---------------------------------------------------------------------------
 
 type sink struct {
-	plane *Plane
-	key   sessionKey
-	gen   uint64
+	plane    *Plane
+	key      sessionKey
+	gen      uint64
+	classify func(sessionKey, []byte) bool
 }
 
 func (p *Plane) newSink(tenant sessionwire.TenantID, session sessionwire.SessionID) *sink {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.nextGen++
-	return &sink{plane: p, key: sessionKey{tenant: tenant, session: session}, gen: p.nextGen}
+	return &sink{plane: p, key: sessionKey{tenant: tenant, session: session}, gen: p.nextGen, classify: droppableEphemeral}
 }
 
 // Subscribed makes this subscription the accepted one and queues its start.
@@ -507,17 +511,17 @@ func (k *sink) Subscribed() {
 }
 
 // Publication queues one frame of the accepted subscription. Ephemeral frames
-// may be dropped to preserve room for enduring records; an irreducible
+// may be dropped to make room for non-ephemeral publications; an irreducible
 // overflow loses the tail and is repaired with a reset.
 func (k *sink) Publication(data []byte) {
 	p := k.plane
+	ephemeral := k.classify(k.key, data)
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	s := p.sessions[k.key]
 	if s == nil || !s.watched || s.gen == 0 || s.gen != k.gen {
 		return
 	}
-	ephemeral := droppableEphemeral(k.key, data)
 	if len(s.events) >= p.limit {
 		if ephemeral {
 			p.droppedEphemerals++
@@ -548,7 +552,13 @@ func (k *sink) Publication(data []byte) {
 			}
 			s.events = kept
 			s.gen = 0
-			// Withdrawal stays ordered with the repair's re-subscribe.
+			// The subscription is NOT withdrawn here. The repair this queues
+			// withdraws it synchronously (Relay.HostLinkClosed -> Tail.Stop), in
+			// order with its own re-bind and re-subscribe; a withdrawal started
+			// here would run in no order with them and, landing after the
+			// re-subscribe, would remove the NEW tail (v0.4.0 gates F1/F2).
+			// Until the repair runs, the old tail's frames are dropped by the
+			// generation check above.
 			p.pushLocked(s, event{kind: evLost})
 			return
 		}
@@ -559,6 +569,9 @@ func (k *sink) Publication(data []byte) {
 // droppableEphemeral uses Core's full decoder and the tail identity. A frame
 // that cannot pass both still reaches Relay.Receive (or an overflow repair).
 func droppableEphemeral(key sessionKey, data []byte) bool {
+	if !bytes.Contains(data, []byte(`"ephemeral_publication"`)) {
+		return false
+	}
 	kind, err := sessionwire.SessionRecordTypeOf(data)
 	if err != nil || kind != sessionwire.SessionRecordTypeEphemeralPublication {
 		return false
