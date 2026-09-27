@@ -469,9 +469,11 @@ func (l ReconcileLimits) passTimeout() time.Duration {
 
 // ClientLinkLimits bounds this replica's local connections and fan-out queues.
 type ClientLinkLimits struct {
-	// MaxMessageBytes bounds the data in one inbound command RPC. Centrifuge's
-	// frame ceiling is 16 MiB so an RPC over this deployment's smaller limit
-	// can receive a typed refusal instead of a connection drop.
+	// MaxMessageBytes bounds the data in one inbound command RPC. At the 64 KiB
+	// default, the WebSocket frame cap is exactly 64 KiB. When raised, the frame
+	// cap is MaxMessageBytes plus 16 KiB for the RPC envelope. A payload over
+	// MaxMessageBytes within that cap receives a typed invalid_request refusal;
+	// a frame over the cap closes the transport.
 	MaxMessageBytes int
 	// MaxConnections bounds concurrent ClientLinks on this replica.
 	MaxConnections int

@@ -839,13 +839,17 @@ command stream behind a by-reference gate response until its apply deadline,
 and every command admitted behind it expires with it. A retry of a gate
 response already stored still answers from its record.
 
-**Inbound body limits.** `WithClientLinkLimits` accepts
+**Inbound body limits (Factory v0.14.0).** `WithClientLinkLimits` accepts
 `ClientLinkLimits.MaxMessageBytes` from 64 KiB (the default) through 16 MiB.
 `WithRouteLimits` accepts `RouteLimits.MaxCommandBytes` from 1 MiB (the
 default) through 16 MiB for REST create and input; other REST JSON routes
 retain `MaxRequestBytes` (1 MiB by default). The WebSocket transport admits
-frames through 16 MiB so a command over its configured limit receives a typed
-`invalid_request` RPC response. A REST command over its configured limit
+frames through exactly 65,536 bytes at the default; an oversized frame closes
+the transport, with no typed response promised. When `MaxMessageBytes` is
+raised, the frame cap is that limit plus 16 KiB of RPC envelope headroom. A
+payload over the configured limit that fits in the frame receives a typed
+`invalid_request` RPC response; a frame over the cap closes the transport.
+A REST command over its configured limit
 receives HTTP 413 with `invalid_request`. Gate responses keep their 64 KiB
 canonical payload bound regardless of either setting.
 

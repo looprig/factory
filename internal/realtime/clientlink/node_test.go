@@ -85,6 +85,26 @@ func TestTheLimitsReachTheFieldsThatEnforceThem(t *testing.T) {
 	}
 }
 
+func TestWebsocketFrameLimitFollowsConfiguredMessageLimit(t *testing.T) {
+	for _, row := range []struct {
+		name                         string
+		messageLimit, wantFrameLimit int
+	}{
+		{name: "unset", messageLimit: 0, wantFrameLimit: 65536},
+		{name: "explicit default", messageLimit: 65536, wantFrameLimit: 65536},
+		{name: "raised", messageLimit: 128 << 10, wantFrameLimit: (128 + 16) << 10},
+		{name: "maximum", messageLimit: 16 << 20, wantFrameLimit: (16 << 20) + (16 << 10)},
+	} {
+		t.Run(row.name, func(t *testing.T) {
+			limits := nodeTestLimits()
+			limits.MaxMessageBytes = row.messageLimit
+			if got := websocketConfig(Config{Limits: limits}).MessageSizeLimit; got != row.wantFrameLimit {
+				t.Fatalf("MessageSizeLimit = %d, want %d", got, row.wantFrameLimit)
+			}
+		})
+	}
+}
+
 // TestTheTransportConfigurationIsTheOnlyPlaceTheCadenceIsStated is the reader
 // the ping cadence would otherwise have none of.
 //

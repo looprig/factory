@@ -101,6 +101,12 @@ func NewHandler(cfg Config) (*Handler, error) {
 // for symmetry. A per-connection cadence becomes worth having when something
 // varies it, and nothing does.
 func websocketConfig(cfg Config) centrifuge.WebsocketConfig {
+	// The default preserves Centrifuge's historical 64 KiB frame ceiling.
+	// Raised payload limits need space for the JSON RPC command envelope.
+	frameLimit := 64 << 10
+	if cfg.Limits.MaxMessageBytes > frameLimit {
+		frameLimit = cfg.Limits.MaxMessageBytes + rpcFrameHeadroomBytes
+	}
 	return centrifuge.WebsocketConfig{
 		// Origin is decided by internal/httpapi's guard, which owns the
 		// trusted-origin list, the forwarded-header trust option and the rule
@@ -111,11 +117,15 @@ func websocketConfig(cfg Config) centrifuge.WebsocketConfig {
 		// permessage-deflate is a per-connection memory and CPU cost at the
 		// 1,000-5,000 connection scale, and it is off.
 		Compression:      false,
-		MessageSizeLimit: 16 << 20,
+		MessageSizeLimit: frameLimit,
 		WriteTimeout:     cfg.Limits.WriteTimeout,
 		PingPongConfig:   centrifuge.PingPongConfig{PingInterval: cfg.Limits.PingInterval, PongTimeout: cfg.Limits.PongTimeout},
 	}
 }
+
+// rpcFrameHeadroomBytes covers the Centrifuge JSON RPC envelope above a
+// configured command payload limit. Frames beyond the cap close the transport.
+const rpcFrameHeadroomBytes = 16 << 10
 
 // nodeConfig is the whole of what this surface configures on the node.
 //
