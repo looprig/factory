@@ -62,6 +62,7 @@ type scriptedLinks struct {
 	gateHook    func()
 	// gateCapableHosts, when set, answers per Host instead of gateCapable.
 	gateCapableHosts      map[sessionwire.HostID]bool
+	payloadCapableHosts   map[sessionwire.HostID]bool
 	principalCapableHosts map[sessionwire.HostID]bool
 	principalAsks         []sessionwire.HostID
 }
@@ -153,6 +154,12 @@ func (l *scriptedLinks) AcceptsCommandPrincipal(_ context.Context, owner session
 		return true, nil
 	}
 	return l.principalCapableHosts[owner.HostID], nil
+}
+
+func (l *scriptedLinks) AcceptsPayloadReferences(_ context.Context, owner sessionwire.HostLinkRegistryObservation) (bool, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.payloadCapableHosts[owner.HostID], nil
 }
 
 func (l *scriptedLinks) RouteFor(sessionwire.TenantID, sessionwire.SessionID) (sessionwire.HostID, bool) {

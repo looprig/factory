@@ -110,9 +110,10 @@ func websocketConfig(cfg Config) centrifuge.WebsocketConfig {
 		CheckOrigin: func(*http.Request) bool { return true },
 		// permessage-deflate is a per-connection memory and CPU cost at the
 		// 1,000-5,000 connection scale, and it is off.
-		Compression:    false,
-		WriteTimeout:   cfg.Limits.WriteTimeout,
-		PingPongConfig: centrifuge.PingPongConfig{PingInterval: cfg.Limits.PingInterval, PongTimeout: cfg.Limits.PongTimeout},
+		Compression:      false,
+		MessageSizeLimit: 16 << 20,
+		WriteTimeout:     cfg.Limits.WriteTimeout,
+		PingPongConfig:   centrifuge.PingPongConfig{PingInterval: cfg.Limits.PingInterval, PongTimeout: cfg.Limits.PongTimeout},
 	}
 }
 

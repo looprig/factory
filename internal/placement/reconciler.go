@@ -228,6 +228,11 @@ type Request struct {
 	// command not named here is delivered as before.
 	GateResponses []sessionwire.CommandID
 
+	// PayloadReferences names pending create or input commands whose bodies are
+	// stored by reference. Only a Host advertising body dereference may receive
+	// them; until one is available the accepted command waits in the inbox.
+	PayloadReferences []sessionwire.CommandID
+
 	// PrincipalCommands names live pending or claimed commands carrying a
 	// principal or metadata. Placement requires a capable Host for them.
 	PrincipalCommands []sessionwire.CommandID

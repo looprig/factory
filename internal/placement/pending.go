@@ -215,6 +215,7 @@ type openSession struct {
 	// gates is the subset of wake that is gate responses, which placement
 	// delivers only to a Host that can apply one.
 	gates      []sessionwire.CommandID
+	references []sessionwire.CommandID
 	principals []sessionwire.CommandID
 	// restore reports a PENDING restore command still inside its deadline:
 	// the explicit intent that may bring a released dedicated session back.
@@ -243,7 +244,7 @@ func (s *PendingSweeper) Sweep(ctx context.Context, principal identity.Principal
 		}
 		result.Sessions++
 		placed, err := s.cfg.Placer.Reconcile(ctx, Request{
-			TenantID: session.tenant, SessionID: session.id, Wake: session.wake, GateResponses: session.gates, PrincipalCommands: session.principals,
+			TenantID: session.tenant, SessionID: session.id, Wake: session.wake, GateResponses: session.gates, PayloadReferences: session.references, PrincipalCommands: session.principals,
 			// Only a live pending restore licenses re-expressing a released
 			// dedicated session's launch template (D3.1 F2); other open work
 			// may be what the product abandoned by deleting it.
@@ -340,7 +341,7 @@ func (s *PendingSweeper) PlaceAdmissionWith(ctx context.Context, principal ident
 	}
 	req := Request{
 		TenantID: target.tenant, SessionID: target.id,
-		Wake: target.wake, GateResponses: target.gates,
+		Wake: target.wake, GateResponses: target.gates, PayloadReferences: target.references,
 		PrincipalCommands: target.principals, RestoreRequested: target.restore,
 	}
 	return placer.Reconcile(ctx, req)
@@ -412,6 +413,9 @@ func (session *openSession) add(entry sessionstore.DispositionInboxEntry, now ti
 	case sessionstore.InboxStatePending:
 		if live {
 			session.wake = append(session.wake, descriptor.CommandID)
+			if descriptor.PayloadObject != nil && (descriptor.Kind == command.KindCreateSession || descriptor.Kind == command.KindInput) {
+				session.references = append(session.references, descriptor.CommandID)
+			}
 			if carries {
 				session.principals = append(session.principals, descriptor.CommandID)
 			}

@@ -12,6 +12,7 @@ import (
 
 	sessionwire "github.com/looprig/core/sessionwire/v1"
 	"github.com/looprig/factory/identity"
+	"github.com/looprig/factory/internal/httpapi"
 	"github.com/looprig/factory/internal/realtime/hostlink"
 )
 
@@ -130,6 +131,7 @@ type config struct {
 	csrf      identity.CSRFConfig
 	csrfSet   bool
 	http      HTTPLimits
+	route     RouteLimits
 	reconcile ReconcileLimits
 	client    ClientLinkLimits
 	host      HostLinkLimits
@@ -329,6 +331,17 @@ func WithClientLinkLimits(l ClientLinkLimits) Option {
 	return option("WithClientLinkLimits", func(c *config) error { c.client = l; return nil })
 }
 
+// WithRouteLimits replaces the REST request and command body limits.
+func WithRouteLimits(l RouteLimits) Option {
+	return option("WithRouteLimits", func(c *config) error { c.route = l; return nil })
+}
+
+// RouteLimits bounds REST JSON bodies and request work.
+type RouteLimits = httpapi.RouteLimits
+
+// DefaultRouteLimits returns the REST defaults.
+func DefaultRouteLimits() RouteLimits { return httpapi.DefaultRouteLimits() }
+
 // WithHostLinkLimits replaces the HostLink pool limits.
 func WithHostLinkLimits(l HostLinkLimits) Option {
 	return option("WithHostLinkLimits", func(c *config) error { c.host = l; return nil })
@@ -456,6 +469,10 @@ func (l ReconcileLimits) passTimeout() time.Duration {
 
 // ClientLinkLimits bounds this replica's local connections and fan-out queues.
 type ClientLinkLimits struct {
+	// MaxMessageBytes bounds the data in one inbound command RPC. Centrifuge's
+	// frame ceiling is 16 MiB so an RPC over this deployment's smaller limit
+	// can receive a typed refusal instead of a connection drop.
+	MaxMessageBytes int
 	// MaxConnections bounds concurrent ClientLinks on this replica.
 	MaxConnections int
 
@@ -550,7 +567,8 @@ const MinClientLinkPingInterval = time.Second
 // replica is expected to hold.
 func DefaultClientLinkLimits() ClientLinkLimits {
 	return ClientLinkLimits{
-		MaxConnections: 5000,
+		MaxMessageBytes: 64 << 10,
+		MaxConnections:  5000,
 		// A browser watching a large workspace holds many session channels on
 		// one link, so the ceiling is set above the transport's silent 128 and
 		// stated here. At the 5,000-connection scale this is a ceiling, not a
@@ -610,6 +628,9 @@ func clientOwnershipPollInterval(l ClientLinkLimits) time.Duration {
 
 // Validate reports why these limits may not be used.
 func (l ClientLinkLimits) Validate() error {
+	if l.MaxMessageBytes < 64<<10 || l.MaxMessageBytes > 16<<20 {
+		return fmt.Errorf("%w: ClientLinkLimits.MaxMessageBytes is %d, want 64 KiB through 16 MiB", ErrInvalidLimits, l.MaxMessageBytes)
+	}
 	if err := atLeastOne("ClientLinkLimits.MaxConnections", l.MaxConnections); err != nil {
 		return err
 	}
@@ -756,6 +777,9 @@ func (s *Server) ReconcileLimits() ReconcileLimits { return s.cfg.reconcile }
 
 // ClientLinkLimits returns the composed ClientLink limits.
 func (s *Server) ClientLinkLimits() ClientLinkLimits { return s.cfg.client }
+
+// RouteLimits returns the configured REST request and command limits.
+func (s *Server) RouteLimits() RouteLimits { return s.cfg.route }
 
 // HostLinkLimits returns the composed HostLink pool limits.
 func (s *Server) HostLinkLimits() HostLinkLimits { return s.cfg.host }

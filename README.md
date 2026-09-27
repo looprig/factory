@@ -839,6 +839,24 @@ command stream behind a by-reference gate response until its apply deadline,
 and every command admitted behind it expires with it. A retry of a gate
 response already stored still answers from its record.
 
+**Inbound body limits.** `WithClientLinkLimits` accepts
+`ClientLinkLimits.MaxMessageBytes` from 64 KiB (the default) through 16 MiB.
+`WithRouteLimits` accepts `RouteLimits.MaxCommandBytes` from 1 MiB (the
+default) through 16 MiB for REST create and input; other REST JSON routes
+retain `MaxRequestBytes` (1 MiB by default). The WebSocket transport admits
+frames through 16 MiB so a command over its configured limit receives a typed
+`invalid_request` RPC response. A REST command over its configured limit
+receives HTTP 413 with `invalid_request`. Gate responses keep their 64 KiB
+canonical payload bound regardless of either setting.
+
+A pending create or input whose canonical payload is stored by reference
+requires a Host advertising Core's
+`HostLinkCapabilityPayloadReference` (`hostlink.payload.reference`) in
+`hostlink_methods`. Factory skips incapable Hosts during pooled or dedicated
+placement and withholds a referenced command wake from an incapable owner.
+The accepted command remains pending until a capable Host is available;
+Factory does not turn absence of that capability into an admission refusal.
+
 **Mixed fleets: do not run v0.3.0 and v0.4.0 Hosts that serve gating agents
 together.** An answer admitted under a v0.4.0 owner that is then re-placed onto
 a v0.3.0 Host — or that was already claimed there — sits `applying` until a

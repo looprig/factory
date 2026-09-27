@@ -45,6 +45,8 @@ const MinPingInterval = time.Second
 // shapes in step by name and type, so a field added to one and not the other,
 // or renamed on one side, fails there rather than configuring a zero.
 type Limits struct {
+	// MaxMessageBytes is the limit on one command RPC's data.
+	MaxMessageBytes int
 	// MaxConnections bounds concurrent ClientLinks on this replica.
 	MaxConnections int
 	// MaxChannelsPerConnection bounds the session channels one link may hold.
@@ -126,6 +128,9 @@ type Limits struct {
 // Limits would otherwise configure a zero-byte queue and a zero ping cadence
 // and fail at run time on a live connection.
 func (l Limits) Validate() error {
+	if l.MaxMessageBytes != 0 && (l.MaxMessageBytes < 64<<10 || l.MaxMessageBytes > 16<<20) {
+		return fmt.Errorf("%w: MaxMessageBytes is %d, want 64 KiB through 16 MiB", ErrInvalidConfig, l.MaxMessageBytes)
+	}
 	if l.MaxConnections < 1 {
 		return fmt.Errorf("%w: MaxConnections is %d, want at least 1", ErrInvalidConfig, l.MaxConnections)
 	}

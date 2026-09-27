@@ -85,6 +85,10 @@ func (l realPoolLinks) AcceptsGateResponses(ctx context.Context, owner sessionwi
 func (l realPoolLinks) AcceptsCommandPrincipal(ctx context.Context, owner sessionwire.HostLinkRegistryObservation) (bool, error) {
 	return l.pool.AcceptsCommandPrincipal(ctx, hostlink.Target{Host: owner.HostID, Endpoint: owner.InternalEndpoint}, owner.TenantID)
 }
+
+func (l realPoolLinks) AcceptsPayloadReferences(ctx context.Context, owner sessionwire.HostLinkRegistryObservation) (bool, error) {
+	return l.pool.AcceptsPayloadReferences(ctx, hostlink.Target{Host: owner.HostID, Endpoint: owner.InternalEndpoint}, owner.TenantID)
+}
 func (l realPoolLinks) RouteFor(tenant sessionwire.TenantID, session sessionwire.SessionID) (sessionwire.HostID, bool) {
 	return l.pool.RouteFor(tenant, session)
 }

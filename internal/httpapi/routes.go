@@ -50,6 +50,9 @@ type IDSource interface {
 
 // RouteLimits bounds one request's body and one request's work.
 type RouteLimits struct {
+	// MaxCommandBytes bounds create and input JSON bodies. Other routes retain
+	// MaxRequestBytes, including gate responses.
+	MaxCommandBytes int64
 	// MaxRequestBytes is the inclusive ceiling on a request body, applied while
 	// READING rather than by trusting Content-Length.
 	MaxRequestBytes int64
@@ -70,13 +73,12 @@ type RouteLimits struct {
 
 // DefaultRouteLimits is what a composition naming no limits receives.
 //
-// One mebibyte is generous for the V1 command envelopes this surface accepts --
-// identities plus a bounded prompt -- and an oversized private payload goes to
-// SessionObjectStore by reference rather than through this ceiling (A3.1 step
-// 5). Thirty seconds is longer than any durable read here should take and short
-// enough that a stuck dependency does not accumulate handlers.
+// One mebibyte preserves the existing REST body ceiling. Deployments can
+// raise MaxCommandBytes for create and input, whose canonical payloads above
+// the inbox inline bound are stored by reference. Thirty seconds bounds work.
 func DefaultRouteLimits() RouteLimits {
 	return RouteLimits{
+		MaxCommandBytes: 1 << 20,
 		MaxRequestBytes: 1 << 20,
 		RequestTimeout:  30 * time.Second,
 	}
@@ -84,6 +86,9 @@ func DefaultRouteLimits() RouteLimits {
 
 // Validate reports why these limits may not be used.
 func (l RouteLimits) Validate() error {
+	if l.MaxCommandBytes != 0 && (l.MaxCommandBytes < 1<<20 || l.MaxCommandBytes > 16<<20) {
+		return fmt.Errorf("%w: RouteLimits.MaxCommandBytes is %d, want 1 MiB through 16 MiB", ErrInvalidRouterConfig, l.MaxCommandBytes)
+	}
 	if l.MaxRequestBytes < 1 {
 		return fmt.Errorf("%w: RouteLimits.MaxRequestBytes is %d, want at least 1", ErrInvalidRouterConfig, l.MaxRequestBytes)
 	}
@@ -1060,7 +1065,7 @@ func (rt *Router) serveRoute(entry route) http.Handler {
 			return
 		}
 
-		if rule.body == bodyJSON && !rt.readBoundedJSONBody(w, r) {
+		if rule.body == bodyJSON && !rt.readBoundedJSONBody(w, r, rule.command) {
 			return
 		}
 
@@ -1132,10 +1137,9 @@ func (rt *Router) resolveSession(
 // them. A3.1 decodes the command envelope from exactly those bytes and needs no
 // signature change to reach them; discarding here would have forced one.
 //
-// The buffer is bounded by the same ceiling that produces the 413, so retaining
-// it costs at most MaxRequestBytes per in-flight request, which is the bound
-// the ceiling exists to state.
-func (rt *Router) readBoundedJSONBody(w http.ResponseWriter, r *http.Request) bool {
+// The buffer is bounded by the route's ceiling: MaxCommandBytes for create and
+// input, MaxRequestBytes elsewhere. The same ceiling produces the 413.
+func (rt *Router) readBoundedJSONBody(w http.ResponseWriter, r *http.Request, kind sessionstore.CommandKind) bool {
 	if !hasJSONContentType(r.Header.Get("Content-Type")) {
 		writeAPIError(w, apiError{
 			status:  http.StatusUnsupportedMediaType,
@@ -1144,13 +1148,23 @@ func (rt *Router) readBoundedJSONBody(w http.ResponseWriter, r *http.Request) bo
 		})
 		return false
 	}
-	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, rt.limits.MaxRequestBytes))
+	limit := rt.limits.MaxRequestBytes
+	if kind == commandCreate || kind == commandInput {
+		if rt.limits.MaxCommandBytes != 0 {
+			limit = rt.limits.MaxCommandBytes
+		}
+	}
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, limit))
 	var tooLarge *http.MaxBytesError
 	switch {
 	case errors.As(err, &tooLarge):
+		code := ErrorCodePayloadTooLarge
+		if (kind == commandCreate || kind == commandInput) && rt.limits.MaxCommandBytes != 0 {
+			code = sessionwire.ErrorCodeInvalidRequest
+		}
 		writeAPIError(w, apiError{
 			status:  http.StatusRequestEntityTooLarge,
-			code:    ErrorCodePayloadTooLarge,
+			code:    code,
 			message: "the request body is larger than this deployment accepts",
 		})
 		return false

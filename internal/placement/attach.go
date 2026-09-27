@@ -137,6 +137,7 @@ type HostLinks interface {
 	// by the one capability predicate (hostlink.GateResponseCapable). An error
 	// means it could not be asked, and is never read as "can".
 	AcceptsGateResponses(ctx context.Context, owner sessionwire.HostLinkRegistryObservation) (bool, error)
+	AcceptsPayloadReferences(ctx context.Context, owner sessionwire.HostLinkRegistryObservation) (bool, error)
 	AcceptsCommandPrincipal(ctx context.Context, owner sessionwire.HostLinkRegistryObservation) (bool, error)
 }
 
@@ -202,6 +203,33 @@ func (r *Reconciler) placeDedicated(ctx context.Context, req Request, result Res
 	}
 	if len(req.GateResponses) > 0 {
 		capable, err := r.cfg.Links.AcceptsGateResponses(ctx, sessionwire.HostLinkRegistryObservation{
+			TenantID: req.TenantID, SessionID: req.SessionID, HostID: endpoint.HostID,
+			HostGeneration: endpoint.HostGeneration, InternalEndpoint: endpoint.InternalEndpoint,
+		})
+		switch verdict, err := classifyGateCapability(capable, err); verdict {
+		case gateUnaddressable:
+			result.Unaddressable = append(result.Unaddressable, endpoint.HostID)
+			return result, nil
+		case gateUnreachable:
+			result.Unreachable = append(result.Unreachable, endpoint.HostID)
+			return result, nil
+		case gateAbort:
+			return result, err
+		case gateIncapable:
+			result.Incapable = append(result.Incapable, endpoint.HostID)
+			return result, nil
+		}
+		entry, err = r.cfg.Catalog.GetCatalogEntry(ctx, sessionstore.GetCatalogEntryRequest{TenantID: req.TenantID, SessionID: req.SessionID})
+		if err != nil {
+			return result, err
+		}
+		if entry.Record.DesiredPlacement != sessionwire.HostPlacementDedicated || entry.Record.DesiredGeneration != intent.Generation {
+			result.Decision = Decision{Outcome: OutcomeUndecided}
+			return result, nil
+		}
+	}
+	if len(req.PayloadReferences) > 0 {
+		capable, err := r.cfg.Links.AcceptsPayloadReferences(ctx, sessionwire.HostLinkRegistryObservation{
 			TenantID: req.TenantID, SessionID: req.SessionID, HostID: endpoint.HostID,
 			HostGeneration: endpoint.HostGeneration, InternalEndpoint: endpoint.InternalEndpoint,
 		})
@@ -506,6 +534,23 @@ func (r *Reconciler) placePooled(ctx context.Context, req Request, writes int) (
 					return result, err
 				}
 			}
+			if len(req.PayloadReferences) > 0 {
+				switch verdict, err := r.appliesPayloadReferences(ctx, req, candidate); verdict {
+				case gateUnaddressable:
+					result.Unaddressable = append(result.Unaddressable, candidate.HostID)
+					r.logUnaddressable(ctx, req, candidate, err)
+					continue
+				case gateIncapable:
+					result.Incapable = append(result.Incapable, candidate.HostID)
+					incapableWhy[candidate.HostID] = "does not advertise " + sessionwire.HostLinkCapabilityPayloadReference
+					continue
+				case gateUnreachable:
+					result.Unreachable = append(result.Unreachable, candidate.HostID)
+					continue
+				case gateAbort:
+					return result, err
+				}
+			}
 			if len(req.PrincipalCommands) > 0 {
 				switch verdict, err := r.appliesPrincipal(ctx, req, candidate); verdict {
 				case gateUnaddressable:
@@ -604,6 +649,15 @@ func (r *Reconciler) appliesGateResponses(ctx context.Context, req Request, cand
 	return classifyGateCapability(capable, err)
 }
 
+func (r *Reconciler) appliesPayloadReferences(ctx context.Context, req Request, candidate sessionwire.HostLinkCapacityReport) (gateCapability, error) {
+	capable, err := r.cfg.Links.AcceptsPayloadReferences(ctx, sessionwire.HostLinkRegistryObservation{
+		TenantID: req.TenantID, SessionID: req.SessionID,
+		HostID: candidate.HostID, HostGeneration: candidate.HostGeneration,
+		InternalEndpoint: candidate.InternalEndpoint,
+	})
+	return classifyGateCapability(capable, err)
+}
+
 func (r *Reconciler) appliesPrincipal(ctx context.Context, req Request, candidate sessionwire.HostLinkCapacityReport) (gateCapability, error) {
 	capable, err := r.cfg.Links.AcceptsCommandPrincipal(ctx, sessionwire.HostLinkRegistryObservation{
 		TenantID: req.TenantID, SessionID: req.SessionID,
@@ -688,13 +742,17 @@ func (r *Reconciler) reportIncapable(ctx context.Context, req Request, result *R
 		hosts = append(hosts, entry)
 	}
 	message := "placement: skipped pooled candidates that cannot apply this session's pending gate response"
-	if len(req.PrincipalCommands) > 0 {
+	if len(req.PayloadReferences) > 0 {
+		message = "placement: skipped pooled candidates that cannot dereference this session's pending body"
+	}
+	if len(req.PrincipalCommands) > 0 && len(req.PayloadReferences) == 0 {
 		message = "placement: skipped pooled candidates that cannot apply this session's principal or metadata"
 	}
 	r.logger().WarnContext(ctx, message,
 		slog.String("tenant_id", string(req.TenantID)),
 		slog.String("session_id", string(req.SessionID)),
 		slog.Int("pending_gate_responses", len(req.GateResponses)),
+		slog.Int("pending_referenced_bodies", len(req.PayloadReferences)),
 		slog.Int("attributed_commands", len(req.PrincipalCommands)),
 		slog.Any("skipped_hosts", hosts),
 		// waiting: no capable candidate was found this pass, so the session
@@ -808,6 +866,7 @@ func (r *Reconciler) bindAndDeliver(ctx context.Context, req Request, observatio
 	}
 	result.Bound = true
 	gate := commandSet(req.GateResponses)
+	references := commandSet(req.PayloadReferences)
 	principal := commandSet(req.PrincipalCommands)
 	var (
 		asked            bool
@@ -816,8 +875,20 @@ func (r *Reconciler) bindAndDeliver(ctx context.Context, req Request, observatio
 		askedPrincipal   bool
 		principalCapable bool
 		principalErr     error
+		askedReference   bool
+		referenceCapable bool
+		referenceErr     error
 	)
 	for _, command := range req.Wake {
+		if _, referenced := references[command]; referenced {
+			if !askedReference {
+				referenceCapable, referenceErr = r.cfg.Links.AcceptsPayloadReferences(ctx, observation)
+				askedReference = true
+			}
+			if referenceErr != nil || !referenceCapable {
+				continue
+			}
+		}
 		if _, isGate := gate[command]; isGate {
 			// Asked once, lazily, of the Host this route was just bound to:
 			// a wake with no gate response costs no capability read.

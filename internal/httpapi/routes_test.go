@@ -3054,7 +3054,7 @@ func TestABoundedBodyIsStillReadableByTheHandler(t *testing.T) {
 	const payload = `{"command_id":"c-1"}`
 	r := request(http.MethodPost, "/v1/sessions", strings.NewReader(payload))
 	recorder := httptest.NewRecorder()
-	if !f.router.readBoundedJSONBody(recorder, r) {
+	if !f.router.readBoundedJSONBody(recorder, r, commandCreate) {
 		t.Fatalf("the body was refused: %d %s", recorder.Code, recorder.Body)
 	}
 	got, err := io.ReadAll(r.Body)

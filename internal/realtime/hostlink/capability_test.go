@@ -15,6 +15,43 @@ import (
 // "hostlink.command.gate_response"), which is the real signal.
 const testGateMethod = "test.only.gate-response-capability"
 
+func TestPayloadReferenceCapabilityUsesCoresExactToken(t *testing.T) {
+	if sessionwire.HostLinkCapabilityPayloadReference != "hostlink.payload.reference" {
+		t.Fatalf("Core token = %q", sessionwire.HostLinkCapabilityPayloadReference)
+	}
+	for _, row := range []struct {
+		methods []string
+		want    bool
+	}{
+		{nil, false},
+		{[]string{"hostlink.payload.reference.v2"}, false},
+		{[]string{sessionwire.HostLinkCapabilityPayloadReference}, true},
+	} {
+		reply := sessionwire.VersionNegotiationResponse{Version: sessionwire.CurrentWireVersion}.WithHostLinkMethods(row.methods...)
+		if got := hostlink.PayloadReferenceCapable(reply); got != row.want {
+			t.Errorf("methods %v: got %v, want %v", row.methods, got, row.want)
+		}
+	}
+}
+
+func TestPoolAsksTenantsLinkForPayloadReferenceCapability(t *testing.T) {
+	capable := newHostServer(t, hostOptions{token: serviceToken, methods: []string{sessionwire.HostLinkMethodBind, sessionwire.HostLinkCapabilityPayloadReference}})
+	older := newHostServer(t, hostOptions{token: serviceToken, methods: []string{sessionwire.HostLinkMethodBind}})
+	pool, err := hostlink.NewPool(hostlink.Config{Dialer: dialerFor(t, serviceToken)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = pool.Close(context.Background()) })
+	if yes, err := pool.AcceptsPayloadReferences(context.Background(), capable.target(), tenant); err != nil || !yes {
+		t.Fatalf("capable = (%t, %v)", yes, err)
+	}
+	other := older.target()
+	other.Host = hostTwo
+	if yes, err := pool.AcceptsPayloadReferences(context.Background(), other, tenant); err != nil || yes {
+		t.Fatalf("incapable = (%t, %v)", yes, err)
+	}
+}
+
 func TestPrincipalCapabilityMatchesOnlyCoresExactToken(t *testing.T) {
 	for _, row := range []struct {
 		methods []string

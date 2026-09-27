@@ -233,6 +233,7 @@ func New(opts ...Option) (*Server, error) {
 		http:      DefaultHTTPLimits(),
 		reconcile: DefaultReconcileLimits(),
 		client:    DefaultClientLinkLimits(),
+		route:     httpapi.DefaultRouteLimits(),
 		host:      DefaultHostLinkLimits(),
 	}
 
@@ -360,6 +361,7 @@ func New(opts ...Option) (*Server, error) {
 		{"WithHTTPLimits", cfg.http.Validate()},
 		{"WithReconcileLimits", cfg.reconcile.Validate()},
 		{"WithClientLinkLimits", cfg.client.Validate()},
+		{"WithRouteLimits", cfg.route.Validate()},
 		{"WithHostLinkLimits", cfg.host.Validate()},
 	} {
 		if limits.err != nil {
@@ -467,6 +469,7 @@ func composeRouter(cfg config, credentials *internalidentity.Authenticator, part
 	// failure and never the application shell. A composition that consulted the
 	// UI first would serve index.html with status 200 there.
 	router, err := httpapi.NewRouter(httpapi.RouterConfig{
+		Limits:           cfg.route,
 		StampsPrincipal:  cfg.stampPrincipal,
 		CommandReads:     cfg.commands,
 		Credentials:      credentials,

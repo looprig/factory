@@ -260,6 +260,16 @@ func (e *Engine) Admit(ctx context.Context, principal identity.Principal, method
 	if !known {
 		return nil, fmt.Errorf("%w: %q", ErrUnknownMethod, method)
 	}
+	limit := e.cfg.Limits.MaxMessageBytes
+	if limit == 0 {
+		limit = 64 << 10
+	}
+	if method != MethodSessionCreate && method != MethodSessionInput && limit > 64<<10 {
+		limit = 64 << 10
+	}
+	if len(data) > limit {
+		return refusalBody(sessionwire.ErrorCodeInvalidRequest)
+	}
 	decoded, err := spec.decode(data)
 	if err != nil {
 		// Core's own decoder refused the bytes, and Core's own vocabulary

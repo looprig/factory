@@ -48,6 +48,9 @@ func TestRequiredOptionsCompose(t *testing.T) {
 	if got := server.ClientLinkLimits(); got != DefaultClientLinkLimits() {
 		t.Errorf("ClientLinkLimits() = %+v, want the default %+v", got, DefaultClientLinkLimits())
 	}
+	if got := server.RouteLimits(); got != DefaultRouteLimits() {
+		t.Errorf("RouteLimits() = %+v, want the default %+v", got, DefaultRouteLimits())
+	}
 	if got := server.HostLinkLimits(); got != DefaultHostLinkLimits() {
 		t.Errorf("HostLinkLimits() = %+v, want the default %+v", got, DefaultHostLinkLimits())
 	}
@@ -280,6 +283,8 @@ func TestExplicitLimitsReplaceTheDefaults(t *testing.T) {
 	reconcile.MaxDuePerSweep = 7
 	client := DefaultClientLinkLimits()
 	client.PerConnectionQueueBytes = 4096
+	route := DefaultRouteLimits()
+	route.MaxCommandBytes = 8 << 20
 	host := DefaultHostLinkLimits()
 	host.MaxLinks = 13
 
@@ -287,6 +292,7 @@ func TestExplicitLimitsReplaceTheDefaults(t *testing.T) {
 		WithHTTPLimits(http),
 		WithReconcileLimits(reconcile),
 		WithClientLinkLimits(client),
+		WithRouteLimits(route),
 		WithHostLinkLimits(host),
 	)...)
 	if err != nil {
@@ -300,6 +306,9 @@ func TestExplicitLimitsReplaceTheDefaults(t *testing.T) {
 	}
 	if got := server.ClientLinkLimits(); got != client {
 		t.Errorf("ClientLinkLimits() = %+v, want %+v", got, client)
+	}
+	if got := server.RouteLimits(); got != route {
+		t.Errorf("RouteLimits() = %+v, want %+v", got, route)
 	}
 	if got := server.HostLinkLimits(); got != host {
 		t.Errorf("HostLinkLimits() = %+v, want %+v", got, host)

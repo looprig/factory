@@ -46,6 +46,11 @@ func PrincipalCapable(reply sessionwire.VersionNegotiationResponse) bool {
 	return reply.Supports(sessionwire.HostLinkCapabilityAttributionPrincipal)
 }
 
+// PayloadReferenceCapable reports the exact body dereference capability.
+func PayloadReferenceCapable(reply sessionwire.VersionNegotiationResponse) bool {
+	return reply.Supports(sessionwire.HostLinkCapabilityPayloadReference)
+}
+
 // Negotiator is the capability of a Link that can report the connect reply its
 // Host last sent. It is discovered by assertion, like Subscriber, so a Link a
 // test or a later transport supplies without it fails the capability question
@@ -160,6 +165,12 @@ func (p *Pool) AcceptsGateResponses(ctx context.Context, target Target, tenantID
 // attribution capability reply.
 func (p *Pool) AcceptsCommandPrincipal(ctx context.Context, target Target, tenantID sessionwire.TenantID) (bool, error) {
 	return p.accepts(ctx, target, tenantID, PrincipalCapable)
+}
+
+// AcceptsPayloadReferences asks the tenant's HostLink whether the Host can
+// dereference an inbox payload object before placement or delivery.
+func (p *Pool) AcceptsPayloadReferences(ctx context.Context, target Target, tenantID sessionwire.TenantID) (bool, error) {
+	return p.accepts(ctx, target, tenantID, PayloadReferenceCapable)
 }
 
 func (p *Pool) accepts(ctx context.Context, target Target, tenantID sessionwire.TenantID, capable func(sessionwire.VersionNegotiationResponse) bool) (bool, error) {

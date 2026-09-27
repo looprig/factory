@@ -535,6 +535,17 @@ func (l placementLinks) AcceptsCommandPrincipal(ctx context.Context, owner sessi
 	return capable, err
 }
 
+func (l placementLinks) AcceptsPayloadReferences(ctx context.Context, owner sessionwire.HostLinkRegistryObservation) (bool, error) {
+	capable, err := l.pool.AcceptsPayloadReferences(ctx, hostlink.Target{Host: owner.HostID, Endpoint: owner.InternalEndpoint, Generation: owner.HostGeneration}, owner.TenantID)
+	if errors.Is(err, hostlink.ErrNoTenantEndpoint) {
+		return false, fmt.Errorf("%w: %w", placement.ErrTenantUnaddressable, err)
+	}
+	if err != nil && (errors.Is(err, hostlink.ErrLinkReconnecting) || errors.Is(err, hostlink.ErrLinkClosed)) {
+		return false, fmt.Errorf("%w: %w", placement.ErrHostUnreachable, err)
+	}
+	return capable, err
+}
+
 // gateResponders is the gate_response capability question asked of the pool:
 // the owner's link FOR THE SESSION'S TENANT, at the address derived from the
 // owner's advertised base, answered by hostlink.GateResponseCapable. Admission
