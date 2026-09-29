@@ -120,12 +120,12 @@ func TestRuntimeUnavailableIsNotTheRetryable503(t *testing.T) {
 //
 // Both are negative claims -- "no refusal is retryable" -- and a RetryableStatus
 // that returned false for everything would satisfy them while telling every
-// caller of the REST plane not to retry a dependency outage. The three statuses
+// caller of the REST plane not to retry a dependency outage. These statuses
 // here are the ones that name a condition the REQUEST did not cause.
 func TestTheRetryableRuleCanSayTrue(t *testing.T) {
 	t.Parallel()
 
-	for _, status := range []int{http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout} {
+	for _, status := range []int{http.StatusTooManyRequests, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout} {
 		if !command.RetryableStatus(status) {
 			t.Errorf("RetryableStatus(%d) = false; a dependency condition the caller did not cause is retryable", status)
 		}

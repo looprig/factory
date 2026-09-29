@@ -181,6 +181,75 @@ func TestObjectAuthPrecedesExistenceAndPolicyPrecedesMetadata(t *testing.T) {
 	}
 }
 
+func TestObjectPolicyRateLimitIsRetryable(t *testing.T) {
+	for _, tc := range []struct {
+		name, retryAfter string
+		err              error
+		status           int
+		code             sessionwire.ErrorCode
+		retryable        bool
+	}{
+		{"sentinel", "", identity.ErrRateLimited, 429, ErrorCodeUnavailable, true},
+		{"wrapped", "", fmt.Errorf("policy: %w", identity.ErrRateLimited), 429, ErrorCodeUnavailable, true},
+		{"typed", "3", fmt.Errorf("policy: %w", &identity.RateLimitedError{RetryAfter: 2500 * time.Millisecond}), 429, ErrorCodeUnavailable, true},
+		{"fault", "", errors.New("policy failed"), 500, ErrorCodeInternal, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f, m, blobs := observedObjectFixture(t, "secret")
+			f.router.objectPolicy = objectPolicyFunc(func(context.Context, identity.Principal, sessionstore.CatalogEntry, sessionwire.ObjectReference) (sessionstore.ObjectKind, error) {
+				return "", tc.err
+			})
+			for _, suffix := range []string{"", "/metadata"} {
+				got := f.get(objectTarget(m) + suffix)
+				if got.Code != tc.status || got.Header().Get("Retry-After") != tc.retryAfter || blobs.gets != 0 {
+					t.Errorf("%s: status=%d Retry-After=%q reads=%d", suffix, got.Code, got.Header().Get("Retry-After"), blobs.gets)
+				}
+				detail := decodeEnvelope(t, got).Error
+				if detail.Code != tc.code || detail.Retryable != tc.retryable {
+					t.Errorf("%s: error=%+v, want %q retryable=%t", suffix, detail, tc.code, tc.retryable)
+				}
+			}
+		})
+	}
+}
+
+type failingObjectAuthorizer struct {
+	Authorizer
+	err error
+}
+
+func (a failingObjectAuthorizer) AuthorizeObjectRead(context.Context, identity.Principal, sessionwire.SessionID, sessionwire.ObjectReference) error {
+	return a.err
+}
+
+func TestObjectAuthorizerRateLimitIsRetryable(t *testing.T) {
+	for _, tc := range []struct {
+		name, retryAfter string
+		err              error
+		status           int
+		code             sessionwire.ErrorCode
+		retryable        bool
+	}{
+		{"sentinel", "", identity.ErrRateLimited, 429, ErrorCodeUnavailable, true},
+		{"wrapped", "", fmt.Errorf("authorizer: %w", identity.ErrRateLimited), 429, ErrorCodeUnavailable, true},
+		{"typed", "2", &identity.RateLimitedError{RetryAfter: 2 * time.Second}, 429, ErrorCodeUnavailable, true},
+		{"fault", "", errors.New("authorizer failed"), 500, ErrorCodeInternal, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f, m, blobs := observedObjectFixture(t, "secret")
+			f.router.authorizer = failingObjectAuthorizer{Authorizer: f.router.authorizer, err: tc.err}
+			got := f.get(objectTarget(m))
+			if got.Code != tc.status || got.Header().Get("Retry-After") != tc.retryAfter || blobs.gets != 0 {
+				t.Errorf("status=%d Retry-After=%q reads=%d", got.Code, got.Header().Get("Retry-After"), blobs.gets)
+			}
+			detail := decodeEnvelope(t, got).Error
+			if detail.Code != tc.code || detail.Retryable != tc.retryable {
+				t.Errorf("error=%+v, want %q retryable=%t", detail, tc.code, tc.retryable)
+			}
+		})
+	}
+}
+
 func TestObjectTenantAndSessionAreAuthenticatedScope(t *testing.T) {
 	f, m, _ := observedObjectFixture(t, "secret")
 	// A query tenant never changes the principal's authorized object scope.

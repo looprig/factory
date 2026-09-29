@@ -6,6 +6,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	sessionwire "github.com/looprig/core/sessionwire/v1"
 	"github.com/looprig/factory/identity"
@@ -33,6 +34,22 @@ func TestErrUnauthorizedIsAStablePublicSentinel(t *testing.T) {
 	} {
 		if !errors.Is(wrapped, identity.ErrUnauthorized) {
 			t.Errorf("errors.Is(%v, ErrUnauthorized) = false", wrapped)
+		}
+	}
+}
+
+func TestErrRateLimitedIsAStablePublicSentinel(t *testing.T) {
+	t.Parallel()
+	if got := identity.ErrRateLimited.Error(); got != "identity: rate limited" {
+		t.Fatalf("ErrRateLimited text = %q", got)
+	}
+	for _, err := range []error{
+		identity.ErrRateLimited,
+		fmt.Errorf("policy: %w", identity.ErrRateLimited),
+		fmt.Errorf("policy: %w", &identity.RateLimitedError{RetryAfter: time.Second}),
+	} {
+		if !errors.Is(err, identity.ErrRateLimited) {
+			t.Errorf("%v does not wrap ErrRateLimited", err)
 		}
 	}
 }

@@ -109,6 +109,7 @@ func TestRetryabilityIsAFunctionOfTheStatus(t *testing.T) {
 		http.StatusUnauthorized:          false,
 		http.StatusForbidden:             false,
 		http.StatusNotFound:              false,
+		http.StatusTooManyRequests:       true,
 		http.StatusMethodNotAllowed:      false,
 		http.StatusRequestEntityTooLarge: false,
 		http.StatusUnsupportedMediaType:  false,

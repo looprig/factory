@@ -39,8 +39,9 @@ type Authenticator interface {
 }
 
 // Authorizer decides every public REST operation. A nil error is the only
-// grant; a denial wraps identity.ErrUnauthorized, and any other error is an
-// authorization dependency fault.
+// grant; a denial wraps identity.ErrUnauthorized, a retryable throttle wraps
+// identity.ErrRateLimited, and any other error is an authorization dependency
+// fault.
 type Authorizer interface {
 	// AuthorizeSessionList covers the tenant-scoped session list.
 	AuthorizeSessionList(ctx context.Context, principal identity.Principal) error

@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"strconv"
+	"time"
 
 	sessionwire "github.com/looprig/core/sessionwire/v1"
 	"github.com/looprig/factory/identity"
@@ -75,9 +77,8 @@ const (
 	// text: a dependency's error string is diagnosis for an operator's log, not
 	// for a caller's response body.
 	ErrorCodeInternal sessionwire.ErrorCode = "internal_error"
-	// ErrorCodeUnavailable reports a dependency Factory could not reach, which
-	// is a different operational condition from a rejected request and is
-	// retryable.
+	// ErrorCodeUnavailable reports a temporary outage or throttle. The
+	// condition is retryable, even when the request itself is valid.
 	ErrorCodeUnavailable sessionwire.ErrorCode = "unavailable"
 	// ErrorCodeTimeout reports that the deadline this router imposed on the
 	// request's work expired.
@@ -169,16 +170,17 @@ func apiErrorCodes() []sessionwire.ErrorCode {
 // see retryableStatus -- because a per-construction boolean is a place a caller
 // can disagree with another caller about what the same status means.
 type apiError struct {
-	status  int
-	code    sessionwire.ErrorCode
-	message string
+	status     int
+	code       sessionwire.ErrorCode
+	message    string
+	retryAfter time.Duration
 }
 
 // retryableStatus reports whether a client may usefully repeat the identical
 // request.
 //
-// The set is the three statuses that name a condition the REQUEST did not
-// cause: a bad gateway, an unavailable dependency, and an expired deadline. A
+// The set includes throttling, a bad gateway, an unavailable dependency, and
+// an expired deadline. A
 // 500 is deliberately absent -- a fault Factory could not classify is not one a
 // client should be told to hammer -- and so is 403 csrf_token_expired, which is
 // recoverable but only after the client changes the request by fetching a new
@@ -222,6 +224,13 @@ func writeAPIError(w http.ResponseWriter, e apiError) {
 	if err != nil {
 		status = http.StatusInternalServerError
 		body = fallbackErrorBody
+	}
+	if status == http.StatusTooManyRequests && e.retryAfter > 0 {
+		seconds := int64(e.retryAfter / time.Second)
+		if e.retryAfter%time.Second != 0 {
+			seconds++
+		}
+		w.Header().Set("Retry-After", strconv.FormatInt(seconds, 10))
 	}
 	writeJSONBytes(w, status, body)
 }
@@ -269,10 +278,18 @@ func authenticationFailure(err error) apiError {
 //
 // A denial stays a denial: it carries internal/identity's sentinel and nothing
 // derived from the resource, because ErrUnauthorized's whole contract is that a
-// refusal discloses no identifier. Anything else the authorizer returns is a
-// fault, not a decision, and must not be answered as one -- reporting a broken
-// authorizer as 403 would make an outage look like a permissions change.
+// refusal discloses no identifier. ErrRateLimited is a retryable throttle.
+// Other errors are faults; reporting a broken authorizer as 403 would make an
+// outage look like a permissions change.
 func authorizationFailure(err error) apiError {
+	if errors.Is(err, identity.ErrRateLimited) {
+		var limited *identity.RateLimitedError
+		failure := apiError{status: http.StatusTooManyRequests, code: ErrorCodeUnavailable, message: "this request is throttled; retry later"}
+		if errors.As(err, &limited) {
+			failure.retryAfter = limited.RetryAfter
+		}
+		return failure
+	}
 	if errors.Is(err, internalidentity.ErrUnauthorized) {
 		return apiError{
 			status:  http.StatusForbidden,

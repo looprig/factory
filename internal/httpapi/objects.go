@@ -23,7 +23,8 @@ import (
 // Metadata index existence is not that evidence. The returned kind comes from
 // policy, never from a caller's reference syntax. Nil policy grants nothing.
 // The catalog entry carries the immutable binding the evidence must belong to.
-// A denial wraps identity.ErrUnauthorized; any other error is a policy fault.
+// A denial wraps identity.ErrUnauthorized; identity.ErrRateLimited reports a
+// retryable throttle. Any other error is a policy fault.
 // A9 must supply the production policy; this interface does not implement one.
 type ObjectPolicy interface {
 	AuthorizeReference(context.Context, identity.Principal, sessionstore.CatalogEntry, sessionwire.ObjectReference) (sessionstore.ObjectKind, error)
@@ -68,7 +69,7 @@ func objectAbsent() apiError {
 }
 
 // objectPolicyFailure classifies an ObjectPolicy error. A denial is absence;
-// anything else is the policy's own fault and stays 500.
+// a throttle is retryable, and any other error is the policy's own fault.
 func objectPolicyFailure(err error) apiError {
 	if errors.Is(err, internalidentity.ErrUnauthorized) {
 		return objectAbsent()

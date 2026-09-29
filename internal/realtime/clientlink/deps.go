@@ -19,6 +19,7 @@ type Authenticator interface {
 }
 
 // Authorizer decides subscription and RPC operations on an established link.
+// A throttle wraps identity.ErrRateLimited and receives temporary code 100.
 type Authorizer interface {
 	// AuthorizeSubscribe covers session:{tenant}:{session}. Parsing a channel
 	// name grants nothing: the tenant segment is compared to the principal.

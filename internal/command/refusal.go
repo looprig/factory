@@ -28,7 +28,7 @@ import (
 // # Every status here is a 4xx, and that is the A3.3-retryable ruling
 //
 // `httpapi`'s retryableStatus -- RetryableStatus below, now that there is one
-// of it -- reports 502, 503 and 504 retryable, because each names a condition
+// of it -- reports 429, 502, 503 and 504 retryable, because each names a condition
 // the REQUEST did not cause. The ClientLink answers every classified refusal
 // retryable:false. So a status in that set would make the identical refusal
 // retryable over REST and not over the RPC, which is the divergence the open
@@ -154,8 +154,8 @@ func RefusalCodes() []sessionwire.ErrorCode {
 // RetryableStatus reports whether a client may usefully repeat the identical
 // request.
 //
-// The set is the three statuses that name a condition the REQUEST did not
-// cause: a bad gateway, an unavailable dependency, and an expired deadline. A
+// The set includes throttling, a bad gateway, an unavailable dependency, and
+// an expired deadline. A
 // 500 is deliberately absent -- a fault Factory could not classify is not one a
 // client should be told to hammer -- and so is 403 csrf_token_expired, which is
 // recoverable but only after the client changes the request by fetching a new
@@ -166,7 +166,7 @@ func RefusalCodes() []sessionwire.ErrorCode {
 // exists to remove.
 func RetryableStatus(status int) bool {
 	switch status {
-	case http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
+	case http.StatusTooManyRequests, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
 		return true
 	default:
 		return false

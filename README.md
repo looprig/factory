@@ -67,7 +67,7 @@ go get github.com/looprig/factory@latest
 | Package | Purpose |
 |---|---|
 | `github.com/looprig/factory` | `New`, options, public seams, `Server` (`Handler`, `Start`, `Serve`, `Quiesce`, `Stop`) |
-| `github.com/looprig/factory/identity` | Public identity vocabulary: `Principal`, `Verifier`, `Credential`, `CSRFConfig`, `ErrUnauthorized` |
+| `github.com/looprig/factory/identity` | Public identity vocabulary: `Principal`, `Verifier`, `Credential`, `CSRFConfig`, `ErrUnauthorized`, `ErrRateLimited`, `RateLimitedError` |
 | `internal/httpapi` | The public REST plane, origin/CSRF guard and error envelope |
 | `internal/identity` | Principal derivation from credentials |
 | `internal/admission` | Durable command admission and deadline reconciliation |
@@ -458,7 +458,9 @@ tenant, the public session and the catalog binding, and Factory addresses the
 read to the runtime id. The object route serves only with an injected
 `ObjectPolicy` (503 without one), serves only `tool-result` objects, answers a
 policy denial with the same 404 as an absent object, and verifies at most
-64 MiB per object. A dedicated workload is controlled by its
+64 MiB per object. A policy returning `identity.ErrRateLimited` answers
+retryable 429; `identity.RateLimitedError` also supplies `Retry-After`. A
+dedicated workload is controlled by its
 workload controller, including drain and termination; Factory does not issue a
 HostLink drain or implement drain-before-delete in its placement seam.
 

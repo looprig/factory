@@ -761,6 +761,9 @@ func TestExternalSubscribeAuthorizationErrorsKeepTheirWireClass(t *testing.T) {
 		// the two rows above and fails both of these.
 		{"doubly wrapped public sentinel", fmt.Errorf("external authorizer: %w", fmt.Errorf("policy engine: %w", identity.ErrUnauthorized)), 103},
 		{"joined public sentinel", errors.Join(errors.New("audit sink unavailable"), identity.ErrUnauthorized), 103},
+		{"rate limit sentinel", identity.ErrRateLimited, 100},
+		{"wrapped rate limit", fmt.Errorf("external authorizer: %w", identity.ErrRateLimited), 100},
+		{"typed rate limit", fmt.Errorf("external authorizer: %w", &identity.RateLimitedError{RetryAfter: time.Second}), 100},
 		{"authorization dependency fault", errors.New("authorization backend failed"), 100},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -996,6 +999,9 @@ func TestARefusedCommandRPCIsDenied(t *testing.T) {
 		// the two rows above and fails both of these.
 		{"doubly wrapped public sentinel", fmt.Errorf("external authorizer: %w", fmt.Errorf("policy engine: %w", identity.ErrUnauthorized)), 103},
 		{"joined public sentinel", errors.Join(errors.New("audit sink unavailable"), identity.ErrUnauthorized), 103},
+		{"rate limit sentinel", identity.ErrRateLimited, 100},
+		{"wrapped rate limit", fmt.Errorf("external authorizer: %w", identity.ErrRateLimited), 100},
+		{"typed rate limit", fmt.Errorf("external authorizer: %w", &identity.RateLimitedError{RetryAfter: time.Second}), 100},
 		{"authorization dependency fault", errors.New("authorization backend failed"), 100},
 	} {
 		t.Run(test.name, func(t *testing.T) {

@@ -14,6 +14,7 @@ package identity
 import (
 	"errors"
 	"fmt"
+	"time"
 	"unicode/utf8"
 
 	sessionwire "github.com/looprig/core/sessionwire/v1"
@@ -45,6 +46,23 @@ var ErrUnauthenticated = errors.New("identity: unauthenticated")
 // wrap it with an operation name, but must not add resource identifiers: a
 // denial must not disclose whether a named resource exists.
 var ErrUnauthorized = errors.New("identity: unauthorized")
+
+// ErrRateLimited is what an Authorizer or ObjectPolicy reports when a request
+// is throttled and may be retried later. Implementations may wrap it without
+// changing its classification.
+var ErrRateLimited = errors.New("identity: rate limited")
+
+// RateLimitedError reports a throttle with an optional RetryAfter duration.
+// A positive duration is rounded up to whole seconds in HTTP's Retry-After
+// header. A nonpositive duration leaves the header unset.
+type RateLimitedError struct {
+	RetryAfter time.Duration
+}
+
+func (e *RateLimitedError) Error() string { return ErrRateLimited.Error() }
+
+// Unwrap lets errors.Is recognize ErrRateLimited through this error and its wrappers.
+func (e *RateLimitedError) Unwrap() error { return ErrRateLimited }
 
 // ErrCredentialExpired is the expiry case of ErrUnauthenticated, and it WRAPS
 // it, so a caller matching only ErrUnauthenticated needs no change.
