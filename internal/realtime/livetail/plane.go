@@ -315,9 +315,18 @@ func (p *Plane) Bind(ctx context.Context, endpoint sessionwire.InternalEndpoint,
 // is not optional: a Host never unsubscribes a Factory -- not on unbind, not
 // when it invalidates the session's routes -- so a tail left behind would keep
 // publishing into a route this replica no longer holds.
+//
+// A failure on a link whose connection is gone (hostlink.ConnectionGone) is
+// classified routing.ErrRouteGone, with the transport's cause kept: the Host
+// dropped the route with the connection, which the routing plane's shutdown
+// paths count as released rather than as a failure.
 func (p *Plane) Unbind(ctx context.Context, req sessionwire.HostLinkUnbindRequest) error {
 	p.stopTail(req.TenantID, req.SessionID)
-	return p.links.Unbind(ctx, req)
+	err := p.links.Unbind(ctx, req)
+	if err != nil && hostlink.ConnectionGone(err) {
+		return fmt.Errorf("%w: %w", routing.ErrRouteGone, err)
+	}
+	return err
 }
 
 // RouteHeld is routing.RouteReporter: whether the pool still holds the

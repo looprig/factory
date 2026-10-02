@@ -398,7 +398,9 @@ func (d *Demand) Rebind(ctx context.Context, tenant sessionwire.TenantID, sessio
 //
 // Every session is attempted and every failure joined rather than returning at
 // the first, for Bindings.Close's reason: one Host's failure must not strand
-// the routes on the others.
+// the routes on the others. An unbind refused because the route's connection
+// is already gone (ErrRouteGone) is not a failure here, for the reason
+// Bindings.Close gives.
 func (d *Demand) Close(ctx context.Context) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -406,7 +408,7 @@ func (d *Demand) Close(ctx context.Context) error {
 
 	var failures []error
 	for key, entry := range d.sessions {
-		if err := d.teardownLocked(ctx, key, entry); err != nil {
+		if err := d.teardownLocked(ctx, key, entry); err != nil && !errors.Is(err, ErrRouteGone) {
 			failures = append(failures, err)
 		}
 	}

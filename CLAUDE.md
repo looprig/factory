@@ -2028,6 +2028,19 @@ are the ones a restarted replica would then conflict with. `Close` has no
 idempotence comes from emptying the table — the same evidence on which the
 HostLink pool removed its own.
 
+**An unbind refused because the route's connection is gone is not a shutdown
+failure.** A Host keeps routes per connection (keyed by the transport's
+per-connection client id) and drops all of them on disconnect
+(`Multiplexer.CloseLink` from `OnDisconnect`, in every released Host from
+v0.1.0); a reconnect inherits none. So `livetail.Plane.Unbind` wraps a link
+error that proves nothing was sent on a gone connection
+(`hostlink.ConnectionGone`: `ErrLinkReconnecting` or a terminal link error) in
+`routing.ErrRouteGone`, and `Bindings.Close` and `Demand.Close` absorb it. A
+cancelled or timed-out unbind is not classified -- it may have left on a live
+connection. `Release` still reports it. Found by `stack`, whose teardown stops
+the Host before Factory: centrifuge v0.39's faster transport close made Stop
+fail ~5/75 with `hostlink.unbind: hostlink: link is reconnecting`.
+
 **The bind key is derived and framed.** Core wants a retry-stable idempotency
 key; deriving it from the tuple is what makes a repeated bind a repeat without
 coordination, and the unbind carries the same key so a Host's two records of

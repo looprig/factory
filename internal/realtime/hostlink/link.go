@@ -612,6 +612,26 @@ func terminalLinkError(err error) bool {
 	return errors.Is(err, ErrUnsupportedProtocol) || errors.Is(err, ErrLinkClosed) || errors.As(err, &disconnect)
 }
 
+// ConnectionGone reports an error from a link whose connection is gone and
+// which sent nothing: the link is reconnecting (ErrLinkReconnecting), or it is
+// terminal (terminalLinkError). Every one of those is returned BEFORE the
+// request reaches the transport.
+//
+// What it lets a caller conclude about an UNBIND is that the route it named no
+// longer exists on the Host. A Host keeps routes per connection -- keyed by the
+// connection's client id, minted per connection -- and drops all of them when
+// the connection closes (host's Multiplexer.CloseLink, run from OnDisconnect
+// in every released Host from v0.1.0); a reconnect is a new connection that
+// inherits no route. A route this pool held was bound on the connection that
+// has now gone, so the Host has dropped it or will on noticing the close.
+//
+// It deliberately does NOT cover a cancelled or timed-out call, nor a failure
+// returned by the transport itself: that request may have left, on a
+// connection the Host still holds.
+func ConnectionGone(err error) bool {
+	return errors.Is(err, ErrLinkReconnecting) || terminalLinkError(err)
+}
+
 // evict drops a dead link from the pool, with every route that names its Host
 // FOR ITS TENANT, and closes it. Another tenant's link to the same Host is a
 // different connection and is left alone: one tenant's terminal close is not

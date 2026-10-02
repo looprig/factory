@@ -35,6 +35,24 @@ var ErrNoBinding = errors.New("routing: no local binding for session")
 // ErrNoDemand reports a release of demand nobody holds.
 var ErrNoDemand = errors.New("routing: no local demand for session")
 
+// ErrRouteGone classifies a failed unbind whose route no longer exists on the
+// Host, because the connection that carried it is gone. A Binder wraps it
+// around the transport's own cause, which stays in the chain.
+//
+// It is a fact about the Host, not a guess: a Host's routes are per
+// CONNECTION (host's Multiplexer keys them by the transport's client id,
+// minted per connection), it drops every route a connection held when that
+// connection closes, and a reconnect is a new connection that inherits none.
+// A Binder may therefore wrap it only for a failure that proves the unbind was
+// never sent AND the connection is gone -- never for a timeout or a cancelled
+// call, whose request may have reached a Host that is still connected.
+//
+// Only the SHUTDOWN paths -- Close here and Demand.Close -- absorb it, because
+// there a reported failure is all that is left of it: the table is emptied
+// either way and nothing retries. Release and Observe are unchanged; Release
+// still reports it, so a caller in normal operation still sees the link down.
+var ErrRouteGone = errors.New("routing: the route's connection is gone")
+
 // Resolver reads the authoritative owner of a session. *Directory implements
 // it, and that is the only implementation this module has: ownership comes
 // from the epoch-fenced registry and from nowhere else.
@@ -402,6 +420,12 @@ func (b *Bindings) Len() int {
 // deleted such a guard survived the whole suite for exactly that reason. The
 // HostLink pool removed the same redundant guard on the same evidence. A
 // second Close unbinds nothing because there is nothing left to unbind.
+//
+// An unbind refused with ErrRouteGone is NOT a failure. The Host already
+// dropped that route with the connection that carried it, so the route has
+// been given back and there is nothing a restarted replica could conflict
+// with. Reporting it made an ordinary teardown -- a Host stopped before the
+// Factory, whose link is then reconnecting when Close runs -- fail Stop.
 func (b *Bindings) Close(ctx context.Context) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -412,7 +436,7 @@ func (b *Bindings) Close(ctx context.Context) error {
 		if !route.bound {
 			continue
 		}
-		if err := b.binder.Unbind(ctx, unbindRequest(route.binding)); err != nil {
+		if err := b.binder.Unbind(ctx, unbindRequest(route.binding)); err != nil && !errors.Is(err, ErrRouteGone) {
 			failures = append(failures, err)
 		}
 	}
