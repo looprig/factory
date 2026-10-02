@@ -17,7 +17,7 @@ var releasedLooprigVersions = map[string]string{
 	"github.com/looprig/storage":      "v0.7.0",
 	"github.com/looprig/fsstore":      "v0.6.0",
 	"github.com/looprig/natsstore":    "v0.5.3",
-	"github.com/looprig/sessionstore": "v0.14.0",
+	"github.com/looprig/sessionstore": "v0.15.0",
 }
 
 // forbiddenModules may never appear in go.mod at any version, released or not.

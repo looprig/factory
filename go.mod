@@ -6,7 +6,7 @@ require (
 	github.com/centrifugal/centrifuge v0.39.3
 	github.com/centrifugal/centrifuge-go v0.12.1
 	github.com/looprig/core v0.13.0
-	github.com/looprig/sessionstore v0.14.0
+	github.com/looprig/sessionstore v0.15.0
 )
 
 require (

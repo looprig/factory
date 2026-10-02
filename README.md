@@ -378,6 +378,22 @@ digest or a re-encoding leaks that derivative, and
 `TestScrubbingCoversOnlyAVerbatimCredential` pins the boundary from both sides
 rather than leaving it to a caveat.
 
+## v0.16.0 release notes
+
+Factory now pins sessionstore v0.15.0. Journal tip reads use `TipOnly`, so
+an offloaded public event above the 512 KiB page budget no longer closes a
+viewer. Journal catch-up and gap repair can read offloaded public bodies up
+to 16 MiB through this SessionStore version. **Rollout: deploy this Factory
+before relying on large-event catch-up.**
+
+The transport moves to centrifuge v0.39.3, centrifuge-go v0.12.1 and protocol
+v0.22.1, fixing the Node shutdown goroutine leak and picking up the
+GHSA-4r3x-2rwr-6w65 stream decoder fix. The wire version is unchanged;
+mixed old/new Factory and Host fleets interoperate. Shutdown treats an
+unbind on a gone HostLink connection as already released, because the Host
+drops that connection's routes on disconnect. The upstream centrifuge-go
+close/reconnect race remains; bounded Close and the race stress skip remain.
+
 ## Realtime transport
 
 The realtime transport is pinned exactly. The pins below, the constants in
@@ -777,7 +793,7 @@ unread is logged at WARN. `Commands` accordingly names the disposition admission
 retry read, payload upload, rejection and due query in place of `AdmitCommand`
 and `GetCommand`; a `*sessionstore.Store` satisfies it.
 
-**The gate rollout rule is met: sessionstore is pinned at v0.13.1**, whose
+**The gate rollout rule is met: sessionstore is pinned at v0.15.0**, whose
 readers accept a gate page a Host wrote on a disposition session (older readers
 refuse it). `TestAHostPublishedDispositionGateIsReadByThePinnedStore` writes a
 gate the way a Host does and reads it through both of Factory's gate readers.

@@ -30,8 +30,8 @@ github.com/jpillora/backoff v1.0.0 h1:uvFg412JmmHBHw7iwprIxkPMI+sGQ4kzOWsMeHnm2E
 github.com/jpillora/backoff v1.0.0/go.mod h1:J/6gKK9jxlEcS3zixgDgUAsiuZ7yrSoa/FX5e0EB2j4=
 github.com/looprig/core v0.13.0 h1:I0em+yJzTSGjmwo/+G9EKdPJyyIG/vjj8Gb7QxKfans=
 github.com/looprig/core v0.13.0/go.mod h1:PB+2uceqh0Js6uXbwyj42bRDtiCDe9aCjTDeO47yPmo=
-github.com/looprig/sessionstore v0.14.0 h1:B0ZNy72UJolMJTdKZgM7yvrISLy8TUaKBlzDJSOHmBM=
-github.com/looprig/sessionstore v0.14.0/go.mod h1:mSPJ253ljp5ehpOefhI8ix32RqSxDPURC4z8t7/PrOk=
+github.com/looprig/sessionstore v0.15.0 h1:xARzqWDovMnF6AZ42SpHqCtzPBeqnCtcaOzNL0I3qDo=
+github.com/looprig/sessionstore v0.15.0/go.mod h1:mSPJ253ljp5ehpOefhI8ix32RqSxDPURC4z8t7/PrOk=
 github.com/looprig/storage v0.7.0 h1:3s6hHgYEoKZRW0HSDpOK5f3UBc4owQ7bAr2GhJV1g50=
 github.com/looprig/storage v0.7.0/go.mod h1:z9XKe/fQBSJgr13Sh2PKqxmLAVZ6d2X0lZUm1eDLj7M=
 github.com/mailru/easyjson v0.9.2 h1:dX8U45hQsZpxd80nLvDGihsQ/OxlvTkVUXH2r/8cb2M=
