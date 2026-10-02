@@ -17,6 +17,7 @@ import (
 	"github.com/looprig/factory/internal/realtime/hostlink"
 	"github.com/looprig/factory/internal/realtime/livetail"
 	"github.com/looprig/sessionstore"
+	"github.com/looprig/storage"
 	"github.com/looprig/storage/memstore"
 )
 
@@ -51,6 +52,13 @@ func hostSessionWorld(t *testing.T) (control, runtime *sessionstore.Store, seqs 
 // for a case that commits more records to it.
 func hostSessionWorldWriter(t *testing.T) (control, runtime *sessionstore.Store, seqs []uint64, writer *sessionstore.JournalWriter) {
 	t.Helper()
+	return hostSessionWorldOver(t, memstore.New())
+}
+
+// hostSessionWorldOver is hostSessionWorldWriter with the runtime store opened
+// over runtimeBackend, for a case that must reach beneath the store.
+func hostSessionWorldOver(t *testing.T, runtimeBackend *storage.Composite) (control, runtime *sessionstore.Store, seqs []uint64, writer *sessionstore.JournalWriter) {
+	t.Helper()
 	ctx := context.Background()
 	control, err := sessionstore.Open(ctx, memstore.New())
 	if err != nil {
@@ -75,7 +83,7 @@ func hostSessionWorldWriter(t *testing.T) (control, runtime *sessionstore.Store,
 		t.Fatalf("AdmitPublicCreate: %v", err)
 	}
 
-	runtime, err = sessionstore.Open(ctx, memstore.New(), sessionstore.WithLegacySingleTenant(FakeTenant))
+	runtime, err = sessionstore.Open(ctx, runtimeBackend, sessionstore.WithLegacySingleTenant(FakeTenant))
 	if err != nil {
 		t.Fatal(err)
 	}

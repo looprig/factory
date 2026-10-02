@@ -99,15 +99,22 @@ func (l DemandLimits) Validate() error {
 	return nil
 }
 
-// tipReadLimit is the page size of a tip read.
+// tipReadLimit is the page size of a tip read's fallback.
 //
 // The tip is a property of the scan PLAN -- SessionStore captures the ledger
-// tip before it walks anything -- so a tip read wants the smallest page the
-// store will build, not a useful one. Tail keeps the walk at the end of the
-// journal instead of from sequence one, and ScanLimit bounds the records
-// examined including the private ones a public page withholds. Both are set:
-// Tail already bounds this walk to one record, and ScanLimit is the bound that
-// still holds if a later store release changes what Tail means.
+// tip before it walks anything -- so a tip read asks for no page at all:
+// TipOnly returns the captured tip without reading a record. That matters
+// beyond cost. A page read resolves each public event's body, and SessionStore
+// refuses an offloaded public body above MaxInlineBodyBytes (every public body
+// Harness offloads under its default 512 KiB threshold), so a one-record tail
+// read whose tip is such an event FAILS -- and every repair, resync and anchor
+// built on it closes the session's viewers instead of resetting them.
+//
+// Tail, Limit and ScanLimit are still set, to the smallest page the store will
+// build, for a JournalReader that predates TipOnly and answers the request as a
+// page read: Tail keeps that walk at the end of the journal instead of from
+// sequence one, and ScanLimit bounds the records it examines including the
+// private ones a public page withholds.
 const tipReadLimit = 1
 
 // Demand is this replica's LOCAL subscriber demand, and the binding and
@@ -649,12 +656,13 @@ func (d *Demand) hintLocked(ctx context.Context, key sessionKey) {
 	_ = d.hints.PublishJournalTip(ctx, hint)
 }
 
-// tipRequest is the bounded read a tip poll makes. Only CapturedTip is read
-// from the answer; the request asks for the smallest page the store will build.
+// tipRequest is the read a tip poll makes. Only CapturedTip is read from the
+// answer, so it asks for the tip and no record (see tipReadLimit).
 func tipRequest(key sessionKey) sessionstore.ReadPublicJournalRequest {
 	return sessionstore.ReadPublicJournalRequest{
 		TenantID:  key.tenant,
 		SessionID: key.session,
+		TipOnly:   true,
 		Tail:      true,
 		Limit:     tipReadLimit,
 		ScanLimit: tipReadLimit,
