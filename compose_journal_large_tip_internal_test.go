@@ -8,6 +8,7 @@ import (
 	"sync"
 	"testing"
 
+	sessionwire "github.com/looprig/core/sessionwire/v1"
 	"github.com/looprig/sessionstore"
 	"github.com/looprig/storage"
 	"github.com/looprig/storage/memstore"
@@ -43,9 +44,26 @@ func (l *namingLedger) journal() string {
 // the store. It returns the event's sequence.
 func appendOffloadedPublicEvent(t *testing.T, runtime *sessionstore.Store, ledger *namingLedger) uint64 {
 	t.Helper()
-	ctx := context.Background()
-	body := []byte(`{"n":4,"text":"` + strings.Repeat("x", sessionstore.MaxInlineBodyBytes+1024) + `"}`)
-	metadata, err := runtime.PutObject(ctx, sessionstore.PutObjectRequest{
+	seq, _ := appendOffloadedPublicBody(t, runtime, ledger, "event-4", sessionstore.MaxInlineBodyBytes+1024)
+	return seq
+}
+
+// offloadedBody is a public JSON body of exactly size bytes.
+func offloadedBody(t *testing.T, size int) []byte {
+	t.Helper()
+	const framing = len(`{"text":""}`)
+	if size < framing {
+		t.Fatalf("body size %d is below the JSON framing", size)
+	}
+	return []byte(`{"text":"` + strings.Repeat("x", size-framing) + `"}`)
+}
+
+// appendOffloadedPublicBody is appendOffloadedPublicEvent for a named event of
+// a given body size. It returns the event's sequence and its body.
+func appendOffloadedPublicBody(t *testing.T, runtime *sessionstore.Store, ledger *namingLedger, id sessionwire.EventID, size int) (uint64, []byte) {
+	t.Helper()
+	body := offloadedBody(t, size)
+	metadata, err := runtime.PutObject(context.Background(), sessionstore.PutObjectRequest{
 		TenantID: FakeTenant, SessionID: journalRuntime, Kind: sessionstore.ObjectKindJournalPublic,
 		SizeBytes: uint64(len(body)), SHA256: sha256.Sum256(body), Body: bytes.NewReader(body),
 	})
@@ -56,10 +74,19 @@ func appendOffloadedPublicEvent(t *testing.T, runtime *sessionstore.Store, ledge
 	if err != nil {
 		t.Fatalf("BodyReferenceFromObjectMetadata: %v", err)
 	}
-	frame, err := sessionstore.EncodeEnvelope(sessionstore.Envelope{
-		Kind: sessionstore.EnvelopeKindPublicEvent, EventID: "event-4",
+	return appendBeneath(t, ledger, sessionstore.Envelope{
+		Kind: sessionstore.EnvelopeKindPublicEvent, EventID: id,
 		Public: sessionstore.BodySlot{Reference: &reference},
-	})
+	}), body
+}
+
+// appendBeneath appends env at the runtime journal's tip beneath the store --
+// for a record committed after appendOffloadedPublicBody, whose append the
+// SessionStore writer did not see. It returns the record's sequence.
+func appendBeneath(t *testing.T, ledger *namingLedger, env sessionstore.Envelope) uint64 {
+	t.Helper()
+	ctx := context.Background()
+	frame, err := sessionstore.EncodeEnvelope(env)
 	if err != nil {
 		t.Fatalf("EncodeEnvelope: %v", err)
 	}
@@ -77,11 +104,12 @@ func appendOffloadedPublicEvent(t *testing.T, runtime *sessionstore.Store, ledge
 // TestAHostSessionsViewerIsResetNotClosedWhenTheTipIsAnOffloadedPublicEvent
 // is the tip-only read (R5.3 factory v0.9.0 limit): the repair after a
 // HostLink drop needs only how far the journal has got, but a one-record tail
-// read resolves the tip record's body, and SessionStore refuses an offloaded
-// public body above MaxInlineBodyBytes as too_large -- so a session whose
-// newest event is a large public body (a long assistant message, a big tool
-// result) had its viewers CLOSED by every repair, tip hint and resync. The tip
-// is read without a body, so the viewer is reset to it instead.
+// read resolves the tip record's body, and SessionStore before v0.15.0 refused
+// an offloaded public body above MaxInlineBodyBytes as too_large -- so a
+// session whose newest event was a large public body (a long assistant
+// message, a big tool result) had its viewers CLOSED by every repair, tip hint
+// and resync. The tip is read without a body, so the viewer is reset to it
+// instead, and the repair never pays for resolving that body.
 func TestAHostSessionsViewerIsResetNotClosedWhenTheTipIsAnOffloadedPublicEvent(t *testing.T) {
 	t.Parallel()
 
@@ -90,13 +118,6 @@ func TestAHostSessionsViewerIsResetNotClosedWhenTheTipIsAnOffloadedPublicEvent(t
 	backend.Ledger = ledger
 	control, runtime, seqs, _ := hostSessionWorldOver(t, backend)
 	seqs = append(seqs, appendOffloadedPublicEvent(t, runtime, ledger))
-
-	// The control: the store really does refuse that tip through a page read.
-	if _, err := runtime.ReadPublicJournal(context.Background(), sessionstore.ReadPublicJournalRequest{
-		TenantID: FakeTenant, SessionID: journalRuntime, Tail: true, Limit: 1, ScanLimit: 1,
-	}); err == nil {
-		t.Fatal("a tail read of an offloaded public body above MaxInlineBodyBytes succeeded; the case no longer reaches the defect")
-	}
 
 	server := composedJournalServer(t, control, WithJournalResolver(runtimeJournals(runtime)))
 	resets, closes := dropAfterDelivery(t, server, seqs)

@@ -104,11 +104,12 @@ func (l DemandLimits) Validate() error {
 // The tip is a property of the scan PLAN -- SessionStore captures the ledger
 // tip before it walks anything -- so a tip read asks for no page at all:
 // TipOnly returns the captured tip without reading a record. That matters
-// beyond cost. A page read resolves each public event's body, and SessionStore
-// refuses an offloaded public body above MaxInlineBodyBytes (every public body
-// Harness offloads under its default 512 KiB threshold), so a one-record tail
-// read whose tip is such an event FAILS -- and every repair, resync and anchor
-// built on it closes the session's viewers instead of resetting them.
+// beyond cost. A page read resolves each public event's body -- up to 16 MiB
+// for an offloaded one -- and SessionStore before v0.15.0 refused an offloaded
+// public body above MaxInlineBodyBytes (every public body Harness offloads
+// under its default 512 KiB threshold), so a one-record tail read whose tip
+// was such an event FAILED, and every repair, resync and anchor built on it
+// closed the session's viewers instead of resetting them.
 //
 // Tail, Limit and ScanLimit are still set, to the smallest page the store will
 // build, for a JournalReader that predates TipOnly and answers the request as a
