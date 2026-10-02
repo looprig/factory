@@ -1235,7 +1235,7 @@ func TestTheTipReadIsBoundedAndAsksOnlyForTheTip(t *testing.T) {
 	}
 	want := sessionstore.ReadPublicJournalRequest{
 		TenantID: bindTenant, SessionID: bindSession,
-		Tail: true, Limit: 1, ScanLimit: 1,
+		TipOnly: true, Tail: true, Limit: 1, ScanLimit: 1,
 	}
 	if reads[0] != want {
 		t.Errorf("the tip read was %+v, want %+v", reads[0], want)
