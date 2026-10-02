@@ -13,7 +13,7 @@ import (
 //
 // Without it the doc comment is a claim about a file nothing compares it to,
 // and a `go get -u` in some later task would move the dependency while leaving
-// every sentence about "measured at v0.38.0" in place. The failure it produces
+// every sentence about "measured at v0.39.3" in place. The failure it produces
 // is the useful one: not "a dependency changed", but "the version this
 // package's measurements were taken against is no longer the version that
 // runs".
@@ -65,11 +65,13 @@ func TestTheParserWouldNoticeAWrongVersion(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reading go.mod: %v", err)
 	}
-	// The absolute literal below is a version this module must NOT be on. It is
-	// written out rather than derived from ServerVersion, so it stays a
-	// different value even if the pin moves.
-	if strings.Contains(string(content), transport.ServerModule+" v0.39.0") {
-		t.Fatalf("go.mod requires %s v0.39.0; this package's measurements were taken against %s",
+	// The absolute literal below is a version this module must NOT be on: it
+	// is the server whose Node.Shutdown leaks a metrics goroutine per Node (see
+	// TestNodeShutdownLeavesNoMetricsAggregatorRunning). It is written out
+	// rather than derived from ServerVersion, so it stays a different value
+	// even if the pin moves.
+	if strings.Contains(string(content), transport.ServerModule+" v0.38.0") {
+		t.Fatalf("go.mod requires %s v0.38.0; this package's measurements were taken against %s",
 			transport.ServerModule, transport.ServerVersion)
 	}
 }

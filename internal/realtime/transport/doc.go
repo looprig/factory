@@ -16,28 +16,10 @@
 //
 // # What is pinned
 //
-// The embedded server is github.com/centrifugal/centrifuge at exactly v0.38.0.
-// That version is not "the latest"; v0.39.0 exists. It is the version the
-// workspace's Centrifuge compatibility spike measured, against the JavaScript
-// client centrifuge@5.7.2 that the browser half is pinned to, so moving it
-// would invalidate a measurement rather than merely raise a number.
-//
-// The Go client is github.com/centrifugal/centrifuge-go at exactly v0.12.0,
-// and that is NOT the latest release. v0.12.1 exists. The version was selected
-// by the executable compatibility test the runbook asks for, and "executable"
-// is the load-bearing word: EVERY row below was built and run, not inferred
-// from a go.mod require line. A require is a floor, not a statement about which
-// symbols a package exports, so reading one and concluding a version is
-// incompatible is unsound -- and was, in fact, wrong here on a first attempt.
-//
-// Each row is a scratch module requiring centrifuge v0.38.0 plus one client,
-// blank-importing both packages so both must compile, under GOWORK=off:
-//
-//	centrifuge-go  resolved protocol   go build ./...
-//	v0.10.12       v0.17.0             exit 0
-//	v0.11.0        v0.19.2             exit 0
-//	v0.12.0        v0.19.2             exit 0   <- pinned
-//	v0.12.1        v0.21.0             exit 1
+// The embedded server is github.com/centrifugal/centrifuge at exactly v0.39.3,
+// the Go client github.com/centrifugal/centrifuge-go at exactly v0.12.1 (the
+// newest client release), and the wire library both resolve is
+// github.com/centrifugal/protocol v0.22.1, which the server requires.
 //
 // Minimal version selection resolves ONE protocol version for the whole module,
 // because Factory is unusual: in production a Centrifuge server and a
@@ -45,31 +27,41 @@
 // but Factory embeds the server for ClientLink and dials with the client for
 // HostLink in ONE binary, so the two must coexist in one module graph.
 //
-// The single failing row fails like this:
+// That constraint is what held the previous pins (server v0.38.0, client
+// v0.12.0, protocol v0.19.2). The compatibility test was executable -- each row
+// a scratch module requiring centrifuge v0.38.0 plus one client, blank-
+// importing both, under GOWORK=off -- and it is kept because it explains the
+// shape of the move:
 //
-//	centrifuge@v0.38.0/handler_websocket.go:280:22:
-//	    undefined: protocol.GetStreamCommandDecoder
+//	centrifuge-go  resolved protocol   go build ./...   (server v0.38.0)
+//	v0.10.12       v0.17.0             exit 0
+//	v0.11.0        v0.19.2             exit 0
+//	v0.12.0        v0.19.2             exit 0   <- previously pinned
+//	v0.12.1        v0.21.0             exit 1
 //
-// The mechanism, read out of the dependency rather than guessed at: that symbol
-// was not removed when protocol reached v0.19.x. protocol v0.19.2 exports BOTH
-// GetStreamCommandDecoder (decode_stream.go:18) and its replacement
-// GetStreamCommandDecoderLimited (decode_stream.go:22). Only at v0.21.0 is the
-// unlimited form gone, leaving GetStreamCommandDecoderLimited alone
-// (decode_stream.go:45). So the break is at protocol v0.21.0, and therefore at
-// centrifuge-go v0.12.1 -- the only client release in range that pulls it.
+// The failing row failed at centrifuge@v0.38.0/handler_websocket.go:280:22,
+// `undefined: protocol.GetStreamCommandDecoder`: protocol v0.21.0 dropped the
+// unlimited decoder in favour of GetStreamCommandDecoderLimited. v0.39.x builds
+// against the limited form (centrifuge@v0.39.3/handler_websocket.go:406), so
+// moving the SERVER is what unlocked the client, and the whole triple moved
+// together: server v0.39.3, client v0.12.1, protocol v0.22.1. The client move
+// itself is a protocol bump only -- centrifuge-go v0.12.1's client.go is
+// byte-identical to v0.12.0's, so every centrifuge-go line cited in this module
+// is still exact.
 //
-// go list -m -versions reports no release between v0.12.0 and v0.12.1, so
-// v0.12.0 is the newest client that coexists with the pinned server.
+// Why the server moved: centrifuge v0.38.0's Node.Shutdown never closed the
+// per-Node eagle metrics aggregator, leaking one goroutine per Node; v0.39.0
+// closes it (centrifuge@v0.39.3/node.go:438-442), and
+// TestNodeShutdownLeavesNoMetricsAggregatorRunning holds that fix in place.
+// The browser client pin, centrifuge@5.7.2, was re-measured against v0.39.3
+// with the same harness that selected it against v0.38.0.
 //
-// The consequence for whoever moves these pins next, stated as narrowly as the
-// measurement supports: the client is already AT the newest coexisting release,
-// so the only client version currently out of reach is v0.12.1, and reaching it
-// means moving the embedded server to a release that builds against protocol
-// v0.21.0 or later. centrifuge v0.39.0 requires protocol v0.22.1 and is the
-// candidate. That server move -- not the client move -- is what carries a real
-// price: v0.38.0 is the version the workspace's compatibility spike measured
-// against the pinned browser client centrifuge@5.7.2, so moving it invalidates
-// a measurement and needs that spike redone. Moving the client alone does not.
+// What the move did NOT fix: centrifuge-go's close/reconnect races
+// (Client.send reading c.transport without c.mu, and handle running a pending
+// request's callback that Close's clearConnectedState also runs) are fixed on
+// centrifuge-go's master branch but in no release as of v0.12.1, so HostLink's
+// closeBound and Close ordering, and the -race skip on
+// TestReconnectStressNeverWedgesACaller, all stay.
 //
 // # What this suite does and does not measure
 //
@@ -144,7 +136,7 @@
 // ClientLinkLimits.PingInterval must REJECT a sub-second value at option
 // validation with an OptionError. It must not round it, floor it, or default
 // it. The reason is that the wire cannot carry it and the failure is silent and
-// misattributed: centrifuge@v0.38.0/client.go:2466 computes
+// misattributed: centrifuge@v0.39.3/client.go:3384 computes
 // res.Ping = uint32(c.pingInterval.Seconds()), which truncates 500ms to 0; and
 // centrifuge-go@v0.12.0/client.go:1467-1475 assigns c.sendPong = res.Pong
 // INSIDE `if res.Ping > 0`, so a client told Ping == 0 never pongs at all even
@@ -154,15 +146,15 @@
 // the result as a network fault.
 //
 // A stalled consumer costs its WHOLE connection, and this is structural rather
-// than a missing feature. centrifuge v0.38.0 has exactly one BOUNDED outbound
-// queue per Client (client.go:247, one *writer per connection). A per-channel
-// structure does exist and this doc previously denied it: client.go:248 holds a
-// *perChannelWriter (client_experimental.go:249), built only when the node sets
-// the experimental Config.GetChannelBatchConfig (client.go:2701-2702,
-// config.go:134). It is not a second queue, though -- it is a batching
+// than a missing feature. centrifuge v0.39.3 has exactly one BOUNDED outbound
+// queue per Client (client.go:299, one *writer per connection). A per-channel
+// structure does exist and this doc previously denied it: client.go:300 holds a
+// *perChannelWriter (client_experimental.go:246), built only when the node sets
+// the experimental Config.GetChannelBatchConfig (client.go:3759-3760,
+// config.go:231). It is not a second queue, though -- it is a batching
 // aggregator with no bound of its own. Each channelWriter accumulates into a
-// plain slice (client_experimental.go:138-146, field buffer) and flushes through
-// Client.writeQueueItems (client_experimental.go:109-117), which enqueues into
+// plain slice (client_experimental.go:137-146, field buffer) and flushes through
+// Client.writeQueueItems (client_experimental.go:108-116), which enqueues into
 // the single messageWriter and, when THAT overflows, closes the whole
 // connection. So the precise claim is that no per-channel outbound queue BOUND
 // exists anywhere in the library: turning batching on adds an unbounded buffer
@@ -182,19 +174,18 @@ package transport
 const (
 	// ServerModule is the embedded Centrifuge server library.
 	ServerModule  = "github.com/centrifugal/centrifuge"
-	ServerVersion = "v0.38.0"
+	ServerVersion = "v0.39.3"
 
 	// GoClientModule is the official Go client, for HostLink.
 	GoClientModule  = "github.com/centrifugal/centrifuge-go"
-	GoClientVersion = "v0.12.0"
+	GoClientVersion = "v0.12.1"
 
-	// ProtocolModule is the wire library BOTH of the above depend on, and the
-	// reason GoClientVersion is not the latest. It is pinned explicitly
-	// because it is the value the compatibility constraint is actually about:
-	// the constraint is "protocol below v0.21.0", not anything about the
-	// client's own version number.
+	// ProtocolModule is the wire library BOTH of the above depend on. It is
+	// pinned explicitly because it is the value the compatibility constraint
+	// is actually about: the server and the client share ONE protocol version
+	// in this module, and v0.38.0's server needed one below v0.21.0.
 	ProtocolModule  = "github.com/centrifugal/protocol"
-	ProtocolVersion = "v0.19.2"
+	ProtocolVersion = "v0.22.1"
 
 	// BrowserClientPackage and BrowserClientVersion are the npm client the
 	// spike selected against ServerVersion. Nothing in Go can hold this pin,

@@ -481,7 +481,7 @@ type ClientLinkLimits struct {
 	// MaxChannelsPerConnection bounds the session channels one link may hold.
 	//
 	// It is configuration rather than an omission because the transport
-	// defaults it SILENTLY: centrifuge@v0.38.0/node.go:135-136 sets
+	// defaults it SILENTLY: centrifuge@v0.39.3/node.go:146-147 sets
 	// ClientChannelLimit to 128 when it is zero. One browser link multiplexes
 	// every session its user is watching, so a ceiling nobody chose is a
 	// ceiling that is discovered by a user hitting it.
@@ -509,7 +509,7 @@ type ClientLinkLimits struct {
 	// It is the only bound such an admission has, and it is configuration
 	// rather than a constant because the deployment owns how long its durable
 	// plane may take. The transport gives the handler no per-RPC context --
-	// centrifuge@v0.38.0's RPCEvent carries a method and a payload and nothing
+	// centrifuge@v0.39.3's RPCEvent carries a method and a payload and nothing
 	// else -- and it dispatches the RPC synchronously on the connection's read
 	// loop, so an unbounded admission does not merely hang one command: it
 	// holds every other frame on that link and it prevents the replica from
@@ -548,7 +548,7 @@ type ClientLinkLimits struct {
 // can carry.
 //
 // It is one second because the connect reply expresses the cadence as a WHOLE
-// NUMBER OF SECONDS -- centrifuge@v0.38.0/client.go:2466 computes
+// NUMBER OF SECONDS -- centrifuge@v0.39.3/client.go:3384 computes
 // res.Ping = uint32(c.pingInterval.Seconds()) -- so every sub-second value
 // arrives as 0. That is not merely imprecise. The Go client assigns
 // c.sendPong = res.Pong INSIDE `if res.Ping > 0`
@@ -577,7 +577,7 @@ func DefaultClientLinkLimits() ClientLinkLimits {
 		// reservation: nothing is allocated per unused channel.
 		MaxChannelsPerConnection: 256,
 		// One mebibyte is centrifuge's own default
-		// (centrifuge@v0.38.0/node.go:132-133) and it is adopted rather than
+		// (centrifuge@v0.39.3/node.go:143-144) and it is adopted rather than
 		// re-derived. What matters at this scale is the product: 5,000
 		// connections each allowed a mebibyte is a 5 GiB worst case, which is
 		// a number a deployer must be able to see and lower, which is why it

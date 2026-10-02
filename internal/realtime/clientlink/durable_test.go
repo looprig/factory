@@ -641,7 +641,7 @@ func TestAFaultIsAnsweredAsATemporaryTransportFailureOverTheWire(t *testing.T) {
 //
 // The hazard the bound closes is not "one slow command". centrifuge dispatches
 // an RPC synchronously on the connection's read loop
-// (centrifuge@v0.38.0/client.go:1385 -> 2259), so an admission that never
+// (centrifuge@v0.39.3/client.go:1916 -> 3048), so an admission that never
 // returns holds the loop, and the loop is what would deliver every OTHER frame
 // on that link and what must return before Handler.Shutdown can drain the
 // connection. Before the bound, a single wedged store therefore hung the link

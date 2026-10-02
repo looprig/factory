@@ -856,7 +856,7 @@ func TestTheConnectionContextCarriesTheHandshakePrincipal(t *testing.T) {
 // TestOneLinkCarriesManySessionSubscriptions is step 1's multiplexing claim,
 // and it is sized to cross the transport's own silent default.
 //
-// centrifuge@v0.38.0/node.go:135-136 sets ClientChannelLimit to 128 when the
+// centrifuge@v0.39.3/node.go:146-147 sets ClientChannelLimit to 128 when the
 // configuration leaves it zero, so a handler that did not pass
 // MaxChannelsPerConnection would fail here at the 129th channel and nowhere
 // else. The count is an absolute literal above that default for exactly that
@@ -1411,7 +1411,7 @@ func TestManyClientsWatchingOneSessionAreOneDemand(t *testing.T) {
 // It is not the same case as unsubscribing three times: a disconnect never
 // sends an UNSUBSCRIBE frame, and the bindings are given back only because
 // centrifuge's own close unsubscribes every channel on the way out
-// (centrifuge@v0.38.0/client.go:1075-1081). A link is closed with no warning by
+// (centrifuge@v0.39.3/client.go:1618-1623). A link is closed with no warning by
 // a laptop lid, so this is the ordinary path rather than the exceptional one.
 func TestALinkGoingAwayReleasesEveryBindingItHeld(t *testing.T) {
 	t.Parallel()
@@ -1507,7 +1507,7 @@ func TestADemandPlaneFaultRefusesTheSubscriptionOverTheWire(t *testing.T) {
 		t.Fatal("a subscription was established with no demand behind it")
 	}
 	// 100 is ErrorInternal, which centrifuge marks Temporary
-	// (centrifuge@v0.38.0/errors.go:38-42). 103 would tell the browser it may
+	// (centrifuge@v0.39.3/errors.go:38-42). 103 would tell the browser it may
 	// never watch this session again.
 	if got := codeOf(err); got != 100 {
 		t.Errorf("the refusal carried code %d (%v), want 100 (internal, temporary)", got, err)
@@ -1547,7 +1547,7 @@ func TestShutdownGivesBackTheDemandItsLinksHeld(t *testing.T) {
 // this protocol can express "resume me from where I was". The reply must say
 // no to both, because those two members are the only thing that makes
 // centrifuge keep a stream position for this connection at all
-// (centrifuge@v0.38.0/client.go:3224, 3248-3249), and because the durable
+// (centrifuge@v0.39.3/client.go:4725-4727, 4761-4763), and because the durable
 // journal cursor is SessionStore's and the browser's, never a Factory
 // replica's: a cursor held here would be a second, weaker answer that a
 // reconnect to another replica could not honour.

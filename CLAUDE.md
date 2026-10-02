@@ -677,7 +677,7 @@ assumed.**
 
 `ClientLinkLimits.PingInterval` is **rejected below one second** rather than
 floored. The connect reply carries the cadence as a whole number of seconds
-(`centrifuge@v0.38.0/client.go:2466`), so 500ms arrives as `0`; the Go client
+(`centrifuge@v0.39.3/client.go:3384`), so 500ms arrives as `0`; the Go client
 assigns `c.sendPong = res.Pong` *inside* `if res.Ping > 0`
 (`centrifuge-go@v0.12.0/client.go:1467-1474`), so a client told `0` never pongs
 and the server closes **healthy** connections with `DisconnectNoPong` every pong
@@ -689,7 +689,7 @@ carries the unit because the field previously said "in messages" with a default
 of 256 — which would have configured a 256-**byte** budget and closed
 essentially every connection on its first event. The only thing that enforces it
 is `centrifuge.Config.ClientQueueMaxSize`, which is bytes
-(`centrifuge@v0.38.0/config.go:58-61`). It is measured by execution, both ways:
+(`centrifuge@v0.39.3/config.go:154-157`). It is measured by execution, both ways:
 **1,024** publications of 4 KiB kill a stalled consumer at a 4 KiB budget with
 3008 and do not at 16 MiB. The number is 1,024 and not 64 because 64 (256 KiB)
 was measured *surviving* — a stalled consumer's socket and read buffers absorb a
@@ -780,7 +780,7 @@ did. `Engine.Authenticate` now reuses the principal the ROUTER verified at the
 upgrade when, and only when, the client presents **no token**, the upgrade was
 authenticated by a **cookie**, and the context carries a constructed principal.
 The adapter reads the upgrade's operation context off the connection context
-(centrifuge builds it from the HTTP request, `handler_websocket.go:218-225`) and
+(centrifuge builds it from the HTTP request, `handler_websocket.go:290-297`) and
 hands it to the Engine as `ConnectRequest.Upgrade`/`Upgraded`; the Engine
 decides. A non-empty token is verified exactly as before whatever rode the
 upgrade, a **bearer** upgrade is not reused (a browser cannot set one, so it is
@@ -961,9 +961,9 @@ anything.
 **`ClientLinkLimits.CommandTimeout` is the ONLY bound a durable admission has,
 and before it there was none.** This was documented as "bounded by the link's
 lifetime", which is false, and the truth is worse than the claim.
-centrifuge@v0.38.0 dispatches an RPC **synchronously on the connection's read
-loop** (`client.go:1385` → `2259`), and the connection context is cancelled by
-the websocket handler's `defer close(ctxCh)` (`handler_websocket.go:218-222`) —
+centrifuge@v0.39.3 dispatches an RPC **synchronously on the connection's read
+loop** (`client.go:1916` → `3048`), and the connection context is cancelled by
+the websocket handler's `defer close(ctxCh)` (`handler_websocket.go:290-294`) —
 that is, when the read loop **returns**. An in-flight admission is the very
 thing keeping it from returning, so nothing about the connection can cancel one:
 a blocked admission's context was measured surviving `client.Close()`,
@@ -1156,12 +1156,12 @@ a binding it did not take, release one twice, or release someone else's. The
 transport needs exactly that, because it learns a subscription has ended in
 **three** places and all three must give back one binding once: an unsubscribe,
 a disconnect (`Client.close` unsubscribes every channel before reporting the
-disconnect, `client.go:1075-1081`), and a subscribe the library refused AFTER
-the callback returned — `onSubscribeError` deletes the channel and fires no
-unsubscribe event at all (`client.go:1721-1733`, `1773-1789`, `3672-3681`), so the handler
+disconnect, `centrifuge@v0.39.3/client.go:1618-1623`), and a subscribe the library refused AFTER
+the callback returned — `onSubscribeErrorGen` deletes the channel and fires no
+unsubscribe event at all (`client.go:2272-2296`, `2377-2394`, `5410-5423`), so the handler
 consults `IsSubscribed` once the callback returns. The `OnDisconnect` arm is a
 backstop with a mechanism rather than a worry: `unsubscribe` returns early when
-`node.removeSubscription` fails (`client.go:3667-3670`), before the handler is
+`node.removeSubscription` fails (`client.go:5405-5408`), before the handler is
 reached.
 
 **The tenant is the principal's; only the session is parsed.** A tenant read out
@@ -1217,10 +1217,10 @@ demand plane is specified as a FAULT and never as "no owner".
 **Factory does not retain the browser's durable journal cursor (step 3), and
 that is true at three layers.** The transport never hands one to this package:
 `SubscribeEvent` carries a channel, a token, opaque data and three booleans
-(`centrifuge@v0.38.0/events.go:168-183`) and no offset or epoch. The reply is
+(`centrifuge@v0.39.3/events.go:225-240`) and no offset or epoch. The reply is
 the zero `SubscribeOptions`, so `EnableRecovery` and `EnablePositioning` are
 false, and those two are the only members that make centrifuge keep a stream
-position for the connection at all (`client.go:3224`, `3248-3249`) — a
+position for the connection at all (`client.go:4725-4727`, `4761-4763`) — a
 browser asking for a positioned recoverable subscription is told **no** to both,
 with no stream position in the reply. And the demand seam carries the session
 identity and nothing else, asserted as a for-all: two subscriptions differing in
@@ -1287,10 +1287,10 @@ Two cases measure it, one over fakes and one over real sockets.
 written from memory.**
 
 `centrifuge.DisconnectInvalidToken` is **3500**, not 3501
-(`centrifuge@v0.38.0/disconnect.go:122`); 3501 is `DisconnectBadRequest`, at its
-own declaration `disconnect.go:127`. Both line numbers are at the **pinned**
-v0.38.0 and are not interchangeable: at the unpinned v0.39.0, `:122` is
-`DisconnectStateInvalidated`. The code is carried in a structured
+(`centrifuge@v0.39.3/disconnect.go:131`); 3501 is `DisconnectBadRequest`, at its
+own declaration `disconnect.go:136`. Both line numbers are at the **pinned**
+v0.39.3 and moved with the pin: at v0.38.0 they were `:122` and `:127`, and at
+v0.39.x `:122` is `DisconnectStateInvalidated` (3014). The code is carried in a structured
 `HostDisconnect` field so a caller and a test branch on the value rather than
 matching text, and a terminal-band close on a LIVE link — not only at dial
 time — is what stops the link answering.

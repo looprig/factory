@@ -39,7 +39,7 @@ import (
 // Each nil is a mechanism that would otherwise be reachable, and the last one
 // is the one this program has already had to correct a claim about: setting
 // GetChannelBatchConfig is what builds the experimental perChannelWriter
-// (centrifuge@v0.38.0/client.go:2701-2702), and that structure would add an
+// (centrifuge@v0.39.3/client.go:3759-3760), and that structure would add an
 // unbounded buffer in front of the one bounded queue without giving a channel a
 // failure domain of its own.
 func TestTheNodeConfigurationLeavesEveryOptionalMechanismOff(t *testing.T) {

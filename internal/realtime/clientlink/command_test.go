@@ -923,10 +923,10 @@ func TestTheAdmissionServiceIsExactlyTheSeamThisEdgeCalls(t *testing.T) {
 // # Why a bound has to be here, and what it is worth
 //
 // It was documented as "bounded by the LINK's lifetime". Measured on the pinned
-// transport, it was bounded by NOTHING. centrifuge@v0.38.0 dispatches an RPC
-// SYNCHRONOUSLY on the connection's read loop (client.go:1385 -> 2259), and the
+// transport, it was bounded by NOTHING. centrifuge@v0.39.3 dispatches an RPC
+// SYNCHRONOUSLY on the connection's read loop (client.go:1916 -> 3048), and the
 // connection context is cancelled by the websocket handler's
-// `defer close(ctxCh)` (handler_websocket.go:218-222) -- that is, when the read
+// `defer close(ctxCh)` (handler_websocket.go:290-294) -- that is, when the read
 // loop RETURNS. An in-flight admission is the very thing keeping the loop from
 // returning, so a disconnect cannot cancel it, and neither can Shutdown.
 //

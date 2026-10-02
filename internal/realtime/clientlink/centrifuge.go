@@ -140,7 +140,7 @@ const rpcFrameHeadroomBytes = 16 << 10
 //	                        broker and reaches no Redis or NATS
 //	GetPresenceManager      unset, so there is no presence at all
 //	GetChannelBatchConfig   unset, so the EXPERIMENTAL perChannelWriter
-//	                        (centrifuge@v0.38.0/client.go:2701-2702) is never
+//	                        (centrifuge@v0.39.3/client.go:3759-3760) is never
 //	                        built. It would not give a channel a failure domain
 //	                        anyway -- it is an unbounded batching buffer in
 //	                        front of the one bounded queue -- so enabling it
@@ -150,14 +150,14 @@ func nodeConfig(cfg Config) centrifuge.Config {
 		Version:  cfg.Version,
 		Name:     "factory-clientlink",
 		LogLevel: centrifuge.LogLevelNone,
-		// In BYTES. centrifuge@v0.38.0/config.go:58-61 defines
+		// In BYTES. centrifuge@v0.39.3/config.go:154-157 defines
 		// ClientQueueMaxSize that way and A5.1 measured the overflow close as
 		// DisconnectSlow (3008). ClientLinkLimits names the unit for the same
 		// reason: it previously said "messages" with a default of 256, which
 		// would have been a 256-byte budget.
 		ClientQueueMaxSize: cfg.Limits.PerConnectionQueueBytes,
 		// Set explicitly because the library defaults it SILENTLY to 128
-		// (centrifuge@v0.38.0/node.go:135-136), and one browser link
+		// (centrifuge@v0.39.3/node.go:146-147), and one browser link
 		// multiplexes every session its user is watching.
 		ClientChannelLimit: cfg.Limits.MaxChannelsPerConnection,
 	}
@@ -174,7 +174,7 @@ func (h *Handler) Connections() int { return h.node.Hub().NumClients() }
 //
 // The order is what makes the second half meaningful rather than decorative:
 // Node.Shutdown closes every client and waits for the hub
-// (centrifuge@v0.38.0/node.go:334-338), and closing a client unsubscribes its
+// (centrifuge@v0.39.3/node.go:446-454), and closing a client unsubscribes its
 // channels, so by the time it returns every DeliveryBinding is gone and every
 // session's release is merely SCHEDULED behind the debounce. A replica that
 // stopped there would leave the routing table holding demand for sessions no
@@ -193,7 +193,7 @@ func (h *Handler) Shutdown(ctx context.Context) error {
 // The protobuf refusal is Factory's, not the transport's. centrifuge's
 // WebsocketHandler selects Protobuf framing from `?format=protobuf`,
 // `?cf_protocol=protobuf` or the `centrifuge-protobuf` subprotocol
-// (centrifuge@v0.38.0/handler_websocket.go:134-160) and offers no way to turn
+// (centrifuge@v0.39.3/handler_websocket.go:186-213) and offers no way to turn
 // that off, so a browser could select a framing this surface has neither
 // qualified nor measured. It is refused BEFORE the upgrade, with an ordinary
 // HTTP status, because a client that cannot speak our framing cannot be told
@@ -249,7 +249,7 @@ func (h *Handler) connecting(ctx context.Context, e centrifuge.ConnectEvent) (ce
 
 	// The upgrade's operation context, if the router authenticated one. The
 	// transport builds the connection's context from the HTTP request's
-	// (centrifuge@v0.38.0/handler_websocket.go:218-225), so what the router
+	// (centrifuge@v0.39.3/handler_websocket.go:290-297), so what the router
 	// recorded on the upgrade is what ctx carries here, and this is the only
 	// place it is read: the Engine decides whether it may stand in for a
 	// token; this adapter only reports that it was there.
@@ -348,7 +348,7 @@ func (h *Handler) connected(client *centrifuge.Client) {
 			// The mechanism, rather than the adjective: a *Client exists only
 			// after connecting returned a ConnectReply, and the library stores
 			// that reply's Context on the client
-			// (centrifuge@v0.38.0/client.go:2379), so every client this handler
+			// (centrifuge@v0.39.3/client.go:3214), so every client this handler
 			// can be given carries the context connecting built -- which
 			// carries a principal or the handshake failed. Nothing in this
 			// package can produce a client without one, which is why no test
@@ -370,9 +370,9 @@ func (h *Handler) connected(client *centrifuge.Client) {
 		}
 		// Recorded BEFORE the callback, because the callback is what makes the
 		// subscription live: centrifuge sets flagSubscribed inside it
-		// (centrifuge@v0.38.0/client.go:3217) and only then can an unsubscribe
+		// (centrifuge@v0.39.3/client.go:4718) and only then can an unsubscribe
 		// -- including the one a concurrent close drives
-		// (client.go:1075-1081) -- reach the handler below. A binding recorded
+		// (client.go:1618-1623) -- reach the handler below. A binding recorded
 		// afterwards could be released by a close that already ran.
 		held.hold(e.Channel, release)
 		// The zero SubscribeOptions is the configuration this surface wants:
@@ -383,13 +383,13 @@ func (h *Handler) connected(client *centrifuge.Client) {
 		// question. It is also what makes A6.3 step 3 true at the transport:
 		// EnableRecovery and EnablePositioning are the only members that would
 		// make centrifuge retain this connection's stream position at all
-		// (client.go:3224, 3248-3249).
+		// (client.go:4725-4727, 4761-4763).
 		cb(centrifuge.SubscribeReply{Options: centrifuge.SubscribeOptions{}}, nil)
 		// The callback runs the whole of subscribeCmd SYNCHRONOUSLY on this
 		// goroutine, and it can still refuse afterwards -- a reply that fails
-		// to encode or to write ends at onSubscribeError (client.go:1773-1789),
+		// to encode or to write ends at onSubscribeErrorGen (client.go:2377-2394),
 		// which deletes the channel and therefore fires NO unsubscribe event
-		// (client.go:1721-1733, 3672-3681). A binding held for a subscription
+		// (client.go:2272-2296, 5410-5423). A binding held for a subscription
 		// that does not exist would hold demand for the life of the link, so
 		// the transport's own answer is consulted once the callback returns.
 		// This cannot double-release: the holder hands each release out once.
@@ -400,11 +400,11 @@ func (h *Handler) connected(client *centrifuge.Client) {
 
 	// The ordinary end of a binding, and the one a disconnect uses too:
 	// Client.close unsubscribes every channel before it reports the disconnect
-	// (centrifuge@v0.38.0/client.go:1075-1081).
+	// (centrifuge@v0.39.3/client.go:1618-1623).
 	client.OnUnsubscribe(func(e centrifuge.UnsubscribeEvent) { held.drop(e.Channel) })
 
 	// The backstop, and it has a mechanism rather than a worry. unsubscribe
-	// returns EARLY when node.removeSubscription fails (client.go:3667-3670),
+	// returns EARLY when node.removeSubscription fails (client.go:5405-5408),
 	// before the unsubscribe handler is reached, so a broker error on the way
 	// out would strand this connection's demand forever. Nothing in this
 	// composition makes that broker fail -- the node keeps its in-process
@@ -422,14 +422,14 @@ func (h *Handler) connected(client *centrifuge.Client) {
 			return
 		}
 		// The CONNECTION's context, because this transport version offers no
-		// other: centrifuge@v0.38.0's RPCEvent carries a method and a payload
-		// and nothing else (events.go:279-285), so there is no per-RPC
+		// other: centrifuge@v0.39.3's RPCEvent carries a method and a payload
+		// and nothing else (events.go:408-414), so there is no per-RPC
 		// cancellation to derive one from.
 		//
 		// It is not what BOUNDS the admission, and nothing about the connection
 		// could be: an RPC is dispatched synchronously on the read loop
-		// (client.go:1385 -> 2259) and this context is cancelled when that loop
-		// RETURNS (handler_websocket.go:218-222), so an in-flight admission is
+		// (client.go:1916 -> 3048) and this context is cancelled when that loop
+		// RETURNS (handler_websocket.go:290-294), so an in-flight admission is
 		// the very thing keeping it alive -- measured surviving client.Close,
 		// node.Shutdown and the server's own Close. The bound is the Engine's
 		// Limits.CommandTimeout, applied inside Admit; see that field for what
@@ -524,7 +524,7 @@ func (h *heldBindings) dropAll() {
 // Everything else is a FAULT -- an authorized channel this build cannot name a
 // session in, or a demand plane that could not be reached -- and it is answered
 // with centrifuge's ErrorInternal, which the library marks TEMPORARY
-// (centrifuge@v0.38.0/errors.go:38-42). That is the correct advertisement:
+// (centrifuge@v0.39.3/errors.go:38-42). That is the correct advertisement:
 // resubscribing after a demand-plane outage is exactly what a browser should
 // do, and telling it "permission denied" would stop it forever on a condition
 // that has nothing to do with its permissions.
@@ -547,7 +547,7 @@ func subscribeRefusal(err error) error {
 // classifying a denial more precisely than a fault.
 //
 // Everything else is internal, and centrifuge's own ErrorInternal is marked
-// TEMPORARY (centrifuge@v0.38.0/errors.go:38-42), which is the correct
+// TEMPORARY (centrifuge@v0.39.3/errors.go:38-42), which is the correct
 // advertisement for the conditions that reach it: a cancelled context, a
 // closing store, a provider outage. Retrying the same CommandID after one of
 // those is exactly what the durable command identity exists to make safe.

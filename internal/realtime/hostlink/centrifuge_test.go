@@ -116,11 +116,11 @@ func TestADialIsRefusedWhenTheHostRejectsTheCredential(t *testing.T) {
 	if !errors.As(err, &closed) {
 		t.Fatalf("Dial = %v, want a *HostDisconnect", err)
 	}
-	// 3500 is DisconnectInvalidToken (centrifuge@v0.38.0/disconnect.go:122),
+	// 3500 is DisconnectInvalidToken (centrifuge@v0.39.3/disconnect.go:131),
 	// in the terminal band 3500-3999, so the client does not reconnect and
 	// reports it through OnDisconnected. The literal was measured, not
 	// recalled: it was first written as 3501, which is DisconnectBadRequest
-	// (disconnect.go:127 -- its own declaration, not :122).
+	// (disconnect.go:136 -- its own declaration, not :131).
 	if closed.Code != 3500 {
 		t.Errorf("HostDisconnect.Code = %d, want 3500", closed.Code)
 	}
@@ -1020,12 +1020,12 @@ func TestATerminalDisconnectOnALiveLinkStopsItAnswering(t *testing.T) {
 
 	// The library's own constant, so the band is the library's rather than a
 	// number recalled here. DisconnectInvalidToken is 3500
-	// (centrifuge@v0.38.0/disconnect.go:122).
+	// (centrifuge@v0.39.3/disconnect.go:131).
 	host.disconnectEveryone(centrifuge.DisconnectInvalidToken)
 
 	// The wait reads the link's state WITHOUT sending anything (v0.4.0 regate
 	// N5). It used to probe with Bind, and centrifuge's server closes the
-	// connection on a goroutine (centrifuge@v0.38.0 client.go:1044), so the
+	// connection on a goroutine (centrifuge@v0.39.3 client.go:1532), so the
 	// first probing Bind could reach the Host before the close did -- a
 	// legitimate RPC on a still-live link that the count below then read as
 	// "2 rpcs, want 1" (1 run in 60). Negotiated reports the terminal error

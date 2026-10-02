@@ -252,7 +252,7 @@ func assertRejected(t *testing.T, err error, limits any, wantErr string) {
 // turned into a guard.
 //
 // The wire carries the ping cadence as a WHOLE NUMBER OF SECONDS:
-// centrifuge@v0.38.0/client.go:2466 computes res.Ping =
+// centrifuge@v0.39.3/client.go:3384 computes res.Ping =
 // uint32(c.pingInterval.Seconds()), so anything under a second truncates to 0.
 // A client told Ping == 0 takes the res.Pong assignment inside
 // `if res.Ping > 0` (centrifuge-go@v0.12.0/client.go:1467-1474) and therefore

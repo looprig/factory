@@ -64,10 +64,10 @@ type Limits struct {
 	//
 	// It is the only bound a durable admission has, and the reason it must
 	// exist here is a property of the pinned transport rather than a
-	// preference. centrifuge@v0.38.0 dispatches an RPC SYNCHRONOUSLY on the
-	// connection's read loop (client.go:1385 -> 2259), and the connection
+	// preference. centrifuge@v0.39.3 dispatches an RPC SYNCHRONOUSLY on the
+	// connection's read loop (client.go:1916 -> 3048), and the connection
 	// context is cancelled by the websocket handler's `defer close(ctxCh)`
-	// (handler_websocket.go:218-222) -- when that loop RETURNS. An in-flight
+	// (handler_websocket.go:290-294) -- when that loop RETURNS. An in-flight
 	// admission is what keeps the loop from returning, so nothing about the
 	// connection can cancel one: not a disconnect, not Handler.Shutdown. It was
 	// documented as "bounded by the link's lifetime" and was bounded by
