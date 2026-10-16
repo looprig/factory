@@ -881,7 +881,7 @@ flight.
 
 ## Development
 
-The Go baseline is 1.26.8. Verify standalone, with no workspace masking:
+The Go baseline is 1.26.9. Verify standalone, with no workspace masking:
 
 ```sh
 GOWORK=off go test ./...

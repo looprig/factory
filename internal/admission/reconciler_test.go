@@ -2484,7 +2484,9 @@ func TestTheConstantScanReportsWhatItCannotRead(t *testing.T) {
 // directory, and a derived subject read from the wrong one is a guard that
 // looks derived and is not. internal/placement pins core the same way and for
 // the same reason.
-const pinnedSessionstoreVersion = "v0.15.0"
+// Rechecked at v0.15.1: the Go sources, inbox states, error vocabulary and
+// deadline/claim rules are unchanged from v0.15.0.
+const pinnedSessionstoreVersion = "v0.15.1"
 
 const pinnedSessionstoreModule = "github.com/looprig/sessionstore"
 

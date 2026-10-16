@@ -13,11 +13,11 @@ import (
 // name, and the only ones remote-verified as released when the scaffold landed.
 // A Looprig module absent from this map has no version Factory may name.
 var releasedLooprigVersions = map[string]string{
-	"github.com/looprig/core":         "v0.13.0",
-	"github.com/looprig/storage":      "v0.7.0",
-	"github.com/looprig/fsstore":      "v0.6.0",
-	"github.com/looprig/natsstore":    "v0.5.3",
-	"github.com/looprig/sessionstore": "v0.15.0",
+	"github.com/looprig/core":         "v0.13.2",
+	"github.com/looprig/storage":      "v0.9.1",
+	"github.com/looprig/fsstore":      "v0.6.2",
+	"github.com/looprig/natsstore":    "v0.5.5",
+	"github.com/looprig/sessionstore": "v0.15.1",
 }
 
 // forbiddenModules may never appear in go.mod at any version, released or not.

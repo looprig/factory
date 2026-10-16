@@ -322,8 +322,9 @@ func TestAnUnknownDurableStateIsAFaultRatherThanAnAcceptance(t *testing.T) {
 // repository is: the whole point is to notice when the dependency's own answer
 // moves.
 const (
-	pinnedSessionstoreModule  = "github.com/looprig/sessionstore"
-	pinnedSessionstoreVersion = "v0.15.0"
+	pinnedSessionstoreModule = "github.com/looprig/sessionstore"
+	// Rechecked at v0.15.1: errors.go and both vocabularies are unchanged.
+	pinnedSessionstoreVersion = "v0.15.1"
 
 	pinnedCatalogErrorCodes  = 14
 	pinnedKeyspaceErrorCodes = 10

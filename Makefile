@@ -7,8 +7,8 @@ GOFILES = GOWORK=off go run ./internal/modfiles/cmd/modfiles -root .
 
 # GOTOOLCHAIN selects the compiler for `go` commands, not a standalone
 # `gofmt` found on PATH. Resolve the formatter from the pinned toolchain so
-# fmt and fmt-check enforce the module's Go 1.26.8 baseline.
-GOFMT := $(shell GOWORK=off GOTOOLCHAIN=go1.26.8 go env GOROOT)/bin/gofmt
+# fmt and fmt-check enforce the module's Go 1.26.9 baseline.
+GOFMT := $(shell GOWORK=off GOTOOLCHAIN=go1.26.9 go env GOROOT)/bin/gofmt
 
 # PIPEFAIL is stated in each piping recipe rather than inherited from
 # .SHELLFLAGS above, and that is not belt-and-braces: .SHELLFLAGS arrived in GNU
@@ -75,7 +75,7 @@ gosec:
 
 vuln:
 	GOWORK=off go mod verify
-	GOWORK=off go run golang.org/x/vuln/cmd/govulncheck@v1.6.0 ./...
+	GOWORK=off go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...
 
 # Fuzz targets are shaped correctly but only ever executed their seed corpus
 # under `go test`, so a reachable panic could sit behind a green check. Run each
